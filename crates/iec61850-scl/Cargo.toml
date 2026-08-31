@@ -1,0 +1,17 @@
+[package]
+name = "iec61850-scl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SCL parser for IEC 61850-6: reads ICD, CID and SCD files into an IedModel"
+keywords = ["iec61850", "scl", "scd", "icd", "substation"]
+categories = ["parser-implementations", "network-programming"]
+
+[dependencies]
+iec61850-model = { workspace = true }
+quick-xml      = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }

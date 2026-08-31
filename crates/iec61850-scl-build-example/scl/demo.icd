@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  demo.icd - the minimal SCL fixture used by iec61850-scl-build-example.
+
+  Contents:
+    - one IED (name="Demo") with logical device inst="LD0"
+    - LLN0 carrying Mod and Beh, one data set and one unbuffered report
+      control block
+    - MMXU1, a measurement logical node, with TotW whose mag.f is a FLOAT32
+    - CSWI1, a control logical node, with Pos as a DPC (ctlVal, stVal, q, t)
+
+  Every element is either self-closing or properly paired. Each FCDA is
+  addressed by ldInst, lnClass, lnInst and doName.
+-->
+<SCL>
+  <DataTypeTemplates>
+    <!-- Logical node types: LLN0, MMXU, CSWI -->
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+      <DO name="Beh" type="ENC_T"/>
+    </LNodeType>
+    <LNodeType id="MMXU_T" lnClass="MMXU">
+      <DO name="TotW" type="MV_T"/>
+    </LNodeType>
+    <LNodeType id="CSWI_T" lnClass="CSWI">
+      <DO name="Pos" type="DPC_T"/>
+    </LNodeType>
+
+    <!-- DOTypes, that is CDC instances -->
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="Enum" type="ModEnum" dchg="true"/>
+      <DA name="q"     fc="ST" bType="Quality" qchg="true"/>
+      <DA name="t"     fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="MV_T" cdc="MV">
+      <DA name="mag" fc="MX" bType="Struct" type="AnalogValue_T" dchg="true"/>
+      <DA name="q"   fc="MX" bType="Quality" qchg="true"/>
+      <DA name="t"   fc="MX" bType="Timestamp"/>
+    </DOType>
+    <DOType id="DPC_T" cdc="DPC">
+      <DA name="stVal" fc="ST" bType="Dbpos" dchg="true"/>
+      <DA name="q"     fc="ST" bType="Quality" qchg="true"/>
+      <DA name="t"     fc="ST" bType="Timestamp"/>
+      <DA name="ctlVal" fc="CO" bType="BOOLEAN"/>
+    </DOType>
+
+    <!-- Constructed DAType -->
+    <DAType id="AnalogValue_T">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+
+    <!-- EnumType -->
+    <EnumType id="ModEnum">
+      <EnumVal ord="1">on</EnumVal>
+      <EnumVal ord="2">blocked</EnumVal>
+      <EnumVal ord="3">test</EnumVal>
+      <EnumVal ord="4">test/blocked</EnumVal>
+      <EnumVal ord="5">off</EnumVal>
+    </EnumType>
+  </DataTypeTemplates>
+
+  <IED name="Demo">
+    <AccessPoint name="AP1">
+      <Server>
+        <LDevice inst="LD0">
+          <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
+            <!-- Mod.stVal defaults to "on", set through a DAI override -->
+            <DOI name="Mod">
+              <DAI name="stVal">
+                <Val>on</Val>
+              </DAI>
+            </DOI>
+            <!-- Data set, paired with the report control block below -->
+            <DataSet name="Measurements">
+              <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="TotW" fc="MX"/>
+              <FCDA ldInst="LD0" lnClass="CSWI" lnInst="1" doName="Pos"  fc="ST"/>
+            </DataSet>
+            <!-- Unbuffered report control block -->
+            <ReportControl name="urcb01" datSet="Measurements" rptID="DemoRpt"
+                           buffered="false" intgPd="1000" confRev="1">
+              <TrgOps dchg="true" qchg="true" period="false"/>
+              <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true"/>
+              <RptEnabled max="2"/>
+            </ReportControl>
+          </LN0>
+          <LN lnClass="MMXU" inst="1" lnType="MMXU_T"/>
+          <LN lnClass="CSWI" inst="1" lnType="CSWI_T"/>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+</SCL>

@@ -1,0 +1,29 @@
+[package]
+name = "iec61850-asn1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared BER length codec and nesting guards for the IEC 61850 MMS, GOOSE and SV layers"
+keywords = ["iec61850", "asn1", "ber", "mms", "no-std"]
+categories = ["encoding", "network-programming", "no-std"]
+
+[features]
+# `std` is the default, so a desktop build is unaffected.
+# Embedded targets use `--no-default-features --features alloc` for the
+# no_std + alloc path.
+default = ["std"]
+std     = ["alloc", "thiserror/std", "bytes/std", "tracing/std", "tracing/attributes"]
+alloc   = []
+
+[dependencies]
+# Declared directly rather than through the workspace aliases: when a workspace
+# dependency omits `default-features`, a downstream override does not take
+# effect (Cargo warns today, hard error later). Declaring the crates.io versions
+# here lets this crate control the no_std path precisely. Versions match the
+# workspace: thiserror 2 / bytes 1 / tracing 0.1.
+bytes     = { version = "1",   default-features = false }
+thiserror = { version = "2",   default-features = false }
+tracing   = { version = "0.1", default-features = false }

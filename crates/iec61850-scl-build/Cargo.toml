@@ -1,0 +1,21 @@
+[package]
+name = "iec61850-scl-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Build-script helper that compiles an SCL or ICD file into a Rust IedModel"
+keywords = ["iec61850", "scl", "icd", "codegen", "build-script"]
+categories = ["development-tools::build-utils", "network-programming"]
+
+[dependencies]
+# Supplies RawScl, parse_scl and the shared `__build_internals` helpers.
+iec61850-scl = { workspace = true }
+proc-macro2  = { workspace = true }
+quote        = { workspace = true }
+syn          = { workspace = true }
+prettyplease = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }

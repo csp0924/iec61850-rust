@@ -1,0 +1,42 @@
+[package]
+name = "iec61850-goose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GOOSE publisher, subscriber and receiver for IEC 61850-8-1 over raw Ethernet"
+keywords = ["iec61850", "goose", "substation", "ethernet", "scada"]
+categories = ["network-programming"]
+
+[dependencies]
+iec61850-hal   = { workspace = true }
+iec61850-asn1  = { workspace = true }
+iec61850-model = { workspace = true }
+thiserror      = { workspace = true }
+bytes          = { workspace = true }
+tracing        = { workspace = true }
+tokio          = { workspace = true, optional = true, features = ["time", "rt", "sync", "macros"] }
+
+[features]
+# `tokio-runtime` exposes `tokio_helper::run_retrans_loop`, a convenience for
+# development and tests. The default caller-driven mode needs no runtime; a
+# production hot path belongs on a dedicated thread.
+tokio-runtime = ["dep:tokio"]
+
+[dev-dependencies]
+tokio          = { workspace = true, features = ["time", "rt", "sync", "macros", "rt-multi-thread"] }
+
+# AF_PACKET raw socket helpers for the Linux-only examples.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+# The goose_publisher_live example drives the AF_PACKET backend of the hal.
+iec61850-hal = { workspace = true, features = ["ethernet-linux-afpacket"] }
+
+# On Windows and macOS the pcap backend must be requested explicitly:
+#   cargo build -p iec61850-goose --example goose_publisher_live \
+#       --features iec61850-hal/ethernet-pcap
+# The NPCAP or libpcap SDK is supplied by the user. It is deliberately not a
+# dev-dependency, so that a default test build does not fail to link for want
+# of wpcap.lib.

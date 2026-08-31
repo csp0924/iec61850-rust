@@ -1,0 +1,40 @@
+[package]
+name = "iec61850-sv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sampled Values publisher and subscriber for IEC 61850-9-2"
+keywords = ["iec61850", "sampled-values", "substation", "ethernet", "scada"]
+categories = ["network-programming"]
+
+[dependencies]
+iec61850-hal   = { workspace = true }
+iec61850-asn1  = { workspace = true }
+iec61850-model = { workspace = true }
+thiserror      = { workspace = true }
+bytes          = { workspace = true }
+tracing        = { workspace = true }
+tokio          = { workspace = true, optional = true, features = ["time", "rt", "sync", "macros"] }
+
+[features]
+# `tokio-runtime` exposes tokio-based helpers, a convenience for development
+# and tests. The 4000 samples per second publisher hot path does not depend on
+# a runtime; it runs on a dedicated thread with SCHED_FIFO and clock_nanosleep.
+tokio-runtime = ["dep:tokio"]
+
+# publish_thread is Linux-only and calls clock_nanosleep and
+# pthread_setschedparam through libc.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio          = { workspace = true, features = ["time", "rt", "sync", "macros", "rt-multi-thread"] }
+
+# AF_PACKET raw socket helpers for the Linux-only examples.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+# The sv_publisher_live example drives the AF_PACKET backend of the hal.
+iec61850-hal = { workspace = true, features = ["ethernet-linux-afpacket"] }

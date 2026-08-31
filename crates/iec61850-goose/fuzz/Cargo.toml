@@ -1,0 +1,50 @@
+[package]
+name = "iec61850-goose-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Kept out of the parent workspace so that the nightly-only requirements of
+# cargo-fuzz do not affect the stable workspace build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.iec61850-goose]
+path = ".."
+
+# The seed generator builds PDUs from model values.
+[dependencies.iec61850-model]
+path = "../../iec61850-model"
+
+# Arbitrary bytes fed to `GoosePdu::decode_ber` must not panic.
+[[bin]]
+name = "goose_pdu_parse"
+path = "fuzz_targets/goose_pdu_parse.rs"
+test = false
+doc = false
+
+# Arbitrary bytes fed through `GooseFrame::decode` into `GoosePdu::decode_ber`,
+# covering the whole raw-socket attack surface: Ethernet and VLAN header
+# parsing followed by PDU decoding.
+[[bin]]
+name = "goose_frame_parse"
+path = "fuzz_targets/goose_frame_parse.rs"
+test = false
+doc = false
+
+# Not a fuzz target: regenerates the checked-in seed corpus of the two targets
+# above. Run it with `cargo run --bin gen_corpus`.
+[[bin]]
+name = "gen_corpus"
+path = "bin/gen_corpus.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1

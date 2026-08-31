@@ -1,0 +1,73 @@
+# cargo-deny configuration for the iec61850-* workspace.
+#
+# Run:
+#   cargo deny check                # everything
+#   cargo deny check advisories     # RUSTSEC advisories and unmaintained crates
+#   cargo deny check licenses       # license allow list
+#   cargo deny check bans           # duplicate versions and banned crates
+#   cargo deny check sources        # registry and git sources
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ── advisories ────────────────────────────────────────────────────────────────
+[advisories]
+# No advisory is suppressed. An entry added here carries the reason it is
+# there; a new entry is never added silently.
+ignore = []
+
+# ── licenses ──────────────────────────────────────────────────────────────────
+# Permissive licenses only. MPL-2.0, GPL and AGPL are not allowed; adding one
+# requires an explicit review.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.8
+
+# ── bans ──────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The client and server crates depend on each other as dev-dependencies for
+# their end-to-end tests. Those entries are path-only and carry no version, so
+# that Cargo strips them when packaging and the cycle stays out of the publish
+# graph; a version-less path dependency would otherwise read as a wildcard.
+allow-wildcard-paths = true
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# openssl-sys must not be pulled in: the IEC 62351 path runs on rustls, and
+# mbedtls interoperability stays behind an iec61850-tls feature flag.
+deny = [
+    { crate = "openssl-sys", reason = "TLS runs on rustls; for mbedtls interoperability use the iec61850-tls feature flag rather than openssl-sys" },
+]
+
+# Accepted duplicate versions, where the upgrade cost outweighs the impact.
+skip = []
+skip-tree = []
+
+# ── sources ───────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

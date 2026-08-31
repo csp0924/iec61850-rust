@@ -1,0 +1,5 @@
+# Text files are stored with LF endings regardless of the checkout platform.
+* text=auto eol=lf
+
+# Fuzzing seed corpora are opaque byte strings and must not be rewritten.
+crates/*/fuzz/corpus/** binary

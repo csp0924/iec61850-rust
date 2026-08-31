@@ -1,0 +1,15 @@
+/target
+**/target
+
+# Coverage instrumentation output.
+*.profraw
+
+# cargo-fuzz reproducers and coverage data.
+crates/*/fuzz/artifacts/
+crates/*/fuzz/coverage/
+
+# The GOOSE seed corpus is regenerated on demand by the fuzz crate's gen_corpus
+# binary, so it is not checked in. The Sampled Values corpus under
+# crates/iec61850-sv/fuzz/corpus is checked in, together with any minimized
+# reproducer promoted into it.
+crates/iec61850-goose/fuzz/corpus/

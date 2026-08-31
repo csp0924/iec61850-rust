@@ -1,0 +1,28 @@
+[package]
+name = "iec61850-scl-build-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Demonstrates compiling an .icd file into an IedModel from build.rs and serving it"
+publish = false
+
+# Two halves: build.rs runs the code generation, the binary consumes the
+# generated IedModel. This is a crate rather than a cargo example because an
+# example cannot carry its own build script, and the SCL to Rust translation
+# has to happen at build time.
+[dependencies]
+# The generated IedModel is reached through the `__rt` re-export of
+# iec61850-scl, so a consumer does not depend on iec61850-model directly.
+iec61850-scl    = { workspace = true }
+# iec61850-server is referenced by path rather than through a workspace alias,
+# matching iec61850-client: it stays out of the shared alias list so that the
+# alias graph carries no apparent cycle.
+iec61850-server = { path = "../iec61850-server", version = "0.1.0" }
+tokio           = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+
+[build-dependencies]
+# Runs the SCL to Rust code generation and writes model.rs into OUT_DIR.
+iec61850-scl-build = { workspace = true }

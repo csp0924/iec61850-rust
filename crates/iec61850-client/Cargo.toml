@@ -1,0 +1,128 @@
+[package]
+name = "iec61850-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "IEC 61850 client: ACSI control, reporting, data sets and directory browsing over MMS"
+keywords = ["iec61850", "client", "mms", "acsi", "scada"]
+categories = ["network-programming"]
+
+[dependencies]
+# The downstream crates are referenced by path with an explicit
+# `default-features = false` rather than through the workspace aliases: a
+# workspace alias does not reliably propagate a downstream
+# `default-features = false` (rust-lang/cargo#12162) and the override is
+# silently unified back into the default.
+iec61850-mms   = { path = "../iec61850-mms",   version = "0.1.0", default-features = false }
+iec61850-model = { path = "../iec61850-model", version = "0.1.0", default-features = false }
+# `IedConnection<T, Tm>` names the hal traits `AsyncTransport` and `Timer`
+# directly, plus `TokioTimer` as the default type parameter on std targets.
+iec61850-hal   = { path = "../iec61850-hal",   version = "0.1.0", default-features = false }
+iec61850-tls   = { workspace = true, optional = true }
+rustls         = { workspace = true, optional = true }
+thiserror      = { version = "2",   default-features = false }
+tracing        = { version = "0.1", default-features = false }
+# tokio is enabled only by `std`; an embedded build does not pull it in.
+tokio          = { workspace = true, features = ["sync", "rt", "macros"], optional = true }
+bytes          = { version = "1",   default-features = false }
+# bitflags is not a workspace dependency; the version is pinned here.
+bitflags       = { version = "2", default-features = false }
+# The embedded path needs a HashMap and synchronization primitives for the
+# report registry and control state. Both are optional and gated on the
+# `embedded` feature, so a std build does not pull them in.
+hashbrown      = { version = "0.14", default-features = false, features = ["ahash", "inline-more"], optional = true }
+ahash          = { version = "0.8",  default-features = false, features = ["compile-time-rng"], optional = true }
+spin           = { version = "0.9",  default-features = false, features = ["mutex", "spin_mutex", "rwlock"], optional = true }
+
+[features]
+# The default keeps the full desktop feature set.
+default = [
+    "std",
+    "reporting",
+    "control",
+    "datasets",
+]
+# `minimal` is a bare connect / disconnect / read / write skeleton used as a
+# code-size baseline. It carries no submodule feature and selects no
+# environment, so the caller states one:
+#   desktop host:      `--no-default-features --features minimal,std`
+#   Cortex-M target:   `--no-default-features --features minimal,embedded`
+minimal = []
+# `mms-core` covers the five core MMS services: Read, Write, DataSet, Control
+# and Report. It carries neither tls nor the GOOSE and SV data planes.
+mms-core = ["reporting", "control", "datasets"]
+# std environment: tokio runtime and std::sync, with the downstream mms and
+# model crates switched back to std.
+std = [
+    "dep:tokio",
+    "iec61850-mms/std",
+    "iec61850-model/std",
+    "thiserror/std",
+    "bytes/std",
+    "tracing/std",
+    "tracing/attributes",
+]
+# Embedded environment: no_std + alloc, with mms and model on their embedded
+# paths plus hashbrown and spin. It composes with reporting, control and
+# datasets: the synchronization primitives are selected in sync.rs, where the
+# embedded path wraps spin in an async-shaped API, adequate for the
+# single-core, single-future case. TLS is not available here; GOOSE and SV run
+# over raw Ethernet and are outside this crate.
+embedded = [
+    "iec61850-mms/embedded",
+    "iec61850-model/embedded",
+    "dep:hashbrown",
+    "dep:ahash",
+    "dep:spin",
+]
+# reporting: URCB and BRCB report dispatch, the RCB API, GoCB and the journal.
+# `poll_reports` and `spawn_report_dispatcher` need std::time::Instant and
+# tokio::spawn and are therefore gated on `std`; an embedded caller drives the
+# registry manually.
+reporting = []
+# control: ControlObjectClient with select, operate and cancel. The
+# direct-normal and sbo-normal models work in either environment; the enhanced
+# models wait for a command termination against a std::time::Instant deadline
+# and are gated on `std`.
+control = []
+# datasets: DataSet access (get_data_set_values, set_data_set_values,
+# DataSetMember). Needs alloc and the async MmsClient API only.
+datasets = []
+# TLS over MMS (IedConnection::connect_tls), forwarded to iec61850-mms.
+tls = ["std", "iec61850-mms/tls", "dep:iec61850-tls", "dep:rustls"]
+
+[dev-dependencies]
+tokio          = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "signal"] }
+# The end-to-end tests host a server. Deliberately path-only, with no version:
+# Cargo strips a version-less dev-dependency when packaging, which is what keeps
+# the client/server dev-dependency cycle out of the publish graph.
+iec61850-server = { path = "../iec61850-server" }
+iec61850-model  = { workspace = true }
+
+# Minimal client binary used as a code-size baseline: connect, read_object,
+# write_object, disconnect, without reporting, control or datasets.
+[[example]]
+name = "min_client"
+path = "examples/min_client.rs"
+
+[[example]]
+name = "client_reporting_subscriber"
+path = "examples/client_reporting_subscriber.rs"
+
+[[example]]
+name = "directory_browser"
+path = "examples/directory_browser.rs"
+
+[[example]]
+name = "read_write_cycle"
+path = "examples/read_write_cycle.rs"
+
+# `required-features = ["tls"]` keeps `cargo build --workspace` off the TLS
+# path, which is not free to compile and is not needed by the default tests.
+[[example]]
+name = "tls_client"
+path = "examples/tls_client.rs"
+required-features = ["tls"]

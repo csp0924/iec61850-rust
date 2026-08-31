@@ -1,0 +1,53 @@
+[package]
+name = "iec61850-mms-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Kept out of the parent workspace so that the nightly-only requirements of
+# cargo-fuzz do not affect the stable workspace build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.iec61850-mms]
+path = ".."
+
+# Every fuzz target is its own binary.
+[[bin]]
+name = "mms_pdu_decode"
+path = "fuzz_targets/mms_pdu_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "acse_parse"
+path = "fuzz_targets/acse_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cotp_parse"
+path = "fuzz_targets/cotp_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "session_parse"
+path = "fuzz_targets/session_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "presentation_parse"
+path = "fuzz_targets/presentation_parse.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1

@@ -1,0 +1,91 @@
+[package]
+name = "iec61850-mms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MMS protocol stack for IEC 61850: COTP, Session, Presentation, ACSE and MMS PDUs"
+keywords = ["iec61850", "mms", "iso9506", "cotp", "acse"]
+categories = ["network-programming", "encoding", "no-std"]
+
+[features]
+# Default: std plus the tokio backend.
+default = ["std"]
+
+# std environment: tokio plus the `transport-tokio` backend of iec61850-hal
+# (TcpStream + TokioTimer). thiserror, bytes and tracing are switched to their
+# std modes at the same time.
+std = [
+    "alloc",
+    "dep:tokio",
+    "iec61850-hal/transport-tokio",
+    "iec61850-asn1/std",
+    "iec61850-model/std",
+    "thiserror/std",
+    "bytes/std",
+    "tracing/std",
+    "tracing/attributes",
+]
+
+# alloc-only path: no_std + alloc. Every upper-layer type stays available; only
+# the std::io and tokio entry points are absent.
+alloc = []
+
+# Embedded environment: alloc plus the hal transport traits, with the
+# downstream crates switched to no_std. Neither tokio nor std::io is enabled;
+# the concrete backend comes from the `transport-embassy` feature of the hal.
+embedded = [
+    "alloc",
+    "iec61850-hal/transport",
+    "iec61850-asn1/alloc",
+    "iec61850-model/embedded",
+    "dep:hashbrown",
+    "dep:ahash",
+]
+
+# TLS over MMS (secure MMS port 3782). Implies std, since tokio-rustls needs a
+# tokio runtime.
+tls = ["std", "dep:iec61850-tls", "dep:tokio-rustls", "dep:rustls"]
+
+[dependencies]
+# The hal `transport` and `transport-tokio` features are enabled conditionally
+# by this crate's own std / embedded features; the baseline dependency provides
+# the trait definitions only.
+# The three intra-workspace crates are referenced by path rather than through
+# the workspace aliases: a workspace alias does not reliably propagate a
+# downstream `default-features = false` (rust-lang/cargo#12162) and the
+# override is silently unified back into the default. A direct path reference
+# bypasses the alias mechanism.
+iec61850-hal   = { path = "../iec61850-hal",   version = "0.1.0", default-features = false }
+iec61850-asn1  = { path = "../iec61850-asn1",  version = "0.1.0", default-features = false }
+iec61850-tls   = { workspace = true, optional = true }
+iec61850-model = { path = "../iec61850-model", version = "0.1.0", default-features = false }
+# Declared directly for the same reason: precise control of the no_std path.
+thiserror      = { version = "2",   default-features = false }
+bytes          = { version = "1",   default-features = false }
+tracing        = { version = "0.1", default-features = false }
+# hashbrown replaces std::HashSet on embedded targets. compile-time-rng avoids
+# the OS RNG that getrandom would otherwise require.
+hashbrown      = { version = "0.14", default-features = false, features = ["ahash", "inline-more"], optional = true }
+ahash          = { version = "0.8",  default-features = false, features = ["compile-time-rng"], optional = true }
+# tokio is enabled only by `std`; an embedded build does not pull it in.
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros", "time", "sync"], optional = true }
+tokio-rustls   = { workspace = true, optional = true }
+rustls         = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time", "sync"] }
+iec61850-tls   = { workspace = true }
+rcgen          = { workspace = true }
+criterion      = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# BER decode and encode microbenchmarks. Target: a 100 byte PDU under 1 us.
+[[bench]]
+name = "ber_decode"
+harness = false
+
+[[bench]]
+name = "ber_encode"
+harness = false

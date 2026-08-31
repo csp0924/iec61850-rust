@@ -1,0 +1,19 @@
+[package]
+name = "iec61850-sntp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SNTPv4 (RFC 4330) client and server for IEC 61850 IED time synchronization"
+keywords = ["sntp", "ntp", "iec61850", "rfc4330", "scada"]
+categories = ["network-programming", "date-and-time"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+tokio     = { workspace = true, features = ["net", "rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt", "macros", "rt-multi-thread", "time"] }

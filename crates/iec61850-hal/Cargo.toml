@@ -1,0 +1,76 @@
+[package]
+name = "iec61850-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Platform abstraction for IEC 61850: raw Ethernet sockets, async transport and timer traits"
+keywords = ["iec61850", "hal", "ethernet", "no-std", "embedded"]
+categories = ["network-programming", "hardware-support", "no-std"]
+
+[features]
+# The default keeps ethernet + std enabled so that a plain `cargo build` on a
+# desktop target behaves as before.
+default = ["std", "ethernet"]
+
+# no_std / std selection, matching the asn1 and model crates.
+std      = ["alloc"]
+alloc    = []
+# `embedded` targets cross-compilation: trait definitions only, no platform backend.
+embedded = ["alloc"]
+
+# Ethernet HAL traits, enabled by default and free of dependencies.
+ethernet = []
+
+# Linux AF_PACKET raw socket backend. Requires CAP_NET_RAW.
+ethernet-linux-afpacket = ["ethernet", "std", "dep:libc"]
+
+# Portable pcap fallback for development and testing. Needs libpcap on Linux
+# and the NPCAP runtime on Windows.
+ethernet-pcap = ["ethernet", "std", "dep:pcap"]
+
+# Windows NPCAP backend. It shares the implementation with `ethernet-pcap`; the
+# separate feature exists so that deployment documentation can address the
+# NPCAP installation requirement on its own.
+ethernet-windows-npcap = ["ethernet", "std", "dep:pcap"]
+
+# `AsyncTransport` and `Timer` traits used by the MMS stack. Trait definitions
+# only, orthogonal to `ethernet`. An embedded consumer that needs a connection
+# enables this.
+transport = []
+# Blanket impl over the tokio backend, for the MMS stack on std targets. Off by
+# default so that a default build does not pull in tokio. A downstream crate
+# enables it through `features = ["transport-tokio"]`.
+transport-tokio = ["transport", "std", "dep:tokio"]
+# Blanket impl over embassy and embedded-io-async, for the MMS stack on
+# no_std + alloc targets. Enabled by a downstream crate through
+# `features = ["transport-embassy"]`, or transitively by the `embedded` feature
+# of `iec61850-mms`.
+transport-embassy = [
+    "transport",
+    "embedded",
+    "dep:embedded-io-async",
+    "dep:embassy-time",
+]
+
+[dependencies]
+# Declared directly rather than through a workspace alias, as in asn1 and model:
+# an alias that omits `default-features` swallows a downstream override.
+thiserror = { version = "2", default-features = false }
+libc = { workspace = true, optional = true }
+pcap  = { version = "2", optional = true }
+# tokio is pulled in only by `transport-tokio`; the feature set matches the one
+# used by the downstream mms, server and client crates.
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time"], optional = true }
+# embassy bindings. embedded-io-async supplies Cortex-M friendly Read/Write and
+# embassy-time supplies an RTC-tick Timer::after.
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
+embassy-time      = { version = "0.3", default-features = false, optional = true }
+
+[dev-dependencies]
+# Used by the transport and time module tests. `test-util` lets
+# `tokio::test(start_paused = true)` drive timer tests off the wall clock so
+# that they do not flake in CI.
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "rt-multi-thread", "time", "macros", "sync", "test-util"] }

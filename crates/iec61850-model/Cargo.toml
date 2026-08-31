@@ -1,0 +1,33 @@
+[package]
+name = "iec61850-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "IEC 61850 data model: MmsValue, common data classes and the LD/LN/DO/DA tree"
+keywords = ["iec61850", "scada", "mms", "substation", "no-std"]
+categories = ["network-programming", "data-structures", "no-std"]
+
+[features]
+# `std` is the default, so a desktop build is unaffected.
+# Embedded targets use `--no-default-features --features embedded` for the
+# no_std + hashbrown + spin path.
+default  = ["std"]
+std      = ["alloc", "thiserror/std", "tracing/std", "tracing/attributes"]
+alloc    = []
+# Embedded path: hashbrown replaces std::HashMap/HashSet and spin::RwLock
+# replaces std::sync::RwLock. spin must never be enabled on a std target, where
+# busy-waiting would saturate a CPU. ahash uses compile-time-rng so that no OS
+# RNG is required.
+embedded = ["alloc", "dep:hashbrown", "dep:spin", "dep:ahash"]
+
+[dependencies]
+# Declared directly rather than through a workspace alias, as in asn1: an alias
+# that omits `default-features` swallows a downstream override.
+thiserror = { version = "2",    default-features = false }
+tracing   = { version = "0.1",  default-features = false }
+hashbrown = { version = "0.14", default-features = false, features = ["ahash", "inline-more"], optional = true }
+ahash     = { version = "0.8",  default-features = false, features = ["compile-time-rng"], optional = true }
+spin      = { version = "0.9",  default-features = false, features = ["rwlock"], optional = true }

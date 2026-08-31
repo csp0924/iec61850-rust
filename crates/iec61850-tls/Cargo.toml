@@ -1,0 +1,25 @@
+[package]
+name = "iec61850-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "TLS configuration and socket wrapper for IEC 61850 per IEC 62351-3, on rustls"
+keywords = ["iec61850", "iec62351", "tls", "rustls", "scada"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+iec61850-hal  = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+bytes         = { workspace = true }
+tokio         = { workspace = true, features = ["io-util", "net", "rt"] }
+rustls        = { workspace = true }
+tokio-rustls  = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+tokio         = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time"] }
+rcgen         = { workspace = true }

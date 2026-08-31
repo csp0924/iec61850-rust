@@ -1,0 +1,138 @@
+[package]
+name = "iec61850-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "IEC 61850 server: ACSI control, reporting, logging, setting groups and GoCB mapping over MMS"
+keywords = ["iec61850", "server", "ied", "mms", "scada"]
+categories = ["network-programming"]
+
+[dependencies]
+# The downstream crates are referenced by path with an explicit
+# `default-features = false` rather than through the workspace aliases: a
+# workspace alias does not reliably propagate a downstream
+# `default-features = false` (rust-lang/cargo#12162) and the override is
+# silently unified back into the default.
+iec61850-asn1  = { path = "../iec61850-asn1",  version = "0.1.0", default-features = false }
+iec61850-mms   = { path = "../iec61850-mms",   version = "0.1.0", default-features = false }
+iec61850-model = { path = "../iec61850-model", version = "0.1.0", default-features = false }
+iec61850-tls   = { workspace = true, optional = true }
+# Exposing a GoCB as an MMS variable requires control over the GOOSE publisher
+# for the GoEna toggle. Gated on the `goose-mapping` feature.
+iec61850-goose = { workspace = true, optional = true }
+thiserror      = { version = "2",   default-features = false }
+tracing        = { version = "0.1", default-features = false }
+# tokio is enabled only by `std`; an embedded build has no runtime.
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "macros", "time"], optional = true }
+bytes          = { version = "1",   default-features = false }
+# SQLite persistence backend for buffered report control blocks.
+rusqlite       = { workspace = true, optional = true }
+# hashbrown replaces std::collections on embedded targets. compile-time-rng
+# avoids the OS RNG that getrandom would otherwise require.
+hashbrown      = { version = "0.14", default-features = false, features = ["ahash", "inline-more"], optional = true }
+ahash          = { version = "0.8",  default-features = false, features = ["compile-time-rng"], optional = true }
+# spin replaces std::sync on embedded targets. It must never be enabled on a
+# std target, where busy-waiting would saturate a CPU.
+spin           = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock"], optional = true }
+
+[features]
+# The default keeps the full desktop feature set.
+default = [
+    "std",
+    "tls",
+    "full-server",
+]
+# `minimal` selects the core PDU dispatch only: Read, Write,
+# GetServerDirectory, GetVariableAccessAttributes and GetNameList. It carries
+# no submodule feature and selects no environment, so the caller states one:
+#   desktop host:      `--no-default-features --features minimal,std`
+#   Cortex-M target:   `--no-default-features --features minimal,embedded`
+minimal = []
+# `mms-core-server` is the server counterpart of the five core MMS services.
+# It carries neither tls nor logging, goose-mapping or setting-groups. Note
+# that `reporting` and `control` on their own compile the catalog modules but
+# not the integrated IedServer runtime, which still requires `full-server`.
+mms-core-server = ["std", "reporting", "control"]
+# std environment: tokio runtime, std::sync, std::collections and
+# std::net::SocketAddr, with the downstream crates switched back to std.
+std = [
+    "dep:tokio",
+    "iec61850-mms/std",
+    "iec61850-asn1/std",
+    "iec61850-model/std",
+    "thiserror/std",
+    "bytes/std",
+    "tracing/std",
+    "tracing/attributes",
+]
+# Embedded environment: no_std + alloc with hashbrown and spin, over the mms
+# transport skeleton. It deliberately does not enable `full-server`, whose
+# lifecycle and reporting paths need SocketAddr and a tokio runtime.
+embedded = [
+    "iec61850-mms/embedded",
+    "iec61850-asn1/alloc",
+    "iec61850-model/embedded",
+    "dep:hashbrown",
+    "dep:ahash",
+    "dep:spin",
+]
+# `full-server` aggregates the IedServer runtime and every dispatcher
+# subsystem. A subfeature does not imply it, so subsets such as
+# `std,reporting` build on their own. The shared server bone (connection,
+# lifecycle, server and the integrated dispatcher) is gated on any of the
+# subfeatures rather than on a sixth umbrella.
+full-server = ["reporting", "control", "logging", "goose-mapping", "setting-groups"]
+# reporting: URCB, BRCB, data sets and the ReportingEngine.
+reporting = []
+# control: the control object registry and its handlers.
+control = []
+# logging: LCB and journal storage. lcb.rs uses reporting::flags::TriggerOptions.
+logging = []
+# goose-mapping: exposes a GoCB as an MMS variable. Requires iec61850-goose.
+goose-mapping = ["dep:iec61850-goose"]
+# setting-groups: the SGCB runtime and DefaultSettingGroupHandler.
+setting-groups = []
+# Enables the TLS acceptor (IedServerBuilder::with_tls_acceptor).
+tls = ["dep:iec61850-tls"]
+# Enables the SQLite backend for buffered reports (reporting/sqlite_buffer.rs).
+# Off by default, so that a deployment without persistence does not link
+# SQLite, which costs a few hundred KB in a release build.
+sqlite-backend = ["dep:rusqlite", "reporting"]
+
+[dev-dependencies]
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "macros", "time", "signal"] }
+rcgen          = { workspace = true }
+rustls         = { workspace = true }
+iec61850-tls   = { workspace = true }
+iec61850-mms   = { workspace = true, features = ["tls"] }
+# The server examples and the demo CID tests load SCL through the parser.
+iec61850-scl   = { workspace = true }
+# The SQLite backend integration tests open a temporary database.
+tempfile       = { workspace = true }
+# The GOOSE mapping end-to-end test drives the client API for a round trip.
+# Deliberately path-only, with no version: Cargo strips a version-less
+# dev-dependency when packaging, which is what keeps the client/server
+# dev-dependency cycle out of the publish graph.
+iec61850-client = { path = "../iec61850-client" }
+
+[[example]]
+name = "server_basic_io"
+path = "examples/server_basic_io.rs"
+
+[[example]]
+name = "server_with_reporting"
+path = "examples/server_with_reporting.rs"
+
+# The smallest complete server: it loads examples/models/demo.cid, which ships
+# with this crate, and listens
+# on loopback. Paired with the min_client example.
+[[example]]
+name = "min_server"
+path = "examples/min_server.rs"
+
+[[example]]
+name = "server_from_scl"
+path = "examples/server_from_scl.rs"

@@ -1,0 +1,46 @@
+[package]
+name = "iec61850-sv-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Kept out of the parent workspace so that the nightly-only requirements of
+# cargo-fuzz do not affect the stable workspace build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.iec61850-sv]
+path = ".."
+
+# Arbitrary bytes fed to `decode_sav_pdu` must not panic.
+[[bin]]
+name = "sv_pdu_parse"
+path = "fuzz_targets/sv_pdu_parse.rs"
+test = false
+doc = false
+
+# Arbitrary bytes fed through `SvFrame::decode` into `decode_sav_pdu`,
+# covering the whole raw-socket attack surface: Ethernet and VLAN header
+# parsing followed by PDU decoding.
+[[bin]]
+name = "sv_frame_parse"
+path = "fuzz_targets/sv_frame_parse.rs"
+test = false
+doc = false
+
+# Not a fuzz target: regenerates the checked-in seed corpus of the two targets
+# above. Run it with `cargo run --bin gen_corpus`.
+[[bin]]
+name = "gen_corpus"
+path = "bin/gen_corpus.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1
