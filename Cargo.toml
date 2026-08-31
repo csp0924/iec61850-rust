@@ -17,12 +17,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Cheng Sin Pang"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/csp0924/iec61850-rust"
+homepage = "https://github.com/csp0924/iec61850-rust"
 
 [workspace.dependencies]
 # Aliases for intra-workspace dependencies.
@@ -30,16 +31,16 @@ repository = "https://github.com/csp0924/iec61850-rust"
 # select `default-features = false` and reach the no_std path: when a workspace
 # alias omits `default-features`, a downstream override is ignored with a
 # warning and will become a hard error in a future Cargo release.
-iec61850-hal   = { path = "crates/iec61850-hal",   version = "0.1.0", default-features = true }
-iec61850-asn1  = { path = "crates/iec61850-asn1",  version = "0.1.0", default-features = true }
-iec61850-tls   = { path = "crates/iec61850-tls",   version = "0.1.0" }
-iec61850-model = { path = "crates/iec61850-model", version = "0.1.0", default-features = true }
-iec61850-mms   = { path = "crates/iec61850-mms",   version = "0.1.0" }
-iec61850-goose = { path = "crates/iec61850-goose", version = "0.1.0" }
-iec61850-sv    = { path = "crates/iec61850-sv",    version = "0.1.0" }
-iec61850-scl   = { path = "crates/iec61850-scl",   version = "0.1.0" }
-iec61850-scl-build = { path = "crates/iec61850-scl-build", version = "0.1.0" }
-iec61850-sntp  = { path = "crates/iec61850-sntp",  version = "0.1.0" }
+iec61850-hal   = { path = "crates/iec61850-hal",   version = "0.1.1", default-features = true }
+iec61850-asn1  = { path = "crates/iec61850-asn1",  version = "0.1.1", default-features = true }
+iec61850-tls   = { path = "crates/iec61850-tls",   version = "0.1.1" }
+iec61850-model = { path = "crates/iec61850-model", version = "0.1.1", default-features = true }
+iec61850-mms   = { path = "crates/iec61850-mms",   version = "0.1.1" }
+iec61850-goose = { path = "crates/iec61850-goose", version = "0.1.1" }
+iec61850-sv    = { path = "crates/iec61850-sv",    version = "0.1.1" }
+iec61850-scl   = { path = "crates/iec61850-scl",   version = "0.1.1" }
+iec61850-scl-build = { path = "crates/iec61850-scl-build", version = "0.1.1" }
+iec61850-sntp  = { path = "crates/iec61850-sntp",  version = "0.1.1" }
 
 # Shared external dependencies. A crate that does not enable one does not build it.
 thiserror       = "2"

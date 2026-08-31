@@ -26,7 +26,7 @@ Its MMS domain name is the IED name followed by the logical device instance:
 `dsMeas` holds the three measured values and is the payload of both report
 control blocks; `dsStatus` holds the four status points and is the payload of
 the GOOSE control block. The name plates carry vendor `rust61850` and software
-revision `0.1.0`.
+revision `0.1.1`.
 
 The `ConnectedAP` gives `127.0.0.1` and port 102. The server examples bind
 `127.0.0.1:8102` by default instead, so that they run without elevated

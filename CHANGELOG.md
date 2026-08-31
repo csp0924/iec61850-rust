@@ -8,6 +8,15 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-01
+
+Documentation and packaging metadata only; no code changes.
+
+### Added
+
+- A README for every published crate, rendered on its crates.io page.
+- `homepage` and `readme` manifest metadata for every published crate.
+
 ## [0.1.0] - 2026-08-31
 
 Initial public release.
@@ -77,5 +86,6 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.0

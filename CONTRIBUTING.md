@@ -45,7 +45,7 @@ documentation build denies rustdoc warnings too, which catches a broken intra-do
 link or a malformed code block.
 
 `cargo deny check` covers advisories, the license allow list, duplicate versions
-and dependency sources. No advisories stand open against `0.1.0`; a change must
+and dependency sources. No advisories stand open against `0.1.1`; a change must
 not introduce one. Adding a crate under a license outside the allow list, or
 suppressing an advisory, needs the reason recorded in `deny.toml` next to the
 entry.

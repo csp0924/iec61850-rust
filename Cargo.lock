@@ -521,7 +521,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "iec61850-asn1"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "thiserror",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bitflags 2.11.1",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-goose"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "iec61850-asn1",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-hal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "embassy-time",
  "embedded-io-async",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-mms"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "hashbrown 0.14.5",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-scl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iec61850-model",
  "quick-xml",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-scl-build"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iec61850-scl",
  "prettyplease",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-scl-build-example"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iec61850-scl",
  "iec61850-scl-build",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-sntp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "tokio",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-sv"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "iec61850-asn1",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-tls"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "iec61850-hal",

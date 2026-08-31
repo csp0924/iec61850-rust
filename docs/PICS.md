@@ -1,13 +1,13 @@
 # Protocol Implementation Conformance Statement
 
-Implementation: **iec61850-rust**, version **0.1.0**.
+Implementation: **iec61850-rust**, version **0.1.1**.
 
 This document states which ACSI services and models of IEC 61850-7-2, and which
 parts of the MMS mapping of IEC 61850-8-1, the crates of this workspace
 implement, in the server role, the client role, or both.
 
 This statement has **not been certified by any conformance test body**. It
-describes the source code of release 0.1.0 and nothing else. Every entry below
+describes the source code of release 0.1.1 and nothing else. Every entry below
 is derived from the implementation; where a service is absent, incomplete, or
 constrained, the row says so.
 
@@ -16,7 +16,7 @@ constrained, the row says so.
 | Item | Value |
 |---|---|
 | Implementation name | iec61850-rust |
-| Version | 0.1.0 |
+| Version | 0.1.1 |
 | Roles | Server and client |
 | Editions | Edition 1, Edition 2 and Edition 2.1 selectable through `IedServerConfig::edition`; the default is Edition 2 |
 | Default identification strings | vendor `rust61850`, model `iec61850-rust`, revision = crate version; all three configurable |

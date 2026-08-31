@@ -20,7 +20,7 @@ iec61850-scl    = { workspace = true }
 # iec61850-server is referenced by path rather than through a workspace alias,
 # matching iec61850-client: it stays out of the shared alias list so that the
 # alias graph carries no apparent cycle.
-iec61850-server = { path = "../iec61850-server", version = "0.1.0" }
+iec61850-server = { path = "../iec61850-server", version = "0.1.1" }
 tokio           = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 
 [build-dependencies]
