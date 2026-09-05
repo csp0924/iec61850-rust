@@ -29,6 +29,7 @@ pub mod conclude;
 pub mod define_named_variable_list;
 pub mod delete_named_variable_list;
 pub mod get_name_list;
+pub mod get_named_variable_list_attrs;
 pub mod get_var_access_attrs;
 pub mod information_report;
 pub mod initiate;
@@ -65,6 +66,13 @@ pub use get_name_list::{
     decode_confirmed_get_name_list_request, decode_confirmed_get_name_list_response,
     encode_confirmed_get_name_list_request, encode_confirmed_get_name_list_response,
     GetNameListRequest, GetNameListResponse, ObjectClass, ObjectScope, SERVICE_TAG_GET_NAME_LIST,
+};
+pub use get_named_variable_list_attrs::{
+    decode_confirmed_get_named_variable_list_attrs_request,
+    decode_confirmed_get_named_variable_list_attrs_response,
+    encode_confirmed_get_named_variable_list_attrs_request,
+    encode_confirmed_get_named_variable_list_attrs_response, GetNamedVariableListAttributesRequest,
+    GetNamedVariableListAttributesResponse, SERVICE_TAG_GET_NAMED_VARIABLE_LIST_ATTRS,
 };
 pub use get_var_access_attrs::{
     decode_confirmed_get_var_access_attrs_request, decode_confirmed_get_var_access_attrs_response,

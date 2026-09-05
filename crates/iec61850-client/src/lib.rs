@@ -14,7 +14,7 @@
 //!   are exposed, because the async API needs a runtime.
 //! - `reporting` / `control` / `datasets`: gate report dispatch together with
 //!   the RCB, GoCB and journal APIs, the control API, and data set
-//!   administration. Each implies `std`.
+//!   administration and directory. Each implies `std`.
 //! - `minimal`: environment-neutral marker carrying no submodule feature; the
 //!   caller selects `minimal,std` or `minimal,embedded`.
 //!
@@ -66,6 +66,9 @@ pub mod control;
 #[cfg(feature = "datasets")]
 pub mod dataset_admin;
 
+#[cfg(feature = "datasets")]
+pub mod dataset_directory;
+
 #[cfg(feature = "reporting")]
 pub mod gocb;
 
@@ -86,6 +89,8 @@ pub use control::{
 };
 #[cfg(feature = "datasets")]
 pub use dataset_admin::DataSetMember;
+#[cfg(feature = "datasets")]
+pub use dataset_directory::DataSetDirectory;
 pub use directory::{AcsiClass, DeviceModel, IcLogicalDevice};
 pub use error::ClientError;
 #[cfg(feature = "reporting")]

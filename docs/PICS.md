@@ -121,10 +121,10 @@ elsewhere. macOS and BSD backends are absent.
 |---|:---:|:---:|---|
 | GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results |
 | SetDataSetValues | Y | Y | A value count that differs from the member count fails every entry with `type-inconsistent` |
-| GetDataSetDirectory | Y | Y | GetNameList over the named-variable-list class |
+| GetDataSetDirectory | Y | Y | MMS GetNamedVariableListAttributes: the member list, each member as an IEC reference with its functional constraint, plus `mmsDeletable`. Enumerating the data set *names* of a logical node is a different service, GetLogicalNodeDirectory(DataSet), which maps onto MMS GetNameList |
 | CreateDataSet | Y | Y | MMS DefineNamedVariableList, domain scope; association scope is not implemented |
 | DeleteDataSet | Y | Y | MMS DeleteNamedVariableList; a statically configured data set is refused |
-| GetDataSetAttributes (GetNamedVariableListAttributes) | N | N | The server has no handler and does not advertise the service; the client issues no such request |
+| GetDataSetAttributes (GetNamedVariableListAttributes) | Y | Y | The same MMS request as GetDataSetDirectory. The server answers from the data set registry, in registration order, and reports `mmsDeletable` true only for a data set created at runtime; an unknown name is answered with `object-non-existent` |
 
 ### 3.4 Setting group control
 
@@ -273,7 +273,7 @@ Service tags are as in ISO 9506-2.
 | Write | `0xa5` | Y | Y |
 | GetVariableAccessAttributes | `0xa6` | Y | Y |
 | DefineNamedVariableList | `0xab` | Y | Y |
-| GetNamedVariableListAttributes | `0xac` | N | N |
+| GetNamedVariableListAttributes | `0xac` | Y | Y |
 | DeleteNamedVariableList | `0xad` | Y | Y |
 | InformationReport | – | Y | Y |
 | ReadJournal | `0xbf 0x41` | Y | Y |
@@ -300,8 +300,7 @@ includes, so that it announces exactly what the dispatcher answers.
 |---|---|
 | `status` | Never; no handler exists |
 | `getNameList`, `identify`, `read`, `write`, `getVariableAccessAttributes` | Always |
-| `defineNamedVariableList`, `deleteNamedVariableList`, `informationReport` | The reporting subsystem is compiled in |
-| `getNamedVariableListAttributes` | Never; no handler exists |
+| `defineNamedVariableList`, `getNamedVariableListAttributes`, `deleteNamedVariableList`, `informationReport` | The reporting subsystem is compiled in |
 | `readJournal` | The logging subsystem is compiled in |
 | `writeJournal` | Never; the request is answered with an access error rather than served |
 | `conclude` | Always |
@@ -388,9 +387,8 @@ need before selecting this implementation.
    `object-access-unsupported`; the attributes must be read individually.
 7. **The Communication and Substation sections of an SCL file are not parsed**,
    so GOOSE and Sampled Values addressing is not taken from SCL.
-8. **GetNamedVariableListAttributes has no server handler**, and no ACSE
-   authentication mechanism is negotiated: an association is authenticated by
-   TLS or not at all.
+8. **No ACSE authentication mechanism is negotiated**: an association is
+   authenticated by TLS or not at all.
 9. **Revocation checking is CRL only**, from static lists the operator keeps
    current; there is no OCSP and no distribution-point fetching. No
    IEC 62351-6 signatures on GOOSE or Sampled Values.

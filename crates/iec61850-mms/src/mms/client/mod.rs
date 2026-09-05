@@ -373,6 +373,28 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
             .await
     }
 
+    /// Retrieves the attributes of a dynamic or configured named variable list.
+    ///
+    /// This is GetDataSetDirectory of IEC 61850-7-2. The response carries the
+    /// members in the order the server holds them, each with an optional
+    /// `AlternateAccess` selector, together with `mmsDeletable`, which is true
+    /// only for a list created by DefineNamedVariableList.
+    ///
+    /// A list the server does not hold becomes `ClientError::ServiceError`.
+    pub async fn get_named_variable_list_attributes(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+    ) -> Result<crate::mms::pdu::GetNamedVariableListAttributesResponse, ClientError> {
+        services::get_named_variable_list_attributes(
+            &mut self.conn,
+            &mut self.alloc,
+            domain,
+            list_name,
+        )
+        .await
+    }
+
     /// Retrieves a list of object names.
     ///
     /// `object_class` selects the class to enumerate, such as `ObjectClass::NamedVariable`.

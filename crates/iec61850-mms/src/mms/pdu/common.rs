@@ -442,7 +442,7 @@ impl VariableAccessSpecification {
 /// CONSTRUCTED) rather than the canonical `0x30` (universal SEQUENCE OF)
 /// that [`AlternateAccess::encode`] produces. We rewrite the leading byte
 /// in place after emitting the canonical form.
-fn encode_list_of_variable_seq(entry: &ListOfVariableEntry, buf: &mut BytesMut) {
+pub(super) fn encode_list_of_variable_seq(entry: &ListOfVariableEntry, buf: &mut BytesMut) {
     let mut seq_inner = BytesMut::new();
     encode_variable_specification_name(&entry.name, &mut seq_inner);
     if let Some(aa) = &entry.alt_access {
@@ -466,7 +466,7 @@ fn encode_variable_specification_name(name: &ObjectName, buf: &mut BytesMut) {
 }
 
 /// Decode `listOfVariable` inner (`data` is the body of the outer `0xa0`).
-fn decode_list_of_variable(data: &[u8]) -> Result<Vec<ListOfVariableEntry>, MmsError> {
+pub(super) fn decode_list_of_variable(data: &[u8]) -> Result<Vec<ListOfVariableEntry>, MmsError> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     while pos < data.len() {

@@ -43,7 +43,7 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 
 ## 協定涵蓋範圍
 
-**MMS 服務，server 側。** Initiate 與 Conclude、GetNameList、GetVariableAccessAttributes、Read、Write、Identify、DefineNamedVariableList、DeleteNamedVariableList、ReadJournal，以及用於報告的 InformationReport。PDU 大小在 Initiate 時協商，並在每個送出的 PDU 上強制執行；單一 PDU 裝不下的報告會被分段。
+**MMS 服務，server 側。** Initiate 與 Conclude、GetNameList、GetVariableAccessAttributes、Read、Write、Identify、DefineNamedVariableList、GetNamedVariableListAttributes、DeleteNamedVariableList、ReadJournal，以及用於報告的 InformationReport。PDU 大小在 Initiate 時協商，並在每個送出的 PDU 上強制執行；單一 PDU 裝不下的報告會被分段。
 
 **報告。** 非緩衝（URCB）與緩衝（BRCB）報告控制區塊：觸發選項、選用欄位、general interrogation、緩衝區溢位與 entry id。BRCB 預設在記憶體中緩衝，`sqlite-backend` feature 另外提供以 SQLite 為後端的緩衝區。
 
