@@ -16,7 +16,7 @@ use iec61850_mms::mms::pdu::{
         encode_confirmed_delete_named_variable_list_response, DeleteNamedVariableListRequest,
         DeleteNamedVariableListResponse, ScopeOfDelete,
     },
-    service_error::ErrorClass,
+    service_error::{subcode::access, ErrorClass},
     ObjectName,
 };
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
@@ -38,7 +38,10 @@ pub(crate) fn handle_delete_named_variable_list(
                 error = %e,
                 "delete-named-variable-list request failed to decode, answering confirmed-error"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(0));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OTHER),
+            );
         }
     };
 
@@ -48,7 +51,10 @@ pub(crate) fn handle_delete_named_variable_list(
             scope = ?req.scope_of_delete,
             "delete-named-variable-list serves only scope-of-delete specific, answering object-access-unsupported"
         );
-        return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(9));
+        return crate::service::make_confirmed_error_pub(
+            invoke_id,
+            ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+        );
     }
 
     let mut number_matched: u32 = 0;

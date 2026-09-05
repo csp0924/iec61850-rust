@@ -33,7 +33,10 @@ use iec61850_mms::mms::pdu::{
         encode_confirmed_get_named_variable_list_attrs_response,
         GetNamedVariableListAttributesRequest, GetNamedVariableListAttributesResponse,
     },
-    service_error::ErrorClass,
+    service_error::{
+        subcode::{access, resource},
+        ErrorClass,
+    },
     ListOfVariableEntry, ObjectName,
 };
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
@@ -56,7 +59,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
                 error = %e,
                 "get-named-variable-list-attributes request failed to decode, answering confirmed-error"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(0));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OTHER),
+            );
         }
     };
 
@@ -68,7 +74,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
                 ?other,
                 "get-named-variable-list-attributes accepts only a domain-specific list name, answering object-access-unsupported"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(9));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+            );
         }
     };
 
@@ -79,7 +88,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
                 invoke_id,
                 "dataset registry lock is poisoned, answering resource error"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Resource(0));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Resource(resource::OTHER),
+            );
         }
     };
 
@@ -90,7 +102,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
             list_name,
             "get-named-variable-list-attributes names an unknown data set, answering object-non-existent"
         );
-        return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(10));
+        return crate::service::make_confirmed_error_pub(
+            invoke_id,
+            ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+        );
     };
 
     let mut list_of_variable = Vec::with_capacity(dataset.entries.len());
@@ -108,7 +123,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
                     attr_ref = %entry.attr_ref,
                     "data set member reference carries no domain separator, answering access error"
                 );
-                return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(0));
+                return crate::service::make_confirmed_error_pub(
+                    invoke_id,
+                    ErrorClass::Access(access::OTHER),
+                );
             }
         }
     }

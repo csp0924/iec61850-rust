@@ -54,7 +54,10 @@ use iec61850_mms::mms::pdu::{
         SERVICE_TAG_GET_VAR_ACCESS_ATTRS,
     },
     read::{encode_confirmed_read_response, ReadRequest, ReadResponse, SERVICE_TAG_READ},
-    service_error::{ErrorClass, ServiceError},
+    service_error::{
+        subcode::{access, resource},
+        ErrorClass, ServiceError,
+    },
     write::{encode_confirmed_write_response, WriteRequest, WriteResponse, SERVICE_TAG_WRITE},
 };
 // The ReadJournal PDU types belong to the logging subsystem.
@@ -575,7 +578,7 @@ fn dispatch_get_name_list(
                 error = %e,
                 "get-name-list request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
 
@@ -608,14 +611,17 @@ fn dispatch_get_name_list(
                 invoke_id,
                 "get-name-list: unknown domain or continueAfter, answering object-non-existent"
             );
-            make_confirmed_error(invoke_id, ErrorClass::Access(10)) // object-non-existent
+            make_confirmed_error(invoke_id, ErrorClass::Access(access::OBJECT_NON_EXISTENT))
         }
         GetNameListResult::Unsupported => {
             tracing::warn!(
                 invoke_id,
                 "get-name-list: this object class and scope are not served"
             );
-            make_confirmed_error(invoke_id, ErrorClass::Access(9)) // object-access-unsupported
+            make_confirmed_error(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+            )
         }
     }
 }
@@ -746,7 +752,7 @@ fn dispatch_get_var_access_attrs(
                 error = %e,
                 "get-variable-access-attributes request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
 
@@ -761,7 +767,7 @@ fn dispatch_get_var_access_attrs(
                         error = %e,
                         "get-variable-access-attributes response failed to encode, answering confirmed-error"
                     );
-                    make_confirmed_error(invoke_id, ErrorClass::Access(0))
+                    make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER))
                 }
             }
         }
@@ -770,14 +776,17 @@ fn dispatch_get_var_access_attrs(
                 invoke_id,
                 "get-variable-access-attributes: the path does not resolve, answering object-non-existent"
             );
-            make_confirmed_error(invoke_id, ErrorClass::Access(10)) // object-non-existent
+            make_confirmed_error(invoke_id, ErrorClass::Access(access::OBJECT_NON_EXISTENT))
         }
         GetVarAccessAttrsResult::Unsupported => {
             tracing::warn!(
                 invoke_id,
                 "get-variable-access-attributes: this object name scope is not served"
             );
-            make_confirmed_error(invoke_id, ErrorClass::Access(9)) // object-access-unsupported
+            make_confirmed_error(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+            )
         }
     }
 }
@@ -787,7 +796,7 @@ fn dispatch_get_var_access_attrs(
 ///
 /// A read that expands a logical node or a functional-constraint group tracks a
 /// byte budget as it goes; exceeding the negotiated maximum PDU size replaces
-/// the whole ReadResponse with `ConfirmedError(Resource(0))`, as
+/// the whole ReadResponse with a ConfirmedError of errorClass resource other, as
 /// IEC 61850-8-1 requires, rather than failing individual entries.
 #[cfg(any(
     feature = "reporting",
@@ -820,7 +829,7 @@ fn dispatch_read(
                 error = %e,
                 "read request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
 
@@ -953,7 +962,10 @@ fn dispatch_read(
                             invoke_id,
                             "read: the access results exceed the negotiated maximum PDU size, answering the whole request with a resource error"
                         );
-                        return make_confirmed_error(invoke_id, ErrorClass::Resource(0));
+                        return make_confirmed_error(
+                            invoke_id,
+                            ErrorClass::Resource(resource::OTHER),
+                        );
                     }
                     *b -= used;
                 }
@@ -964,7 +976,7 @@ fn dispatch_read(
                     invoke_id,
                     "read: expanding the logical node exceeds the negotiated maximum PDU size, answering a resource error per IEC 61850-8-1"
                 );
-                return make_confirmed_error(invoke_id, ErrorClass::Resource(0));
+                return make_confirmed_error(invoke_id, ErrorClass::Resource(resource::OTHER));
             }
         }
     }
@@ -1004,7 +1016,7 @@ fn dispatch_read(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(invoke_id, error = %e, "read request failed to decode, answering confirmed-error");
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
     let entries = match &req.variable_access_spec {
@@ -1036,14 +1048,17 @@ fn dispatch_read(
                 if let Some(b) = remaining.as_mut() {
                     let used = r.estimated_encoded_size();
                     if *b < used {
-                        return make_confirmed_error(invoke_id, ErrorClass::Resource(0));
+                        return make_confirmed_error(
+                            invoke_id,
+                            ErrorClass::Resource(resource::OTHER),
+                        );
                     }
                     *b -= used;
                 }
                 results.push(r);
             }
             LookupResult::OverBudget => {
-                return make_confirmed_error(invoke_id, ErrorClass::Resource(0));
+                return make_confirmed_error(invoke_id, ErrorClass::Resource(resource::OTHER));
             }
         }
     }
@@ -1211,7 +1226,7 @@ fn dispatch_write(
                 error = %e,
                 "write request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
 
@@ -1396,7 +1411,7 @@ fn dispatch_write(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(invoke_id, error = %e, "write request failed to decode, answering confirmed-error");
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
     let entries = match &req.variable_access_spec {
@@ -2548,7 +2563,7 @@ fn dispatch_read_journal(
                 error = %e,
                 "read-journal request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
         }
     };
 
@@ -2570,7 +2585,7 @@ fn dispatch_read_journal(
             item = req.item_id,
             "read-journal: no such log control block, answering object-non-existent"
         );
-        return make_confirmed_error(invoke_id, ErrorClass::Access(10));
+        return make_confirmed_error(invoke_id, ErrorClass::Access(access::OBJECT_NON_EXISTENT));
     };
 
     // A log control block with no storage attached yields an empty list.
@@ -2594,7 +2609,7 @@ fn dispatch_read_journal(
             error = %e,
             "read-journal: the log storage backend failed, answering confirmed-error"
         );
-        return make_confirmed_error(invoke_id, ErrorClass::Access(0));
+        return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
     }
 
     let budget = read_journal_budget(negotiated_max_pdu_size);
@@ -2727,7 +2742,10 @@ fn dispatch_write_journal_unsupported(invoke_id: u32) -> ConfirmedResponse {
         invoke_id,
         "write-journal is not served, answering object-access-unsupported"
     );
-    make_confirmed_error(invoke_id, ErrorClass::Access(9))
+    make_confirmed_error(
+        invoke_id,
+        ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+    )
 }
 
 /// Silences a dead-code warning: `LogControl` and `LogStorageError` are reached
@@ -3496,7 +3514,7 @@ mod tests {
     /// association, so this test pins both tags.
     #[test]
     fn confirmed_error_byte_exact_format() {
-        let resp = make_confirmed_error(3, ErrorClass::Access(10));
+        let resp = make_confirmed_error(3, ErrorClass::Access(access::OBJECT_NON_EXISTENT));
         let bytes = match resp {
             ConfirmedResponse::Error(b) => b,
             other => panic!("expected an error, got {:?}", other),
@@ -3507,9 +3525,9 @@ mod tests {
         //     0x80 0x01 0x03     invokeID [0] IMPLICIT Unsigned32 = 3
         //     0xa2 0x05          serviceError [2] IMPLICIT, len=5
         //       0xa0 0x03        errorClass [0] EXPLICIT, len=3
-        //         0x87 0x01 0x0a   access [7] IMPLICIT INTEGER = 10
+        //         0x87 0x01 0x02   access [7] IMPLICIT INTEGER = 2, object-non-existent
         let expected: &[u8] = &[
-            0xa2, 0x0a, 0x80, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x0a,
+            0xa2, 0x0a, 0x80, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
         ];
         assert_eq!(
             &bytes[..],

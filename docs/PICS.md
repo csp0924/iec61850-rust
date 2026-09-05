@@ -282,6 +282,21 @@ Service tags are as in ISO 9506-2.
 
 Any other service tag is answered with a Reject PDU.
 
+A service that fails as a whole is answered with a Confirmed-ErrorPDU carrying
+an ISO 9506-2 `ServiceError`. The `errorClass` alternatives and subcodes the
+server emits are below. They are not the `DataAccessError` codes, which are
+reported per variable inside a Read or Write response and are numbered
+separately.
+
+| errorClass | Subcode | Emitted when |
+|---|:---:|---|
+| `access [7]` other | 0 | A request fails to decode, or a response fails to encode |
+| `access [7]` object-access-unsupported | 1 | The named object class or scope is not served, and for WriteJournal |
+| `access [7]` object-non-existent | 2 | The named domain, variable, data set or log control block does not exist |
+| `definition [2]` invalid-address | 2 | A data set member reference is malformed |
+| `definition [2]` object-exists | 5 | DefineNamedVariableList names a data set that is already defined |
+| `resource [3]` other | 0 | The response would exceed the negotiated maximum PDU size, or an internal lock is unusable |
+
 ---
 
 ## 5. Association negotiation and `servicesSupported`

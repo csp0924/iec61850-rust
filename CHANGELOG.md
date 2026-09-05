@@ -33,6 +33,23 @@ Every crate in the workspace shares one version number.
   `read_object`. `AccessResult` is re-exported so the return type can be named
   without depending on `iec61850-mms`.
 
+### Fixed
+
+- **`iec61850-mms`, `iec61850-server`** — the `ServiceError` `errorClass`
+  subcodes the server sends now follow the ISO 9506-2 `ServiceError` ASN.1
+  named numbers. The `access [7]` alternative defines `other(0)`,
+  `object-access-unsupported(1)`, `object-non-existent(2)`,
+  `object-access-denied(3)` and `object-invalidated(4)`; the server was sending
+  the `DataAccessError` codes 9 and 10, which that alternative does not define,
+  so a client read them as `other`. This changes the bytes on the wire:
+  object-non-existent goes out as `0x87 0x01 0x02` where it was `0x87 0x01
+  0x0a`, and object-access-unsupported as `0x87 0x01 0x01` where it was `0x87
+  0x01 0x09`. A malformed data set member reference is now
+  `definition invalid-address` and a duplicate data set name
+  `definition object-exists`, in place of subcodes the `access` alternative
+  does not define. `ErrorClass` subcodes are available as named constants in
+  `mms::pdu::service_error::subcode`, one module per alternative.
+
 ## [0.1.1] - 2026-09-01
 
 Documentation and packaging metadata only; no code changes.

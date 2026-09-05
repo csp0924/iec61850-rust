@@ -220,11 +220,11 @@ fn read_journal_unknown_lcb_returns_object_nonexistent() {
     match resp {
         ConfirmedResponse::Error(bytes) => {
             assert_eq!(bytes[0], 0xa2, "the ConfirmedError tag must be 0xa2");
-            // ObjectNonExistent = access(7) sub-code 10
+            // object-non-existent is sub-code 2 of the access [7] alternative.
             // The serviceError carries an explicit errorClass, so the access
-            // class with ObjectNonExistent encodes as 0x87 0x01 0x0a.
+            // class with object-non-existent encodes as 0x87 0x01 0x02.
             assert!(
-                bytes.windows(3).any(|w| w == [0x87, 0x01, 0x0a]),
+                bytes.windows(3).any(|w| w == [0x87, 0x01, 0x02]),
                 "an unregistered log control block must answer object-nonexistent, bytes={:?}",
                 bytes.as_ref()
             );
@@ -253,9 +253,9 @@ fn write_journal_returns_object_access_unsupported() {
     match resp {
         ConfirmedResponse::Error(bytes) => {
             assert_eq!(bytes[0], 0xa2);
-            // ObjectAccessUnsupported = access(7) sub-code 9
+            // object-access-unsupported is sub-code 1 of the access [7] alternative.
             assert!(
-                bytes.windows(3).any(|w| w == [0x87, 0x01, 0x09]),
+                bytes.windows(3).any(|w| w == [0x87, 0x01, 0x01]),
                 "WriteJournal must answer object-access-unsupported, bytes={:?}",
                 bytes.as_ref()
             );
