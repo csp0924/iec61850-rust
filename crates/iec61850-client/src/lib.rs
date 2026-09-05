@@ -90,6 +90,10 @@ pub use directory::{AcsiClass, DeviceModel, IcLogicalDevice};
 pub use error::ClientError;
 #[cfg(feature = "reporting")]
 pub use gocb::{GoCBValues, GoCBValuesWrite, PhyComAddress};
+// Re-exported so that the per-entry result of `read_objects` and
+// `get_data_set_values` can be named without depending on `iec61850-mms`
+// directly.
+pub use iec61850_mms::AccessResult;
 // Re-exported so that the return type of
 // `IedConnection::get_variable_specification` can be named without depending
 // on `iec61850-mms` directly.

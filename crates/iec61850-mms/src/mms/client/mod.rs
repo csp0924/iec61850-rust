@@ -470,6 +470,23 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
             }
         }
     }
+
+    /// Reads several MMS variables with one Read service.
+    ///
+    /// The entries travel as a `listOfVariable`, so no temporary named
+    /// variable list is needed. The result holds one `AccessResult` per entry
+    /// in request order, and an entry that fails keeps its position as a
+    /// `Failure`.
+    ///
+    /// An empty `entries` is refused before anything is sent, and a response
+    /// whose access result count differs from `entries.len()` is an error
+    /// rather than a padded or truncated list.
+    pub async fn read_list(
+        &mut self,
+        entries: Vec<crate::mms::pdu::ListOfVariableEntry>,
+    ) -> Result<Vec<crate::mms::pdu::AccessResult>, ClientError> {
+        services::read_list(&mut self.conn, &mut self.alloc, entries).await
+    }
 }
 
 #[cfg(feature = "std")]

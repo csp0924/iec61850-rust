@@ -17,6 +17,7 @@
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
 use iec61850_mms::mms::pdu::common::MmsData;
+use iec61850_mms::{AlternateAccess, ListOfVariableEntry, ObjectName};
 use iec61850_model::value::MmsValue;
 use iec61850_model::{ObjectRef, Quality, Segment, FC};
 
@@ -559,6 +560,83 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     }
 }
 
+// Multi-variable read: one MMS Read carrying several object references.
+
+/// Turns a resolved object path into one `listOfVariable` entry.
+///
+/// A path without an array index becomes a bare `ObjectName`; a path with one
+/// carries an `AlternateAccess` selector, `index` alone or `index` plus a
+/// sub-component, matching what [`IedConnection::read_object`] sends for the
+/// same reference.
+///
+/// # Errors
+///
+/// `InvalidArgument` if the sub-component path cannot form an
+/// `AlternateAccess` selector.
+fn list_of_variable_entry(path: IecObjectPath) -> Result<ListOfVariableEntry, ClientError> {
+    let name = ObjectName::DomainSpecific {
+        domain_id: path.domain,
+        item_id: path.item_id,
+    };
+    match path.array {
+        None => Ok(ListOfVariableEntry::name(name)),
+        Some(arr) => {
+            let alt_access = match arr.component.as_deref() {
+                None => AlternateAccess::index(arr.index),
+                Some(c) => AlternateAccess::index_component(arr.index, c).map_err(|e| {
+                    ClientError::InvalidArgument(format!(
+                        "array element component `{c}` cannot be addressed: {e}"
+                    ))
+                })?,
+            };
+            Ok(ListOfVariableEntry::with_alt_access(name, alt_access))
+        }
+    }
+}
+
+impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
+    /// Reads several IEC 61850 objects with a single MMS Read.
+    ///
+    /// Each target is an object reference with its functional constraint,
+    /// resolved exactly as by [`read_object`](Self::read_object): IEC or MMS
+    /// notation, and an array index or sub-component routed through MMS
+    /// `AlternateAccess`. Unlike a data set read this needs no named variable
+    /// list on the server, so an arbitrary set of variables can be fetched in
+    /// one round trip.
+    ///
+    /// The returned vector follows the order of `targets` and has the same
+    /// length. One failing target yields `AccessResult::Failure` in its own
+    /// position and leaves the other values intact.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` if the association is not established, and
+    /// `InvalidArgument` for an empty `targets` or a reference that does not
+    /// resolve. Neither sends anything: one bad reference refuses the whole
+    /// request rather than shifting the results of the others.
+    pub async fn read_objects(
+        &self,
+        targets: &[(&str, FC)],
+    ) -> Result<Vec<iec61850_mms::AccessResult>, ClientError> {
+        if !self.is_connected() {
+            return Err(ClientError::NotConnected);
+        }
+        if targets.is_empty() {
+            return Err(ClientError::InvalidArgument(
+                "read_objects requires at least one target".to_string(),
+            ));
+        }
+        let mut entries = Vec::with_capacity(targets.len());
+        for (reference, fc) in targets {
+            entries.push(list_of_variable_entry(parse_iec_object_path(
+                reference, *fc,
+            )?)?);
+        }
+        let mut client = self.mms_client.lock().await;
+        Ok(client.read_list(entries).await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +826,43 @@ mod tests {
             parse_data_set_ref("LD/.dsCurrent"),
             Err(ClientError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn entry_without_index_is_a_bare_name() {
+        let entry = list_of_variable_entry(p("simpleIOGenericIO/GGIO1.AnIn1.mag.f", FC::Mx))
+            .expect("entry should build");
+        assert_eq!(
+            entry.name,
+            ObjectName::DomainSpecific {
+                domain_id: "simpleIOGenericIO".to_string(),
+                item_id: "GGIO1$MX$AnIn1$mag$f".to_string(),
+            }
+        );
+        assert_eq!(entry.alt_access, None);
+    }
+
+    #[test]
+    fn entry_with_index_carries_alternate_access() {
+        let entry = list_of_variable_entry(p("simpleIOGenericIO/GGIO1.Ind1(0).stVal", FC::St))
+            .expect("entry should build");
+        assert_eq!(
+            entry.name,
+            ObjectName::DomainSpecific {
+                domain_id: "simpleIOGenericIO".to_string(),
+                item_id: "GGIO1$ST$Ind1".to_string(),
+            }
+        );
+        assert_eq!(
+            entry.alt_access,
+            Some(AlternateAccess::index_component(0, "stVal").expect("selector"))
+        );
+    }
+
+    #[test]
+    fn entry_with_index_and_no_component_selects_the_element() {
+        let entry = list_of_variable_entry(p("simpleIOGenericIO/GGIO1.Ind1(2)", FC::St))
+            .expect("entry should build");
+        assert_eq!(entry.alt_access, Some(AlternateAccess::index(2)));
     }
 }

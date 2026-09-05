@@ -8,6 +8,20 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+- **`iec61850-mms`** — `MmsClient::read_list`, a Read service over an explicit
+  `listOfVariable`, returning one `AccessResult` per requested variable. An
+  empty list is refused before anything is sent, and a response whose access
+  result count differs from the request is rejected rather than padded or
+  truncated.
+- **`iec61850-client`** — `IedConnection::read_objects`, reading several object
+  references with their functional constraints in a single MMS Read. Results
+  follow the request order, one failing reference stays a per-entry failure,
+  and array-indexed references keep the `AlternateAccess` mapping of
+  `read_object`. `AccessResult` is re-exported so the return type can be named
+  without depending on `iec61850-mms`.
+
 ## [0.1.1] - 2026-09-01
 
 Documentation and packaging metadata only; no code changes.

@@ -107,7 +107,7 @@ elsewhere. macOS and BSD backends are absent.
 | GetLogicalNodeDirectory (LOG) | Y | Y | Journal object class; the server answers an empty list |
 | GetLogicalNodeDirectory (GsCB / MSVCB / USVCB) | N | N | The client refuses the request rather than returning a misleading empty list |
 | GetAllDataValues | Y | N | Server expands a whole logical node or one functional-constraint group under a PDU budget; the client has no single-call equivalent |
-| GetDataValues | Y | Y | Includes sub-data-object nesting to any depth |
+| GetDataValues | Y | Y | Includes sub-data-object nesting to any depth; the client reads several variables with one MMS Read through `read_objects`, needing no temporary data set |
 | SetDataValues | Y | Y | Server-side writes are gated by a functional-constraint policy, `SP \| SV \| SE` by default; `DC`, `CF` and `BL` can be enabled |
 | GetDataDirectory | Y | Y | |
 | GetDataDirectory by functional constraint | – | Y | Client convenience over the same wire service |

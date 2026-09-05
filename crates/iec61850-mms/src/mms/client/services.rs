@@ -917,3 +917,117 @@ fn handle_confirmed_error(inner: &[u8]) -> ClientError {
     // nothing could be decoded, so report a generic parse failure
     ClientError::PduParse("ConfirmedError decode failed".to_string())
 }
+
+/// Reads several MMS variables with one Read service.
+///
+/// The request carries `VariableAccessSpecification::ListOfVariable`, so the
+/// whole set travels under one invokeID and needs no temporary named variable
+/// list. The answer holds one `AccessResult` per entry, in request order, so a
+/// per-entry failure keeps its position instead of failing the whole call.
+///
+/// Each entry may carry an `AlternateAccess` selector, exactly as in
+/// [`read_single_array_element`].
+///
+/// # Errors
+///
+/// - `PduParse` for an empty entry list; nothing is sent.
+/// - `PduParse` when the response carries a number of access results that
+///   differs from the number of entries requested. The list is neither padded
+///   nor truncated, because position is what binds a result to its request.
+pub async fn read_list<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    alloc: &mut InvokeIdAllocator,
+    entries: Vec<ListOfVariableEntry>,
+) -> Result<Vec<AccessResult>, ClientError> {
+    if entries.is_empty() {
+        warn!("read_list: the entry list is empty, refusing to send a request");
+        return Err(ClientError::PduParse(
+            "read_list requires at least one variable entry".to_string(),
+        ));
+    }
+    let requested = entries.len();
+
+    let invoke_id = alloc.allocate()?;
+
+    let req = ReadRequest {
+        specification_with_result: false,
+        variable_access_spec: VariableAccessSpecification::ListOfVariable(entries),
+    };
+
+    let mut full = BytesMut::new();
+    encode_confirmed_read_request(invoke_id, &req, &mut full);
+    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
+    let pdu = MmsPdu::ConfirmedRequest(inner);
+
+    if let Err(e) = conn.send_mms_pdu(&pdu).await {
+        alloc.release(invoke_id);
+        return Err(e);
+    }
+
+    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
+        Ok(p) => p,
+        Err(e) => {
+            alloc.release(invoke_id);
+            return Err(e);
+        }
+    };
+
+    alloc.release(invoke_id);
+    check_access_result_count(dispatch_read_list_response(resp_pdu)?, requested)
+}
+
+/// Checks that a Read answer holds exactly one access result per requested
+/// variable.
+///
+/// Position is what binds a result to its variable, so a mismatch is reported
+/// rather than repaired: padding would invent values and truncating would hide
+/// them, and either way the caller would read a result against the wrong
+/// reference.
+fn check_access_result_count(
+    results: Vec<AccessResult>,
+    requested: usize,
+) -> Result<Vec<AccessResult>, ClientError> {
+    if results.len() != requested {
+        warn!(
+            "read_list: the response carries {} access results for {} requested variables",
+            results.len(),
+            requested
+        );
+        return Err(ClientError::PduParse(format!(
+            "read response carries {} access results for {} requested variables",
+            results.len(),
+            requested
+        )));
+    }
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mms::pdu::DataAccessError;
+
+    fn results(n: usize) -> Vec<AccessResult> {
+        (0..n)
+            .map(|_| AccessResult::Failure(DataAccessError::ObjectNonExistent))
+            .collect()
+    }
+
+    #[test]
+    fn matching_access_result_count_passes_through() {
+        let out = check_access_result_count(results(3), 3).expect("count matches");
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn short_access_result_list_is_rejected() {
+        let err = check_access_result_count(results(2), 3).expect_err("count is short");
+        assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn long_access_result_list_is_rejected() {
+        let err = check_access_result_count(results(4), 3).expect_err("count is long");
+        assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
+    }
+}
