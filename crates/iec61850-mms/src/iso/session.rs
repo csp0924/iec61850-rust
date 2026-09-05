@@ -1244,7 +1244,7 @@ mod tests {
     // RF SPDU encoding, including the deliberate non-standard lengths
 
     #[test]
-    fn rf_spdu_encode_c_bug_reproduced() {
+    fn rf_spdu_encode_keeps_the_documented_lengths() {
         let mut out = BytesMut::new();
         encode_refuse(0x03, &mut out);
         // SPDU ID = 0x0C
