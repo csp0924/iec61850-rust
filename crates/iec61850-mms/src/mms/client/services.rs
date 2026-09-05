@@ -1,4 +1,5 @@
-//! MMS confirmed services: Read, Write, GetNameList and GetVariableAccessAttributes.
+//! MMS confirmed services: Read, Write, GetNameList, GetVariableAccessAttributes
+//! and the named variable list services.
 //!
 //! Every service function follows the same shape:
 //! 1. Take a fresh invokeID from the allocator.
@@ -32,16 +33,20 @@ use crate::compat::prelude::*;
 use crate::mms::pdu::{
     decode_confirmed_define_named_variable_list_response,
     decode_confirmed_delete_named_variable_list_response, decode_confirmed_get_name_list_response,
+    decode_confirmed_get_named_variable_list_attrs_response,
     decode_confirmed_get_var_access_attrs_response, decode_confirmed_read_journal_response,
     decode_confirmed_read_response, decode_confirmed_write_response,
     encode_confirmed_define_named_variable_list_request,
     encode_confirmed_delete_named_variable_list_request, encode_confirmed_get_name_list_request,
+    encode_confirmed_get_named_variable_list_attrs_request,
     encode_confirmed_get_var_access_attrs_request, encode_confirmed_read_journal_request,
     encode_confirmed_read_request, encode_confirmed_write_request, AccessResult, AlternateAccess,
     DefineNamedVariableEntry, DefineNamedVariableListRequest, DeleteNamedVariableListRequest,
-    GetNameListRequest, GetVariableAccessAttributesRequest, ListOfVariableEntry, MmsData, MmsPdu,
-    ObjectClass, ObjectName, ObjectScope, ReadJournalRequest, ReadJournalResponse, ReadRequest,
-    ServiceError, TypeSpecification, VariableAccessSpecification, WriteRequest,
+    GetNameListRequest, GetNamedVariableListAttributesRequest,
+    GetNamedVariableListAttributesResponse, GetVariableAccessAttributesRequest,
+    ListOfVariableEntry, MmsData, MmsPdu, ObjectClass, ObjectName, ObjectScope, ReadJournalRequest,
+    ReadJournalResponse, ReadRequest, ServiceError, TypeSpecification, VariableAccessSpecification,
+    WriteRequest,
 };
 use bytes::{Bytes, BytesMut};
 use iec61850_hal::time::Timer;
@@ -705,6 +710,74 @@ pub async fn delete_named_variable_list<T: AsyncTransport, Tm: Timer>(
 
     alloc.release(invoke_id);
     dispatch_delete_named_variable_list_response(resp_pdu)
+}
+
+/// Retrieves the attributes of a named variable list: its members, in order,
+/// and whether it may be deleted.
+///
+/// A confirmed error from the server, for instance because the list does not
+/// exist, becomes `ClientError::ServiceError`, the same shape
+/// `delete_named_variable_list` produces for a refused request.
+pub async fn get_named_variable_list_attributes<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    alloc: &mut InvokeIdAllocator,
+    domain: &str,
+    list_name: &str,
+) -> Result<GetNamedVariableListAttributesResponse, ClientError> {
+    let invoke_id = alloc.allocate()?;
+
+    let req = GetNamedVariableListAttributesRequest::domain(domain, list_name);
+
+    let mut full = BytesMut::new();
+    encode_confirmed_get_named_variable_list_attrs_request(invoke_id, &req, &mut full);
+    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
+    let pdu = MmsPdu::ConfirmedRequest(inner);
+
+    if let Err(e) = conn.send_mms_pdu(&pdu).await {
+        alloc.release(invoke_id);
+        return Err(e);
+    }
+
+    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
+        Ok(p) => p,
+        Err(e) => {
+            alloc.release(invoke_id);
+            return Err(e);
+        }
+    };
+
+    alloc.release(invoke_id);
+    dispatch_get_named_variable_list_attrs_response(resp_pdu)
+}
+
+fn dispatch_get_named_variable_list_attrs_response(
+    pdu: MmsPdu,
+) -> Result<GetNamedVariableListAttributesResponse, ClientError> {
+    match pdu {
+        MmsPdu::ConfirmedResponse(inner) => {
+            let full = rewrap_response(0xa1, &inner);
+            let (_id, resp) = decode_confirmed_get_named_variable_list_attrs_response(&full)
+                .map_err(|e| {
+                    warn!("getnamedvariablelistattributes response failed to decode: {e}");
+                    ClientError::PduParse(format!("{e}"))
+                })?;
+            Ok(resp)
+        }
+        MmsPdu::ConfirmedError(inner) => Err(handle_confirmed_error(&inner)),
+        MmsPdu::Reject(reject) => {
+            warn!(
+                "getnamedvariablelistattributes received a reject pdu: {:?}",
+                reject.reason
+            );
+            Err(ClientError::RejectError {
+                reason: reject.reason,
+            })
+        }
+        other => Err(ClientError::PduParse(format!(
+            "unexpected PDU tag=0x{:02X}",
+            other.tag_byte()
+        ))),
+    }
 }
 
 fn dispatch_define_named_variable_list_response(pdu: MmsPdu) -> Result<(), ClientError> {

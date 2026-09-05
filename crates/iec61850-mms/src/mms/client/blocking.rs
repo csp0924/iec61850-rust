@@ -22,7 +22,7 @@
 
 use super::error::ClientError;
 use super::{ConnectionState, MmsClient, MmsClientBuilder, MmsValue};
-use crate::mms::pdu::{ObjectClass, TypeSpecification};
+use crate::mms::pdu::{GetNamedVariableListAttributesResponse, ObjectClass, TypeSpecification};
 
 /// Synchronous wrapper over [`MmsClient`], owning a private current-thread runtime.
 pub struct BlockingMmsClient {
@@ -127,5 +127,18 @@ impl BlockingMmsClient {
     ) -> Result<TypeSpecification, ClientError> {
         self.rt
             .block_on(self.inner.get_variable_access_attributes(domain, item))
+    }
+
+    /// Retrieves the attributes of a named variable list: its members, in
+    /// order, and whether it may be deleted.
+    pub fn get_named_variable_list_attributes(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+    ) -> Result<GetNamedVariableListAttributesResponse, ClientError> {
+        self.rt.block_on(
+            self.inner
+                .get_named_variable_list_attributes(domain, list_name),
+        )
     }
 }
