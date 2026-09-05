@@ -451,7 +451,10 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
             }
         }
 
-        match service_tag {
+        // Every answer below leaves through the outbound size guard, so a
+        // service added later is bounded by the negotiated maximum PDU size
+        // without having to arrange it itself.
+        let response = match service_tag {
             SERVICE_TAG_GET_NAME_LIST => dispatch_get_name_list(
                 invoke_id,
                 &body,
@@ -465,12 +468,9 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "logging")]
                 &self.log_controls,
             ),
-            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => dispatch_get_var_access_attrs(
-                invoke_id,
-                &body,
-                &self.mms_model,
-                conn.negotiated_max_pdu_size(),
-            ),
+            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => {
+                dispatch_get_var_access_attrs(invoke_id, &body, &self.mms_model)
+            }
             SERVICE_TAG_IDENTIFY => dispatch_identify(invoke_id, &self.identification),
             SERVICE_TAG_READ => dispatch_read(
                 invoke_id,
@@ -528,7 +528,6 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &body,
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
-                conn.negotiated_max_pdu_size(),
             ),
             // DeleteNamedVariableList, the mapping of DeleteDataSet.
             #[cfg(feature = "reporting")]
@@ -546,7 +545,14 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 );
                 ConfirmedResponse::Reject
             }
-        }
+        };
+
+        pdu_budget::guard_outbound_pdu_size(
+            invoke_id,
+            service_tag,
+            response,
+            conn.negotiated_max_pdu_size(),
+        )
     }
 }
 
@@ -745,15 +751,13 @@ fn is_lcb_path(item: &str) -> bool {
 
 /// Dispatches a GetVariableAccessAttributes request (`0xa6`).
 ///
-/// The type specification of a logical node grows with the model, so the
-/// encoded response is measured against the negotiated maximum PDU size before
-/// it is sent; one that does not fit answers a ConfirmedError of errorClass
-/// resource other.
+/// The type specification of a logical node grows with the model, so a
+/// response can outgrow the negotiated maximum PDU size; the dispatcher's
+/// outbound guard bounds it.
 fn dispatch_get_var_access_attrs(
     invoke_id: u32,
     body: &Bytes,
     mms_model: &MmsDeviceModel,
-    negotiated_max_pdu_size: Option<u32>,
 ) -> ConfirmedResponse {
     let req = match GetVariableAccessAttributesRequest::decode(body) {
         Ok(r) => r,
@@ -771,21 +775,7 @@ fn dispatch_get_var_access_attrs(
         GetVarAccessAttrsResult::Response(resp) => {
             let mut buf = BytesMut::new();
             match encode_confirmed_get_var_access_attrs_response(invoke_id, &resp, &mut buf) {
-                Ok(()) => {
-                    if pdu_budget::response_exceeds_pdu_budget(buf.len(), negotiated_max_pdu_size) {
-                        tracing::warn!(
-                            invoke_id,
-                            encoded_len = buf.len(),
-                            negotiated_max_pdu_size,
-                            "get-variable-access-attributes: the response exceeds the negotiated maximum PDU size, answering a resource error"
-                        );
-                        return make_confirmed_error(
-                            invoke_id,
-                            ErrorClass::Resource(resource::OTHER),
-                        );
-                    }
-                    ConfirmedResponse::Response(buf.freeze())
-                }
+                Ok(()) => ConfirmedResponse::Response(buf.freeze()),
                 Err(e) => {
                     tracing::warn!(
                         invoke_id,
@@ -3451,6 +3441,186 @@ mod tests {
                 );
             }
             other => panic!("expected a confirmed error, got {:?}", other),
+        }
+    }
+
+    // ── GetNamedVariableListAttributes under the outbound guard ─────
+
+    /// Registers a configured data set of `members` boolean entries and
+    /// returns the member item ids in registration order.
+    #[cfg(feature = "reporting")]
+    fn register_dataset_of(dispatcher: &MmsModelDispatcher, members: usize) -> Vec<String> {
+        use crate::reporting::{Dataset, DatasetEntry};
+
+        let mut dataset = Dataset::new(NVL_LIST_NAME);
+        let mut item_ids = Vec::with_capacity(members);
+        for n in 0..members {
+            let item_id = format!("GGIO1$ST$Ind{n}$stVal");
+            dataset.push(DatasetEntry::new(
+                format!("{NVL_DOMAIN}/{item_id}"),
+                Arc::new(std::sync::RwLock::new(MmsValue::Boolean(true))),
+            ));
+            item_ids.push(item_id);
+        }
+        dispatcher
+            .dataset_registry
+            .write()
+            .expect("the data set registry lock must be usable")
+            .insert(
+                (NVL_DOMAIN.to_string(), NVL_LIST_NAME.to_string()),
+                Arc::new(dataset),
+            );
+        item_ids
+    }
+
+    /// Encodes the response those members imply, so the expected size never
+    /// comes from the dispatch path under test.
+    #[cfg(feature = "reporting")]
+    fn nvl_response_len(item_ids: &[String], invoke_id: u32) -> usize {
+        use iec61850_mms::mms::pdu::get_named_variable_list_attrs::{
+            encode_confirmed_get_named_variable_list_attrs_response,
+            GetNamedVariableListAttributesResponse,
+        };
+        use iec61850_mms::mms::pdu::{ListOfVariableEntry, ObjectName};
+
+        let resp = GetNamedVariableListAttributesResponse {
+            mms_deletable: false,
+            list_of_variable: item_ids
+                .iter()
+                .map(|item_id| {
+                    ListOfVariableEntry::name(ObjectName::DomainSpecific {
+                        domain_id: NVL_DOMAIN.to_string(),
+                        item_id: item_id.clone(),
+                    })
+                })
+                .collect(),
+        };
+        let mut buf = BytesMut::new();
+        encode_confirmed_get_named_variable_list_attrs_response(invoke_id, &resp, &mut buf);
+        buf.len()
+    }
+
+    /// The GetNamedVariableListAttributes service body for the registered set.
+    #[cfg(feature = "reporting")]
+    fn nvl_request_body(invoke_id: u32) -> Bytes {
+        use iec61850_mms::mms::pdu::get_named_variable_list_attrs::{
+            encode_confirmed_get_named_variable_list_attrs_request,
+            GetNamedVariableListAttributesRequest,
+        };
+
+        let req = GetNamedVariableListAttributesRequest::domain(NVL_DOMAIN, NVL_LIST_NAME);
+        let mut buf = BytesMut::new();
+        encode_confirmed_get_named_variable_list_attrs_request(invoke_id, &req, &mut buf);
+        extract_service_body_from_confirmed_request(&buf)
+    }
+
+    /// A connection that has negotiated `max_pdu_size`.
+    #[cfg(feature = "reporting")]
+    fn conn_with_max(max_pdu_size: u32) -> MmsServerConnection {
+        use iec61850_mms::mms::server::connection::NegotiatedParams;
+
+        let mut conn = MmsServerConnection::new();
+        conn.set_negotiated(NegotiatedParams {
+            max_pdu_size,
+            ..NegotiatedParams::default()
+        });
+        conn
+    }
+
+    #[cfg(feature = "reporting")]
+    const NVL_DOMAIN: &str = "IED1LD0";
+    #[cfg(feature = "reporting")]
+    const NVL_LIST_NAME: &str = "GGIO1$ds1";
+
+    #[cfg(feature = "reporting")]
+    fn assert_resource_other(resp: ConfirmedResponse, invoke_id: u32) {
+        use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
+
+        match resp {
+            ConfirmedResponse::Error(bytes) => {
+                let (decoded_id, service_error) =
+                    decode_confirmed_error_pdu(&bytes).expect("the confirmed error must decode");
+                assert_eq!(decoded_id, invoke_id);
+                assert_eq!(
+                    service_error.error_class,
+                    ErrorClass::Resource(resource::OTHER),
+                    "an undeliverable response must answer resource other"
+                );
+            }
+            other => panic!("expected a confirmed error, got {:?}", other),
+        }
+    }
+
+    /// A data set with many members over an association that negotiated 200
+    /// bytes cannot be delivered, so the guard answers resource other.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_nvl_attrs_over_budget_returns_resource_other() {
+        const INVOKE_ID: u32 = 31;
+
+        let dispatcher = build_dispatcher();
+        register_dataset_of(&dispatcher, 40);
+
+        let resp = dispatcher.dispatch(
+            &conn_with_max(200),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: nvl_request_body(INVOKE_ID),
+            },
+        );
+        assert_resource_other(resp, INVOKE_ID);
+    }
+
+    /// A response of exactly the budget is delivered and one byte more is not.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_nvl_attrs_at_the_budget_boundary() {
+        const INVOKE_ID: u32 = 32;
+
+        let dispatcher = build_dispatcher();
+        let item_ids = register_dataset_of(&dispatcher, 6);
+        let exact_max =
+            (nvl_response_len(&item_ids, INVOKE_ID) + read::PDU_OVERHEAD_RESERVE) as u32;
+
+        let request = || ConfirmedRequest {
+            invoke_id: INVOKE_ID,
+            service_body: nvl_request_body(INVOKE_ID),
+        };
+
+        match dispatcher.dispatch(&conn_with_max(exact_max), request()) {
+            ConfirmedResponse::Response(bytes) => assert_eq!(
+                bytes[0], 0xa1,
+                "a response of exactly the budget must be delivered"
+            ),
+            other => panic!("expected a response, got {:?}", other),
+        }
+
+        assert_resource_other(
+            dispatcher.dispatch(&conn_with_max(exact_max - 1), request()),
+            INVOKE_ID,
+        );
+    }
+
+    /// Before negotiation completes no maximum applies, so the response goes
+    /// out whatever its size.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_nvl_attrs_unnegotiated_sends_the_response() {
+        const INVOKE_ID: u32 = 33;
+
+        let dispatcher = build_dispatcher();
+        register_dataset_of(&dispatcher, 40);
+
+        let resp = dispatcher.dispatch(
+            &make_conn(),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: nvl_request_body(INVOKE_ID),
+            },
+        );
+        match resp {
+            ConfirmedResponse::Response(bytes) => assert_eq!(bytes[0], 0xa1),
+            other => panic!("expected a response, got {:?}", other),
         }
     }
 

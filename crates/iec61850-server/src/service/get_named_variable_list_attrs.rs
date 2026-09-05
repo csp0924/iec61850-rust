@@ -28,11 +28,10 @@
 //!
 //! ## Response size
 //!
-//! The member list grows with the data set, so the encoded response is
-//! measured against the maximum PDU size negotiated for the association. A
-//! response that does not fit is replaced by a ConfirmedError of errorClass
-//! resource other, as IEC 61850-8-1 requires, rather than sent to a client
-//! that cannot accept it.
+//! The member list grows with the data set, so a response can outgrow the
+//! maximum PDU size negotiated for the association. The dispatcher's outbound
+//! guard measures the encoded response and answers errorClass resource other
+//! when it does not fit, so this handler always builds the complete list.
 
 use bytes::BytesMut;
 
@@ -51,18 +50,13 @@ use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
 
 use crate::reporting::DatasetRegistry;
 use crate::service::define_named_variable_list::DynamicDatasetKeys;
-use crate::service::pdu_budget::response_exceeds_pdu_budget;
 
 /// Handles a GetNamedVariableListAttributes request (confirmed service tag 0xac).
-///
-/// `negotiated_max_pdu_size` bounds the encoded response; `None` before
-/// negotiation completes leaves it unbounded.
 pub(crate) fn handle_get_named_variable_list_attributes(
     invoke_id: u32,
     body: &[u8],
     registry: &DatasetRegistry,
     dynamic_keys: &DynamicDatasetKeys,
-    negotiated_max_pdu_size: Option<u32>,
 ) -> ConfirmedResponse {
     let req = match GetNamedVariableListAttributesRequest::decode(body) {
         Ok(r) => r,
@@ -161,21 +155,6 @@ pub(crate) fn handle_get_named_variable_list_attributes(
     };
     let mut buf = BytesMut::new();
     encode_confirmed_get_named_variable_list_attrs_response(invoke_id, &resp, &mut buf);
-    if response_exceeds_pdu_budget(buf.len(), negotiated_max_pdu_size) {
-        tracing::warn!(
-            invoke_id,
-            domain,
-            list_name,
-            members = resp.list_of_variable.len(),
-            encoded_len = buf.len(),
-            negotiated_max_pdu_size,
-            "get-named-variable-list-attributes: the response exceeds the negotiated maximum PDU size, answering a resource error"
-        );
-        return crate::service::make_confirmed_error_pub(
-            invoke_id,
-            ErrorClass::Resource(resource::OTHER),
-        );
-    }
     ConfirmedResponse::Response(buf.freeze())
 }
 
@@ -193,143 +172,6 @@ fn split_attr_ref(attr_ref: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
-
-    use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
-    use iec61850_model::MmsValue;
-
-    use crate::reporting::{Dataset, DatasetEntry};
-    use crate::service::define_named_variable_list::new_dynamic_dataset_keys;
-    use crate::service::read::PDU_OVERHEAD_RESERVE;
-
-    const DOMAIN: &str = "IED1LD0";
-    const LIST_NAME: &str = "GGIO1$ds1";
-    const INVOKE_ID: u32 = 7;
-
-    /// Builds a registry holding one configured data set of `members` boolean
-    /// entries and returns the member item ids in registration order.
-    fn registry_with_members(members: usize) -> (DatasetRegistry, Vec<String>) {
-        let mut dataset = Dataset::new(LIST_NAME);
-        let mut item_ids = Vec::with_capacity(members);
-        for n in 0..members {
-            let item_id = format!("GGIO1$ST$Ind{n}$stVal");
-            dataset.push(DatasetEntry::new(
-                format!("{DOMAIN}/{item_id}"),
-                Arc::new(RwLock::new(MmsValue::Boolean(true))),
-            ));
-            item_ids.push(item_id);
-        }
-        let mut map = HashMap::new();
-        map.insert(
-            (DOMAIN.to_string(), LIST_NAME.to_string()),
-            Arc::new(dataset),
-        );
-        (Arc::new(RwLock::new(map)), item_ids)
-    }
-
-    /// Encodes the response those members imply and returns its length, so the
-    /// expected size never comes from the handler under test.
-    fn encoded_response_len(item_ids: &[String]) -> usize {
-        let resp = GetNamedVariableListAttributesResponse {
-            mms_deletable: false,
-            list_of_variable: item_ids
-                .iter()
-                .map(|item_id| {
-                    ListOfVariableEntry::name(ObjectName::DomainSpecific {
-                        domain_id: DOMAIN.to_string(),
-                        item_id: item_id.clone(),
-                    })
-                })
-                .collect(),
-        };
-        let mut buf = BytesMut::new();
-        encode_confirmed_get_named_variable_list_attrs_response(INVOKE_ID, &resp, &mut buf);
-        buf.len()
-    }
-
-    /// Encodes the request service body the handler consumes.
-    fn request_body() -> BytesMut {
-        let mut buf = BytesMut::new();
-        GetNamedVariableListAttributesRequest::domain(DOMAIN, LIST_NAME).encode(&mut buf);
-        buf
-    }
-
-    fn handle(
-        registry: &DatasetRegistry,
-        negotiated_max_pdu_size: Option<u32>,
-    ) -> ConfirmedResponse {
-        handle_get_named_variable_list_attributes(
-            INVOKE_ID,
-            &request_body(),
-            registry,
-            &new_dynamic_dataset_keys(),
-            negotiated_max_pdu_size,
-        )
-    }
-
-    /// Asserts the answer is a ConfirmedError of errorClass resource other.
-    fn assert_resource_other(resp: ConfirmedResponse) {
-        match resp {
-            ConfirmedResponse::Error(bytes) => {
-                let (invoke_id, service_error) =
-                    decode_confirmed_error_pdu(&bytes).expect("confirmed error must decode");
-                assert_eq!(invoke_id, INVOKE_ID);
-                assert_eq!(
-                    service_error.error_class,
-                    ErrorClass::Resource(resource::OTHER),
-                    "an oversized response must answer resource other"
-                );
-            }
-            other => panic!("expected a confirmed error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_response_over_the_negotiated_size_answers_resource_other() {
-        let (registry, _) = registry_with_members(40);
-        assert_resource_other(handle(&registry, Some(200)));
-    }
-
-    #[test]
-    fn a_response_under_the_negotiated_size_is_sent() {
-        let (registry, item_ids) = registry_with_members(3);
-        let generous = (encoded_response_len(&item_ids) + PDU_OVERHEAD_RESERVE + 64) as u32;
-        match handle(&registry, Some(generous)) {
-            ConfirmedResponse::Response(bytes) => assert_eq!(
-                bytes[0], 0xa1,
-                "a response must start with the confirmed-response tag"
-            ),
-            other => panic!("expected a response, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_response_exactly_at_the_negotiated_size_is_sent() {
-        let (registry, item_ids) = registry_with_members(6);
-        let exact = (encoded_response_len(&item_ids) + PDU_OVERHEAD_RESERVE) as u32;
-        match handle(&registry, Some(exact)) {
-            ConfirmedResponse::Response(bytes) => assert_eq!(bytes[0], 0xa1),
-            other => panic!("a response of exactly the budget must be sent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_response_one_byte_over_the_negotiated_size_is_refused() {
-        let (registry, item_ids) = registry_with_members(6);
-        let one_short = (encoded_response_len(&item_ids) + PDU_OVERHEAD_RESERVE - 1) as u32;
-        assert_resource_other(handle(&registry, Some(one_short)));
-    }
-
-    #[test]
-    fn an_unnegotiated_association_sends_the_response() {
-        let (registry, _) = registry_with_members(40);
-        match handle(&registry, None) {
-            ConfirmedResponse::Response(bytes) => assert_eq!(bytes[0], 0xa1),
-            other => panic!("without a negotiated maximum the response is sent, got {other:?}"),
-        }
-    }
 
     #[test]
     fn attr_ref_splits_on_the_first_separator() {

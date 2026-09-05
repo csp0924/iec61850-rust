@@ -19,10 +19,13 @@ Every crate in the workspace shares one version number.
   from the data set registry: members in registration order, `mmsDeletable`
   true only for a data set created through DefineNamedVariableList, and
   `object-non-existent` for an unknown name. The service is advertised in
-  `servicesSupportedCalled` when the reporting subsystem is compiled in. A
-  member list that would exceed the maximum PDU size negotiated for the
-  association is answered with errorClass `resource other`, as is an
-  oversized GetVariableAccessAttributes type specification.
+  `servicesSupportedCalled` when the reporting subsystem is compiled in.
+- **`iec61850-server`** — the dispatcher bounds every confirmed response by the
+  maximum PDU size negotiated for the association, answering errorClass
+  `resource other` when one does not fit. A client that negotiates a small
+  maximum is therefore never sent a GetNamedVariableListAttributes member list
+  or a GetVariableAccessAttributes type specification it cannot accept. Read
+  and GetNameList keep their own budget and pagination.
 - **`iec61850-client`** — `IedConnection::get_data_set_directory`, the ACSI
   GetDataSetDirectory service, returning `DataSetDirectory` with each member as
   an IEC reference and its functional constraint.
