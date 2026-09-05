@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iec61850_client::IedConnection;
 use iec61850_mms::mms::pdu::service_error::subcode::{access, definition};
 use iec61850_mms::mms::pdu::{DefineNamedVariableEntry, ErrorClass};
 use iec61850_mms::{ClientError, MmsClient, MmsClientBuilder};
@@ -69,7 +70,7 @@ fn build_server() -> IedServer {
         .expect("build server")
 }
 
-async fn fresh_mms_client(port: u16) -> MmsClient {
+async fn connected_client(port: u16) -> MmsClient {
     let mut client = MmsClientBuilder::new()
         .connect_timeout_ms(3_000)
         .request_timeout_ms(3_000)
@@ -93,7 +94,7 @@ async fn unknown_data_set_yields_a_typed_service_error() {
     let handle = server.start().await.expect("server start");
     let port = handle.bound_addr.port();
 
-    let mut client = fresh_mms_client(port).await;
+    let mut client = connected_client(port).await;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         client.get_named_variable_list_attributes(DOMAIN, "GGIO1$no_such_set"),
@@ -120,7 +121,7 @@ async fn duplicate_data_set_name_yields_the_definition_error_class() {
     let handle = server.start().await.expect("server start");
     let port = handle.bound_addr.port();
 
-    let mut client = fresh_mms_client(port).await;
+    let mut client = connected_client(port).await;
     let entries = vec![member("GGIO1$ST$Ind1$stVal")];
 
     tokio::time::timeout(
@@ -156,7 +157,7 @@ async fn unknown_member_yields_a_typed_service_error() {
     let handle = server.start().await.expect("server start");
     let port = handle.bound_addr.port();
 
-    let mut client = fresh_mms_client(port).await;
+    let mut client = connected_client(port).await;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         client.define_named_variable_list(
@@ -187,7 +188,7 @@ async fn a_refusal_is_never_reported_as_a_parse_failure() {
     let handle = server.start().await.expect("server start");
     let port = handle.bound_addr.port();
 
-    let mut client = fresh_mms_client(port).await;
+    let mut client = connected_client(port).await;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         client.get_named_variable_list_attributes(DOMAIN, "GGIO1$still_missing"),
@@ -204,4 +205,73 @@ async fn a_refusal_is_never_reported_as_a_parse_failure() {
         matches!(err, ClientError::ServiceError { .. }),
         "expected a service error, got {err:?}"
     );
+}
+
+/// The `IedConnection` facade flattens a layered MMS error into
+/// `ClientError::Mms`, keeping its rendered text. The text must be the one a
+/// service error renders, carrying the errorClass, and not the one a decode
+/// failure renders.
+///
+/// The expected text is built from the typed error rather than written out, so
+/// it follows the `Display` of `ServiceError` instead of pinning a snapshot of
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_data_set_directory_of_an_unknown_set_reports_the_error_class() {
+    let server = build_server();
+    let handle = server.start().await.expect("server start");
+    let port = handle.bound_addr.port();
+
+    let conn = IedConnection::with_mms_client(MmsClientBuilder::new().build());
+    conn.connect("127.0.0.1", port).await.expect("connect");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        conn.get_data_set_directory("IED1LD0/GGIO1.no_such_set"),
+    )
+    .await
+    .expect("timeout");
+
+    let err = result.expect_err("an unknown data set must fail");
+
+    let expected = iec61850_client::ClientError::Mms(
+        ClientError::ServiceError {
+            error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+        }
+        .to_string(),
+    );
+    assert_eq!(
+        err, expected,
+        "an unknown data set must surface as a service error carrying object-non-existent"
+    );
+}
+
+/// The same call must not surface as a parse failure, pinned apart from the
+/// errorClass so that a decoder regression stays visible even if the class the
+/// server picks changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_data_set_directory_of_an_unknown_set_is_not_a_parse_failure() {
+    let server = build_server();
+    let handle = server.start().await.expect("server start");
+    let port = handle.bound_addr.port();
+
+    let conn = IedConnection::with_mms_client(MmsClientBuilder::new().build());
+    conn.connect("127.0.0.1", port).await.expect("connect");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        conn.get_data_set_directory("IED1LD0/GGIO1.still_no_such_set"),
+    )
+    .await
+    .expect("timeout")
+    .expect_err("an unknown data set must fail");
+
+    let text = err.to_string();
+    assert!(
+        !text.contains("decode failed"),
+        "a Confirmed-ErrorPDU the server sent must be decodable, got {text}"
+    );
+    let parse_failure = iec61850_client::ClientError::Mms(
+        ClientError::PduParse("ConfirmedError decode failed".to_string()).to_string(),
+    );
+    assert_ne!(err, parse_failure);
 }
