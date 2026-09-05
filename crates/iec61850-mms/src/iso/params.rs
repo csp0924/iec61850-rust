@@ -127,6 +127,13 @@ impl ApTitle {
         if first > OID_FIRST_ARC_MAX || (first < OID_FIRST_ARC_MAX && second > OID_SECOND_ARC_MAX) {
             return Err(ApTitleError::ArcOutOfRange { first, second });
         }
+        // The first two arcs travel as the single value `40 * first + second`,
+        // which has to stay inside 32 bits. Only a first arc of 2 leaves the
+        // second unbounded by the range check above, so the join is what sets
+        // its ceiling.
+        if joined_first_arcs(first, second).is_none() {
+            return Err(ApTitleError::ArcOutOfRange { first, second });
+        }
         Ok(Self {
             arcs: arcs.to_vec(),
         })
@@ -142,9 +149,13 @@ impl ApTitle {
     /// The first two arcs are joined as `40 * first + second`, and every
     /// further arc is written base-128, most significant group first, with the
     /// continuation bit set on all but the last octet.
+    ///
+    /// Every constructor rejects arcs whose join overflows 32 bits, so the
+    /// join here cannot wrap.
     pub fn to_ber_content(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let joined = OID_FIRST_ARC_FACTOR * self.arcs[0] + self.arcs[1];
+        let joined = joined_first_arcs(self.arcs[0], self.arcs[1])
+            .expect("a constructed ap-title has joinable first arcs");
         write_base128(joined, &mut out);
         for &arc in &self.arcs[2..] {
             write_base128(arc, &mut out);
@@ -221,6 +232,14 @@ impl fmt::Display for ApTitle {
         }
         Ok(())
     }
+}
+
+/// Joins the first two arcs as `40 * first + second`.
+///
+/// Returns `None` when the result does not fit in 32 bits, which is the only
+/// way the pair can be unencodable once the per-arc ranges hold.
+fn joined_first_arcs(first: u32, second: u32) -> Option<u32> {
+    OID_FIRST_ARC_FACTOR.checked_mul(first)?.checked_add(second)
 }
 
 /// Appends one arc to `out` in base-128 form, most significant group first.
@@ -406,6 +425,40 @@ mod tests {
                 second: 40
             })
         ));
+    }
+
+    /// A first arc of 2 leaves the second unbounded by the per-arc range
+    /// check, so the join `40 * 2 + second` is what has to reject it. Building
+    /// the title must fail rather than overflow while encoding.
+    #[test]
+    fn ap_title_rejects_a_second_arc_that_overflows_the_join() {
+        assert_eq!(
+            ApTitle::from_arcs(&[2, u32::MAX]),
+            Err(ApTitleError::ArcOutOfRange {
+                first: 2,
+                second: u32::MAX
+            })
+        );
+        assert_eq!(
+            "2.4294967295".parse::<ApTitle>(),
+            Err(ApTitleError::ArcOutOfRange {
+                first: 2,
+                second: u32::MAX
+            })
+        );
+    }
+
+    /// The largest joinable pair is `2.(u32::MAX - 80)`, which encodes to the
+    /// all-ones join and survives the round trip.
+    #[test]
+    fn ap_title_accepts_the_largest_joinable_second_arc() {
+        let title = ApTitle::from_arcs(&[2, u32::MAX - 80]).expect("the join fits in 32 bits");
+        let content = title.to_ber_content();
+        assert_eq!(
+            ApTitle::from_ber_content(&content).expect("decode"),
+            title,
+            "the widest joinable pair must survive the round trip"
+        );
     }
 
     #[test]
