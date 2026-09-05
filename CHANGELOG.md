@@ -8,6 +8,8 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-06
+
 ### Added
 
 - **`iec61850-mms`** — the MMS GetNamedVariableListAttributes PDUs (confirmed
@@ -139,6 +141,7 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.2.0
 [0.1.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.0
