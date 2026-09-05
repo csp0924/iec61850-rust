@@ -4,9 +4,10 @@
 //! together with the ACSE application-entity title, so that one value carries
 //! every address the association sequence needs.
 //!
-//! The defaults are the values IEC 61850-8-1 Annex A lists for an MMS
+//! The default selectors are the values IEC 61850-8-1 specifies for an MMS
 //! association: T-Selector `00 01`, S-Selector `00 01` and P-Selector
-//! `00 00 00 01`, with an AP-title and an AE-qualifier present on both sides.
+//! `00 00 00 01`. The default AP-titles and AE-qualifiers are the values IEDs
+//! customarily expect; the standard leaves them to the configuration.
 //!
 //! An AP-title is an OBJECT IDENTIFIER, the ISO 8650 AARQ-apdu fields
 //! `called-AP-title` and `calling-AP-title`. [`ApTitle`] holds it as its arc
@@ -266,7 +267,9 @@ pub struct AarqAddressing {
 /// The ISO addressing a client offers when it associates.
 ///
 /// `local_*` names the calling side and `remote_*` the called side. The
-/// defaults are the values IEC 61850-8-1 Annex A lists for an MMS association.
+/// default selectors are the values IEC 61850-8-1 specifies for an MMS
+/// association; the default AP-titles and AE-qualifiers are the values IEDs
+/// customarily expect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsoConnectionParameters {
     /// Calling T-Selector, at most 4 bytes.

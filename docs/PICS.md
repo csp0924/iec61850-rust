@@ -90,7 +90,7 @@ elsewhere. macOS and BSD backends are absent.
 | Abort | Y | Y | Both the peer-initiated ACSE abort and an immediate transport close |
 | Release | Y | Y | ACSE RLRQ / RLRE, with MMS Conclude and a Session FINISH timeout on the server |
 | Association authentication: none | Y | Y | Default |
-| Association gating on calling AP-title and AE-qualifier | Y | – | The server calls an application-supplied authenticator with the calling application reference and refuses the AARQ when it returns false |
+| Association gating on calling AP-title and AE-qualifier | N | – | The MMS layer decodes the calling application reference and can consult an authenticator, but `IedServer` installs none and exposes no hook, so every AARQ is accepted regardless of the calling AP-title |
 | Association authentication: ACSE password | N | N | The AARQ encoder can emit the charstring password mechanism, but the server skips `calling-authentication-value` and always invokes the authenticator with no credentials, and no client API exposes a password |
 | Association authentication: certificate (IEC 62351-4 mechanism OID) | N | N | Peer authentication is performed by TLS; the ACSE mechanism-name OID is not emitted |
 
@@ -336,7 +336,9 @@ never enforced: a peer that uses a service it did not announce is still served.
 ### 5.1 ISO connection parameters
 
 The addressing a client offers is carried by `IsoConnectionParameters`. Its
-defaults are the values IEC 61850-8-1 Annex A lists for an MMS association.
+default selectors are the values IEC 61850-8-1 specifies for an MMS
+association; the default AP-titles and AE-qualifier are the values IEDs
+customarily expect, which the standard leaves to the configuration.
 
 | Parameter | Default | Carried in |
 |---|---|---|

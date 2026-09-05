@@ -86,7 +86,7 @@ cargo run -p iec61850-client --example client_reporting_subscriber
 
 ### ISO 連線參數
 
-client 預設以 IEC 61850-8-1 所列的定址建立 association：T-Selector `00 01`、S-Selector `00 01`、P-Selector `00 00 00 01`、AP-title 主叫 `1.1.1.999` 與被叫 `1.1.1.999.1`、兩側 AE-qualifier 為 12。若 IED 會驗證主叫位址，可自行指定：
+client 預設以慣用的 MMS 定址建立 association：IEC 61850-8-1 規定的 selector（T-Selector `00 01`、S-Selector `00 01`、P-Selector `00 00 00 01`），加上 IED 普遍預期的 AP-title 主叫 `1.1.1.999` 與被叫 `1.1.1.999.1`、兩側 AE-qualifier 為 12。若 IED 會驗證主叫位址，可自行指定：
 
 ```rust
 use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};

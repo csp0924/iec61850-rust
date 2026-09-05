@@ -146,10 +146,11 @@ the demonstration IED in full.
 
 ### ISO connection parameters
 
-A client associates with the addressing IEC 61850-8-1 lists by default:
-T-Selector `00 01`, S-Selector `00 01`, P-Selector `00 00 00 01`, AP-title
-`1.1.1.999` calling and `1.1.1.999.1` called, AE-qualifier 12 on both sides. An
-IED that validates the calling address takes its own values:
+A client associates with the customary MMS addressing by default: the
+selectors IEC 61850-8-1 specifies, T-Selector `00 01`, S-Selector `00 01` and
+P-Selector `00 00 00 01`, together with the AP-title `1.1.1.999` calling and
+`1.1.1.999.1` called and AE-qualifier 12 on both sides that IEDs commonly
+expect. An IED that validates the calling address takes its own values:
 
 ```rust
 use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};
