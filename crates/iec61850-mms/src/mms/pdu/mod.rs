@@ -105,7 +105,10 @@ pub use reject::{
     ConfirmedErrorRejectReason, ConfirmedRequestRejectReason, ConfirmedResponseRejectReason,
     PduErrorRejectReason, RejectPdu, RejectReason, UnconfirmedPduRejectReason,
 };
-pub use service_error::{encode_confirmed_error_pdu, ErrorClass, ServiceError};
+pub use service_error::{
+    decode_confirmed_error_inner, decode_confirmed_error_pdu, encode_confirmed_error_pdu,
+    ErrorClass, ServiceError,
+};
 pub use type_specification::{StructComponent, TypeSpecification, MAX_TYPE_SPEC_DEPTH};
 pub use write::{
     decode_confirmed_write_request, decode_confirmed_write_response,

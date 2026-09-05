@@ -297,6 +297,9 @@ separately.
 | `definition [2]` object-exists | 5 | DefineNamedVariableList names a data set that is already defined |
 | `resource [3]` other | 0 | The response would exceed the negotiated maximum PDU size, or an internal lock is unusable |
 
+The client decodes a Confirmed-ErrorPDU into the errorClass alternative and
+subcode the peer sent, so a refusal is distinguishable by cause.
+
 ---
 
 ## 5. Association negotiation and `servicesSupported`

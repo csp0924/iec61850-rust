@@ -50,6 +50,17 @@ Every crate in the workspace shares one version number.
   does not define. `ErrorClass` subcodes are available as named constants in
   `mms::pdu::service_error::subcode`, one module per alternative.
 
+- **`iec61850-mms`** — the client reads back a Confirmed-ErrorPDU that the
+  server sends. Its decoder looked for the invokeID under the universal INTEGER
+  tag `0x02`, the form an untagged `invokeID` takes in a Confirmed-RequestPDU,
+  while ISO 9506-2 declares the Confirmed-ErrorPDU field `[0] IMPLICIT`, tag
+  `0x80`. Every refusal therefore surfaced as
+  `ClientError::PduParse("ConfirmedError decode failed")` instead of
+  `ClientError::ServiceError`, so a caller could not tell an unknown object from
+  a malformed answer. `decode_confirmed_error_pdu` and
+  `decode_confirmed_error_inner` are now public, accept the optional
+  `modifierPosition [1]`, and validate the invokeID as an `Unsigned32`.
+
 ## [0.1.1] - 2026-09-01
 
 Documentation and packaging metadata only; no code changes.

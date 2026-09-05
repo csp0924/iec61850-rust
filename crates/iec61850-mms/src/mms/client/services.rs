@@ -32,7 +32,8 @@ use super::invoke_id::InvokeIdAllocator;
 use crate::compat::prelude::*;
 use crate::mms::pdu::{
     decode_confirmed_define_named_variable_list_response,
-    decode_confirmed_delete_named_variable_list_response, decode_confirmed_get_name_list_response,
+    decode_confirmed_delete_named_variable_list_response, decode_confirmed_error_inner,
+    decode_confirmed_get_name_list_response,
     decode_confirmed_get_named_variable_list_attrs_response,
     decode_confirmed_get_var_access_attrs_response, decode_confirmed_read_journal_response,
     decode_confirmed_read_response, decode_confirmed_write_response,
@@ -45,8 +46,7 @@ use crate::mms::pdu::{
     GetNameListRequest, GetNamedVariableListAttributesRequest,
     GetNamedVariableListAttributesResponse, GetVariableAccessAttributesRequest,
     ListOfVariableEntry, MmsData, MmsPdu, ObjectClass, ObjectName, ObjectScope, ReadJournalRequest,
-    ReadJournalResponse, ReadRequest, ServiceError, TypeSpecification, VariableAccessSpecification,
-    WriteRequest,
+    ReadJournalResponse, ReadRequest, TypeSpecification, VariableAccessSpecification, WriteRequest,
 };
 use bytes::{Bytes, BytesMut};
 use iec61850_hal::time::Timer;
@@ -954,41 +954,31 @@ fn dispatch_get_var_access_attrs_response(pdu: MmsPdu) -> Result<TypeSpecificati
 
 /// Turns the content of a ConfirmedError PDU into a `ClientError::ServiceError`.
 ///
-/// The content after tag `0xa2` is:
+/// `inner` is what follows the outer `0xa2 <len>`:
 /// ```text
-/// 0x02 <len> <invokeId>   -- invokeID, skipped
-/// 0xa2 <len> ...          -- serviceError
+/// 0x80 <len> <invokeId>   -- invokeID [0] IMPLICIT Unsigned32
+/// (0x81 <len> ... )       -- modifierPosition [1] IMPLICIT, OPTIONAL
+/// 0xa2 <len> ...          -- serviceError [2] IMPLICIT ServiceError
 /// ```
+///
+/// The invokeID is already known to the caller, which matched the answer to its
+/// request, so only the errorClass is carried out.
 fn handle_confirmed_error(inner: &[u8]) -> ClientError {
-    // skip the invokeID, tag 0x02
-    let mut pos = 0usize;
-    if inner.len() >= 3 && inner[0] == 0x02 {
-        let id_len = inner[1] as usize;
-        pos = 2 + id_len;
-    }
-    // serviceError, EXPLICIT [2] with tag 0xa2
-    if pos < inner.len() && inner[pos] == 0xa2 {
-        pos += 1; // skip tag
-        if pos < inner.len() {
-            let svc_len = inner[pos] as usize;
-            pos += 1;
-            if pos + svc_len <= inner.len() {
-                match ServiceError::decode_inner(&inner[pos..pos + svc_len]) {
-                    Ok(se) => {
-                        warn!("mms confirmed error: class={:?}", se.error_class);
-                        return ClientError::ServiceError {
-                            error_class: se.error_class,
-                        };
-                    }
-                    Err(e) => {
-                        warn!("confirmed error service error failed to decode: {e}");
-                    }
-                }
+    match decode_confirmed_error_inner(inner) {
+        Ok((invoke_id, se)) => {
+            warn!(
+                "mms confirmed error: invoke_id={invoke_id} class={:?}",
+                se.error_class
+            );
+            ClientError::ServiceError {
+                error_class: se.error_class,
             }
         }
+        Err(e) => {
+            warn!("confirmed error failed to decode: {e}");
+            ClientError::PduParse(format!("ConfirmedError decode failed: {e}"))
+        }
     }
-    // nothing could be decoded, so report a generic parse failure
-    ClientError::PduParse("ConfirmedError decode failed".to_string())
 }
 
 /// Reads several MMS variables with one Read service.

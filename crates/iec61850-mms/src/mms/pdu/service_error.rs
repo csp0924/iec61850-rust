@@ -522,6 +522,109 @@ pub fn encode_confirmed_error_pdu(
     buf.extend_from_slice(&inner);
 }
 
+// ConfirmedError PDU decoder
+
+/// Splits one TLV at the start of `data`.
+///
+/// Returns the tag, the content and the total number of bytes the TLV occupies,
+/// header included.
+fn split_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), MmsError> {
+    if data.len() < 2 {
+        return Err(MmsError::TruncatedPdu);
+    }
+    let tag = data[0];
+    let (len, len_size) = super::initiate::decode_length(&data[1..])?;
+    let start = 1 + len_size;
+    let end = start.checked_add(len).ok_or(MmsError::InvalidLength)?;
+    if data.len() < end {
+        return Err(MmsError::TruncatedPdu);
+    }
+    Ok((tag, &data[start..end], end))
+}
+
+/// Decodes a BER INTEGER holding an ASN.1 `Unsigned32`.
+///
+/// The encoder pads a value whose most significant bit is set with a leading
+/// `0x00`, so five content bytes are the widest legal form. A shorter encoding
+/// whose first byte has its top bit set is a negative INTEGER, which an
+/// `Unsigned32` field cannot carry.
+fn decode_unsigned32(data: &[u8]) -> Result<u32, MmsError> {
+    if data.is_empty() || data.len() > 5 {
+        return Err(MmsError::InvalidLength);
+    }
+    if data[0] & 0x80 != 0 || (data.len() == 5 && data[0] != 0x00) {
+        return Err(MmsError::InvalidLength);
+    }
+    let mut val: u32 = 0;
+    for &b in data {
+        val = (val << 8) | b as u32;
+    }
+    Ok(val)
+}
+
+/// Decodes a complete ConfirmedError PDU, outer `0xa2 <len>` included, into its
+/// invokeID and ServiceError.
+///
+/// The inverse of [`encode_confirmed_error_pdu`].
+pub fn decode_confirmed_error_pdu(data: &[u8]) -> Result<(u32, ServiceError), MmsError> {
+    let (tag, inner, _) = split_tlv(data)?;
+    if tag != 0xa2 {
+        return Err(MmsError::InvalidTag {
+            expected: 0xa2,
+            actual: tag,
+        });
+    }
+    decode_confirmed_error_inner(inner)
+}
+
+/// Decodes the content of a ConfirmedError PDU, what follows the outer
+/// `0xa2 <len>`, into its invokeID and ServiceError.
+///
+/// Wire format:
+///
+/// ```text
+/// 0x80 <len> <id>  -- invokeID [0] IMPLICIT Unsigned32
+/// (0x81 <len> ...) -- modifierPosition [1] IMPLICIT Unsigned32, OPTIONAL
+/// 0xa2 <len> ...   -- serviceError [2] IMPLICIT ServiceError
+/// ```
+///
+/// invokeID carries the context tag `0x80`, not the universal INTEGER tag
+/// `0x02` that an unqualified `invokeID` field would carry in a
+/// Confirmed-RequestPDU or a Confirmed-ResponsePDU.
+///
+/// `modifierPosition` is accepted and skipped; nothing in this implementation
+/// produces one.
+pub fn decode_confirmed_error_inner(data: &[u8]) -> Result<(u32, ServiceError), MmsError> {
+    // invokeID [0] IMPLICIT Unsigned32, mandatory and first
+    let (tag, id_bytes, used) = split_tlv(data)?;
+    if tag != 0x80 {
+        return Err(MmsError::InvalidTag {
+            expected: 0x80,
+            actual: tag,
+        });
+    }
+    let invoke_id = decode_unsigned32(id_bytes)?;
+    let mut pos = used;
+
+    // modifierPosition [1] IMPLICIT Unsigned32, OPTIONAL
+    if data.get(pos) == Some(&0x81) {
+        let (_, _, used) = split_tlv(&data[pos..])?;
+        pos += used;
+    }
+
+    // serviceError [2] IMPLICIT ServiceError, mandatory
+    let (tag, se_bytes, _) = split_tlv(&data[pos..])?;
+    if tag != 0xa2 {
+        return Err(MmsError::InvalidTag {
+            expected: 0xa2,
+            actual: tag,
+        });
+    }
+    let service_error = ServiceError::decode_inner(se_bytes)?;
+
+    Ok((invoke_id, service_error))
+}
+
 // Helpers
 
 /// Encodes an `i32` as a minimal-length signed big-endian BER INTEGER.
@@ -996,6 +1099,168 @@ mod tests {
         let mut buf = BytesMut::new();
         ec.encode_explicit(&mut buf);
         assert_eq!(&buf[..], &[0xa0, 0x03, 0x87, 0x01, 0x02]);
+    }
+
+    /// A hand-written ConfirmedError PDU, whose bytes follow the ISO 9506-2
+    /// Confirmed-ErrorPDU SEQUENCE: invokeID under the context tag `0x80` and
+    /// serviceError under `0xa2`.
+    const CONFIRMED_ERROR_VECTOR: &[u8] = &[
+        0xa2, 0x0a, // confirmedErrorPdu [2] IMPLICIT SEQUENCE, len 10
+        0x80, 0x01, 0x03, // invokeID [0] IMPLICIT Unsigned32 = 3
+        0xa2, 0x05, // serviceError [2] IMPLICIT, len 5
+        0xa0, 0x03, // errorClass [0] EXPLICIT, len 3
+        0x87, 0x01, 0x02, // access [7] IMPLICIT INTEGER = 2, object-non-existent
+    ];
+
+    #[test]
+    fn confirmed_error_pdu_encodes_the_wire_vector() {
+        let se = ServiceError::new(ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT));
+        let mut buf = BytesMut::new();
+        encode_confirmed_error_pdu(3, &se, &mut buf);
+        assert_eq!(&buf[..], CONFIRMED_ERROR_VECTOR);
+    }
+
+    #[test]
+    fn confirmed_error_pdu_decodes_the_wire_vector() {
+        let (invoke_id, se) = decode_confirmed_error_pdu(CONFIRMED_ERROR_VECTOR).unwrap();
+        assert_eq!(invoke_id, 3);
+        assert_eq!(
+            se.error_class,
+            ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT)
+        );
+    }
+
+    /// What the encoder writes, the decoder reads back, for a spread of
+    /// invokeIDs and errorClass alternatives.
+    #[test]
+    fn confirmed_error_pdu_round_trip() {
+        let cases = [
+            (0u32, ErrorClass::Access(subcode::access::OTHER)),
+            (
+                1,
+                ErrorClass::Access(subcode::access::OBJECT_ACCESS_UNSUPPORTED),
+            ),
+            (
+                127,
+                ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT),
+            ),
+            (
+                128,
+                ErrorClass::Definition(subcode::definition::OBJECT_EXISTS),
+            ),
+            (
+                65_535,
+                ErrorClass::Definition(subcode::definition::INVALID_ADDRESS),
+            ),
+            (16_777_216, ErrorClass::Resource(subcode::resource::OTHER)),
+            (
+                u32::MAX,
+                ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
+            ),
+        ];
+        assert_eq!(cases.len(), 7);
+        for (invoke_id, error_class) in cases {
+            let se = ServiceError::new(error_class.clone());
+            let mut buf = BytesMut::new();
+            encode_confirmed_error_pdu(invoke_id, &se, &mut buf);
+            let (got_id, got_se) = decode_confirmed_error_pdu(&buf)
+                .unwrap_or_else(|e| panic!("invoke id {invoke_id} failed to decode: {e}"));
+            assert_eq!(got_id, invoke_id, "invoke id must survive the round trip");
+            assert_eq!(got_se.error_class, error_class);
+        }
+    }
+
+    /// The optional additionalCode and additionalDescription survive the round
+    /// trip, so a ServiceError carrying them is not truncated.
+    #[test]
+    fn confirmed_error_pdu_round_trip_keeps_optional_fields() {
+        let se = ServiceError {
+            error_class: ErrorClass::Access(subcode::access::OBJECT_ACCESS_DENIED),
+            additional_code: Some(-7),
+            additional_description: Some("no read access".to_string()),
+        };
+        let mut buf = BytesMut::new();
+        encode_confirmed_error_pdu(9, &se, &mut buf);
+        let (invoke_id, got) = decode_confirmed_error_pdu(&buf).unwrap();
+        assert_eq!(invoke_id, 9);
+        assert_eq!(got, se);
+    }
+
+    /// A Confirmed-RequestPDU carries an untagged `invokeID`, which travels
+    /// under the universal INTEGER tag `0x02`. The Confirmed-ErrorPDU field is
+    /// `[0] IMPLICIT`, so `0x02` in that position is a different PDU shape and
+    /// must be refused rather than skipped.
+    #[test]
+    fn confirmed_error_rejects_a_universal_integer_invoke_id() {
+        let with_universal_tag: &[u8] = &[
+            0xa2, 0x0a, 0x02, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+        ];
+        let err = decode_confirmed_error_pdu(with_universal_tag)
+            .expect_err("a universal INTEGER invokeID is not a Confirmed-ErrorPDU");
+        assert!(
+            matches!(
+                err,
+                MmsError::InvalidTag {
+                    expected: 0x80,
+                    actual: 0x02
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn confirmed_error_accepts_and_skips_a_modifier_position() {
+        // 0x81 modifierPosition sits between the invokeID and the serviceError
+        let with_modifier: &[u8] = &[
+            0xa2, 0x0d, 0x80, 0x01, 0x03, 0x81, 0x01, 0x01, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01,
+            0x02,
+        ];
+        let (invoke_id, se) = decode_confirmed_error_pdu(with_modifier).unwrap();
+        assert_eq!(invoke_id, 3);
+        assert_eq!(
+            se.error_class,
+            ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT)
+        );
+    }
+
+    #[test]
+    fn confirmed_error_rejects_truncated_and_mistagged_input() {
+        // every prefix of a valid PDU fails rather than panicking
+        for n in 0..CONFIRMED_ERROR_VECTOR.len() {
+            assert!(
+                decode_confirmed_error_pdu(&CONFIRMED_ERROR_VECTOR[..n]).is_err(),
+                "prefix of {n} bytes must not decode"
+            );
+        }
+        // the whole vector does decode, so the loop above is not vacuous
+        assert!(decode_confirmed_error_pdu(CONFIRMED_ERROR_VECTOR).is_ok());
+
+        // an outer tag that is not 0xa2
+        let mut wrong_outer = CONFIRMED_ERROR_VECTOR.to_vec();
+        wrong_outer[0] = 0xa1;
+        assert!(decode_confirmed_error_pdu(&wrong_outer).is_err());
+
+        // a serviceError under a tag that is not 0xa2
+        let mut wrong_service = CONFIRMED_ERROR_VECTOR.to_vec();
+        wrong_service[5] = 0xa3;
+        assert!(decode_confirmed_error_pdu(&wrong_service).is_err());
+    }
+
+    #[test]
+    fn confirmed_error_rejects_an_oversized_invoke_id() {
+        // six content bytes for a Unsigned32, and a negative INTEGER
+        let too_wide: &[u8] = &[
+            0xa2, 0x0f, 0x80, 0x06, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0xa2, 0x05, 0xa0, 0x03,
+            0x87, 0x01, 0x02,
+        ];
+        assert!(decode_confirmed_error_pdu(too_wide).is_err());
+
+        let negative: &[u8] = &[
+            0xa2, 0x0d, 0x80, 0x04, 0xff, 0xff, 0xff, 0xff, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01,
+            0x02,
+        ];
+        assert!(decode_confirmed_error_pdu(negative).is_err());
     }
 
     /// The access subcodes are not the `DataAccessError` codes; the two sets
