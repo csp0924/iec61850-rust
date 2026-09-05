@@ -363,12 +363,10 @@ fn decode_u32_from_bytes(data: &[u8]) -> Result<u32, MmsError> {
 // Unit tests
 //
 // Every expected byte string below is written by hand from the ASN.1 of
-// ISO 9506-2, cross-checked against the tag assignment the asn1c-generated
-// `GetNamedVariableListAttributesResponse` descriptor of the reference C
-// implementation carries: mmsDeletable CONTEXT [0] IMPLICIT, listOfVariable
-// CONTEXT [1] IMPLICIT SEQUENCE OF UNIVERSAL SEQUENCE, member
-// variableSpecification.name CONTEXT [0] and alternateAccess CONTEXT [5]
-// IMPLICIT, and the ConfirmedServiceRequest tag [12] EXPLICIT against the
+// ISO 9506-2: mmsDeletable CONTEXT [0] IMPLICIT, listOfVariable CONTEXT [1]
+// IMPLICIT SEQUENCE OF UNIVERSAL SEQUENCE, member variableSpecification.name
+// CONTEXT [0] and alternateAccess CONTEXT [5] IMPLICIT, and the
+// ConfirmedServiceRequest tag [12] EXPLICIT against the
 // ConfirmedServiceResponse tag [12] IMPLICIT. No vector is produced by the
 // encoder under test.
 
