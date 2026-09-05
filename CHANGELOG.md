@@ -34,6 +34,46 @@ Every crate in the workspace shares one version number.
   and array-indexed references keep the `AlternateAccess` mapping of
   `read_object`. `AccessResult` is re-exported so the return type can be named
   without depending on `iec61850-mms`.
+- **`iec61850-mms`** — `IsoConnectionParameters`, the ISO addressing a client
+  offers when it associates: the calling and called T, S and P selectors and the
+  AP-title and AE-qualifier of both sides. `ApTitle` holds an AP-title as its
+  OBJECT IDENTIFIER arcs, parses the dotted form and renders it. The parameters
+  reach an association through `MmsClientBuilder::iso_parameters`, and through
+  `MmsClient::from_transport_with_iso_parameters` for a caller that owns its
+  transport. The AARQ now emits called-AP-title `[2]`, called-AE-qualifier
+  `[3]`, calling-AP-title `[6]` and calling-AE-qualifier `[7]` when they are
+  set, in the order the ISO 8650 AARQ-apdu declares them.
+- **`iec61850-mms`** — the session layer decodes the REFUSE SPDU (RF, SPDU ID
+  12) of ISO 8327-1, returning the reason code (PI 50), the transport
+  disconnect parameter (PI 17) and the user data; the long form of LI is
+  accepted. The presentation layer decodes the CPR PPDU of ISO 8823 through
+  `parse_reject`, returning the responding presentation selector, the
+  context-definition result list, the default-context result and the
+  provider-reason. `refuse_reason_name` and `provider_reason_name` give the
+  names the two standards define.
+- **`iec61850-mms`, `iec61850-client`** — `ClientError::SessionRefused`, carrying
+  the session reason code, the transport disconnect parameter and the
+  presentation provider-reason of a refused association. A refusal used to
+  surface as `unknown spdu id 0x0C`.
+- **`iec61850-client`** — `IedConnection::with_iso_parameters`, with
+  `IsoConnectionParameters` and `ApTitle` re-exported so the addressing can be
+  built without depending on `iec61850-mms`.
+
+### Changed
+
+- **`iec61850-mms`, `iec61850-client`** — the calling and called presentation
+  selectors a client offers default to `00 00 00 01`, where they used to be
+  empty. This changes the bytes on the wire: the CP PPDU now carries
+  `81 04 00 00 00 01` and `82 04 00 00 00 01` where it carried `81 00` and
+  `82 00`. A caller that needs the empty selectors sets them explicitly through
+  `IsoConnectionParameters`; a zero-length selector still occupies its tag and
+  length pair.
+- **`iec61850-mms`, `iec61850-client`** — the AARQ a client sends now carries
+  the calling and called AP-title and AE-qualifier by default, `1.1.1.999` and
+  `1.1.1.999.1` with AE-qualifier 12, where it carried none. Setting a field to
+  `None` leaves it out.
+- **`iec61850-mms`** — `encode_aarq` takes the addressing fields as an
+  additional `AarqAddressing` argument.
 
 ### Fixed
 

@@ -18,6 +18,7 @@
 //! - calling-AE-qualifier is decoded from the INTEGER in its field content.
 //! - Fields are appended straight to a `BytesMut`, with no intermediate buffer chain.
 
+use super::params::{AarqAddressing, ApTitle};
 use crate::compat::prelude::*;
 use bytes::BytesMut;
 use tracing::warn;
@@ -74,6 +75,24 @@ const AUTH_MECH_PASSWORD_OID: [u8; 3] = [0x52, 0x03, 0x01];
 
 /// sender-ACSE-requirements BIT STRING value; bit 0 signals authentication.
 const REQUIREMENTS_AUTHENTICATION: [u8; 1] = [0x80];
+
+/// AARQ called-AP-title `[2]` EXPLICIT.
+const TAG_CALLED_AP_TITLE: u8 = 0xa2;
+
+/// AARQ called-AE-qualifier `[3]` EXPLICIT.
+const TAG_CALLED_AE_QUALIFIER: u8 = 0xa3;
+
+/// AARQ calling-AP-title `[6]` EXPLICIT.
+const TAG_CALLING_AP_TITLE: u8 = 0xa6;
+
+/// AARQ calling-AE-qualifier `[7]` EXPLICIT.
+const TAG_CALLING_AE_QUALIFIER: u8 = 0xa7;
+
+/// Universal BER tag of an OBJECT IDENTIFIER.
+const BER_TAG_OID: u8 = 0x06;
+
+/// Universal BER tag of an INTEGER.
+const BER_TAG_INTEGER: u8 = 0x02;
 
 // Data structures
 
@@ -451,10 +470,18 @@ impl AcseConnection {
 /// - `payload`: the MMS Initiate PDU carried inside user-information.
 /// - `auth`: credentials; `None` selects no authentication.
 /// - `next_reference`: the indirect-reference value, 3 for MMS.
+/// - `addressing`: the optional AP-title and AE-qualifier fields; each `None`
+///   field is left out.
+///
+/// The fields follow the order of the ISO 8650 AARQ-apdu SEQUENCE:
+/// application-context-name `[1]`, called-AP-title `[2]`, called-AE-qualifier
+/// `[3]`, calling-AP-title `[6]`, calling-AE-qualifier `[7]`, the
+/// authentication fields, then user-information `[30]`.
 pub fn encode_aarq(
     payload: &[u8],
     auth: Option<&AcseAuth>,
     next_reference: u32,
+    addressing: &AarqAddressing,
     out: &mut BytesMut,
 ) {
     // user-information field
@@ -463,19 +490,21 @@ pub fn encode_aarq(
     // application-context-name field
     let app_ctx_bytes = build_app_context_name();
 
+    // called and calling AP-title and AE-qualifier fields
+    let addressing_bytes = build_addressing_fields(addressing);
+
     // authentication fields
     let auth_bytes = build_auth_fields(auth);
 
     // AARQ body length
-    let body_len = app_ctx_bytes.len() + auth_bytes.len() + user_info_inner.len();
+    let body_len =
+        app_ctx_bytes.len() + addressing_bytes.len() + auth_bytes.len() + user_info_inner.len();
 
-    let start = out.len();
     write_tl(0x60, body_len, out);
     out.extend_from_slice(&app_ctx_bytes);
+    out.extend_from_slice(&addressing_bytes);
     out.extend_from_slice(&auth_bytes);
     out.extend_from_slice(&user_info_inner);
-
-    let _ = start;
 }
 
 /// Serializes an AARE PDU, tag 0x61, into `out`.
@@ -547,6 +576,72 @@ pub fn encode_rlre(out: &mut [u8; 2]) {
 }
 
 // Private helpers
+
+/// Builds the called and calling AP-title and AE-qualifier fields, in the order
+/// the ISO 8650 AARQ-apdu SEQUENCE declares them.
+///
+/// An absent field contributes no bytes.
+fn build_addressing_fields(addressing: &AarqAddressing) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(title) = addressing.called_ap_title.as_ref() {
+        write_ap_title_field(TAG_CALLED_AP_TITLE, title, &mut out);
+    }
+    if let Some(qualifier) = addressing.called_ae_qualifier {
+        write_ae_qualifier_field(TAG_CALLED_AE_QUALIFIER, qualifier, &mut out);
+    }
+    if let Some(title) = addressing.calling_ap_title.as_ref() {
+        write_ap_title_field(TAG_CALLING_AP_TITLE, title, &mut out);
+    }
+    if let Some(qualifier) = addressing.calling_ae_qualifier {
+        write_ae_qualifier_field(TAG_CALLING_AE_QUALIFIER, qualifier, &mut out);
+    }
+    out
+}
+
+/// Writes an AP-title field: `<tag> <L> 06 <L> <oid content>`.
+///
+/// The field tag is EXPLICIT, so the OBJECT IDENTIFIER keeps its own tag inside.
+fn write_ap_title_field(tag: u8, title: &ApTitle, out: &mut Vec<u8>) {
+    let oid = title.to_ber_content();
+    let inner_len = 1 + ber_length_size(oid.len()) + oid.len();
+    out.push(tag);
+    write_ber_length(out, inner_len);
+    out.push(BER_TAG_OID);
+    write_ber_length(out, oid.len());
+    out.extend_from_slice(&oid);
+}
+
+/// Writes an AE-qualifier field: `<tag> <L> 02 <L> <integer content>`.
+///
+/// The field tag is EXPLICIT, so the INTEGER keeps its own tag inside.
+fn write_ae_qualifier_field(tag: u8, qualifier: i32, out: &mut Vec<u8>) {
+    let content = encode_ber_integer(qualifier);
+    let inner_len = 1 + ber_length_size(content.len()) + content.len();
+    out.push(tag);
+    write_ber_length(out, inner_len);
+    out.push(BER_TAG_INTEGER);
+    write_ber_length(out, content.len());
+    out.extend_from_slice(&content);
+}
+
+/// Encodes an `i32` as the content octets of a BER INTEGER: two's complement,
+/// most significant byte first, with redundant leading octets removed.
+fn encode_ber_integer(value: i32) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0usize;
+    while start + 1 < bytes.len() {
+        let current = bytes[start];
+        let next_sign_bit = bytes[start + 1] & 0x80 != 0;
+        // a leading 0x00 or 0xFF is redundant only when the next octet already
+        // carries the same sign bit
+        let redundant = (current == 0x00 && !next_sign_bit) || (current == 0xFF && next_sign_bit);
+        if !redundant {
+            break;
+        }
+        start += 1;
+    }
+    bytes[start..].to_vec()
+}
 
 /// Builds the application-context-name field: a1 07 06 05 followed by the MMS OID.
 fn build_app_context_name() -> Vec<u8> {
@@ -927,15 +1022,40 @@ mod tests {
 
     fn make_aarq(payload: &[u8]) -> Vec<u8> {
         let mut out = BytesMut::new();
-        encode_aarq(payload, None, 3, &mut out);
+        encode_aarq(payload, None, 3, &AarqAddressing::default(), &mut out);
+        out.to_vec()
+    }
+
+    fn make_aarq_addressed(payload: &[u8], addressing: &AarqAddressing) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        encode_aarq(payload, None, 3, addressing, &mut out);
         out.to_vec()
     }
 
     fn make_aarq_pw(payload: &[u8], pw: &[u8]) -> Vec<u8> {
         let mut out = BytesMut::new();
         let auth = AcseAuth::Password(pw.to_vec());
-        encode_aarq(payload, Some(&auth), 3, &mut out);
+        encode_aarq(
+            payload,
+            Some(&auth),
+            3,
+            &AarqAddressing::default(),
+            &mut out,
+        );
         out.to_vec()
+    }
+
+    fn ap_title(text: &str) -> ApTitle {
+        text.parse().expect("ap-title")
+    }
+
+    fn default_addressing() -> AarqAddressing {
+        AarqAddressing {
+            called_ap_title: Some(ap_title("1.1.1.999.1")),
+            called_ae_qualifier: Some(12),
+            calling_ap_title: Some(ap_title("1.1.1.999")),
+            calling_ae_qualifier: Some(12),
+        }
     }
 
     fn make_aare_accept(payload: &[u8]) -> Vec<u8> {
@@ -951,6 +1071,109 @@ mod tests {
     }
 
     // AARQ encoding
+
+    /// Returns the offset of the first occurrence of `needle` in `haystack`.
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    #[test]
+    fn aarq_addressing_fields_are_hand_checked_byte_vectors() {
+        let pdu = make_aarq_addressed(&[0xde, 0xad], &default_addressing());
+
+        // called-AP-title [2] EXPLICIT OBJECT IDENTIFIER 1.1.1.999.1
+        let called_title: &[u8] = &[0xa2, 0x07, 0x06, 0x05, 0x29, 0x01, 0x87, 0x67, 0x01];
+        // called-AE-qualifier [3] EXPLICIT INTEGER 12
+        let called_qualifier: &[u8] = &[0xa3, 0x03, 0x02, 0x01, 0x0c];
+        // calling-AP-title [6] EXPLICIT OBJECT IDENTIFIER 1.1.1.999
+        let calling_title: &[u8] = &[0xa6, 0x06, 0x06, 0x04, 0x29, 0x01, 0x87, 0x67];
+        // calling-AE-qualifier [7] EXPLICIT INTEGER 12
+        let calling_qualifier: &[u8] = &[0xa7, 0x03, 0x02, 0x01, 0x0c];
+
+        let at_called_title = find(&pdu, called_title).expect("called-AP-title");
+        let at_called_qualifier = find(&pdu, called_qualifier).expect("called-AE-qualifier");
+        let at_calling_title = find(&pdu, calling_title).expect("calling-AP-title");
+        let at_calling_qualifier = find(&pdu, calling_qualifier).expect("calling-AE-qualifier");
+        let at_app_context = find(&pdu, &[0xa1, 0x07, 0x06, 0x05]).expect("application-context");
+        let at_user_info = find(&pdu, &[0xbe]).expect("user-information");
+
+        // ISO 8650 AARQ-apdu sequence order
+        assert!(at_app_context < at_called_title);
+        assert!(at_called_title < at_called_qualifier);
+        assert!(at_called_qualifier < at_calling_title);
+        assert!(at_calling_title < at_calling_qualifier);
+        assert!(at_calling_qualifier < at_user_info);
+    }
+
+    #[test]
+    fn aarq_addressing_round_trips_through_the_parser() {
+        let pdu = make_aarq_addressed(&[0xde, 0xad], &default_addressing());
+        let mut acse = AcseConnection::new(None);
+        let (indication, payload) = acse.parse_message(&pdu).expect("parse aarq");
+        assert_eq!(indication, AcseIndication::Associate);
+        assert_eq!(payload, &[0xde, 0xad]);
+        assert_eq!(
+            acse.application_reference.ap_title,
+            ap_title("1.1.1.999").to_ber_content(),
+            "the parser must read back the calling-AP-title just encoded"
+        );
+        assert_eq!(acse.application_reference.ae_qualifier, 12);
+        assert_eq!(
+            ApTitle::from_ber_content(&acse.application_reference.ap_title).expect("decode"),
+            ap_title("1.1.1.999")
+        );
+    }
+
+    #[test]
+    fn aarq_addressing_round_trips_a_non_default_title() {
+        let addressing = AarqAddressing {
+            called_ap_title: Some(ap_title("1.3.9999.13")),
+            called_ae_qualifier: Some(1),
+            calling_ap_title: Some(ap_title("1.3.9999.13")),
+            calling_ae_qualifier: Some(1),
+        };
+        let pdu = make_aarq_addressed(&[0x01], &addressing);
+        let mut acse = AcseConnection::new(None);
+        acse.parse_message(&pdu).expect("parse aarq");
+        assert_eq!(
+            ApTitle::from_ber_content(&acse.application_reference.ap_title).expect("decode"),
+            ap_title("1.3.9999.13")
+        );
+        assert_eq!(acse.application_reference.ae_qualifier, 1);
+    }
+
+    #[test]
+    fn aarq_without_addressing_writes_no_title_fields() {
+        let payload = &[0xde, 0xad];
+        let plain = make_aarq(payload);
+        let addressed = make_aarq_addressed(payload, &default_addressing());
+        // the four fields occupy 9 + 5 + 8 + 5 bytes
+        assert_eq!(addressed.len(), plain.len() + 27);
+
+        let mut acse = AcseConnection::new(None);
+        acse.parse_message(&plain).expect("parse aarq");
+        assert!(
+            acse.application_reference.ap_title.is_empty(),
+            "an aarq without a calling-AP-title leaves the reference empty"
+        );
+        assert_eq!(acse.application_reference.ae_qualifier, 0);
+    }
+
+    #[test]
+    fn ber_integer_content_is_minimal_twos_complement() {
+        assert_eq!(encode_ber_integer(0), vec![0x00]);
+        assert_eq!(encode_ber_integer(1), vec![0x01]);
+        assert_eq!(encode_ber_integer(12), vec![0x0c]);
+        assert_eq!(encode_ber_integer(127), vec![0x7f]);
+        assert_eq!(encode_ber_integer(128), vec![0x00, 0x80]);
+        assert_eq!(encode_ber_integer(-1), vec![0xff]);
+        assert_eq!(encode_ber_integer(-128), vec![0x80]);
+        assert_eq!(encode_ber_integer(-129), vec![0xff, 0x7f]);
+        assert_eq!(encode_ber_integer(i32::MAX), vec![0x7f, 0xff, 0xff, 0xff]);
+        assert_eq!(encode_ber_integer(i32::MIN), vec![0x80, 0x00, 0x00, 0x00]);
+    }
 
     #[test]
     fn test_encode_aarq_has_mms_oid() {

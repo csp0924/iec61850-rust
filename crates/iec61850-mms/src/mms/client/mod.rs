@@ -42,6 +42,7 @@ pub use error::ClientError;
 pub use services::MmsValue;
 
 use crate::compat::prelude::*;
+use crate::iso::params::IsoConnectionParameters;
 use crate::mms::pdu::{ObjectClass, TypeSpecification};
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
@@ -55,6 +56,9 @@ use iec61850_hal::time::TokioTimer;
 #[cfg(feature = "std")]
 use tokio::net::TcpStream;
 
+/// Outstanding request ceiling applied when the caller does not set one.
+const DEFAULT_MAX_OUTSTANDING: u32 = 5;
+
 // MmsClientBuilder
 
 /// Builder for [`MmsClient`].
@@ -64,6 +68,7 @@ pub struct MmsClientBuilder {
     request_timeout_ms: Option<u64>,
     max_outstanding: Option<u32>,
     local_max_pdu_size: Option<u32>,
+    iso_parameters: Option<IsoConnectionParameters>,
 }
 
 impl MmsClientBuilder {
@@ -101,6 +106,16 @@ impl MmsClientBuilder {
         self
     }
 
+    /// Sets the ISO addressing the association offers: the T, S and P selectors
+    /// and the AP-title and AE-qualifier of both sides.
+    ///
+    /// Without it `IsoConnectionParameters::default()` applies, which is the
+    /// addressing IEC 61850-8-1 Annex A lists for an MMS association.
+    pub fn iso_parameters(mut self, params: IsoConnectionParameters) -> Self {
+        self.iso_parameters = Some(params);
+        self
+    }
+
     /// Builds a client over the default std transport and timer.
     ///
     /// This method is std only. An embedded caller uses
@@ -117,7 +132,10 @@ impl MmsClientBuilder {
         if let Some(size) = self.local_max_pdu_size {
             conn.local_max_pdu_size = Some(size);
         }
-        let max_out = self.max_outstanding.unwrap_or(5);
+        if let Some(params) = self.iso_parameters {
+            conn.set_iso_parameters(params);
+        }
+        let max_out = self.max_outstanding.unwrap_or(DEFAULT_MAX_OUTSTANDING);
         MmsClient {
             conn,
             alloc: invoke_id::InvokeIdAllocator::new(max_out),
@@ -211,12 +229,35 @@ impl<T, Tm> MmsClient<T, Tm> {
 
 impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
     /// As [`Self::from_transport`], but with a caller-supplied timer instance.
+    ///
+    /// The association uses `IsoConnectionParameters::default()`; to offer
+    /// different addressing use [`Self::from_transport_with_iso_parameters`].
     pub async fn from_transport_with_timer(transport: T, timer: Tm) -> Result<Self, ClientError> {
+        Self::from_transport_with_iso_parameters(
+            transport,
+            timer,
+            IsoConnectionParameters::default(),
+        )
+        .await
+    }
+
+    /// As [`Self::from_transport_with_timer`], but with caller-supplied ISO
+    /// addressing.
+    ///
+    /// This is the entry point for a caller that owns its transport, an
+    /// embedded IP stack for instance, and needs selectors or an AP-title other
+    /// than the defaults; such a caller never goes through `MmsClientBuilder`.
+    pub async fn from_transport_with_iso_parameters(
+        transport: T,
+        timer: Tm,
+        params: IsoConnectionParameters,
+    ) -> Result<Self, ClientError> {
         let mut conn = MmsConnection::<T, Tm>::with_timer(timer);
+        conn.set_iso_parameters(params);
         conn.connect_via(transport).await?;
         Ok(Self {
             conn,
-            alloc: invoke_id::InvokeIdAllocator::new(5),
+            alloc: invoke_id::InvokeIdAllocator::new(DEFAULT_MAX_OUTSTANDING),
         })
     }
 

@@ -9,8 +9,8 @@
 //!    connection state stays with the caller.
 //!
 //! Strictness rules enforced by this module:
-//! - The long form of LI is not supported; a payload past 255 bytes returns
-//!   `SessionError::PayloadTooLarge`.
+//! - Encoding never uses the long form of LI; a payload past 255 bytes returns
+//!   `SessionError::PayloadTooLarge`. An incoming REFUSE may use it.
 //! - SESSION_NOT_FINISHED (SPDU ID 8) is not reassembled and returns
 //!   `SessionError::UnsupportedSpdu`.
 //! - An unknown PGI is skipped by its declared length, never byte by byte.
@@ -44,12 +44,28 @@ const SPDU_ID_ABORT: u8 = 0x19;
 
 /// PGI and PI identifiers.
 const PGI_CONNECT_ACCEPT_ITEM: u8 = 0x05;
+const PGI_CONNECTION_IDENTIFIER: u8 = 0x01;
+const PI_TRANSPORT_DISCONNECT: u8 = 0x11; // 17
 const PI_PROTOCOL_OPTIONS: u8 = 0x13; // 19
 const PI_VERSION_NUMBER: u8 = 0x16; // 22
 const PGI_SESSION_REQUIREMENT: u8 = 0x14; // 20
+const PI_REASON_CODE: u8 = 0x32; // 50
 const PGI_CALLING_SS_SEL: u8 = 0x33; // 51
 const PGI_CALLED_SS_SEL: u8 = 0x34; // 52
 const PGI_USER_DATA: u8 = 0xC1; // 193
+const PI_EXTENDED_USER_DATA: u8 = 0xC2; // 194
+
+/// LI value announcing the long form, where the true length follows in two octets.
+const LI_LONG_FORM: u8 = 0xFF;
+
+/// Number of octets the long form of LI occupies after the LI byte itself.
+const LI_LONG_FORM_OCTETS: usize = 2;
+
+/// Number of bytes preceding the parameter block: the SPDU ID and the LI byte.
+const SPDU_HEADER_LEN: usize = 2;
+
+/// Smallest complete parameter header: an identifier byte and a length byte.
+const PARAM_HEADER_LEN: usize = 2;
 
 /// The fixed four-byte header of a Data SPDU: GT followed by DT.
 ///
@@ -216,6 +232,58 @@ pub enum SessionIndication {
     Disconnect,
     /// An AB SPDU. Any message beginning with 0x19 is accepted.
     Abort,
+    /// An RF SPDU, a refusal of the connection request, with the parameters
+    /// decoded from it.
+    Refuse(RefuseInfo),
+}
+
+/// Parameters carried by an RF, REFUSE, SPDU.
+///
+/// `reason_code` is PI 50 and `transport_disconnect` PI 17; both are OPTIONAL
+/// in ISO 8327-1, so both may be absent. The user data, when present, is the
+/// CPR PPDU the presentation layer rejected the connection with; it is located
+/// by offset into the SPDU rather than copied.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RefuseInfo {
+    /// Reason code, PI 50. Names are available from [`refuse_reason_name`].
+    pub reason_code: Option<u8>,
+    /// Transport disconnect parameter, PI 17.
+    pub transport_disconnect: Option<u8>,
+    /// Offset of the user data inside the SPDU.
+    pub user_data_start: usize,
+    /// Length of the user data; 0 when the SPDU carries none.
+    pub user_data_len: usize,
+}
+
+impl RefuseInfo {
+    /// Returns the user data slice borrowed from the SPDU it was parsed from.
+    ///
+    /// An out-of-range offset yields an empty slice rather than a panic.
+    pub fn user_data<'msg>(&self, msg: &'msg [u8]) -> &'msg [u8] {
+        let end = self.user_data_start + self.user_data_len;
+        if self.user_data_len > 0 && end <= msg.len() {
+            &msg[self.user_data_start..end]
+        } else {
+            &[]
+        }
+    }
+}
+
+/// Returns the ISO 8327-1 name of a REFUSE reason code, or `None` when the
+/// code is not one the standard defines.
+pub fn refuse_reason_name(code: u8) -> Option<&'static str> {
+    match code {
+        0 => Some("rejection by called SS-user, reason not specified"),
+        1 => Some("temporary congestion"),
+        2 => Some("rejection by called SS-user, user data"),
+        129 => Some("session selector unknown"),
+        130 => Some("SS-user not attached to SSAP"),
+        131 => Some("SPM congestion at connect time"),
+        132 => Some("proposed protocol versions not supported"),
+        133 => Some("rejection by SPM, reason not specified"),
+        134 => Some("implementation restriction"),
+        _ => None,
+    }
 }
 
 /// Session-layer state retained across calls.
@@ -288,6 +356,7 @@ impl IsoSession {
                 self.extract_user_data_from_simple(msg)?;
                 Ok(SessionIndication::Disconnect)
             }
+            SPDU_ID_REFUSE => self.parse_refuse_spdu(msg),
             SPDU_ID_ABORT => {
                 // Any message beginning with 0x19 is accepted as an ABORT without
                 // validating its content, which keeps the release path interoperable.
@@ -326,6 +395,81 @@ impl IsoSession {
         self.user_data_start = 4;
         self.user_data_len = msg.len() - 4;
         Ok(SessionIndication::Data)
+    }
+
+    /// Parses an RF, REFUSE, SPDU and returns its parameters.
+    ///
+    /// The parameters recognized are the transport disconnect (PI 17), the
+    /// reason code (PI 50) and the user data (PGI 193 or PI 194). Any other
+    /// parameter is skipped by its declared length.
+    ///
+    /// Two accommodations keep the parser usable against peers that encode the
+    /// SPDU loosely, an RF being the last message of a failed association:
+    /// 1. An LI of 0 followed by further bytes is taken to mean that the
+    ///    parameters run to the end of the SPDU.
+    /// 2. The connection-identifier group (PGI 1) is traversed inline: its
+    ///    header is consumed and its nested parameters are read as part of the
+    ///    same stream, so a group whose declared length disagrees with the
+    ///    parameters that follow it still decodes. Parameter identifiers are
+    ///    unique across groups, so this cannot change how one is interpreted.
+    ///
+    /// Every read is bounds checked; a parameter whose length runs past the
+    /// block returns `LiMismatch` instead of reading on.
+    fn parse_refuse_spdu(&mut self, msg: &[u8]) -> Result<SessionIndication, SessionError> {
+        let (mut offset, params_end) = refuse_parameter_bounds(msg)?;
+        let mut info = RefuseInfo::default();
+
+        while offset + 1 < params_end {
+            let id = msg[offset];
+            let len = msg[offset + 1] as usize;
+            offset += PARAM_HEADER_LEN;
+
+            if offset + len > params_end {
+                warn!(
+                    id,
+                    len,
+                    remaining = params_end - offset,
+                    "refuse parameter declares a length past the parameter block"
+                );
+                return Err(SessionError::LiMismatch {
+                    li: len,
+                    buf_len: msg.len(),
+                });
+            }
+
+            match id {
+                PGI_CONNECTION_IDENTIFIER => {
+                    // traversed inline; the nested parameters follow immediately
+                    continue;
+                }
+                PI_TRANSPORT_DISCONNECT if len >= 1 => {
+                    info.transport_disconnect = Some(msg[offset]);
+                }
+                PI_REASON_CODE if len >= 1 => {
+                    info.reason_code = Some(msg[offset]);
+                }
+                PGI_USER_DATA | PI_EXTENDED_USER_DATA => {
+                    info.user_data_start = offset;
+                    info.user_data_len = len;
+                }
+                _ => {
+                    // any other parameter is skipped by its declared length
+                }
+            }
+
+            offset += len;
+        }
+
+        warn!(
+            reason_code = ?info.reason_code,
+            transport_disconnect = ?info.transport_disconnect,
+            user_data_len = info.user_data_len,
+            "session connection refused by the peer"
+        );
+
+        self.user_data_start = info.user_data_start;
+        self.user_data_len = info.user_data_len;
+        Ok(SessionIndication::Refuse(info))
     }
 
     /// Parses a FINISH or DISCONNECT SPDU and returns the payload after PGI 0xC1.
@@ -539,6 +683,63 @@ impl Default for IsoSession {
     }
 }
 
+/// Returns the offsets bounding the parameter block of an RF SPDU.
+///
+/// The short form of LI gives `2 + li`. An LI of `0xFF` selects the long form,
+/// where the true length occupies the next two octets. An LI of 0 followed by
+/// further bytes is taken to mean that the parameters run to the end of the
+/// SPDU.
+///
+/// # Errors
+///
+/// - `TooShort` when the long-form length octets are missing.
+/// - `LiMismatch` when the declared length runs past the buffer.
+fn refuse_parameter_bounds(msg: &[u8]) -> Result<(usize, usize), SessionError> {
+    let li = msg[1];
+
+    if li == LI_LONG_FORM {
+        let start = SPDU_HEADER_LEN + LI_LONG_FORM_OCTETS;
+        if msg.len() < start {
+            warn!(len = msg.len(), "refuse spdu long-form li is truncated");
+            return Err(SessionError::TooShort { len: msg.len() });
+        }
+        let long_li = u16::from_be_bytes([msg[2], msg[3]]) as usize;
+        let end = start + long_li;
+        if end > msg.len() {
+            warn!(
+                li = long_li,
+                buf_len = msg.len(),
+                "refuse spdu long-form li exceeds the buffer length"
+            );
+            return Err(SessionError::LiMismatch {
+                li: long_li,
+                buf_len: msg.len(),
+            });
+        }
+        return Ok((start, end));
+    }
+
+    let li = li as usize;
+    if li == 0 {
+        // an RF whose LI is left at 0 carries its parameters to the end
+        return Ok((SPDU_HEADER_LEN, msg.len()));
+    }
+
+    let end = SPDU_HEADER_LEN + li;
+    if end > msg.len() {
+        warn!(
+            li,
+            buf_len = msg.len(),
+            "refuse spdu li exceeds the buffer length"
+        );
+        return Err(SessionError::LiMismatch {
+            li,
+            buf_len: msg.len(),
+        });
+    }
+    Ok((SPDU_HEADER_LEN, end))
+}
+
 // Stateless encoders
 
 /// Encodes a CN, CONNECT, SPDU with ID 13 into `out`.
@@ -666,19 +867,19 @@ pub fn encode_refuse(reason: u8, out: &mut BytesMut) {
     out.put_u8(0x00); // LI byte, deliberately left at 0
 
     // connection identifier, PGI 0x01
-    out.put_u8(0x01); // PGI = Connection Identifier
+    out.put_u8(PGI_CONNECTION_IDENTIFIER);
 
     // NOTE: deliberate non-standard encoding, kept for on-wire interoperability.
     // The nested length is 2 although 6 bytes of content follow.
     out.put_u8(0x02); // nested length, deliberately 2 rather than 6
 
     // Transport Disconnect PI
-    out.put_u8(0x11); // PI = Transport Disconnect (17)
+    out.put_u8(PI_TRANSPORT_DISCONNECT);
     out.put_u8(0x01); // PI length = 1
     out.put_u8(0x01); // value: release transport connection
 
     // Reason code PI
-    out.put_u8(0x32); // PI = Reason Code (50)
+    out.put_u8(PI_REASON_CODE);
     out.put_u8(0x01); // PI length = 1
     out.put_u8(reason);
 }
@@ -1043,7 +1244,7 @@ mod tests {
     // RF SPDU encoding, including the deliberate non-standard lengths
 
     #[test]
-    fn rf_spdu_encode_c_bug_reproduced() {
+    fn rf_spdu_encode_keeps_the_documented_lengths() {
         let mut out = BytesMut::new();
         encode_refuse(0x03, &mut out);
         // SPDU ID = 0x0C
@@ -1058,6 +1259,181 @@ mod tests {
         assert_eq!(out[3], 0x02, "the rf nested length must stay 2");
         // the reason code sits at offset 9
         assert_eq!(out[9], 0x03);
+    }
+
+    // RF SPDU decoding
+
+    /// Parses `msg` and returns the refusal parameters, failing the test when
+    /// the SPDU is not an RF.
+    fn parse_refuse(msg: &[u8]) -> RefuseInfo {
+        let mut sess = IsoSession::new();
+        match sess.parse_message(msg).expect("refuse must parse") {
+            SessionIndication::Refuse(info) => info,
+            other => panic!("expected a refuse indication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rf_spdu_decodes_the_encoder_output() {
+        let mut out = BytesMut::new();
+        encode_refuse(0x03, &mut out);
+        let bytes = out.freeze();
+        let info = parse_refuse(&bytes);
+        assert_eq!(info.reason_code, Some(0x03));
+        assert_eq!(info.transport_disconnect, Some(0x01));
+        assert_eq!(info.user_data_len, 0);
+        assert_eq!(info.user_data(&bytes), b"");
+    }
+
+    #[test]
+    fn rf_spdu_decodes_the_short_form() {
+        // 0C 08 | 01 00 (connection identifier) | 11 01 01 (transport disconnect)
+        //       | 32 01 81 (reason code 129)
+        let msg: &[u8] = &[
+            SPDU_ID_REFUSE,
+            0x08,
+            0x01,
+            0x00,
+            0x11,
+            0x01,
+            0x01,
+            0x32,
+            0x01,
+            0x81,
+        ];
+        let info = parse_refuse(msg);
+        assert_eq!(info.reason_code, Some(129));
+        assert_eq!(info.transport_disconnect, Some(1));
+        assert_eq!(info.user_data_len, 0);
+    }
+
+    #[test]
+    fn rf_spdu_skips_the_nested_connection_references() {
+        // the connection identifier carries PI 9 and PI 10, which are skipped
+        let msg: &[u8] = &[
+            SPDU_ID_REFUSE,
+            0x0E,
+            0x01,
+            0x06,
+            0x09,
+            0x01,
+            0x01,
+            0x0A,
+            0x01,
+            0x02,
+            0x11,
+            0x01,
+            0x01,
+            0x32,
+            0x01,
+            0x81,
+        ];
+        let info = parse_refuse(msg);
+        assert_eq!(info.reason_code, Some(129));
+        assert_eq!(info.transport_disconnect, Some(1));
+    }
+
+    #[test]
+    fn rf_spdu_returns_the_user_data_range() {
+        // reason code 2 followed by PGI 193 carrying a five-byte CPR PPDU
+        let msg: &[u8] = &[
+            SPDU_ID_REFUSE,
+            0x0A,
+            0x32,
+            0x01,
+            0x02,
+            0xC1,
+            0x05,
+            0x30,
+            0x03,
+            0x8A,
+            0x01,
+            0x03,
+        ];
+        let info = parse_refuse(msg);
+        assert_eq!(info.reason_code, Some(2));
+        assert_eq!(info.transport_disconnect, None);
+        assert_eq!(info.user_data(msg), &[0x30, 0x03, 0x8A, 0x01, 0x03]);
+    }
+
+    #[test]
+    fn rf_spdu_accepts_the_long_form_li() {
+        let msg: &[u8] = &[
+            SPDU_ID_REFUSE,
+            LI_LONG_FORM,
+            0x00,
+            0x08,
+            0x01,
+            0x00,
+            0x11,
+            0x01,
+            0x01,
+            0x32,
+            0x01,
+            0x81,
+        ];
+        let info = parse_refuse(msg);
+        assert_eq!(info.reason_code, Some(129));
+        assert_eq!(info.transport_disconnect, Some(1));
+    }
+
+    #[test]
+    fn rf_spdu_rejects_truncated_input() {
+        let mut sess = IsoSession::new();
+        // LI announces six bytes but only two follow
+        assert_eq!(
+            sess.parse_message(&[SPDU_ID_REFUSE, 0x06, 0x32, 0x01]),
+            Err(SessionError::LiMismatch { li: 6, buf_len: 4 })
+        );
+        // a parameter length runs past the block
+        assert_eq!(
+            sess.parse_message(&[SPDU_ID_REFUSE, 0x03, 0x32, 0x05, 0x01]),
+            Err(SessionError::LiMismatch { li: 5, buf_len: 5 })
+        );
+        // the long-form length octets are missing
+        assert_eq!(
+            sess.parse_message(&[SPDU_ID_REFUSE, LI_LONG_FORM, 0x00]),
+            Err(SessionError::TooShort { len: 3 })
+        );
+        // the long-form length exceeds the buffer
+        assert_eq!(
+            sess.parse_message(&[SPDU_ID_REFUSE, LI_LONG_FORM, 0x00, 0x08, 0x01]),
+            Err(SessionError::LiMismatch { li: 8, buf_len: 5 })
+        );
+    }
+
+    #[test]
+    fn rf_spdu_without_parameters_reports_no_reason() {
+        let info = parse_refuse(&[SPDU_ID_REFUSE, 0x00]);
+        assert_eq!(info.reason_code, None);
+        assert_eq!(info.transport_disconnect, None);
+        assert_eq!(info.user_data_len, 0);
+    }
+
+    #[test]
+    fn an_spdu_id_next_to_refuse_stays_unknown() {
+        let mut sess = IsoSession::new();
+        // 0x0B and 0x8D are not SPDU identifiers this layer knows; adding the
+        // refuse branch must not turn them into refusals
+        assert_eq!(
+            sess.parse_message(&[0x0B, 0x00]),
+            Err(SessionError::UnknownSpdu { id: 0x0B })
+        );
+        assert_eq!(
+            sess.parse_message(&[0x8D, 0x00]),
+            Err(SessionError::UnknownSpdu { id: 0x8D })
+        );
+    }
+
+    #[test]
+    fn refuse_reason_names_cover_the_defined_codes() {
+        assert_eq!(refuse_reason_name(129), Some("session selector unknown"));
+        assert_eq!(refuse_reason_name(1), Some("temporary congestion"));
+        assert_eq!(
+            refuse_reason_name(132),
+            Some("proposed protocol versions not supported")
+        );
+        assert_eq!(refuse_reason_name(200), None);
     }
 
     // an unknown PGI is skipped by its declared length

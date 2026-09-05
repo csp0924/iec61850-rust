@@ -99,6 +99,10 @@ pub use gocb::{GoCBValues, GoCBValuesWrite, PhyComAddress};
 // `get_data_set_values` can be named without depending on `iec61850-mms`
 // directly.
 pub use iec61850_mms::AccessResult;
+// Re-exported so that the ISO addressing accepted by
+// `IedConnection::with_iso_parameters` can be built without depending on
+// `iec61850-mms` directly.
+pub use iec61850_mms::{ApTitle, ApTitleError, IsoConnectionParameters};
 // Re-exported so that the return type of
 // `IedConnection::get_variable_specification` can be named without depending
 // on `iec61850-mms` directly.

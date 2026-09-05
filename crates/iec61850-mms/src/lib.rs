@@ -66,6 +66,13 @@ pub use iso::acse::{
     IsoApplicationReference,
 };
 
+// ISO addressing offered when an association is opened
+pub use iso::params::{
+    AarqAddressing, ApTitle, ApTitleError, IsoConnectionParameters, DEFAULT_AE_QUALIFIER,
+    DEFAULT_LOCAL_AP_TITLE, DEFAULT_P_SELECTOR, DEFAULT_REMOTE_AP_TITLE, DEFAULT_S_SELECTOR,
+    DEFAULT_T_SELECTOR,
+};
+
 // MMS PDU types
 pub use mms::binary_time::{
     binary_time6_from_epoch_ms, epoch_ms_from_binary_time6, BINARY_TIME6_LEN, EPOCH_1984_MS,
@@ -89,10 +96,15 @@ pub use mms::{
 pub use iso::presentation::{
     encode_abort as pres_encode_abort, encode_connect as pres_encode_connect,
     encode_cpa as pres_encode_cpa, encode_user_data, encode_user_data_acse,
-    parse_accept as pres_parse_accept, parse_connect as pres_parse_connect, parse_user_data,
-    ConnectResult, IsoPresentation, PSelector, PresentationConnectionParameters, PresentationError,
-    UserDataResult, ACSE_CONTEXT_ID, MMS_CONTEXT_ID,
+    parse_accept as pres_parse_accept, parse_connect as pres_parse_connect,
+    parse_reject as pres_parse_reject, parse_user_data, provider_reason_name, ConnectResult,
+    IsoPresentation, PSelector, PresentationConnectionParameters, PresentationError,
+    PresentationReject, UserDataResult, ACSE_CONTEXT_ID, MMS_CONTEXT_ID,
 };
 
+// Session types naming a refused association
+pub use iso::session::{refuse_reason_name, RefuseInfo, SessionError, SessionIndication};
+
 // MMS client types
+pub use mms::client::error::session_refused_message;
 pub use mms::client::{ClientError, ConnectionState, MmsClient, MmsClientBuilder, MmsValue};

@@ -84,6 +84,26 @@ cargo run -p iec61850-client --example client_reporting_subscriber
 
 [`examples/README.md`](examples/README.md) 列出每個 example 展示什麼、與哪個 example 配對、確切的執行指令為何，並完整走過這台示範用 IED。
 
+### ISO 連線參數
+
+client 預設以 IEC 61850-8-1 所列的定址建立 association：T-Selector `00 01`、S-Selector `00 01`、P-Selector `00 00 00 01`、AP-title 主叫 `1.1.1.999` 與被叫 `1.1.1.999.1`、兩側 AE-qualifier 為 12。若 IED 會驗證主叫位址，可自行指定：
+
+```rust
+use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};
+use iec61850_mms::iso::presentation::PSelector;
+
+let params = IsoConnectionParameters {
+    local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?,
+    local_ap_title: Some("1.3.9999.13".parse::<ApTitle>()?),
+    local_ae_qualifier: Some(1),
+    ..IsoConnectionParameters::default()
+};
+let conn = IedConnection::with_iso_parameters(params);
+conn.connect("192.0.2.10", 102).await?;
+```
+
+對端拒絕 association 時會回覆 session REFUSE SPDU，此時 connect 會回傳 `ClientError::SessionRefused`，指出 session 拒絕原因碼與 presentation provider-reason，而不是回報一則無法解析的訊息。
+
 ## Server 設定
 
 `IedServerConfig` 帶有 association 上限、edition、以功能約束遮罩表示的寫入權限政策、回報的時間品質，以及 Identify 服務回傳的三個字串。識別欄位若未設定，則採用內建預設值：

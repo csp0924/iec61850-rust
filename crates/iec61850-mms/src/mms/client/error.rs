@@ -12,10 +12,46 @@
 //! - `ServiceError`: the peer answered with a confirmed error PDU
 //! - `DataAccessError`: a read or write reported a data access error
 //! - `RejectError`: the peer answered with a reject PDU
+//! - `SessionRefused`: the peer answered the connect request with a session
+//!   REFUSE SPDU
 
 use crate::compat::prelude::*;
+use crate::iso::presentation::provider_reason_name;
+use crate::iso::session::refuse_reason_name;
 use crate::mms::pdu::{DataAccessError, ErrorClass, RejectReason};
 use thiserror::Error;
+
+/// Renders a session refusal, naming the values ISO 8327-1 and ISO 8823 define
+/// and printing an unrecognized one as a bare number.
+///
+/// Used by the `Display` of [`ClientError::SessionRefused`] and by the client
+/// crate above it, so both render a refusal the same way.
+pub fn session_refused_message(
+    reason_code: Option<u8>,
+    transport_disconnect: Option<u8>,
+    provider_reason: Option<u8>,
+) -> String {
+    let mut text = String::from("session refused");
+    match reason_code {
+        Some(code) => match refuse_reason_name(code) {
+            Some(name) => text.push_str(&format!(": {name} ({code})")),
+            None => text.push_str(&format!(": reason {code}")),
+        },
+        None => text.push_str(": no reason code"),
+    }
+    if let Some(reason) = provider_reason {
+        match provider_reason_name(reason) {
+            Some(name) => text.push_str(&format!(
+                "; presentation provider reason: {name} ({reason})"
+            )),
+            None => text.push_str(&format!("; presentation provider reason: {reason}")),
+        }
+    }
+    if let Some(disconnect) = transport_disconnect {
+        text.push_str(&format!("; transport disconnect: {disconnect}"));
+    }
+    text
+}
 
 /// Errors raised by MMS client operations.
 #[derive(Debug, Error)]
@@ -88,6 +124,21 @@ pub enum ClientError {
     /// The ACSE association was refused.
     #[error("the acse association was refused")]
     AssociateFailed,
+
+    /// The peer answered the connect request with a session REFUSE SPDU.
+    ///
+    /// `reason_code` is PI 50 of the RF SPDU and `transport_disconnect` PI 17.
+    /// `provider_reason` is filled in when the refusal carries a CPR PPDU whose
+    /// provider-reason decodes.
+    #[error("{}", session_refused_message(*reason_code, *transport_disconnect, *provider_reason))]
+    SessionRefused {
+        /// Reason code carried by the RF SPDU.
+        reason_code: Option<u8>,
+        /// Transport disconnect parameter carried by the RF SPDU.
+        transport_disconnect: Option<u8>,
+        /// provider-reason of the CPR PPDU inside the refusal, when present.
+        provider_reason: Option<u8>,
+    },
 
     /// MMS Initiate negotiation failed and the peer answered with an Initiate error.
     #[error("mms initiate failed: errorCode={error_code}")]

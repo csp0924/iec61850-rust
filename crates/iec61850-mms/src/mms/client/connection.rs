@@ -30,7 +30,8 @@ use super::error::ClientError;
 use crate::compat::prelude::*;
 use crate::compat::VecDeque;
 use crate::iso::acse::{self, AcseConnection, AcseIndication};
-use crate::iso::cotp::{CotpConnection, CotpOptions, TSelector};
+use crate::iso::cotp::{CotpConnection, CotpOptions};
+use crate::iso::params::IsoConnectionParameters;
 use crate::iso::presentation::{self, IsoPresentation, PresentationConnectionParameters};
 use crate::iso::session::{self, IsoParameters, IsoSession, SessionIndication};
 use crate::mms::pdu::{
@@ -63,6 +64,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Default request timeout in milliseconds.
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// indirect-reference written into the AARQ user-information; MMS uses 3.
+const ACSE_INDIRECT_REFERENCE: u32 = 3;
 
 // ConnectionState
 
@@ -126,6 +130,9 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     /// `None` uses `DEFAULT_MAX_PDU_SIZE`, that is 65000. A smaller value exercises
     /// the outbound size guard end to end.
     pub local_max_pdu_size: Option<u32>,
+    /// ISO addressing offered by the next association: the T, S and P selectors
+    /// and the AP-title and AE-qualifier of both sides.
+    pub iso_parameters: IsoConnectionParameters,
     /// Inner bytes of Unconfirmed PDUs, such as InformationReport, that arrived while
     /// a confirmed service was awaiting its response.
     ///
@@ -159,6 +166,8 @@ pub struct MmsConnection<T, Tm> {
     pub request_timeout_ms: u64,
     /// `localDetail` proposed in the Initiate request; `None` uses the default.
     pub local_max_pdu_size: Option<u32>,
+    /// ISO addressing offered by the next association.
+    pub iso_parameters: IsoConnectionParameters,
     pending_unconfirmed: VecDeque<Bytes>,
 }
 
@@ -190,8 +199,17 @@ impl<T, Tm> MmsConnection<T, Tm> {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             local_max_pdu_size: None,
+            iso_parameters: IsoConnectionParameters::default(),
             pending_unconfirmed: VecDeque::new(),
         }
+    }
+
+    /// Replaces the ISO addressing offered by the next association.
+    ///
+    /// The entry point for a caller that owns its transport and therefore never
+    /// goes through `MmsClientBuilder`.
+    pub fn set_iso_parameters(&mut self, params: IsoConnectionParameters) {
+        self.iso_parameters = params;
     }
 
     /// Removes the oldest stashed Unconfirmed PDU, if any.
@@ -269,7 +287,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         debug!("tls handshake complete");
 
         // Step 1+2: COTP CR/CC
-        let opts = default_cotp_opts();
+        let opts = cotp_options(&self.iso_parameters);
         let mut cotp = CotpConnection::connect(tls_stream, opts)
             .await
             .map_err(|e| ClientError::IsoError(format!("cotp tls: {e}")))?;
@@ -277,23 +295,8 @@ impl MmsConnection<TcpStream, TokioTimer> {
 
         // Step 3: Session CN + Presentation CP + ACSE AARQ + MMS Initiate-Request
         {
-            let mut mms_buf = BytesMut::new();
-            let mut init_req = InitiateRequestPdu::default();
-            if let Some(size) = self.local_max_pdu_size {
-                init_req.local_detail_calling = Some(size);
-            }
-            init_req.encode(&mut mms_buf);
-
-            let mut acse_buf = BytesMut::new();
-            acse::encode_aarq(&mms_buf, None, 3, &mut acse_buf);
-
-            let pres_params = PresentationConnectionParameters::default();
-            let mut pres_buf = BytesMut::new();
-            presentation::encode_connect(&pres_params, &acse_buf, &mut pres_buf);
-
-            let sess_params = IsoParameters::default();
-            let mut sess_buf = BytesMut::new();
-            session::encode_connect(&sess_params, &self.session, &pres_buf, &mut sess_buf)
+            let sess_buf = self
+                .build_connect_request()
                 .map_err(|e| ClientError::IsoError(format!("session cn tls: {e}")))?;
 
             cotp.send_data(&sess_buf)
@@ -313,12 +316,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
                 .session
                 .parse_message(&raw)
                 .map_err(|e| ClientError::IsoError(format!("session ac tls: {e}")))?;
-            if sess_ind != SessionIndication::Accept {
-                warn!("expected a session accept over tls, got {:?}", sess_ind);
-                return Err(ClientError::IsoError(format!(
-                    "expected Session AC (tls), got {sess_ind:?}"
-                )));
-            }
+            check_session_accept(&raw, sess_ind)?;
             let sess_payload: Vec<u8> = self.session.user_data(&raw).to_vec();
 
             let cpa_result = presentation::parse_accept(&mut self.presentation, &sess_payload)
@@ -396,7 +394,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         self.state = ConnectionState::Connecting;
 
         // Step 1+2: COTP CR/CC handshake
-        let opts = default_cotp_opts();
+        let opts = cotp_options(&self.iso_parameters);
         let mut cotp = CotpConnection::connect(transport, opts)
             .await
             .map_err(|e| ClientError::IsoError(format!("cotp: {e}")))?;
@@ -410,6 +408,46 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         Ok(())
     }
 
+    /// Builds the Session CN SPDU carrying the Presentation CP, the ACSE AARQ and
+    /// the MMS Initiate request.
+    ///
+    /// Every address written here comes from `iso_parameters`: the session
+    /// selectors, the presentation selectors and the AARQ AP-title and
+    /// AE-qualifier fields. The T-Selectors reach the wire through the COTP
+    /// options instead, as the CR TPDU carries them.
+    fn build_connect_request(&self) -> Result<BytesMut, session::SessionError> {
+        let mut mms_buf = BytesMut::new();
+        let mut init_req = InitiateRequestPdu::default();
+        if let Some(size) = self.local_max_pdu_size {
+            init_req.local_detail_calling = Some(size);
+        }
+        init_req.encode(&mut mms_buf);
+
+        let mut acse_buf = BytesMut::new();
+        acse::encode_aarq(
+            &mms_buf,
+            None,
+            ACSE_INDIRECT_REFERENCE,
+            &self.iso_parameters.aarq_addressing(),
+            &mut acse_buf,
+        );
+
+        let pres_params = PresentationConnectionParameters {
+            local_p_sel: self.iso_parameters.local_p_sel.clone(),
+            remote_p_sel: self.iso_parameters.remote_p_sel.clone(),
+        };
+        let mut pres_buf = BytesMut::new();
+        presentation::encode_connect(&pres_params, &acse_buf, &mut pres_buf);
+
+        let sess_params = IsoParameters {
+            local_selector: self.iso_parameters.local_s_sel.clone(),
+            remote_selector: self.iso_parameters.remote_s_sel.clone(),
+        };
+        let mut sess_buf = BytesMut::new();
+        session::encode_connect(&sess_params, &self.session, &pres_buf, &mut sess_buf)?;
+        Ok(sess_buf)
+    }
+
     /// Sends Session CN, Presentation CP, ACSE AARQ and the MMS Initiate request, then
     /// awaits Session AC, Presentation CPA, ACSE AARE and the Initiate response.
     ///
@@ -421,23 +459,8 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     ) -> Result<(), ClientError> {
         // Step 3
         {
-            let mut mms_buf = BytesMut::new();
-            let mut init_req = InitiateRequestPdu::default();
-            if let Some(size) = self.local_max_pdu_size {
-                init_req.local_detail_calling = Some(size);
-            }
-            init_req.encode(&mut mms_buf);
-
-            let mut acse_buf = BytesMut::new();
-            acse::encode_aarq(&mms_buf, None, 3, &mut acse_buf);
-
-            let pres_params = PresentationConnectionParameters::default();
-            let mut pres_buf = BytesMut::new();
-            presentation::encode_connect(&pres_params, &acse_buf, &mut pres_buf);
-
-            let sess_params = IsoParameters::default();
-            let mut sess_buf = BytesMut::new();
-            session::encode_connect(&sess_params, &self.session, &pres_buf, &mut sess_buf)
+            let sess_buf = self
+                .build_connect_request()
                 .map_err(|e| ClientError::IsoError(format!("session cn: {e}")))?;
 
             cotp.send_data(&sess_buf)
@@ -456,12 +479,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             .session
             .parse_message(&raw)
             .map_err(|e| ClientError::IsoError(format!("session ac: {e}")))?;
-        if sess_ind != SessionIndication::Accept {
-            warn!("expected a session accept, got {:?}", sess_ind);
-            return Err(ClientError::IsoError(format!(
-                "expected Session AC, got {sess_ind:?}"
-            )));
-        }
+        check_session_accept(&raw, sess_ind)?;
         let sess_payload: Vec<u8> = self.session.user_data(&raw).to_vec();
 
         let cpa_result = presentation::parse_accept(&mut self.presentation, &sess_payload)
@@ -767,20 +785,221 @@ impl<T, Tm: Default> Default for MmsConnection<T, Tm> {
     }
 }
 
-// Default COTP options
+// Association helpers
 
-/// Returns the default COTP options for an MMS association: the standard TSAPs and
-/// a TPDU size of 8192.
-fn default_cotp_opts() -> CotpOptions {
+/// Returns the COTP options for an association: the T-Selectors of
+/// `params` and the default TPDU size.
+fn cotp_options(params: &IsoConnectionParameters) -> CotpOptions {
     CotpOptions {
-        tsel_src: TSelector {
-            size: 2,
-            value: [0x00, 0x01, 0, 0],
-        },
-        tsel_dst: TSelector {
-            size: 2,
-            value: [0x00, 0x01, 0, 0],
-        },
+        tsel_src: params.local_t_sel.clone(),
+        tsel_dst: params.remote_t_sel.clone(),
         tpdu_size: crate::iso::cotp::TpduSize::default(),
+    }
+}
+
+/// Accepts a Session AC and turns every other indication into an error.
+///
+/// A REFUSE becomes `ClientError::SessionRefused`, carrying the reason code and
+/// the transport disconnect parameter of the RF SPDU together with the
+/// provider-reason of the CPR PPDU it carries, when that decodes. `raw` is the
+/// SPDU the indication was parsed from, which the refusal user data borrows
+/// from.
+fn check_session_accept(raw: &[u8], indication: SessionIndication) -> Result<(), ClientError> {
+    match indication {
+        SessionIndication::Accept => Ok(()),
+        SessionIndication::Refuse(info) => {
+            let provider_reason = presentation::parse_reject(info.user_data(raw))
+                .ok()
+                .and_then(|reject| reject.provider_reason);
+            warn!(
+                reason_code = ?info.reason_code,
+                provider_reason = ?provider_reason,
+                "the peer refused the session connect request"
+            );
+            Err(ClientError::SessionRefused {
+                reason_code: info.reason_code,
+                transport_disconnect: info.transport_disconnect,
+                provider_reason,
+            })
+        }
+        other => {
+            warn!("expected a session accept, got {:?}", other);
+            Err(ClientError::IsoError(format!(
+                "expected Session AC, got {other:?}"
+            )))
+        }
+    }
+}
+
+// Unit tests
+
+// The connect request is built on the std transport and timer, so these run on
+// a std build only.
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::iso::cotp::encode_cr;
+    use crate::iso::params::ApTitle;
+    use crate::iso::presentation::PSelector;
+    use crate::iso::session::{RefuseInfo, SSelector};
+
+    /// Builds the session CN SPDU a connection with `params` would send.
+    fn connect_request(params: IsoConnectionParameters) -> Vec<u8> {
+        let mut conn = MmsConnection::<TcpStream, TokioTimer>::new();
+        conn.set_iso_parameters(params);
+        conn.build_connect_request()
+            .expect("connect request must encode")
+            .to_vec()
+    }
+
+    /// Reports whether `haystack` contains `needle`.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn default_cp_carries_the_documented_p_selectors() {
+        let cn = connect_request(IsoConnectionParameters::default());
+        assert!(
+            contains(&cn, &[0x81, 0x04, 0x00, 0x00, 0x00, 0x01]),
+            "calling-presentation-selector must be 00 00 00 01"
+        );
+        assert!(
+            contains(&cn, &[0x82, 0x04, 0x00, 0x00, 0x00, 0x01]),
+            "called-presentation-selector must be 00 00 00 01"
+        );
+    }
+
+    #[test]
+    fn empty_p_selectors_still_write_their_tag_and_length() {
+        let params = IsoConnectionParameters {
+            local_p_sel: PSelector::default(),
+            remote_p_sel: PSelector::default(),
+            ..IsoConnectionParameters::default()
+        };
+        let cn = connect_request(params);
+        assert!(
+            contains(&cn, &[0x81, 0x00, 0x82, 0x00]),
+            "an empty selector still occupies its tag and length pair"
+        );
+    }
+
+    #[test]
+    fn default_cn_carries_the_documented_session_selectors() {
+        let cn = connect_request(IsoConnectionParameters::default());
+        // PGI 51, calling SS-SEL, and PGI 52, called SS-SEL
+        assert!(contains(&cn, &[0x33, 0x02, 0x00, 0x01]), "pgi 51 is 00 01");
+        assert!(contains(&cn, &[0x34, 0x02, 0x00, 0x01]), "pgi 52 is 00 01");
+    }
+
+    #[test]
+    fn default_aarq_carries_the_documented_ap_titles() {
+        let cn = connect_request(IsoConnectionParameters::default());
+        // called-AP-title 1.1.1.999.1 and calling-AP-title 1.1.1.999
+        assert!(contains(
+            &cn,
+            &[0xa2, 0x07, 0x06, 0x05, 0x29, 0x01, 0x87, 0x67, 0x01]
+        ));
+        assert!(contains(&cn, &[0xa3, 0x03, 0x02, 0x01, 0x0c]));
+        assert!(contains(
+            &cn,
+            &[0xa6, 0x06, 0x06, 0x04, 0x29, 0x01, 0x87, 0x67]
+        ));
+        assert!(contains(&cn, &[0xa7, 0x03, 0x02, 0x01, 0x0c]));
+    }
+
+    #[test]
+    fn custom_selectors_and_titles_reach_the_wire() {
+        let params = IsoConnectionParameters {
+            local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel"),
+            remote_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel"),
+            local_s_sel: SSelector::from_slice(&[0x00, 0x02]).expect("s-sel"),
+            remote_s_sel: SSelector::from_slice(&[0x00, 0x02]).expect("s-sel"),
+            local_ap_title: Some("1.3.9999.13".parse::<ApTitle>().expect("ap-title")),
+            remote_ap_title: Some("1.3.9999.13".parse::<ApTitle>().expect("ap-title")),
+            local_ae_qualifier: Some(1),
+            remote_ae_qualifier: Some(1),
+            ..IsoConnectionParameters::default()
+        };
+        let cn = connect_request(params);
+        assert!(contains(&cn, &[0x81, 0x04, 0x00, 0x00, 0x00, 0x02]));
+        assert!(contains(&cn, &[0x82, 0x04, 0x00, 0x00, 0x00, 0x02]));
+        assert!(contains(&cn, &[0x33, 0x02, 0x00, 0x02]));
+        assert!(contains(&cn, &[0x34, 0x02, 0x00, 0x02]));
+        // 1.3.9999.13 encodes as 2b ce 0f 0d
+        assert!(contains(
+            &cn,
+            &[0xa6, 0x06, 0x06, 0x04, 0x2b, 0xce, 0x0f, 0x0d]
+        ));
+        assert!(contains(&cn, &[0xa7, 0x03, 0x02, 0x01, 0x01]));
+    }
+
+    #[test]
+    fn cotp_cr_carries_the_t_selectors() {
+        let opts = cotp_options(&IsoConnectionParameters::default());
+        let cr = encode_cr(&opts, 1);
+        // 0xC2 called TSAP then 0xC1 calling TSAP, both 00 01
+        assert!(contains(&cr, &[0xc2, 0x02, 0x00, 0x01]));
+        assert!(contains(&cr, &[0xc1, 0x02, 0x00, 0x01]));
+
+        let params = IsoConnectionParameters {
+            local_t_sel: crate::iso::cotp::TSelector::from_slice(&[0x00, 0x02]).expect("t-sel"),
+            ..IsoConnectionParameters::default()
+        };
+        let cr = encode_cr(&cotp_options(&params), 1);
+        assert!(contains(&cr, &[0xc1, 0x02, 0x00, 0x02]));
+    }
+
+    #[test]
+    fn a_refuse_indication_becomes_a_typed_error() {
+        // the refusal user data is a CPR carrying provider-reason 3
+        let raw: &[u8] = &[
+            0x0C, 0x0A, 0x32, 0x01, 0x81, 0xC1, 0x05, 0x30, 0x03, 0x8A, 0x01, 0x03,
+        ];
+        let info = RefuseInfo {
+            reason_code: Some(129),
+            transport_disconnect: None,
+            user_data_start: 7,
+            user_data_len: 5,
+        };
+        let err = check_session_accept(raw, SessionIndication::Refuse(info))
+            .expect_err("a refusal must not be accepted");
+        match err {
+            ClientError::SessionRefused {
+                reason_code,
+                provider_reason,
+                ..
+            } => {
+                assert_eq!(reason_code, Some(129));
+                assert_eq!(provider_reason, Some(3));
+            }
+            other => panic!("expected SessionRefused, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("session selector unknown"), "{text}");
+        assert!(
+            text.contains("called-presentation-address-unknown"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_without_user_data_has_no_provider_reason() {
+        let raw: &[u8] = &[0x0C, 0x03, 0x32, 0x01, 0x02];
+        let info = RefuseInfo {
+            reason_code: Some(2),
+            transport_disconnect: None,
+            user_data_start: 0,
+            user_data_len: 0,
+        };
+        let err = check_session_accept(raw, SessionIndication::Refuse(info))
+            .expect_err("a refusal must not be accepted");
+        assert!(matches!(
+            err,
+            ClientError::SessionRefused {
+                provider_reason: None,
+                ..
+            }
+        ));
     }
 }
