@@ -103,6 +103,22 @@ pub enum ClientError {
     #[error("mms layer error: {0}")]
     Mms(String),
 
+    /// The peer answered the connect request with a session REFUSE SPDU.
+    ///
+    /// Surfaced as a typed variant so a caller can tell an unknown session or
+    /// presentation selector from a malformed peer. `reason_code` is PI 50 of
+    /// the RF SPDU, `transport_disconnect` PI 17, and `provider_reason` the
+    /// provider-reason of the CPR PPDU the refusal carries, when present.
+    #[error("{}", iec61850_mms::session_refused_message(*reason_code, *transport_disconnect, *provider_reason))]
+    SessionRefused {
+        /// Reason code carried by the RF SPDU.
+        reason_code: Option<u8>,
+        /// Transport disconnect parameter carried by the RF SPDU.
+        transport_disconnect: Option<u8>,
+        /// provider-reason of the CPR PPDU inside the refusal, when present.
+        provider_reason: Option<u8>,
+    },
+
     /// `DataAccessError` reported by the server inside an `AccessResult::Failure`.
     ///
     /// Surfaced as a typed variant (rather than `Mms(String)`) so callers can
@@ -116,6 +132,15 @@ impl From<iec61850_mms::ClientError> for ClientError {
     fn from(e: iec61850_mms::ClientError) -> Self {
         match e {
             iec61850_mms::ClientError::DataAccessError(d) => ClientError::DataAccessError(d),
+            iec61850_mms::ClientError::SessionRefused {
+                reason_code,
+                transport_disconnect,
+                provider_reason,
+            } => ClientError::SessionRefused {
+                reason_code,
+                transport_disconnect,
+                provider_reason,
+            },
             other => ClientError::Mms(other.to_string()),
         }
     }
@@ -156,6 +181,18 @@ impl PartialEq for ClientError {
                 },
             ) => e1 == e2 && g1 == g2,
             (NotConnected, NotConnected) => true,
+            (
+                SessionRefused {
+                    reason_code: r1,
+                    transport_disconnect: t1,
+                    provider_reason: p1,
+                },
+                SessionRefused {
+                    reason_code: r2,
+                    transport_disconnect: t2,
+                    provider_reason: p2,
+                },
+            ) => r1 == r2 && t1 == t2 && p1 == p2,
             (Mms(a), Mms(b)) => a == b,
             (DataAccessError(a), DataAccessError(b)) => a == b,
             _ => false,

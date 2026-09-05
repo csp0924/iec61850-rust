@@ -37,6 +37,8 @@ use iec61850_hal::time::TokioTimer;
 #[cfg(feature = "std")]
 use iec61850_mms::mms::client::MmsClientBuilder;
 #[cfg(feature = "std")]
+use iec61850_mms::IsoConnectionParameters;
+#[cfg(feature = "std")]
 use tokio::net::TcpStream;
 
 /// A connection to an IED, exposing the ACSI services over MMS.
@@ -153,8 +155,20 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
 #[cfg(feature = "std")]
 impl IedConnection<TcpStream, TokioTimer> {
     /// Creates a connection object that is not yet connected.
+    ///
+    /// The association it opens offers `IsoConnectionParameters::default()`.
     pub fn new() -> Self {
         Self::with_mms_client(MmsClientBuilder::new().build())
+    }
+
+    /// Creates a connection object that is not yet connected, offering
+    /// caller-supplied ISO addressing.
+    ///
+    /// The parameters carry the T, S and P selectors and the AP-title and
+    /// AE-qualifier of both sides; they apply to the next `connect` or
+    /// `connect_tls`.
+    pub fn with_iso_parameters(params: IsoConnectionParameters) -> Self {
+        Self::with_mms_client(MmsClientBuilder::new().iso_parameters(params).build())
     }
 
     /// Establishes the ISO and MMS association with a server.

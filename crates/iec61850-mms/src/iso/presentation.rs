@@ -23,6 +23,7 @@
 //!   payload range.
 //! - A CP PDU without normal-mode-parameters is rejected.
 
+use crate::compat::prelude::*;
 use bytes::BytesMut;
 use tracing::warn;
 
@@ -115,6 +116,19 @@ pub enum PresentationError {
     /// The BER length field is malformed, for example an indefinite-form length.
     #[error("malformed ber length field")]
     MalformedLength,
+
+    /// A CPR PPDU selects the x410 mode, which this layer does not implement.
+    #[error("cpr pdu selects x410-mode, which is unsupported")]
+    X410ModeUnsupported,
+
+    /// A field that must hold a single-octet value is empty or longer.
+    #[error("cpr field 0x{tag:02X} has length {len}, expected a single octet")]
+    InvalidFieldLength {
+        /// Tag of the offending field.
+        tag: u8,
+        /// Length received.
+        len: usize,
+    },
 }
 
 // Constants
@@ -139,6 +153,36 @@ pub const MMS_CONTEXT_ID: u8 = 3;
 
 /// Maximum P-Selector length in bytes.
 const PSELECTOR_MAX_SIZE: usize = 16;
+
+/// CPR-type normal-mode-parameters, a SEQUENCE.
+const CPR_TAG_NORMAL_MODE: u8 = 0x30;
+
+/// CPR-type x410-mode-parameters, a SET.
+const CPR_TAG_X410_MODE: u8 = 0x31;
+
+/// CPR responding-presentation-selector `[3]` IMPLICIT.
+const CPR_TAG_RESPONDING_P_SEL: u8 = 0x83;
+
+/// CPR presentation-context-definition-result-list `[5]` IMPLICIT.
+const CPR_TAG_RESULT_LIST: u8 = 0xa5;
+
+/// CPR default-context-result `[7]` IMPLICIT.
+const CPR_TAG_DEFAULT_CONTEXT_RESULT: u8 = 0x87;
+
+/// CPR provider-reason `[10]` IMPLICIT INTEGER.
+const CPR_TAG_PROVIDER_REASON: u8 = 0x8a;
+
+/// result `[0]` IMPLICIT inside one context-definition result.
+const CPR_TAG_RESULT: u8 = 0x80;
+
+/// SEQUENCE tag, used by one context-definition result.
+const TAG_SEQUENCE: u8 = 0x30;
+
+/// Fully-Encoded-Data, the user-data alternative this layer accepts.
+const TAG_FULLY_ENCODED_DATA: u8 = 0x61;
+
+/// Length of a single-octet field value.
+const SINGLE_OCTET: usize = 1;
 
 // Data structures
 
@@ -250,6 +294,58 @@ impl UserDataResult {
     /// Returns the payload slice borrowed from `buf`.
     pub fn payload<'buf>(&self, buf: &'buf [u8]) -> &'buf [u8] {
         &buf[self.payload_start..self.payload_start + self.payload_len]
+    }
+}
+
+/// Successful result of [`parse_reject`], the fields of a CPR PPDU.
+///
+/// Every field of CPR normal-mode-parameters is OPTIONAL, so an absent one
+/// stays `None` or empty rather than being defaulted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PresentationReject {
+    /// provider-reason `[10]`. Names are available from
+    /// [`provider_reason_name`].
+    pub provider_reason: Option<u8>,
+    /// responding-presentation-selector `[3]`.
+    pub responding_p_sel: Option<PSelector>,
+    /// default-context-result `[7]`.
+    pub default_context_result: Option<u8>,
+    /// The result value of each entry of
+    /// presentation-context-definition-result-list `[5]`, in wire order.
+    pub context_result_list: Vec<u8>,
+    /// Offset of the user-data payload inside the input buffer.
+    pub user_data_start: usize,
+    /// Length of the user-data payload; 0 when the PPDU carries none.
+    pub user_data_len: usize,
+}
+
+impl PresentationReject {
+    /// Returns the user-data slice borrowed from the buffer it was parsed from.
+    ///
+    /// An out-of-range offset yields an empty slice rather than a panic.
+    pub fn user_data<'buf>(&self, buf: &'buf [u8]) -> &'buf [u8] {
+        let end = self.user_data_start + self.user_data_len;
+        if self.user_data_len > 0 && end <= buf.len() {
+            &buf[self.user_data_start..end]
+        } else {
+            &[]
+        }
+    }
+}
+
+/// Returns the ISO 8823 name of a CPR provider-reason, or `None` when the value
+/// is not one the standard defines.
+pub fn provider_reason_name(reason: u8) -> Option<&'static str> {
+    match reason {
+        0 => Some("reason-not-specified"),
+        1 => Some("temporary-congestion"),
+        2 => Some("local-limit-exceeded"),
+        3 => Some("called-presentation-address-unknown"),
+        4 => Some("protocol-version-not-supported"),
+        5 => Some("default-context-not-supported"),
+        6 => Some("user-data-not-readable"),
+        7 => Some("no-PSAP-available"),
+        _ => None,
     }
 }
 
@@ -627,6 +723,135 @@ pub fn parse_accept(
     buf: &[u8],
 ) -> Result<ConnectResult, PresentationError> {
     parse_connect_or_accept(pres, buf)
+}
+
+/// Parses a received CPR PPDU, the presentation layer's refusal of a CP.
+///
+/// CPR-type is a CHOICE. The normal-mode alternative is a SEQUENCE, tag 0x30,
+/// whose fields are protocol-version `[0]`,
+/// responding-presentation-selector `[3]`,
+/// presentation-context-definition-result-list `[5]`,
+/// default-context-result `[7]`, provider-reason `[10]` and user-data, all
+/// OPTIONAL. The x410-mode alternative, a SET, is not implemented.
+///
+/// The layer state is left untouched: a refused connection negotiates nothing.
+///
+/// # Errors
+///
+/// - `X410ModeUnsupported` when the PPDU selects the x410 mode.
+/// - `WrongTag` when the outer tag is neither alternative.
+/// - `InvalidFieldLength` when a single-octet field has another length.
+/// - `PSelectorTooLong` when the responding selector exceeds 16 bytes.
+/// - `LengthOverflow`, `TooShort` or `MalformedLength` for a malformed BER
+///   length field.
+pub fn parse_reject(buf: &[u8]) -> Result<PresentationReject, PresentationError> {
+    let total = buf.len();
+    let mut pos = 0usize;
+
+    let tag = read_byte(buf, &mut pos, total)?;
+    if tag == CPR_TAG_X410_MODE {
+        warn!("cpr pdu selects x410-mode, which is unsupported");
+        return Err(PresentationError::X410ModeUnsupported);
+    }
+    if tag != CPR_TAG_NORMAL_MODE {
+        warn!(tag, "cpr outer tag is not 0x30 (normal-mode-parameters)");
+        return Err(PresentationError::WrongTag {
+            tag,
+            expected: CPR_TAG_NORMAL_MODE,
+        });
+    }
+
+    let outer_len = read_ber_length(buf, &mut pos, total)?;
+    let outer_end = pos + outer_len;
+    let mut reject = PresentationReject::default();
+
+    while pos < outer_end {
+        let field_tag = read_byte(buf, &mut pos, outer_end)?;
+        let field_len = read_ber_length(buf, &mut pos, outer_end)?;
+        let field_end = pos + field_len;
+
+        match field_tag {
+            CPR_TAG_RESPONDING_P_SEL => {
+                if field_len > PSELECTOR_MAX_SIZE {
+                    warn!(
+                        len = field_len,
+                        "cpr responding p-selector exceeds 16 bytes, rejecting"
+                    );
+                    return Err(PresentationError::PSelectorTooLong { len: field_len });
+                }
+                reject.responding_p_sel = Some(PSelector::from_slice(&buf[pos..field_end])?);
+            }
+            CPR_TAG_RESULT_LIST => {
+                reject.context_result_list = parse_context_result_list(buf, pos, field_end)?;
+            }
+            CPR_TAG_DEFAULT_CONTEXT_RESULT => {
+                reject.default_context_result =
+                    Some(read_single_octet(buf, pos, field_tag, field_len)?);
+            }
+            CPR_TAG_PROVIDER_REASON => {
+                reject.provider_reason = Some(read_single_octet(buf, pos, field_tag, field_len)?);
+            }
+            TAG_FULLY_ENCODED_DATA => {
+                reject.user_data_start = pos;
+                reject.user_data_len = field_len;
+            }
+            _ => {
+                // protocol-version and any other field are skipped; the tag byte
+                // is always consumed, so a zero length cannot stall the loop
+            }
+        }
+
+        pos = field_end;
+    }
+
+    Ok(reject)
+}
+
+/// Reads the result value of every entry of a
+/// presentation-context-definition-result-list.
+///
+/// Each entry is a SEQUENCE holding `result [0] IMPLICIT`; an entry without one
+/// contributes nothing.
+fn parse_context_result_list(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>, PresentationError> {
+    let mut results = Vec::new();
+    let mut pos = start;
+
+    while pos < end {
+        let tag = read_byte(buf, &mut pos, end)?;
+        let len = read_ber_length(buf, &mut pos, end)?;
+        let entry_end = pos + len;
+
+        if tag == TAG_SEQUENCE {
+            let mut inner = pos;
+            while inner < entry_end {
+                let inner_tag = read_byte(buf, &mut inner, entry_end)?;
+                let inner_len = read_ber_length(buf, &mut inner, entry_end)?;
+                if inner_tag == CPR_TAG_RESULT {
+                    results.push(read_single_octet(buf, inner, inner_tag, inner_len)?);
+                }
+                inner += inner_len;
+            }
+        }
+
+        pos = entry_end;
+    }
+
+    Ok(results)
+}
+
+/// Reads a field whose value must be exactly one octet.
+fn read_single_octet(buf: &[u8], pos: usize, tag: u8, len: usize) -> Result<u8, PresentationError> {
+    if len != SINGLE_OCTET {
+        warn!(tag, len, "cpr field is not a single octet, rejecting");
+        return Err(PresentationError::InvalidFieldLength { tag, len });
+    }
+    buf.get(pos)
+        .copied()
+        .ok_or(PresentationError::TooShort { len: buf.len() })
 }
 
 /// Parsing logic shared by CP and CPA.
@@ -1506,5 +1731,105 @@ mod tests {
         assert_eq!(pres.next_context_id, 0);
         assert_eq!(pres.calling_p_sel.size, 0);
         assert_eq!(pres.called_p_sel.size, 0);
+    }
+
+    // CPR decoding, against hand-written vectors
+
+    #[test]
+    fn cpr_minimal_with_provider_reason() {
+        // 30 03 | 8a 01 03  provider-reason = called-presentation-address-unknown
+        let pdu: &[u8] = &[0x30, 0x03, 0x8a, 0x01, 0x03];
+        let reject = parse_reject(pdu).expect("cpr must parse");
+        assert_eq!(reject.provider_reason, Some(3));
+        assert_eq!(reject.responding_p_sel, None);
+        assert!(reject.context_result_list.is_empty());
+        assert_eq!(reject.user_data_len, 0);
+        assert_eq!(reject.user_data(pdu), b"");
+    }
+
+    #[test]
+    fn cpr_without_provider_reason_keeps_it_absent() {
+        // 30 06 | 83 04 00 00 00 01  responding-presentation-selector only
+        let pdu: &[u8] = &[0x30, 0x06, 0x83, 0x04, 0x00, 0x00, 0x00, 0x01];
+        let reject = parse_reject(pdu).expect("cpr must parse");
+        assert_eq!(reject.provider_reason, None);
+        assert_eq!(
+            reject.responding_p_sel.as_ref().map(|s| s.as_slice()),
+            Some(&[0x00, 0x00, 0x00, 0x01][..])
+        );
+    }
+
+    #[test]
+    fn cpr_with_context_result_list() {
+        // 30 0a | a5 05 30 03 80 01 01 | 8a 01 04
+        // one context result of 1 (user-rejection) and provider-reason 4
+        let pdu: &[u8] = &[
+            0x30, 0x0a, 0xa5, 0x05, 0x30, 0x03, 0x80, 0x01, 0x01, 0x8a, 0x01, 0x04,
+        ];
+        let reject = parse_reject(pdu).expect("cpr must parse");
+        assert_eq!(reject.context_result_list, vec![1]);
+        assert_eq!(reject.provider_reason, Some(4));
+    }
+
+    #[test]
+    fn cpr_with_user_data() {
+        // 30 08 | 8a 01 03 | 61 03 aa bb cc
+        let pdu: &[u8] = &[0x30, 0x08, 0x8a, 0x01, 0x03, 0x61, 0x03, 0xaa, 0xbb, 0xcc];
+        let reject = parse_reject(pdu).expect("cpr must parse");
+        assert_eq!(reject.provider_reason, Some(3));
+        assert_eq!(reject.user_data(pdu), &[0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn cpr_rejects_truncated_input() {
+        // the outer length runs past the buffer
+        assert!(matches!(
+            parse_reject(&[0x30, 0x05, 0x8a, 0x01]),
+            Err(PresentationError::LengthOverflow { .. })
+        ));
+        // a field length runs past the outer sequence
+        assert!(matches!(
+            parse_reject(&[0x30, 0x03, 0x8a, 0x03, 0x03]),
+            Err(PresentationError::LengthOverflow { .. })
+        ));
+        // nothing at all
+        assert!(matches!(
+            parse_reject(&[]),
+            Err(PresentationError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn cpr_rejects_x410_mode_and_foreign_tags() {
+        assert_eq!(
+            parse_reject(&[0x31, 0x03, 0x8a, 0x01, 0x03]),
+            Err(PresentationError::X410ModeUnsupported)
+        );
+        assert_eq!(
+            parse_reject(&[0x61, 0x03, 0x8a, 0x01, 0x03]),
+            Err(PresentationError::WrongTag {
+                tag: 0x61,
+                expected: 0x30
+            })
+        );
+    }
+
+    #[test]
+    fn cpr_rejects_a_provider_reason_that_is_not_one_octet() {
+        assert_eq!(
+            parse_reject(&[0x30, 0x04, 0x8a, 0x02, 0x00, 0x03]),
+            Err(PresentationError::InvalidFieldLength { tag: 0x8a, len: 2 })
+        );
+    }
+
+    #[test]
+    fn provider_reason_names_cover_the_defined_values() {
+        assert_eq!(provider_reason_name(0), Some("reason-not-specified"));
+        assert_eq!(
+            provider_reason_name(3),
+            Some("called-presentation-address-unknown")
+        );
+        assert_eq!(provider_reason_name(7), Some("no-PSAP-available"));
+        assert_eq!(provider_reason_name(8), None);
     }
 }

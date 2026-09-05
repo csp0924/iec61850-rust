@@ -144,6 +144,32 @@ cargo run -p iec61850-client --example client_reporting_subscriber
 shows, the example it pairs with and its exact run command, and walks through
 the demonstration IED in full.
 
+### ISO connection parameters
+
+A client associates with the addressing IEC 61850-8-1 lists by default:
+T-Selector `00 01`, S-Selector `00 01`, P-Selector `00 00 00 01`, AP-title
+`1.1.1.999` calling and `1.1.1.999.1` called, AE-qualifier 12 on both sides. An
+IED that validates the calling address takes its own values:
+
+```rust
+use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};
+use iec61850_mms::iso::presentation::PSelector;
+
+let params = IsoConnectionParameters {
+    local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?,
+    local_ap_title: Some("1.3.9999.13".parse::<ApTitle>()?),
+    local_ae_qualifier: Some(1),
+    ..IsoConnectionParameters::default()
+};
+let conn = IedConnection::with_iso_parameters(params);
+conn.connect("192.0.2.10", 102).await?;
+```
+
+A peer that refuses the association answers with a session REFUSE SPDU; the
+connect call then returns `ClientError::SessionRefused`, naming the session
+reason code and the presentation provider-reason rather than reporting an
+unparsable message.
+
 ## Server configuration
 
 `IedServerConfig` carries the association limit, the edition, the write-access

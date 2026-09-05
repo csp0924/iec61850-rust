@@ -333,6 +333,42 @@ registered at that moment would announce less than the server goes on to serve.
 The `servicesSupportedCalling` bitmap a peer proposes is recorded and logged but
 never enforced: a peer that uses a service it did not announce is still served.
 
+### 5.1 ISO connection parameters
+
+The addressing a client offers is carried by `IsoConnectionParameters`. Its
+defaults are the values IEC 61850-8-1 Annex A lists for an MMS association.
+
+| Parameter | Default | Carried in |
+|---|---|---|
+| Calling and called T-Selector | `00 01` | COTP CR variable part, parameters `C1` and `C2` |
+| Calling and called S-Selector | `00 01` | Session CONNECT, PGI 51 and PGI 52 |
+| Calling and called P-Selector | `00 00 00 01` | Presentation CP, fields `81` and `82` |
+| calling-AP-title | `1.1.1.999` | AARQ `[6]` |
+| called-AP-title | `1.1.1.999.1` | AARQ `[2]` |
+| calling and called AE-qualifier | 12 | AARQ `[7]` and `[3]` |
+
+Every field is settable. An AP-title or an AE-qualifier set to `None` is left
+out of the AARQ, and a selector of length 0 still occupies its tag and length
+pair on the wire. Three entry points accept the parameters:
+`MmsClientBuilder::iso_parameters`, `IedConnection::with_iso_parameters`, and
+`MmsClient::from_transport_with_iso_parameters` for a caller that owns its
+transport.
+
+The server accepts an association whatever addressing it carries; the calling
+AP-title and AE-qualifier are decoded and made available as the application
+reference.
+
+| Refusal decoding | Support | Remark |
+|---|:---:|---|
+| Session REFUSE (RF, SPDU ID 12) | Y | Reason code PI 50 and transport disconnect PI 17 are decoded, the connection-identifier group is traversed, and PGI 193 or PI 194 user data is returned. The long form of LI is accepted |
+| Presentation CPR, normal mode | Y | responding-presentation-selector `[3]`, context-definition-result-list `[5]`, default-context-result `[7]` and provider-reason `[10]` |
+| Presentation CPR, x410 mode | N | Rejected with a distinct error rather than parsed |
+
+A refused association returns `ClientError::SessionRefused`, carrying the
+session reason code, the transport disconnect parameter and, when the refusal
+carries a CPR PPDU, its provider-reason. The `Display` names the values ISO
+8327-1 and ISO 8823 define and prints an unrecognized one as a number.
+
 ---
 
 ## 6. Security
