@@ -209,7 +209,7 @@ fn decode_variable_access_spec(data: &[u8]) -> Result<(VariableAccessSpec, usize
             ))
         }
         // [0] listOfVariable SEQUENCE OF VariableSpec, where each VariableSpec is
-        // SEQUENCE { name [0] IMPLICIT ObjectName }, encoded as
+        // SEQUENCE { name [0] EXPLICIT ObjectName }, encoded as
         // 0x30 <len> 0xa0 <name_len> <ObjectName body>
         0xa0 => {
             let (inner, hdr_len): (&[u8], usize) =
@@ -323,7 +323,7 @@ fn take_tag_and_length<'a>(
 /// Returns the complete PDU, outer `0xa3` tag included.
 pub fn encode_information_report(variables: &[(ObjectName, Bytes)]) -> Bytes {
     // listOfVariable, [0] IMPLICIT SEQUENCE OF VariableSpec, where each element is
-    // SEQUENCE { name [0] IMPLICIT ObjectName }, encoded as
+    // SEQUENCE { name [0] EXPLICIT ObjectName }, encoded as
     // 0x30 <len> 0xa0 <name_len> <ObjectName body>. The domain-specific form starts
     // 0x30 0xa0 0xa1 0x1a 0x1a, the vmd-specific form 0x30 0xa0 0x80.
     let mut list_of_var_inner = BytesMut::new();
@@ -516,7 +516,7 @@ mod tests {
                 0xa0, 0x0c,
                   // SEQUENCE <10>
                   0x30, 0x0a,
-                    // VariableSpec.name [0] IMPLICIT, len=8
+                    // VariableSpec.name [0] EXPLICIT, len=8
                     0xa0, 0x08,
                       // ObjectName.domain-specific
                       0xa1, 0x06,

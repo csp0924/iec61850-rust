@@ -25,6 +25,13 @@
 //! without that separator violates the registry contract and is answered with
 //! an access error rather than emitted as a reference the client cannot
 //! resolve.
+//!
+//! ## Response size
+//!
+//! The member list grows with the data set, so a response can outgrow the
+//! maximum PDU size negotiated for the association. The dispatcher's outbound
+//! guard measures the encoded response and answers errorClass resource other
+//! when it does not fit, so this handler always builds the complete list.
 
 use bytes::BytesMut;
 

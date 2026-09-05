@@ -10,6 +10,28 @@ Every crate in the workspace shares one version number.
 
 ## [0.2.0] - 2026-09-06
 
+### Changed
+
+> Upgrading from 0.1.x: the first two entries below change the bytes a client puts on
+> the wire during association setup. An IED that checks the calling presentation
+> selector or the calling AP-title will see different values and may refuse the
+> association until it is reconfigured, or until the previous values are set
+> back through `IsoConnectionParameters`.
+
+- **`iec61850-mms`, `iec61850-client`** — the calling and called presentation
+  selectors a client offers default to `00 00 00 01`, where they used to be
+  empty. This changes the bytes on the wire: the CP PPDU now carries
+  `81 04 00 00 00 01` and `82 04 00 00 00 01` where it carried `81 00` and
+  `82 00`. A caller that needs the empty selectors sets them explicitly through
+  `IsoConnectionParameters`; a zero-length selector still occupies its tag and
+  length pair.
+- **`iec61850-mms`, `iec61850-client`** — the AARQ a client sends now carries
+  the calling and called AP-title and AE-qualifier by default, `1.1.1.999` and
+  `1.1.1.999.1` with AE-qualifier 12, where it carried none. Setting a field to
+  `None` leaves it out.
+- **`iec61850-mms`** — `encode_aarq` takes the addressing fields as an
+  additional `AarqAddressing` argument.
+
 ### Added
 
 - **`iec61850-mms`** — the MMS GetNamedVariableListAttributes PDUs (confirmed
@@ -20,6 +42,17 @@ Every crate in the workspace shares one version number.
   true only for a data set created through DefineNamedVariableList, and
   `object-non-existent` for an unknown name. The service is advertised in
   `servicesSupportedCalled` when the reporting subsystem is compiled in.
+- **`iec61850-server`** — the dispatcher bounds every confirmed response by the
+  maximum PDU size negotiated for the association, answering errorClass
+  `resource other` when one does not fit. A client that negotiates a small
+  maximum is therefore never sent a GetNamedVariableListAttributes member list
+  or a GetVariableAccessAttributes type specification it cannot accept. Read
+  and GetNameList keep their own budget and pagination.
+- **`iec61850-server`** — a Read that names a data set, the ACSI
+  GetDataSetValues service, charges its access results against the negotiated
+  maximum PDU size the same way as a Read that lists its variables. A data set
+  whose values do not fit is answered with errorClass `resource other` for the
+  whole request instead of a truncated list of access results.
 - **`iec61850-client`** — `IedConnection::get_data_set_directory`, the ACSI
   GetDataSetDirectory service, returning `DataSetDirectory` with each member as
   an IEC reference and its functional constraint.
@@ -58,22 +91,6 @@ Every crate in the workspace shares one version number.
 - **`iec61850-client`** — `IedConnection::with_iso_parameters`, with
   `IsoConnectionParameters` and `ApTitle` re-exported so the addressing can be
   built without depending on `iec61850-mms`.
-
-### Changed
-
-- **`iec61850-mms`, `iec61850-client`** — the calling and called presentation
-  selectors a client offers default to `00 00 00 01`, where they used to be
-  empty. This changes the bytes on the wire: the CP PPDU now carries
-  `81 04 00 00 00 01` and `82 04 00 00 00 01` where it carried `81 00` and
-  `82 00`. A caller that needs the empty selectors sets them explicitly through
-  `IsoConnectionParameters`; a zero-length selector still occupies its tag and
-  length pair.
-- **`iec61850-mms`, `iec61850-client`** — the AARQ a client sends now carries
-  the calling and called AP-title and AE-qualifier by default, `1.1.1.999` and
-  `1.1.1.999.1` with AE-qualifier 12, where it carried none. Setting a field to
-  `None` leaves it out.
-- **`iec61850-mms`** — `encode_aarq` takes the addressing fields as an
-  additional `AarqAddressing` argument.
 
 ### Fixed
 

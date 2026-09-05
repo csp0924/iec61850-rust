@@ -23,7 +23,7 @@
 //!     0x80 <1> <bool>   -- mmsDeletable [0] IMPLICIT BOOLEAN
 //!     0xa1 <len>        -- listOfVariable [1] IMPLICIT SEQUENCE OF
 //!       0x30 <len>      -- ListOfVariableSeq, UNIVERSAL SEQUENCE
-//!         0xa0 <len>    -- variableSpecification.name [0] IMPLICIT
+//!         0xa0 <len>    -- variableSpecification.name [0] EXPLICIT
 //!           <ObjectName>
 //!         [0xa5 <len>]  -- alternateAccess [5] IMPLICIT, OPTIONAL
 //!     [0x82 <len> <s>]  -- accessControlList [2] IMPLICIT Identifier, OPTIONAL

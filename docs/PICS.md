@@ -111,7 +111,7 @@ elsewhere. macOS and BSD backends are absent.
 | SetDataValues | Y | Y | Server-side writes are gated by a functional-constraint policy, `SP \| SV \| SE` by default; `DC`, `CF` and `BL` can be enabled |
 | GetDataDirectory | Y | Y | |
 | GetDataDirectory by functional constraint | – | Y | Client convenience over the same wire service |
-| GetDataDefinition (GetVariableAccessAttributes) | Y | Y | Type specification including nested sub-data attributes |
+| GetDataDefinition (GetVariableAccessAttributes) | Y | Y | Type specification including nested sub-data attributes; a specification that would exceed the negotiated maximum PDU size is answered with `resource other` |
 | Single array element access, read | Y | Y | MMS `AlternateAccess` per IEC 61850-8-1 §17, index and index-with-component |
 | Single array element access, write | N | Y | The server answers `object-access-unsupported`: per-element storage is not materialized |
 
@@ -119,12 +119,12 @@ elsewhere. macOS and BSD backends are absent.
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results |
+| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results. A list of access results that would exceed the negotiated maximum PDU size is answered with `resource other` for the whole request, not truncated |
 | SetDataSetValues | Y | Y | A value count that differs from the member count fails every entry with `type-inconsistent` |
-| GetDataSetDirectory | Y | Y | MMS GetNamedVariableListAttributes: the member list, each member as an IEC reference with its functional constraint, plus `mmsDeletable`. Enumerating the data set *names* of a logical node is a different service, GetLogicalNodeDirectory(DataSet), which maps onto MMS GetNameList |
+| GetDataSetDirectory | Y | Y | MMS GetNamedVariableListAttributes: the member list, each member as an IEC reference with its functional constraint, plus `mmsDeletable`. Enumerating the data set *names* of a logical node is a different service, GetLogicalNodeDirectory(DataSet), which maps onto MMS GetNameList. A member list that would exceed the negotiated maximum PDU size is answered with `resource other` |
 | CreateDataSet | Y | Y | MMS DefineNamedVariableList, domain scope; association scope is not implemented |
 | DeleteDataSet | Y | Y | MMS DeleteNamedVariableList; a statically configured data set is refused |
-| GetDataSetAttributes (GetNamedVariableListAttributes) | Y | Y | The same MMS request as GetDataSetDirectory. The server answers from the data set registry, in registration order, and reports `mmsDeletable` true only for a data set created at runtime; an unknown name is answered with `object-non-existent` |
+| GetDataSetAttributes (GetNamedVariableListAttributes) | Y | Y | The same MMS request as GetDataSetDirectory. The server answers from the data set registry, in registration order, and reports `mmsDeletable` true only for a data set created at runtime; an unknown name is answered with `object-non-existent`, and a response that would exceed the negotiated maximum PDU size with `resource other` |
 
 ### 3.4 Setting group control
 
