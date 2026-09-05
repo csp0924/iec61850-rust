@@ -119,7 +119,7 @@ elsewhere. macOS and BSD backends are absent.
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results |
+| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results. A list of access results that would exceed the negotiated maximum PDU size is answered with `resource other` for the whole request, not truncated |
 | SetDataSetValues | Y | Y | A value count that differs from the member count fails every entry with `type-inconsistent` |
 | GetDataSetDirectory | Y | Y | MMS GetNamedVariableListAttributes: the member list, each member as an IEC reference with its functional constraint, plus `mmsDeletable`. Enumerating the data set *names* of a logical node is a different service, GetLogicalNodeDirectory(DataSet), which maps onto MMS GetNameList. A member list that would exceed the negotiated maximum PDU size is answered with `resource other` |
 | CreateDataSet | Y | Y | MMS DefineNamedVariableList, domain scope; association scope is not implemented |

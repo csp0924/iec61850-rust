@@ -12,7 +12,7 @@
 //!     <ObjectName>     -- variableListName CHOICE, which carries its own tag
 //!     0xa0 <len>       -- listOfVariable [0] IMPLICIT SEQUENCE OF Member
 //!       0x30 <len>     -- Member SEQUENCE
-//!         0xa0 <len>   -- variableSpecification.name [0] IMPLICIT
+//!         0xa0 <len>   -- variableSpecification.name [0] EXPLICIT
 //!           <ObjectName>
 //!         [0xa5 <AlternateAccess>]  -- alternateAccess [5] IMPLICIT OPTIONAL
 //!       ... repeated once per member
@@ -41,7 +41,11 @@ pub const SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST: u8 = 0xab;
 /// Outer tag of listOfVariable `[0]` IMPLICIT SEQUENCE OF Member.
 const TAG_LIST_OF_VARIABLE: u8 = 0xa0;
 
-/// Tag of variableSpecification.name `[0]` IMPLICIT inside a Member.
+/// Tag of variableSpecification.name `[0]` EXPLICIT inside a Member.
+///
+/// The tag is explicit because the alternative it selects is a CHOICE,
+/// which no implicit tag may replace, so the ObjectName keeps its own tag
+/// inside this wrapper.
 const TAG_VAR_SPEC_NAME: u8 = 0xa0;
 
 /// The UNIVERSAL 16 CONSTRUCTED SEQUENCE tag.
@@ -161,7 +165,7 @@ impl DefineNamedVariableListRequest {
 fn encode_member(entry: &DefineNamedVariableEntry, buf: &mut BytesMut) {
     let mut member = BytesMut::new();
 
-    // variableSpecification.name [0] IMPLICIT: a 0xa0 wrapper around the ObjectName
+    // variableSpecification.name [0] EXPLICIT: a 0xa0 wrapper around the ObjectName
     let mut name_inner = BytesMut::new();
     entry.object_name().encode(&mut name_inner);
     member.extend_from_slice(&[TAG_VAR_SPEC_NAME]);
@@ -249,7 +253,7 @@ fn decode_member(data: &[u8]) -> Result<DefineNamedVariableEntry, MmsError> {
     if data.is_empty() {
         return Err(MmsError::TruncatedPdu);
     }
-    // the first element is variableSpecification.name [0] IMPLICIT, a 0xa0 over ObjectName
+    // the first element is variableSpecification.name [0] EXPLICIT, a 0xa0 over ObjectName
     if data[0] != TAG_VAR_SPEC_NAME {
         return Err(MmsError::InvalidTag {
             expected: TAG_VAR_SPEC_NAME,

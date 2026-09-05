@@ -809,10 +809,11 @@ fn dispatch_get_var_access_attrs(
 /// Dispatches a Read request (`0xa4`) with data set, control, reporting,
 /// setting group, and GOOSE control block routing.
 ///
-/// A read that expands a logical node or a functional-constraint group tracks a
-/// byte budget as it goes; exceeding the negotiated maximum PDU size replaces
-/// the whole ReadResponse with a ConfirmedError of errorClass resource other, as
-/// IEC 61850-8-1 requires, rather than failing individual entries.
+/// A read that expands a logical node or a functional-constraint group, and a
+/// read that names a data set, track a byte budget as they go; exceeding the
+/// negotiated maximum PDU size replaces the whole ReadResponse with a
+/// ConfirmedError of errorClass resource other, as IEC 61850-8-1 requires,
+/// rather than failing individual entries.
 #[cfg(any(
     feature = "reporting",
     feature = "control",
@@ -900,16 +901,36 @@ fn dispatch_read(
             };
 
             // Each entry snapshots its value under the shared lock and is then
-            // converted to wire data.
+            // converted to wire data. One budget covers the whole list of
+            // access results, derived from the same negotiated maximum as the
+            // variable-list form of the request, so the same values are
+            // refused at the same size whichever way the read names them.
             use crate::service::convert::mms_value_to_mms_data;
-            let results: Vec<AccessResult> = dataset
-                .entries
-                .iter()
-                .map(|entry| match entry.read_value() {
+            let mut remaining_budget = pdu_budget_for_access_results(negotiated_max_pdu_size);
+            let mut results: Vec<AccessResult> = Vec::with_capacity(dataset.entries.len());
+            for entry in &dataset.entries {
+                let result = match entry.read_value() {
                     Some(v) => AccessResult::Success(mms_value_to_mms_data(&v)),
                     None => AccessResult::Failure(DataAccessError::HardwareFault),
-                })
-                .collect();
+                };
+                if let Some(b) = remaining_budget.as_mut() {
+                    let used = result.estimated_encoded_size();
+                    if *b < used {
+                        tracing::warn!(
+                            invoke_id,
+                            domain = key.0.as_str(),
+                            list = key.1.as_str(),
+                            "read: the data set values exceed the negotiated maximum PDU size, answering the whole request with a resource error"
+                        );
+                        return make_confirmed_error(
+                            invoke_id,
+                            ErrorClass::Resource(resource::OTHER),
+                        );
+                    }
+                    *b -= used;
+                }
+                results.push(result);
+            }
             let resp = ReadResponse {
                 variable_access_spec: None,
                 list_of_access_result: results,
@@ -3515,7 +3536,6 @@ mod tests {
     }
 
     /// A connection that has negotiated `max_pdu_size`.
-    #[cfg(feature = "reporting")]
     fn conn_with_max(max_pdu_size: u32) -> MmsServerConnection {
         use iec61850_mms::mms::server::connection::NegotiatedParams;
 
@@ -3621,6 +3641,280 @@ mod tests {
         match resp {
             ConfirmedResponse::Response(bytes) => assert_eq!(bytes[0], 0xa1),
             other => panic!("expected a response, got {:?}", other),
+        }
+    }
+
+    // ── GetDataSetValues under the read budget ──────────────────────
+
+    /// Value every member of the data set under test holds. A visible string
+    /// encodes as its tag, a single length byte, and its characters, so each
+    /// member costs a predictable share of the budget.
+    #[cfg(feature = "reporting")]
+    const DATASET_MEMBER_VALUE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Registers a configured data set of `members` entries, each holding
+    /// [`DATASET_MEMBER_VALUE`], and returns the access results those members
+    /// imply in registration order.
+    #[cfg(feature = "reporting")]
+    fn register_dataset_of_values(
+        dispatcher: &MmsModelDispatcher,
+        members: usize,
+    ) -> Vec<AccessResult> {
+        use crate::reporting::{Dataset, DatasetEntry};
+        use crate::service::convert::mms_value_to_mms_data;
+
+        let value = || MmsValue::VisibleString(DATASET_MEMBER_VALUE.to_string());
+
+        let mut dataset = Dataset::new(NVL_LIST_NAME);
+        for n in 0..members {
+            dataset.push(DatasetEntry::new(
+                format!("{NVL_DOMAIN}/GGIO1$ST$Ind{n}$stVal"),
+                Arc::new(std::sync::RwLock::new(value())),
+            ));
+        }
+        dispatcher
+            .dataset_registry
+            .write()
+            .expect("the data set registry lock must be usable")
+            .insert(
+                (NVL_DOMAIN.to_string(), NVL_LIST_NAME.to_string()),
+                Arc::new(dataset),
+            );
+
+        (0..members)
+            .map(|_| AccessResult::Success(mms_value_to_mms_data(&value())))
+            .collect()
+    }
+
+    /// The GetDataSetValues service body for the registered data set: a Read
+    /// whose access specification names the variable list itself.
+    #[cfg(feature = "reporting")]
+    fn dataset_values_request_body(invoke_id: u32) -> Bytes {
+        use iec61850_mms::mms::pdu::common::ObjectName;
+        use iec61850_mms::mms::pdu::read::{encode_confirmed_read_request, ReadRequest};
+
+        let req = ReadRequest::named_list(
+            ObjectName::DomainSpecific {
+                domain_id: NVL_DOMAIN.to_string(),
+                item_id: NVL_LIST_NAME.to_string(),
+            },
+            false,
+        );
+        let mut buf = BytesMut::new();
+        encode_confirmed_read_request(invoke_id, &req, &mut buf);
+        extract_service_body_from_confirmed_request(&buf)
+    }
+
+    /// Encoded length of a list of access results, measured with the wire
+    /// encoder rather than with the size estimate the budget deducts.
+    #[cfg(feature = "reporting")]
+    fn access_results_encoded_len(results: &[AccessResult]) -> usize {
+        let mut buf = BytesMut::new();
+        for result in results {
+            result.encode(&mut buf);
+        }
+        buf.len()
+    }
+
+    /// Bytes the read budget holds back from the negotiated maximum for the
+    /// ReadResponse frame and the carrying protocol frames, derived from the
+    /// budget helper so that a boundary can be stated as a negotiated size.
+    #[cfg(feature = "reporting")]
+    fn read_budget_overhead() -> usize {
+        const PROBE: u32 = 4_096;
+
+        PROBE as usize
+            - pdu_budget_for_access_results(Some(PROBE)).expect("a negotiated maximum has a budget")
+    }
+
+    /// Values that do not fit the negotiated maximum PDU size answer the whole
+    /// request with errorClass resource other, not a truncated list.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_dataset_values_over_budget_returns_resource_other() {
+        const INVOKE_ID: u32 = 41;
+
+        let dispatcher = build_dispatcher();
+        register_dataset_of_values(&dispatcher, 40);
+
+        let resp = dispatcher.dispatch(
+            &conn_with_max(200),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: dataset_values_request_body(INVOKE_ID),
+            },
+        );
+        assert_resource_other(resp, INVOKE_ID);
+    }
+
+    /// A data set that fits is read in full over the same negotiated maximum,
+    /// so the limit and not the data set path is what refuses the larger one.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_dataset_values_within_budget_returns_the_values() {
+        use iec61850_mms::mms::pdu::read::decode_confirmed_read_response;
+
+        const INVOKE_ID: u32 = 42;
+
+        let dispatcher = build_dispatcher();
+        let expected = register_dataset_of_values(&dispatcher, 3);
+
+        let resp = dispatcher.dispatch(
+            &conn_with_max(200),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: dataset_values_request_body(INVOKE_ID),
+            },
+        );
+        match resp {
+            ConfirmedResponse::Response(bytes) => {
+                let (invoke_id, read_response) =
+                    decode_confirmed_read_response(&bytes).expect("the response must decode");
+                assert_eq!(invoke_id, INVOKE_ID);
+                assert_eq!(
+                    read_response.list_of_access_result, expected,
+                    "every member value must reach the client"
+                );
+            }
+            other => panic!("expected a response, got {:?}", other),
+        }
+    }
+
+    /// Before negotiation completes no maximum bounds the read, so the same
+    /// data set is served whatever its size.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_dataset_values_unnegotiated_sends_the_response() {
+        use iec61850_mms::mms::pdu::read::decode_confirmed_read_response;
+
+        const INVOKE_ID: u32 = 43;
+        const MEMBERS: usize = 40;
+
+        let dispatcher = build_dispatcher();
+        register_dataset_of_values(&dispatcher, MEMBERS);
+
+        let resp = dispatcher.dispatch(
+            &make_conn(),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: dataset_values_request_body(INVOKE_ID),
+            },
+        );
+        match resp {
+            ConfirmedResponse::Response(bytes) => {
+                let (_, read_response) =
+                    decode_confirmed_read_response(&bytes).expect("the response must decode");
+                assert_eq!(read_response.list_of_access_result.len(), MEMBERS);
+            }
+            other => panic!("expected a response, got {:?}", other),
+        }
+    }
+
+    /// The list of access results is charged against the negotiated maximum:
+    /// a list of exactly the budget is delivered, and one byte less of budget
+    /// answers resource other.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_dataset_values_at_the_budget_boundary() {
+        const INVOKE_ID: u32 = 44;
+
+        let dispatcher = build_dispatcher();
+        let expected = register_dataset_of_values(&dispatcher, 4);
+        let exact_max = (access_results_encoded_len(&expected) + read_budget_overhead()) as u32;
+
+        let request = || ConfirmedRequest {
+            invoke_id: INVOKE_ID,
+            service_body: dataset_values_request_body(INVOKE_ID),
+        };
+
+        match dispatcher.dispatch(&conn_with_max(exact_max), request()) {
+            ConfirmedResponse::Response(bytes) => assert_eq!(
+                bytes[0], 0xa1,
+                "a list of exactly the budget must be delivered"
+            ),
+            other => panic!("expected a response, got {:?}", other),
+        }
+
+        assert_resource_other(
+            dispatcher.dispatch(&conn_with_max(exact_max - 1), request()),
+            INVOKE_ID,
+        );
+    }
+
+    // ── GetNameList keeps its own page under a small maximum ────────
+
+    /// Logical devices the model needs for a domain name list to run past one
+    /// page and set `moreFollows`.
+    const PAGED_DOMAIN_COUNT: usize = 101;
+
+    /// A dispatcher whose model holds [`PAGED_DOMAIN_COUNT`] logical devices.
+    fn build_paged_dispatcher() -> MmsModelDispatcher {
+        let mut builder = IedModelBuilder::new("IED1");
+        for n in 0..PAGED_DOMAIN_COUNT {
+            let ld = LogicalDeviceBuilder::new(format!("LD{n}"))
+                .add_ln(LogicalNodeBuilder::lln0().build().expect("lln0"))
+                .build()
+                .expect("logical device");
+            builder = builder.add_ld(ld).expect("add_ld");
+        }
+        let model = builder.build().expect("model");
+        let mms_model = MmsDeviceModel::from_ied_model(&model).expect("mms model");
+        MmsModelDispatcher::new(
+            Arc::new(model),
+            Arc::new(mms_model),
+            Arc::new(WriteAccessPolicies::default()),
+        )
+    }
+
+    /// GetNameList bounds its own answer by paging, so the outbound size limit
+    /// leaves it alone: a page larger than the negotiated maximum is still
+    /// delivered with `moreFollows` set, because replacing it with an error
+    /// would lose the continuation point the client resumes browsing from.
+    #[test]
+    fn dispatcher_get_name_list_page_survives_a_small_negotiated_size() {
+        use iec61850_mms::mms::pdu::get_name_list::{
+            decode_confirmed_get_name_list_response, encode_confirmed_get_name_list_request,
+            GetNameListRequest, ObjectClass, ObjectScope,
+        };
+
+        const INVOKE_ID: u32 = 51;
+        const SMALL_MAX_PDU_SIZE: u32 = 128;
+
+        let dispatcher = build_paged_dispatcher();
+        let gnl_req = GetNameListRequest {
+            object_class: ObjectClass::Domain,
+            object_scope: ObjectScope::VmdSpecific,
+            continue_after: None,
+        };
+        let mut full_buf = BytesMut::new();
+        encode_confirmed_get_name_list_request(INVOKE_ID, &gnl_req, &mut full_buf);
+
+        let resp = dispatcher.dispatch(
+            &conn_with_max(SMALL_MAX_PDU_SIZE),
+            ConfirmedRequest {
+                invoke_id: INVOKE_ID,
+                service_body: extract_service_body_from_confirmed_request(&full_buf),
+            },
+        );
+        match resp {
+            ConfirmedResponse::Response(bytes) => {
+                assert!(
+                    bytes.len() > SMALL_MAX_PDU_SIZE as usize,
+                    "the page must exceed the negotiated maximum for this to test the exception"
+                );
+                let (invoke_id, name_list) = decode_confirmed_get_name_list_response(&bytes)
+                    .expect("the name list must decode");
+                assert_eq!(invoke_id, INVOKE_ID);
+                assert!(
+                    !name_list.identifiers.is_empty(),
+                    "the page must carry names"
+                );
+                assert!(
+                    name_list.more_follows,
+                    "a name list longer than one page must set moreFollows"
+                );
+            }
+            other => panic!("a paged name list must be delivered, got {:?}", other),
         }
     }
 

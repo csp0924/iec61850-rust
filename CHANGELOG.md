@@ -48,6 +48,11 @@ Every crate in the workspace shares one version number.
   maximum is therefore never sent a GetNamedVariableListAttributes member list
   or a GetVariableAccessAttributes type specification it cannot accept. Read
   and GetNameList keep their own budget and pagination.
+- **`iec61850-server`** — a Read that names a data set, the ACSI
+  GetDataSetValues service, charges its access results against the negotiated
+  maximum PDU size the same way as a Read that lists its variables. A data set
+  whose values do not fit is answered with errorClass `resource other` for the
+  whole request instead of a truncated list of access results.
 - **`iec61850-client`** — `IedConnection::get_data_set_directory`, the ACSI
   GetDataSetDirectory service, returning `DataSetDirectory` with each member as
   an IEC reference and its functional constraint.
