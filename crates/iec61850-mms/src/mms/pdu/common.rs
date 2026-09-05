@@ -317,8 +317,8 @@ pub enum VariableAccessSpecification {
 /// Wire layout per entry (ASN.1 `ListOfVariableSeq`):
 /// ```text
 /// 0x30 <len>            -- UNIVERSAL SEQUENCE
-///   0xa0 <len>          -- variableSpecification.name [0] IMPLICIT
-///     <ObjectName body>
+///   0xa0 <len>          -- variableSpecification.name [0] EXPLICIT
+///     <ObjectName>
 ///   [<AlternateAccess>] -- OPTIONAL: 0x30 <len> ... (SEQUENCE OF)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,7 +456,11 @@ pub(super) fn encode_list_of_variable_seq(entry: &ListOfVariableEntry, buf: &mut
     buf.extend_from_slice(&seq_inner);
 }
 
-/// Encodes VariableSpecification.name, tag 0xa0 IMPLICIT CONSTRUCTED over an ObjectName.
+/// Encodes VariableSpecification.name, tag 0xa0 over an ObjectName.
+///
+/// `name [0]` tags a CHOICE, so the tagging is EXPLICIT whatever the module
+/// default: the `0xa0` wrapper carries the chosen ObjectName alternative,
+/// `0xa1` for a domain-specific name, with its own tag intact.
 fn encode_variable_specification_name(name: &ObjectName, buf: &mut BytesMut) {
     let mut obj_buf = BytesMut::new();
     name.encode(&mut obj_buf);
