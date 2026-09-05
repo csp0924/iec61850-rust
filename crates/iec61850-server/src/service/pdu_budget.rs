@@ -89,7 +89,7 @@ pub(crate) fn guard_outbound_pdu_size(
         negotiated_max_pdu_size,
         "the response exceeds the negotiated maximum PDU size, answering a resource error"
     );
-    crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Resource(resource::OTHER))
+    super::make_confirmed_error(invoke_id, ErrorClass::Resource(resource::OTHER))
 }
 
 #[cfg(test)]

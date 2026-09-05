@@ -492,7 +492,7 @@ pub(super) fn decode_list_of_variable(data: &[u8]) -> Result<Vec<ListOfVariableE
         let seq_inner = &data[seq_start..seq_start + seq_len];
         pos = seq_start + seq_len;
 
-        // VariableSpecification.name [0] IMPLICIT = 0xa0
+        // VariableSpecification.name [0] EXPLICIT = 0xa0
         if seq_inner.is_empty() {
             return Err(MmsError::TruncatedPdu);
         }
