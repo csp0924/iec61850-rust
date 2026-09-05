@@ -19,7 +19,10 @@ Every crate in the workspace shares one version number.
   from the data set registry: members in registration order, `mmsDeletable`
   true only for a data set created through DefineNamedVariableList, and
   `object-non-existent` for an unknown name. The service is advertised in
-  `servicesSupportedCalled` when the reporting subsystem is compiled in.
+  `servicesSupportedCalled` when the reporting subsystem is compiled in. A
+  member list that would exceed the maximum PDU size negotiated for the
+  association is answered with errorClass `resource other`, as is an
+  oversized GetVariableAccessAttributes type specification.
 - **`iec61850-client`** — `IedConnection::get_data_set_directory`, the ACSI
   GetDataSetDirectory service, returning `DataSetDirectory` with each member as
   an IEC reference and its functional constraint.

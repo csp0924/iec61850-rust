@@ -25,6 +25,7 @@ pub mod get_name_list;
 #[cfg(feature = "reporting")]
 pub mod get_named_variable_list_attrs;
 pub mod get_var_access_attrs;
+pub(crate) mod pdu_budget;
 pub mod read;
 pub mod write;
 
@@ -464,9 +465,12 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "logging")]
                 &self.log_controls,
             ),
-            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => {
-                dispatch_get_var_access_attrs(invoke_id, &body, &self.mms_model)
-            }
+            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => dispatch_get_var_access_attrs(
+                invoke_id,
+                &body,
+                &self.mms_model,
+                conn.negotiated_max_pdu_size(),
+            ),
             SERVICE_TAG_IDENTIFY => dispatch_identify(invoke_id, &self.identification),
             SERVICE_TAG_READ => dispatch_read(
                 invoke_id,
@@ -524,6 +528,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &body,
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
+                conn.negotiated_max_pdu_size(),
             ),
             // DeleteNamedVariableList, the mapping of DeleteDataSet.
             #[cfg(feature = "reporting")]
@@ -739,10 +744,16 @@ fn is_lcb_path(item: &str) -> bool {
 }
 
 /// Dispatches a GetVariableAccessAttributes request (`0xa6`).
+///
+/// The type specification of a logical node grows with the model, so the
+/// encoded response is measured against the negotiated maximum PDU size before
+/// it is sent; one that does not fit answers a ConfirmedError of errorClass
+/// resource other.
 fn dispatch_get_var_access_attrs(
     invoke_id: u32,
     body: &Bytes,
     mms_model: &MmsDeviceModel,
+    negotiated_max_pdu_size: Option<u32>,
 ) -> ConfirmedResponse {
     let req = match GetVariableAccessAttributesRequest::decode(body) {
         Ok(r) => r,
@@ -760,7 +771,21 @@ fn dispatch_get_var_access_attrs(
         GetVarAccessAttrsResult::Response(resp) => {
             let mut buf = BytesMut::new();
             match encode_confirmed_get_var_access_attrs_response(invoke_id, &resp, &mut buf) {
-                Ok(()) => ConfirmedResponse::Response(buf.freeze()),
+                Ok(()) => {
+                    if pdu_budget::response_exceeds_pdu_budget(buf.len(), negotiated_max_pdu_size) {
+                        tracing::warn!(
+                            invoke_id,
+                            encoded_len = buf.len(),
+                            negotiated_max_pdu_size,
+                            "get-variable-access-attributes: the response exceeds the negotiated maximum PDU size, answering a resource error"
+                        );
+                        return make_confirmed_error(
+                            invoke_id,
+                            ErrorClass::Resource(resource::OTHER),
+                        );
+                    }
+                    ConfirmedResponse::Response(buf.freeze())
+                }
                 Err(e) => {
                     tracing::warn!(
                         invoke_id,
@@ -3349,6 +3374,83 @@ mod tests {
                 "get-variable-access-attributes must answer with a response, got {:?}",
                 other
             ),
+        }
+    }
+
+    /// The type specification is measured against the negotiated maximum PDU
+    /// size: a response of exactly the budget is sent, one byte more is
+    /// answered with errorClass resource other.
+    #[test]
+    fn dispatcher_gva_over_budget_returns_resource_other() {
+        use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
+        use iec61850_mms::mms::pdu::{
+            common::ObjectName,
+            get_var_access_attrs::{
+                encode_confirmed_get_var_access_attrs_request, GetVariableAccessAttributesRequest,
+            },
+        };
+        use iec61850_mms::mms::server::connection::NegotiatedParams;
+
+        const INVOKE_ID: u32 = 21;
+
+        let dispatcher = build_dispatcher();
+        let gva_req = GetVariableAccessAttributesRequest {
+            object_name: ObjectName::DomainSpecific {
+                domain_id: "IED1LD0".to_string(),
+                item_id: "MMXU1$MX$TotW$mag".to_string(),
+            },
+        };
+
+        // The expected size comes from encoding the response the model implies,
+        // not from what the dispatch path returns.
+        let resp = match handle_get_var_access_attrs(&dispatcher.mms_model, &gva_req) {
+            GetVarAccessAttrsResult::Response(r) => r,
+            other => panic!("the model must resolve this path, got {:?}", other),
+        };
+        let mut expected = BytesMut::new();
+        encode_confirmed_get_var_access_attrs_response(INVOKE_ID, &resp, &mut expected)
+            .expect("the type specification must encode");
+        let exact_max = (expected.len() + read::PDU_OVERHEAD_RESERVE) as u32;
+
+        let mut full_buf = BytesMut::new();
+        encode_confirmed_get_var_access_attrs_request(INVOKE_ID, &gva_req, &mut full_buf);
+        let body = extract_service_body_from_confirmed_request(&full_buf);
+
+        let dispatch_with_max = |max_pdu_size: u32| {
+            let mut conn = MmsServerConnection::new();
+            conn.set_negotiated(NegotiatedParams {
+                max_pdu_size,
+                ..NegotiatedParams::default()
+            });
+            dispatcher.dispatch(
+                &conn,
+                ConfirmedRequest {
+                    invoke_id: INVOKE_ID,
+                    service_body: body.clone(),
+                },
+            )
+        };
+
+        match dispatch_with_max(exact_max) {
+            ConfirmedResponse::Response(bytes) => assert_eq!(
+                bytes[0], 0xa1,
+                "a response of exactly the budget must be sent"
+            ),
+            other => panic!("expected a response, got {:?}", other),
+        }
+
+        match dispatch_with_max(exact_max - 1) {
+            ConfirmedResponse::Error(bytes) => {
+                let (invoke_id, service_error) =
+                    decode_confirmed_error_pdu(&bytes).expect("the confirmed error must decode");
+                assert_eq!(invoke_id, INVOKE_ID);
+                assert_eq!(
+                    service_error.error_class,
+                    ErrorClass::Resource(resource::OTHER),
+                    "a response one byte over the budget must answer resource other"
+                );
+            }
+            other => panic!("expected a confirmed error, got {:?}", other),
         }
     }
 
