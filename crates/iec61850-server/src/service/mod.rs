@@ -3,8 +3,8 @@
 //! `MmsModelDispatcher` implements the `MmsServiceDispatcher` trait and routes
 //! a ConfirmedRequest by its service tag: `0xa1` GetNameList, `0xa6`
 //! GetVariableAccessAttributes, `0xa4` Read, `0xa5` Write, `0x82` Identify,
-//! `0xab` DefineNamedVariableList, `0xad` DeleteNamedVariableList, and the
-//! long-form `0xbf 0x41` ReadJournal.
+//! `0xab` DefineNamedVariableList, `0xac` GetNamedVariableListAttributes,
+//! `0xad` DeleteNamedVariableList, and the long-form `0xbf 0x41` ReadJournal.
 //!
 //! `ConfirmedResponse::Response` carries a complete ConfirmedResponsePdu,
 //! outermost `0xa1 <len>` tag included, exactly as the
@@ -22,6 +22,8 @@ pub mod define_named_variable_list;
 #[cfg(feature = "reporting")]
 pub mod delete_named_variable_list;
 pub mod get_name_list;
+#[cfg(feature = "reporting")]
+pub mod get_named_variable_list_attrs;
 pub mod get_var_access_attrs;
 pub mod read;
 pub mod write;
@@ -350,10 +352,10 @@ const SERVICES_READ_JOURNAL_BIT: u8 = 0x40;
 /// services this build actually serves.
 ///
 /// Starting from the baseline of the connection layer, a bit is cleared unless
-/// a handler answers it: `status`, `cancel`, and
-/// `getNamedVariableListAttributes` have no handler in any build, and data set
-/// creation and deletion together with `informationReport` are cleared without
-/// the reporting subsystem. The baseline carries no journal service, so
+/// a handler answers it: `status` and `cancel` have no handler in any build,
+/// and data set creation, deletion and directory together with
+/// `informationReport` are cleared without the reporting subsystem. The
+/// baseline carries no journal service, so
 /// `readJournal` is set rather than cleared when the logging subsystem answers
 /// it; `writeJournal` stays clear, since that request is answered with an
 /// access error rather than served.
@@ -371,10 +373,10 @@ fn compute_services_supported(reporting: bool, logging: bool) -> [u8; 11] {
     use iec61850_mms::mms::server::connection::SERVER_SERVICES_SUPPORTED;
     let mut map = SERVER_SERVICES_SUPPORTED;
     map[0] &= !0x80; // status
-    map[1] &= !0x08; // getNamedVariableListAttributes
     map[10] &= !0x08; // cancel: a Cancel-RequestPDU is rejected at the PDU layer
     if !reporting {
-        map[1] &= !(0x10 | 0x04); // define and delete NamedVariableList
+        // define, getAttributes and delete NamedVariableList
+        map[1] &= !(0x10 | 0x08 | 0x04);
         map[9] &= !0x01; // informationReport
     }
     if logging {
@@ -509,6 +511,14 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 invoke_id,
                 &body,
                 &self.model,
+                &self.dataset_registry,
+                &self.dynamic_dataset_keys,
+            ),
+            // GetNamedVariableListAttributes, the mapping of GetDataSetDirectory.
+            #[cfg(feature = "reporting")]
+            0xac => get_named_variable_list_attrs::handle_get_named_variable_list_attributes(
+                invoke_id,
+                &body,
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
             ),
@@ -2792,17 +2802,27 @@ mod services_supported_tests {
     const ALL_BUILDS: [(bool, bool); 4] =
         [(true, true), (true, false), (false, true), (false, false)];
 
-    /// No build answers getNamedVariableListAttributes (`0xac`), so no build
-    /// may advertise it.
+    /// getNamedVariableListAttributes (`0xac`) is answered from the data set
+    /// registry, so it is advertised exactly when the reporting subsystem is
+    /// compiled in.
     #[test]
-    fn never_advertises_get_nvl_attributes() {
-        for (reporting, logging) in ALL_BUILDS {
-            assert_eq!(compute_services_supported(reporting, logging)[1] & 0x08, 0);
+    fn reporting_gates_get_nvl_attributes() {
+        for logging in [true, false] {
+            assert_eq!(
+                compute_services_supported(true, logging)[1] & 0x08,
+                0x08,
+                "a reporting build must advertise getNamedVariableListAttributes"
+            );
+            assert_eq!(
+                compute_services_supported(false, logging)[1] & 0x08,
+                0,
+                "a build without reporting must not advertise getNamedVariableListAttributes"
+            );
         }
     }
 
-    /// Data set creation and deletion and `informationReport` belong to the
-    /// reporting subsystem and are advertised only when it is enabled: a client
+    /// Data set creation, deletion and directory and `informationReport` belong
+    /// to the reporting subsystem and are advertised only when it is enabled: a client
     /// enables its own data set paths from this bitmap, and advertising a
     /// service that is not implemented leads it into a request that can only
     /// fail.
@@ -2827,7 +2847,7 @@ mod services_supported_tests {
 
         let without = compute_services_supported(false, false);
         assert_eq!(
-            without[1] & (0x10 | 0x04),
+            without[1] & (0x10 | 0x08 | 0x04),
             0,
             "a build without reporting must not advertise data set services"
         );
@@ -2914,7 +2934,7 @@ mod services_supported_tests {
     fn full_bitmap_is_bit_exact() {
         assert_eq!(
             compute_services_supported(true, true),
-            [0x6e, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10],
+            [0x6e, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10],
             "a build with reporting and logging"
         );
         assert_eq!(
@@ -3026,22 +3046,61 @@ mod tests {
     /// A service the bitmap does not advertise is still answered, with a
     /// Reject, when a client sends it anyway. Advertising honestly and
     /// answering everything are one pair: without the first a client walks into
-    /// a dead end, without the second it waits forever.
+    /// a dead end, without the second it waits forever. `0x80` is Status,
+    /// which no build serves.
     #[test]
     fn dispatcher_unadvertised_services_return_reject_not_silence() {
         let dispatcher = build_dispatcher();
         let conn = make_conn();
-        for tag in [0x80u8, 0xac] {
-            let req = ConfirmedRequest {
+        let req = ConfirmedRequest {
+            invoke_id: 7,
+            service_body: Bytes::copy_from_slice(&[0x80, 0x00]),
+        };
+        let resp = dispatcher.dispatch(&conn, req);
+        assert!(
+            matches!(resp, ConfirmedResponse::Reject),
+            "status must be rejected, neither ignored nor panicked on"
+        );
+    }
+
+    /// GetNamedVariableListAttributes (`0xac`) reaches its handler rather than
+    /// the unknown-tag arm: a malformed body is answered with a
+    /// ConfirmedError, and a well-formed request for a data set that is not
+    /// registered with `object-non-existent` rather than an empty member list.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn dispatcher_get_nvl_attrs_is_routed_to_its_handler() {
+        use iec61850_mms::mms::pdu::get_named_variable_list_attrs::GetNamedVariableListAttributesRequest;
+
+        let dispatcher = build_dispatcher();
+        let conn = make_conn();
+
+        let malformed = dispatcher.dispatch(
+            &conn,
+            ConfirmedRequest {
                 invoke_id: 7,
-                service_body: Bytes::copy_from_slice(&[tag, 0x00]),
-            };
-            let resp = dispatcher.dispatch(&conn, req);
-            assert!(
-                matches!(resp, ConfirmedResponse::Reject),
-                "0x{tag:02x} must be rejected, neither ignored nor panicked on"
-            );
-        }
+                service_body: Bytes::copy_from_slice(&[0xac, 0x00]),
+            },
+        );
+        assert!(
+            matches!(malformed, ConfirmedResponse::Error(_)),
+            "a malformed 0xac body must produce a confirmed error"
+        );
+
+        let mut body = BytesMut::new();
+        GetNamedVariableListAttributesRequest::domain("IED1LD0", "GGIO1$ds_absent")
+            .encode(&mut body);
+        let unknown = dispatcher.dispatch(
+            &conn,
+            ConfirmedRequest {
+                invoke_id: 8,
+                service_body: body.freeze(),
+            },
+        );
+        assert!(
+            matches!(unknown, ConfirmedResponse::Error(_)),
+            "an unregistered data set must produce a confirmed error"
+        );
     }
 
     // ── GetNameList answers with a response ─────────────────────────
