@@ -8,6 +8,20 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+- **`iec61850-mms`** — the MMS GetNamedVariableListAttributes PDUs (confirmed
+  service tag `0xac`) and `MmsClient::get_named_variable_list_attributes`, with
+  a synchronous wrapper on `BlockingMmsClient`.
+- **`iec61850-server`** — a GetNamedVariableListAttributes handler answering
+  from the data set registry: members in registration order, `mmsDeletable`
+  true only for a data set created through DefineNamedVariableList, and
+  `object-non-existent` for an unknown name. The service is advertised in
+  `servicesSupportedCalled` when the reporting subsystem is compiled in.
+- **`iec61850-client`** — `IedConnection::get_data_set_directory`, the ACSI
+  GetDataSetDirectory service, returning `DataSetDirectory` with each member as
+  an IEC reference and its functional constraint.
+
 ## [0.1.1] - 2026-09-01
 
 Documentation and packaging metadata only; no code changes.

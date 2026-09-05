@@ -71,7 +71,8 @@ the sans-IO boundaries and the contracts every crate holds to.
 
 **MMS services, server side.** Initiate and Conclude, GetNameList,
 GetVariableAccessAttributes, Read, Write, Identify, DefineNamedVariableList,
-DeleteNamedVariableList, ReadJournal, and InformationReport for reports. PDU
+GetNamedVariableListAttributes, DeleteNamedVariableList, ReadJournal, and
+InformationReport for reports. PDU
 size is negotiated on Initiate and enforced on every outbound PDU; a report too
 large for one PDU is segmented.
 
