@@ -19,7 +19,10 @@ use iec61850_mms::mms::pdu::{
         encode_confirmed_define_named_variable_list_response, DefineNamedVariableListRequest,
         DefineNamedVariableListResponse,
     },
-    service_error::ErrorClass,
+    service_error::{
+        subcode::{access, definition, resource},
+        ErrorClass,
+    },
     ObjectName,
 };
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
@@ -55,7 +58,10 @@ pub(crate) fn handle_define_named_variable_list(
                 error = %e,
                 "define-named-variable-list request failed to decode, answering confirmed-error"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(0));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OTHER),
+            );
         }
     };
 
@@ -67,7 +73,10 @@ pub(crate) fn handle_define_named_variable_list(
                 ?other,
                 "define-named-variable-list accepts only a domain-specific list name, answering object-access-unsupported"
             );
-            return crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(9));
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+            );
         }
     };
 
@@ -108,9 +117,10 @@ pub(crate) fn handle_define_named_variable_list(
                 name,
                 "define-named-variable-list name already exists, answering definition error"
             );
-            // Definition class codes: 0 object-undefined, 1 invalid-attribute,
-            // 2 object-attribute-inconsistent.
-            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Definition(0))
+            crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Definition(definition::OBJECT_EXISTS),
+            )
         }
         Err(DatasetError::MemberNotFound { path }) => {
             tracing::warn!(
@@ -118,7 +128,10 @@ pub(crate) fn handle_define_named_variable_list(
                 path,
                 "define-named-variable-list member does not resolve, answering object-non-existent"
             );
-            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(10))
+            crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+            )
         }
         Err(DatasetError::MemberInvalidPath { path }) => {
             tracing::warn!(
@@ -126,7 +139,10 @@ pub(crate) fn handle_define_named_variable_list(
                 path,
                 "define-named-variable-list member path is malformed, answering invalid-address"
             );
-            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(5))
+            crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Definition(definition::INVALID_ADDRESS),
+            )
         }
         Err(DatasetError::StaticNotDeletable { name }) => {
             // Not reachable on the add path; handled so the match stays total.
@@ -135,14 +151,17 @@ pub(crate) fn handle_define_named_variable_list(
                 name,
                 "unexpected static-not-deletable while adding a data set"
             );
-            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(0))
+            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(access::OTHER))
         }
         Err(DatasetError::RegistryPoisoned) => {
             tracing::warn!(
                 invoke_id,
                 "dataset registry lock is poisoned, answering resource error"
             );
-            crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Resource(0))
+            crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Resource(resource::OTHER),
+            )
         }
     }
 }

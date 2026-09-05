@@ -16,41 +16,231 @@ use super::super::error::MmsError;
 use crate::compat::prelude::*;
 use bytes::BytesMut;
 
+// Subcodes of the errorClass alternatives
+
+/// Named subcodes of every `errorClass` alternative, one module per alternative.
+///
+/// The values are the INTEGER named numbers of the ISO 9506-2 `ServiceError`
+/// ASN.1 definition. Every alternative except `others [12]`, which enumerates
+/// nothing, defines `OTHER = 0`.
+///
+/// The subcode namespaces are disjoint: the same number means different things
+/// under different alternatives, so a subcode is only meaningful together with
+/// the alternative that carries it.
+pub mod subcode {
+    /// Subcodes of `vmd-state [0]`.
+    pub mod vmd_state {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// vmd-state-conflict
+        pub const VMD_STATE_CONFLICT: u8 = 1;
+        /// vmd-operational-problem
+        pub const VMD_OPERATIONAL_PROBLEM: u8 = 2;
+        /// domain-transfer-problem
+        pub const DOMAIN_TRANSFER_PROBLEM: u8 = 3;
+        /// state-machine-id-invalid
+        pub const STATE_MACHINE_ID_INVALID: u8 = 4;
+    }
+
+    /// Subcodes of `application-reference [1]`.
+    pub mod application_reference {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// application-unreachable
+        pub const APPLICATION_UNREACHABLE: u8 = 1;
+        /// connection-lost
+        pub const CONNECTION_LOST: u8 = 2;
+        /// application-reference-invalid
+        pub const APPLICATION_REFERENCE_INVALID: u8 = 3;
+        /// context-unsupported
+        pub const CONTEXT_UNSUPPORTED: u8 = 4;
+    }
+
+    /// Subcodes of `definition [2]`.
+    pub mod definition {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// object-undefined
+        pub const OBJECT_UNDEFINED: u8 = 1;
+        /// invalid-address
+        pub const INVALID_ADDRESS: u8 = 2;
+        /// type-unsupported
+        pub const TYPE_UNSUPPORTED: u8 = 3;
+        /// type-inconsistent
+        pub const TYPE_INCONSISTENT: u8 = 4;
+        /// object-exists
+        pub const OBJECT_EXISTS: u8 = 5;
+        /// object-attribute-inconsistent
+        pub const OBJECT_ATTRIBUTE_INCONSISTENT: u8 = 6;
+    }
+
+    /// Subcodes of `resource [3]`.
+    pub mod resource {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// memory-unavailable
+        pub const MEMORY_UNAVAILABLE: u8 = 1;
+        /// processor-resource-unavailable
+        pub const PROCESSOR_RESOURCE_UNAVAILABLE: u8 = 2;
+        /// mass-storage-unavailable
+        pub const MASS_STORAGE_UNAVAILABLE: u8 = 3;
+        /// capability-unavailable
+        pub const CAPABILITY_UNAVAILABLE: u8 = 4;
+        /// capability-unknown
+        pub const CAPABILITY_UNKNOWN: u8 = 5;
+    }
+
+    /// Subcodes of `service [4]`.
+    pub mod service {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// primitives-out-of-sequence
+        pub const PRIMITIVES_OUT_OF_SEQUENCE: u8 = 1;
+        /// object-state-conflict
+        pub const OBJECT_STATE_CONFLICT: u8 = 2;
+        /// pdu-size
+        pub const PDU_SIZE: u8 = 3;
+        /// continuation-invalid
+        pub const CONTINUATION_INVALID: u8 = 4;
+        /// object-constraint-conflict
+        pub const OBJECT_CONSTRAINT_CONFLICT: u8 = 5;
+    }
+
+    /// Subcodes of `service-preempt [5]`.
+    pub mod service_preempt {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// timeout
+        pub const TIMEOUT: u8 = 1;
+        /// deadlock
+        pub const DEADLOCK: u8 = 2;
+        /// cancel
+        pub const CANCEL: u8 = 3;
+    }
+
+    /// Subcodes of `time-resolution [6]`.
+    pub mod time_resolution {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// unsupportable-time-resolution
+        pub const UNSUPPORTABLE_TIME_RESOLUTION: u8 = 1;
+    }
+
+    /// Subcodes of `access [7]`.
+    ///
+    /// These are not the `DataAccessError` codes: `DataAccessError` is a
+    /// separate INTEGER carried inside an `AccessResult`, with its own,
+    /// unrelated numbering.
+    pub mod access {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// object-access-unsupported
+        pub const OBJECT_ACCESS_UNSUPPORTED: u8 = 1;
+        /// object-non-existent
+        pub const OBJECT_NON_EXISTENT: u8 = 2;
+        /// object-access-denied
+        pub const OBJECT_ACCESS_DENIED: u8 = 3;
+        /// object-invalidated
+        pub const OBJECT_INVALIDATED: u8 = 4;
+    }
+
+    /// Subcodes of `initiate [8]`.
+    pub mod initiate {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// version-incompatible
+        pub const VERSION_INCOMPATIBLE: u8 = 1;
+        /// max-segment-insufficient
+        pub const MAX_SEGMENT_INSUFFICIENT: u8 = 2;
+        /// max-services-outstanding-calling-insufficient
+        pub const MAX_SERVICES_OUTSTANDING_CALLING_INSUFFICIENT: u8 = 3;
+        /// max-services-outstanding-called-insufficient
+        pub const MAX_SERVICES_OUTSTANDING_CALLED_INSUFFICIENT: u8 = 4;
+        /// service-CBB-insufficient
+        pub const SERVICE_CBB_INSUFFICIENT: u8 = 5;
+        /// parameter-CBB-insufficient
+        pub const PARAMETER_CBB_INSUFFICIENT: u8 = 6;
+        /// nesting-level-insufficient
+        pub const NESTING_LEVEL_INSUFFICIENT: u8 = 7;
+    }
+
+    /// Subcodes of `conclude [9]`.
+    pub mod conclude {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// further-communication-required
+        pub const FURTHER_COMMUNICATION_REQUIRED: u8 = 1;
+    }
+
+    /// Subcodes of `cancel [10]`.
+    pub mod cancel {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// invoke-id-unknown
+        pub const INVOKE_ID_UNKNOWN: u8 = 1;
+        /// cancel-not-possible
+        pub const CANCEL_NOT_POSSIBLE: u8 = 2;
+    }
+
+    /// Subcodes of `file [11]`.
+    pub mod file {
+        /// other
+        pub const OTHER: u8 = 0;
+        /// filename-ambiguous
+        pub const FILENAME_AMBIGUOUS: u8 = 1;
+        /// file-busy
+        pub const FILE_BUSY: u8 = 2;
+        /// filename-syntax-error
+        pub const FILENAME_SYNTAX_ERROR: u8 = 3;
+        /// content-type-invalid
+        pub const CONTENT_TYPE_INVALID: u8 = 4;
+        /// position-invalid
+        pub const POSITION_INVALID: u8 = 5;
+        /// file-access-denied
+        pub const FILE_ACCESS_DENIED: u8 = 6;
+        /// file-non-existent
+        pub const FILE_NON_EXISTENT: u8 = 7;
+        /// duplicate-filename
+        pub const DUPLICATE_FILENAME: u8 = 8;
+        /// insufficient-space-in-filestore
+        pub const INSUFFICIENT_SPACE_IN_FILESTORE: u8 = 9;
+    }
+}
+
 // The errorClass CHOICE, thirteen alternatives
 
 /// The errorClass CHOICE of a ServiceError.
 ///
 /// The `u8` in each variant is the subcode INTEGER, and the BER context tag is the
-/// index of the alternative, `[0]` through `[12]`.
+/// index of the alternative, `[0]` through `[12]`. The named subcodes are in
+/// [`subcode`], one module per alternative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// `[0]` vmd-state (sub-code 0=vmd-state-conflict, 1=vmd-operational-problem, ...)
+    /// `[0]` vmd-state; subcodes in [`subcode::vmd_state`].
     VmdState(u8),
-    /// `[1]` application-reference
+    /// `[1]` application-reference; subcodes in [`subcode::application_reference`].
     ApplicationReference(u8),
-    /// `[2]` definition
+    /// `[2]` definition; subcodes in [`subcode::definition`].
     Definition(u8),
-    /// `[3]` resource
+    /// `[3]` resource; subcodes in [`subcode::resource`].
     Resource(u8),
-    /// `[4]` service
+    /// `[4]` service; subcodes in [`subcode::service`].
     Service(u8),
-    /// `[5]` service-preempt
+    /// `[5]` service-preempt; subcodes in [`subcode::service_preempt`].
     ServicePreempt(u8),
-    /// `[6]` time-resolution
+    /// `[6]` time-resolution; subcodes in [`subcode::time_resolution`].
     TimeResolution(u8),
-    /// `[7]` access
+    /// `[7]` access; subcodes in [`subcode::access`].
     Access(u8),
-    /// `[8]` initiate. Subcodes: 0 other, 1 version-incompatible,
-    ///             3=max-calling-outstanding, 4=max-called-outstanding,
-    ///             5 service-error, 6 continuing, 7 user-error.
+    /// `[8]` initiate; subcodes in [`subcode::initiate`].
     Initiate(u8),
-    /// `[9]` conclude
+    /// `[9]` conclude; subcodes in [`subcode::conclude`].
     Conclude(u8),
-    /// `[10]` cancel
+    /// `[10]` cancel; subcodes in [`subcode::cancel`].
     Cancel(u8),
-    /// `[11]` file
+    /// `[11]` file; subcodes in [`subcode::file`].
     File(u8),
-    /// `[12]` others
+    /// `[12]` others, which enumerates no subcodes.
     Others(u8),
 }
 
@@ -332,6 +522,109 @@ pub fn encode_confirmed_error_pdu(
     buf.extend_from_slice(&inner);
 }
 
+// ConfirmedError PDU decoder
+
+/// Splits one TLV at the start of `data`.
+///
+/// Returns the tag, the content and the total number of bytes the TLV occupies,
+/// header included.
+fn split_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), MmsError> {
+    if data.len() < 2 {
+        return Err(MmsError::TruncatedPdu);
+    }
+    let tag = data[0];
+    let (len, len_size) = super::initiate::decode_length(&data[1..])?;
+    let start = 1 + len_size;
+    let end = start.checked_add(len).ok_or(MmsError::InvalidLength)?;
+    if data.len() < end {
+        return Err(MmsError::TruncatedPdu);
+    }
+    Ok((tag, &data[start..end], end))
+}
+
+/// Decodes a BER INTEGER holding an ASN.1 `Unsigned32`.
+///
+/// The encoder pads a value whose most significant bit is set with a leading
+/// `0x00`, so five content bytes are the widest legal form. A shorter encoding
+/// whose first byte has its top bit set is a negative INTEGER, which an
+/// `Unsigned32` field cannot carry.
+fn decode_unsigned32(data: &[u8]) -> Result<u32, MmsError> {
+    if data.is_empty() || data.len() > 5 {
+        return Err(MmsError::InvalidLength);
+    }
+    if data[0] & 0x80 != 0 || (data.len() == 5 && data[0] != 0x00) {
+        return Err(MmsError::InvalidLength);
+    }
+    let mut val: u32 = 0;
+    for &b in data {
+        val = (val << 8) | b as u32;
+    }
+    Ok(val)
+}
+
+/// Decodes a complete ConfirmedError PDU, outer `0xa2 <len>` included, into its
+/// invokeID and ServiceError.
+///
+/// The inverse of [`encode_confirmed_error_pdu`].
+pub fn decode_confirmed_error_pdu(data: &[u8]) -> Result<(u32, ServiceError), MmsError> {
+    let (tag, inner, _) = split_tlv(data)?;
+    if tag != 0xa2 {
+        return Err(MmsError::InvalidTag {
+            expected: 0xa2,
+            actual: tag,
+        });
+    }
+    decode_confirmed_error_inner(inner)
+}
+
+/// Decodes the content of a ConfirmedError PDU, what follows the outer
+/// `0xa2 <len>`, into its invokeID and ServiceError.
+///
+/// Wire format:
+///
+/// ```text
+/// 0x80 <len> <id>  -- invokeID [0] IMPLICIT Unsigned32
+/// (0x81 <len> ...) -- modifierPosition [1] IMPLICIT Unsigned32, OPTIONAL
+/// 0xa2 <len> ...   -- serviceError [2] IMPLICIT ServiceError
+/// ```
+///
+/// invokeID carries the context tag `0x80`, not the universal INTEGER tag
+/// `0x02` that an unqualified `invokeID` field would carry in a
+/// Confirmed-RequestPDU or a Confirmed-ResponsePDU.
+///
+/// `modifierPosition` is accepted and skipped; nothing in this implementation
+/// produces one.
+pub fn decode_confirmed_error_inner(data: &[u8]) -> Result<(u32, ServiceError), MmsError> {
+    // invokeID [0] IMPLICIT Unsigned32, mandatory and first
+    let (tag, id_bytes, used) = split_tlv(data)?;
+    if tag != 0x80 {
+        return Err(MmsError::InvalidTag {
+            expected: 0x80,
+            actual: tag,
+        });
+    }
+    let invoke_id = decode_unsigned32(id_bytes)?;
+    let mut pos = used;
+
+    // modifierPosition [1] IMPLICIT Unsigned32, OPTIONAL
+    if data.get(pos) == Some(&0x81) {
+        let (_, _, used) = split_tlv(&data[pos..])?;
+        pos += used;
+    }
+
+    // serviceError [2] IMPLICIT ServiceError, mandatory
+    let (tag, se_bytes, _) = split_tlv(&data[pos..])?;
+    if tag != 0xa2 {
+        return Err(MmsError::InvalidTag {
+            expected: 0xa2,
+            actual: tag,
+        });
+    }
+    let service_error = ServiceError::decode_inner(se_bytes)?;
+
+    Ok((invoke_id, service_error))
+}
+
 // Helpers
 
 /// Encodes an `i32` as a minimal-length signed big-endian BER INTEGER.
@@ -438,5 +731,546 @@ mod tests {
         // fewer than 5 bytes
         let result = ErrorClass::decode_explicit(&[0xa0, 0x03, 0x88]);
         assert!(result.is_err());
+    }
+
+    /// The named subcodes are compared against a second, hand-written
+    /// transcription of the ISO 9506-2 named numbers, so that a wrong constant
+    /// cannot travel on the wire unnoticed.
+    #[test]
+    fn subcode_constants_match_the_asn1_named_numbers() {
+        // (alternative, subcode name, value)
+        let expected: &[(&str, &str, u8)] = &[
+            ("vmd-state", "other", subcode::vmd_state::OTHER),
+            (
+                "vmd-state",
+                "vmd-state-conflict",
+                subcode::vmd_state::VMD_STATE_CONFLICT,
+            ),
+            (
+                "vmd-state",
+                "vmd-operational-problem",
+                subcode::vmd_state::VMD_OPERATIONAL_PROBLEM,
+            ),
+            (
+                "vmd-state",
+                "domain-transfer-problem",
+                subcode::vmd_state::DOMAIN_TRANSFER_PROBLEM,
+            ),
+            (
+                "vmd-state",
+                "state-machine-id-invalid",
+                subcode::vmd_state::STATE_MACHINE_ID_INVALID,
+            ),
+            (
+                "application-reference",
+                "other",
+                subcode::application_reference::OTHER,
+            ),
+            (
+                "application-reference",
+                "application-unreachable",
+                subcode::application_reference::APPLICATION_UNREACHABLE,
+            ),
+            (
+                "application-reference",
+                "connection-lost",
+                subcode::application_reference::CONNECTION_LOST,
+            ),
+            (
+                "application-reference",
+                "application-reference-invalid",
+                subcode::application_reference::APPLICATION_REFERENCE_INVALID,
+            ),
+            (
+                "application-reference",
+                "context-unsupported",
+                subcode::application_reference::CONTEXT_UNSUPPORTED,
+            ),
+            ("definition", "other", subcode::definition::OTHER),
+            (
+                "definition",
+                "object-undefined",
+                subcode::definition::OBJECT_UNDEFINED,
+            ),
+            (
+                "definition",
+                "invalid-address",
+                subcode::definition::INVALID_ADDRESS,
+            ),
+            (
+                "definition",
+                "type-unsupported",
+                subcode::definition::TYPE_UNSUPPORTED,
+            ),
+            (
+                "definition",
+                "type-inconsistent",
+                subcode::definition::TYPE_INCONSISTENT,
+            ),
+            (
+                "definition",
+                "object-exists",
+                subcode::definition::OBJECT_EXISTS,
+            ),
+            (
+                "definition",
+                "object-attribute-inconsistent",
+                subcode::definition::OBJECT_ATTRIBUTE_INCONSISTENT,
+            ),
+            ("resource", "other", subcode::resource::OTHER),
+            (
+                "resource",
+                "memory-unavailable",
+                subcode::resource::MEMORY_UNAVAILABLE,
+            ),
+            (
+                "resource",
+                "processor-resource-unavailable",
+                subcode::resource::PROCESSOR_RESOURCE_UNAVAILABLE,
+            ),
+            (
+                "resource",
+                "mass-storage-unavailable",
+                subcode::resource::MASS_STORAGE_UNAVAILABLE,
+            ),
+            (
+                "resource",
+                "capability-unavailable",
+                subcode::resource::CAPABILITY_UNAVAILABLE,
+            ),
+            (
+                "resource",
+                "capability-unknown",
+                subcode::resource::CAPABILITY_UNKNOWN,
+            ),
+            ("service", "other", subcode::service::OTHER),
+            (
+                "service",
+                "primitives-out-of-sequence",
+                subcode::service::PRIMITIVES_OUT_OF_SEQUENCE,
+            ),
+            (
+                "service",
+                "object-state-conflict",
+                subcode::service::OBJECT_STATE_CONFLICT,
+            ),
+            ("service", "pdu-size", subcode::service::PDU_SIZE),
+            (
+                "service",
+                "continuation-invalid",
+                subcode::service::CONTINUATION_INVALID,
+            ),
+            (
+                "service",
+                "object-constraint-conflict",
+                subcode::service::OBJECT_CONSTRAINT_CONFLICT,
+            ),
+            ("service-preempt", "other", subcode::service_preempt::OTHER),
+            (
+                "service-preempt",
+                "timeout",
+                subcode::service_preempt::TIMEOUT,
+            ),
+            (
+                "service-preempt",
+                "deadlock",
+                subcode::service_preempt::DEADLOCK,
+            ),
+            (
+                "service-preempt",
+                "cancel",
+                subcode::service_preempt::CANCEL,
+            ),
+            ("time-resolution", "other", subcode::time_resolution::OTHER),
+            (
+                "time-resolution",
+                "unsupportable-time-resolution",
+                subcode::time_resolution::UNSUPPORTABLE_TIME_RESOLUTION,
+            ),
+            ("access", "other", subcode::access::OTHER),
+            (
+                "access",
+                "object-access-unsupported",
+                subcode::access::OBJECT_ACCESS_UNSUPPORTED,
+            ),
+            (
+                "access",
+                "object-non-existent",
+                subcode::access::OBJECT_NON_EXISTENT,
+            ),
+            (
+                "access",
+                "object-access-denied",
+                subcode::access::OBJECT_ACCESS_DENIED,
+            ),
+            (
+                "access",
+                "object-invalidated",
+                subcode::access::OBJECT_INVALIDATED,
+            ),
+            ("initiate", "other", subcode::initiate::OTHER),
+            (
+                "initiate",
+                "version-incompatible",
+                subcode::initiate::VERSION_INCOMPATIBLE,
+            ),
+            (
+                "initiate",
+                "max-segment-insufficient",
+                subcode::initiate::MAX_SEGMENT_INSUFFICIENT,
+            ),
+            (
+                "initiate",
+                "max-services-outstanding-calling-insufficient",
+                subcode::initiate::MAX_SERVICES_OUTSTANDING_CALLING_INSUFFICIENT,
+            ),
+            (
+                "initiate",
+                "max-services-outstanding-called-insufficient",
+                subcode::initiate::MAX_SERVICES_OUTSTANDING_CALLED_INSUFFICIENT,
+            ),
+            (
+                "initiate",
+                "service-CBB-insufficient",
+                subcode::initiate::SERVICE_CBB_INSUFFICIENT,
+            ),
+            (
+                "initiate",
+                "parameter-CBB-insufficient",
+                subcode::initiate::PARAMETER_CBB_INSUFFICIENT,
+            ),
+            (
+                "initiate",
+                "nesting-level-insufficient",
+                subcode::initiate::NESTING_LEVEL_INSUFFICIENT,
+            ),
+            ("conclude", "other", subcode::conclude::OTHER),
+            (
+                "conclude",
+                "further-communication-required",
+                subcode::conclude::FURTHER_COMMUNICATION_REQUIRED,
+            ),
+            ("cancel", "other", subcode::cancel::OTHER),
+            (
+                "cancel",
+                "invoke-id-unknown",
+                subcode::cancel::INVOKE_ID_UNKNOWN,
+            ),
+            (
+                "cancel",
+                "cancel-not-possible",
+                subcode::cancel::CANCEL_NOT_POSSIBLE,
+            ),
+            ("file", "other", subcode::file::OTHER),
+            (
+                "file",
+                "filename-ambiguous",
+                subcode::file::FILENAME_AMBIGUOUS,
+            ),
+            ("file", "file-busy", subcode::file::FILE_BUSY),
+            (
+                "file",
+                "filename-syntax-error",
+                subcode::file::FILENAME_SYNTAX_ERROR,
+            ),
+            (
+                "file",
+                "content-type-invalid",
+                subcode::file::CONTENT_TYPE_INVALID,
+            ),
+            ("file", "position-invalid", subcode::file::POSITION_INVALID),
+            (
+                "file",
+                "file-access-denied",
+                subcode::file::FILE_ACCESS_DENIED,
+            ),
+            (
+                "file",
+                "file-non-existent",
+                subcode::file::FILE_NON_EXISTENT,
+            ),
+            (
+                "file",
+                "duplicate-filename",
+                subcode::file::DUPLICATE_FILENAME,
+            ),
+            (
+                "file",
+                "insufficient-space-in-filestore",
+                subcode::file::INSUFFICIENT_SPACE_IN_FILESTORE,
+            ),
+        ];
+
+        // the named numbers, transcribed independently of the constants above
+        let asn1: &[(&str, &str, u8)] = &[
+            ("vmd-state", "other", 0),
+            ("vmd-state", "vmd-state-conflict", 1),
+            ("vmd-state", "vmd-operational-problem", 2),
+            ("vmd-state", "domain-transfer-problem", 3),
+            ("vmd-state", "state-machine-id-invalid", 4),
+            ("application-reference", "other", 0),
+            ("application-reference", "application-unreachable", 1),
+            ("application-reference", "connection-lost", 2),
+            ("application-reference", "application-reference-invalid", 3),
+            ("application-reference", "context-unsupported", 4),
+            ("definition", "other", 0),
+            ("definition", "object-undefined", 1),
+            ("definition", "invalid-address", 2),
+            ("definition", "type-unsupported", 3),
+            ("definition", "type-inconsistent", 4),
+            ("definition", "object-exists", 5),
+            ("definition", "object-attribute-inconsistent", 6),
+            ("resource", "other", 0),
+            ("resource", "memory-unavailable", 1),
+            ("resource", "processor-resource-unavailable", 2),
+            ("resource", "mass-storage-unavailable", 3),
+            ("resource", "capability-unavailable", 4),
+            ("resource", "capability-unknown", 5),
+            ("service", "other", 0),
+            ("service", "primitives-out-of-sequence", 1),
+            ("service", "object-state-conflict", 2),
+            ("service", "pdu-size", 3),
+            ("service", "continuation-invalid", 4),
+            ("service", "object-constraint-conflict", 5),
+            ("service-preempt", "other", 0),
+            ("service-preempt", "timeout", 1),
+            ("service-preempt", "deadlock", 2),
+            ("service-preempt", "cancel", 3),
+            ("time-resolution", "other", 0),
+            ("time-resolution", "unsupportable-time-resolution", 1),
+            ("access", "other", 0),
+            ("access", "object-access-unsupported", 1),
+            ("access", "object-non-existent", 2),
+            ("access", "object-access-denied", 3),
+            ("access", "object-invalidated", 4),
+            ("initiate", "other", 0),
+            ("initiate", "version-incompatible", 1),
+            ("initiate", "max-segment-insufficient", 2),
+            (
+                "initiate",
+                "max-services-outstanding-calling-insufficient",
+                3,
+            ),
+            (
+                "initiate",
+                "max-services-outstanding-called-insufficient",
+                4,
+            ),
+            ("initiate", "service-CBB-insufficient", 5),
+            ("initiate", "parameter-CBB-insufficient", 6),
+            ("initiate", "nesting-level-insufficient", 7),
+            ("conclude", "other", 0),
+            ("conclude", "further-communication-required", 1),
+            ("cancel", "other", 0),
+            ("cancel", "invoke-id-unknown", 1),
+            ("cancel", "cancel-not-possible", 2),
+            ("file", "other", 0),
+            ("file", "filename-ambiguous", 1),
+            ("file", "file-busy", 2),
+            ("file", "filename-syntax-error", 3),
+            ("file", "content-type-invalid", 4),
+            ("file", "position-invalid", 5),
+            ("file", "file-access-denied", 6),
+            ("file", "file-non-existent", 7),
+            ("file", "duplicate-filename", 8),
+            ("file", "insufficient-space-in-filestore", 9),
+        ];
+
+        assert_eq!(
+            expected.len(),
+            asn1.len(),
+            "every named number must have exactly one constant"
+        );
+        assert_eq!(
+            expected.len(),
+            63,
+            "the twelve enumerated alternatives together define 63 named numbers"
+        );
+        for (got, want) in expected.iter().zip(asn1.iter()) {
+            assert_eq!(got, want, "subcode {}.{} is wrong", want.0, want.1);
+        }
+    }
+
+    /// The access subcode travels as a one-byte INTEGER inside the errorClass
+    /// CHOICE, under the IMPLICIT tag `0x87`.
+    #[test]
+    fn access_object_non_existent_wire_vector() {
+        let ec = ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT);
+        let mut buf = BytesMut::new();
+        ec.encode_explicit(&mut buf);
+        assert_eq!(&buf[..], &[0xa0, 0x03, 0x87, 0x01, 0x02]);
+    }
+
+    /// A hand-written ConfirmedError PDU, whose bytes follow the ISO 9506-2
+    /// Confirmed-ErrorPDU SEQUENCE: invokeID under the context tag `0x80` and
+    /// serviceError under `0xa2`.
+    const CONFIRMED_ERROR_VECTOR: &[u8] = &[
+        0xa2, 0x0a, // confirmedErrorPdu [2] IMPLICIT SEQUENCE, len 10
+        0x80, 0x01, 0x03, // invokeID [0] IMPLICIT Unsigned32 = 3
+        0xa2, 0x05, // serviceError [2] IMPLICIT, len 5
+        0xa0, 0x03, // errorClass [0] EXPLICIT, len 3
+        0x87, 0x01, 0x02, // access [7] IMPLICIT INTEGER = 2, object-non-existent
+    ];
+
+    #[test]
+    fn confirmed_error_pdu_encodes_the_wire_vector() {
+        let se = ServiceError::new(ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT));
+        let mut buf = BytesMut::new();
+        encode_confirmed_error_pdu(3, &se, &mut buf);
+        assert_eq!(&buf[..], CONFIRMED_ERROR_VECTOR);
+    }
+
+    #[test]
+    fn confirmed_error_pdu_decodes_the_wire_vector() {
+        let (invoke_id, se) = decode_confirmed_error_pdu(CONFIRMED_ERROR_VECTOR).unwrap();
+        assert_eq!(invoke_id, 3);
+        assert_eq!(
+            se.error_class,
+            ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT)
+        );
+    }
+
+    /// What the encoder writes, the decoder reads back, for a spread of
+    /// invokeIDs and errorClass alternatives.
+    #[test]
+    fn confirmed_error_pdu_round_trip() {
+        let cases = [
+            (0u32, ErrorClass::Access(subcode::access::OTHER)),
+            (
+                1,
+                ErrorClass::Access(subcode::access::OBJECT_ACCESS_UNSUPPORTED),
+            ),
+            (
+                127,
+                ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT),
+            ),
+            (
+                128,
+                ErrorClass::Definition(subcode::definition::OBJECT_EXISTS),
+            ),
+            (
+                65_535,
+                ErrorClass::Definition(subcode::definition::INVALID_ADDRESS),
+            ),
+            (16_777_216, ErrorClass::Resource(subcode::resource::OTHER)),
+            (
+                u32::MAX,
+                ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
+            ),
+        ];
+        assert_eq!(cases.len(), 7);
+        for (invoke_id, error_class) in cases {
+            let se = ServiceError::new(error_class.clone());
+            let mut buf = BytesMut::new();
+            encode_confirmed_error_pdu(invoke_id, &se, &mut buf);
+            let (got_id, got_se) = decode_confirmed_error_pdu(&buf)
+                .unwrap_or_else(|e| panic!("invoke id {invoke_id} failed to decode: {e}"));
+            assert_eq!(got_id, invoke_id, "invoke id must survive the round trip");
+            assert_eq!(got_se.error_class, error_class);
+        }
+    }
+
+    /// The optional additionalCode and additionalDescription survive the round
+    /// trip, so a ServiceError carrying them is not truncated.
+    #[test]
+    fn confirmed_error_pdu_round_trip_keeps_optional_fields() {
+        let se = ServiceError {
+            error_class: ErrorClass::Access(subcode::access::OBJECT_ACCESS_DENIED),
+            additional_code: Some(-7),
+            additional_description: Some("no read access".to_string()),
+        };
+        let mut buf = BytesMut::new();
+        encode_confirmed_error_pdu(9, &se, &mut buf);
+        let (invoke_id, got) = decode_confirmed_error_pdu(&buf).unwrap();
+        assert_eq!(invoke_id, 9);
+        assert_eq!(got, se);
+    }
+
+    /// A Confirmed-RequestPDU carries an untagged `invokeID`, which travels
+    /// under the universal INTEGER tag `0x02`. The Confirmed-ErrorPDU field is
+    /// `[0] IMPLICIT`, so `0x02` in that position is a different PDU shape and
+    /// must be refused rather than skipped.
+    #[test]
+    fn confirmed_error_rejects_a_universal_integer_invoke_id() {
+        let with_universal_tag: &[u8] = &[
+            0xa2, 0x0a, 0x02, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+        ];
+        let err = decode_confirmed_error_pdu(with_universal_tag)
+            .expect_err("a universal INTEGER invokeID is not a Confirmed-ErrorPDU");
+        assert!(
+            matches!(
+                err,
+                MmsError::InvalidTag {
+                    expected: 0x80,
+                    actual: 0x02
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn confirmed_error_accepts_and_skips_a_modifier_position() {
+        // 0x81 modifierPosition sits between the invokeID and the serviceError
+        let with_modifier: &[u8] = &[
+            0xa2, 0x0d, 0x80, 0x01, 0x03, 0x81, 0x01, 0x01, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01,
+            0x02,
+        ];
+        let (invoke_id, se) = decode_confirmed_error_pdu(with_modifier).unwrap();
+        assert_eq!(invoke_id, 3);
+        assert_eq!(
+            se.error_class,
+            ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT)
+        );
+    }
+
+    #[test]
+    fn confirmed_error_rejects_truncated_and_mistagged_input() {
+        // every prefix of a valid PDU fails rather than panicking
+        for n in 0..CONFIRMED_ERROR_VECTOR.len() {
+            assert!(
+                decode_confirmed_error_pdu(&CONFIRMED_ERROR_VECTOR[..n]).is_err(),
+                "prefix of {n} bytes must not decode"
+            );
+        }
+        // the whole vector does decode, so the loop above is not vacuous
+        assert!(decode_confirmed_error_pdu(CONFIRMED_ERROR_VECTOR).is_ok());
+
+        // an outer tag that is not 0xa2
+        let mut wrong_outer = CONFIRMED_ERROR_VECTOR.to_vec();
+        wrong_outer[0] = 0xa1;
+        assert!(decode_confirmed_error_pdu(&wrong_outer).is_err());
+
+        // a serviceError under a tag that is not 0xa2
+        let mut wrong_service = CONFIRMED_ERROR_VECTOR.to_vec();
+        wrong_service[5] = 0xa3;
+        assert!(decode_confirmed_error_pdu(&wrong_service).is_err());
+    }
+
+    #[test]
+    fn confirmed_error_rejects_an_oversized_invoke_id() {
+        // six content bytes for a Unsigned32, and a negative INTEGER
+        let too_wide: &[u8] = &[
+            0xa2, 0x0f, 0x80, 0x06, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0xa2, 0x05, 0xa0, 0x03,
+            0x87, 0x01, 0x02,
+        ];
+        assert!(decode_confirmed_error_pdu(too_wide).is_err());
+
+        let negative: &[u8] = &[
+            0xa2, 0x0d, 0x80, 0x04, 0xff, 0xff, 0xff, 0xff, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01,
+            0x02,
+        ];
+        assert!(decode_confirmed_error_pdu(negative).is_err());
+    }
+
+    /// The access subcodes are not the `DataAccessError` codes; the two sets
+    /// overlap numerically and mean different things.
+    #[test]
+    fn access_subcodes_are_distinct_from_data_access_error_codes() {
+        use super::super::common::DataAccessError;
+        assert_eq!(DataAccessError::ObjectNonExistent as u8, 10);
+        assert_eq!(subcode::access::OBJECT_NON_EXISTENT, 2);
+        assert_eq!(DataAccessError::ObjectAccessUnsupported as u8, 9);
+        assert_eq!(subcode::access::OBJECT_ACCESS_UNSUPPORTED, 1);
     }
 }
