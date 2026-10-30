@@ -2,7 +2,8 @@
 //!
 //! Shows the receiving side of IEC 61850-9-2:
 //!
-//! 1. `SvSubscriberBuilder` sets the APPID and svID filter and the listener
+//! 1. `SvSubscriberBuilder` sets the APPID and svID filter, the 9-2 LE sample
+//!    length and the listener
 //! 2. `SvReceiver` collects subscribers while idle
 //! 3. `start_thread` runs the receive loop, which reads frames from the HAL
 //!    Ethernet source and dispatches them to the matching subscriber
@@ -52,6 +53,7 @@ mod linux_impl {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use iec61850_sv::nine_two_le::SAMPLE_SIZE;
     use iec61850_sv::receiver::{Idle, SvReceiver};
     use iec61850_sv::subscriber::SvSubscriberBuilder;
 
@@ -67,6 +69,7 @@ mod linux_impl {
             SvSubscriberBuilder::new()
                 .app_id(APP_ID)
                 .sv_id(SV_ID)
+                .sample_size(SAMPLE_SIZE)
                 .listener(move |asdu| {
                     counter_cb.fetch_add(1, Ordering::Relaxed);
                     if counter_cb.load(Ordering::Relaxed).is_multiple_of(4000) {

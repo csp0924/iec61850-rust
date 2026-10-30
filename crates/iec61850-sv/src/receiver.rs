@@ -11,7 +11,7 @@
 //!
 //! Validation is layered: the frame layer checks the Ethernet length, the
 //! EtherType, and the SV header; the PDU layer bounds the ASDU count and every
-//! field; and the subscriber checks sample length consistency and smpCnt
+//! field; and the subscriber checks the configured sample length and smpCnt
 //! continuity as it dispatches.
 //!
 //! TODO: refrTm plausibility is not validated at any layer.

@@ -17,6 +17,12 @@ Every crate in the workspace shares one version number.
   limit returns `TsduTooLarge` and moves the connection to `Closed`, so the rest
   of it is never read as the next TSDU. `set_max_tsdu_size(None)` removes the
   bound.
+- **`iec61850-sv`** — an `SvSubscriber` no longer takes its sample length
+  from the first ASDU it receives, which let a single forged frame shut out the
+  real stream. The length is set with `SvSubscriberBuilder::sample_size`, from
+  the data set the stream publishes, and an ASDU of any other length is dropped;
+  a subscriber built without it delivers every ASDU whatever its sample length.
+  `SvSubscriber::expected_sample_size` returns the configured length, or 0.
 
 ### Added
 
@@ -27,6 +33,8 @@ Every crate in the workspace shares one version number.
 - **`iec61850-mms`** — `DEFAULT_MAX_TSDU_SIZE`, the default bound on a
   reassembled COTP TSDU: `DEFAULT_MAX_PDU_SIZE` plus 8192 bytes for the Session,
   Presentation and ACSE envelope.
+- **`iec61850-sv`** — `SvSubscriberBuilder::sample_size`, the sample length
+  every delivered ASDU must have.
 
 ### Fixed
 

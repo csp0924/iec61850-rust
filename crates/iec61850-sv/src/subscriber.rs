@@ -5,17 +5,19 @@
 //! from the receive buffer, so dispatch copies no samples. Every ASDU is
 //! delivered to every subscriber that matches it.
 //!
-//! Two consistency checks run before the listener. The sample length is locked
-//! to the length of the first ASDU delivered; a later ASDU of a different
-//! length is reported and dropped, so a listener never reads a sample laid out
-//! differently from the one it was written for. A smpCnt that does not follow
-//! its predecessor is counted in `missed_count`, which exposes gaps in the
-//! stream; that ASDU is still delivered.
+//! Two consistency checks run before the listener. A subscriber built with a
+//! sample length, the encoded size of the data set it subscribes to, reports
+//! and drops an ASDU of any other length, so a listener never reads a sample
+//! laid out differently from the one it was written for. Without one every
+//! ASDU is delivered with its own sample, whose accessors check bounds, and no
+//! received frame decides the length later frames must have. A smpCnt that
+//! does not follow its predecessor is counted in `missed_count`, which exposes
+//! gaps in the stream; that ASDU is still delivered.
 //!
 //! The state a subscriber accumulates is atomic, so one `Arc<SvSubscriber>`
 //! can be shared across threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use iec61850_model::Quality;
@@ -155,6 +157,7 @@ pub struct SvSubscriberBuilder {
     app_id_filter: Option<u16>,
     sv_id_filter: Option<String>,
     dst_mac_filter: Option<[u8; 6]>,
+    sample_size: Option<usize>,
     listener: Option<SvListener>,
 }
 
@@ -166,6 +169,7 @@ impl Default for SvSubscriberBuilder {
             app_id_filter: None,
             sv_id_filter: None,
             dst_mac_filter: None,
+            sample_size: None,
             listener: None,
         }
     }
@@ -195,6 +199,17 @@ impl SvSubscriberBuilder {
         self
     }
 
+    /// Sets the sample length, in bytes, every delivered ASDU must have.
+    ///
+    /// The length follows from the data set the stream publishes, for instance
+    /// [`SAMPLE_SIZE`] for the 9-2 LE profile. An ASDU of any other length is
+    /// reported and dropped. Leaving it unset delivers every ASDU whatever its
+    /// sample length.
+    pub fn sample_size(mut self, len: usize) -> Self {
+        self.sample_size = Some(len);
+        self
+    }
+
     /// Sets the listener invoked for each matching ASDU.
     pub fn listener(mut self, cb: impl Fn(&SvSubscriberAsdu<'_>) + Send + Sync + 'static) -> Self {
         self.listener = Some(Arc::new(cb));
@@ -208,7 +223,7 @@ impl SvSubscriberBuilder {
             sv_id_filter: self.sv_id_filter,
             dst_mac_filter: self.dst_mac_filter,
             listener: self.listener,
-            expected_sample_size: AtomicUsize::new(0),
+            expected_sample_size: self.sample_size,
             last_smp_cnt: AtomicU16::new(u16::MAX),
             missed_count: AtomicU64::new(0),
             first_received: AtomicBool::new(false),
@@ -230,8 +245,8 @@ pub struct SvSubscriber {
     dst_mac_filter: Option<[u8; 6]>,
     /// Listener invoked for each matching ASDU.
     listener: Option<SvListener>,
-    /// Sample length locked by the first ASDU delivered; 0 until then.
-    expected_sample_size: AtomicUsize,
+    /// Sample length every delivered ASDU must have; `None` accepts any length.
+    expected_sample_size: Option<usize>,
     /// smpCnt of the most recent ASDU.
     last_smp_cnt: AtomicU16,
     /// Number of samples missed, summed over every detected gap.
@@ -247,10 +262,7 @@ impl std::fmt::Debug for SvSubscriber {
             .field("sv_id_filter", &self.sv_id_filter)
             .field("dst_mac_filter", &self.dst_mac_filter)
             .field("has_listener", &self.listener.is_some())
-            .field(
-                "expected_sample_size",
-                &self.expected_sample_size.load(Ordering::Relaxed),
-            )
+            .field("expected_sample_size", &self.expected_sample_size)
             .finish()
     }
 }
@@ -281,9 +293,9 @@ impl SvSubscriber {
         self.dst_mac_filter
     }
 
-    /// Returns the locked sample length, or 0 before the first ASDU.
+    /// Returns the configured sample length, or 0 when none is configured.
     pub fn expected_sample_size(&self) -> usize {
-        self.expected_sample_size.load(Ordering::Relaxed)
+        self.expected_sample_size.unwrap_or(0)
     }
 
     /// Returns the number of samples missed so far.
@@ -323,40 +335,21 @@ impl SvSubscriber {
 
     /// Delivers one ASDU to the listener.
     ///
-    /// The first ASDU locks the sample length; one of a different length is
+    /// When a sample length is configured, an ASDU of a different length is
     /// reported and dropped. A smpCnt that skips ahead adds the gap to
     /// `missed_count` but is still delivered.
     pub fn dispatch(&self, asdu_view: &SvSubscriberAsdu<'_>) {
         let sample_len = asdu_view.sample.len();
-
-        let expected = self.expected_sample_size.load(Ordering::Acquire);
-        if expected == 0 {
-            // Two threads may reach this at once; whichever wins the exchange
-            // sets the length, and the other re-reads it below.
-            let _ = self.expected_sample_size.compare_exchange(
-                0,
-                sample_len,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            let locked = self.expected_sample_size.load(Ordering::Acquire);
-            if locked != sample_len {
+        if let Some(expected) = self.expected_sample_size {
+            if expected != sample_len {
                 tracing::warn!(
-                    "sv subscriber svid={:?}: sample length {} differs from the locked {}, dropping",
+                    "sv subscriber svid={:?}: sample length {} differs from the expected {}, dropping",
                     asdu_view.sv_id,
                     sample_len,
-                    locked
+                    expected
                 );
                 return;
             }
-        } else if expected != sample_len {
-            tracing::warn!(
-                "sv subscriber svid={:?}: sample length {} differs from the expected {}, dropping",
-                asdu_view.sv_id,
-                sample_len,
-                expected
-            );
-            return;
         }
 
         let cur_cnt = asdu_view.smp_cnt;
@@ -591,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_q4_first_call_locks_sample_size() {
+    fn dispatch_unconfigured_delivers_every_sample_length() {
         let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let c = counter.clone();
         let sub = SvSubscriberBuilder::new()
@@ -600,17 +593,11 @@ mod tests {
             })
             .build();
 
-        // The first ASDU locks the sample length at 8.
         let asdu1 = make_asdu("sv1", 0, vec![0u8; 8]);
-        let view1 = SvSubscriberAsdu::from_asdu(&asdu1);
-        sub.dispatch(&view1);
-        assert_eq!(sub.expected_sample_size(), 8);
-        assert_eq!(*counter.lock().unwrap(), 1);
-
-        // A matching length is delivered.
-        let asdu2 = make_asdu("sv1", 1, vec![0u8; 8]);
-        let view2 = SvSubscriberAsdu::from_asdu(&asdu2);
-        sub.dispatch(&view2);
+        sub.dispatch(&SvSubscriberAsdu::from_asdu(&asdu1));
+        let asdu2 = make_asdu("sv1", 1, vec![0u8; 16]);
+        sub.dispatch(&SvSubscriberAsdu::from_asdu(&asdu2));
+        assert_eq!(sub.expected_sample_size(), 0);
         assert_eq!(*counter.lock().unwrap(), 2);
     }
 
@@ -619,12 +606,13 @@ mod tests {
         let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let c = counter.clone();
         let sub = SvSubscriberBuilder::new()
+            .sample_size(64)
             .listener(move |_| {
                 *c.lock().unwrap() += 1;
             })
             .build();
 
-        // The first ASDU locks the sample length at 64.
+        // The configured length is delivered.
         let asdu1 = make_asdu("sv1", 0, vec![0u8; 64]);
         sub.dispatch(&SvSubscriberAsdu::from_asdu(&asdu1));
         assert_eq!(*counter.lock().unwrap(), 1);

@@ -1,5 +1,5 @@
 //! Integration tests for `SvSubscriber` dispatch: stream filters, delivery to
-//! every matching subscription, the sample length lock, smpCnt gap counting,
+//! every matching subscription, the configured sample length, smpCnt gap counting,
 //! the ASDU view accessors, and 9-2 LE sample decoding.
 
 use std::sync::{Arc, Mutex};
@@ -219,25 +219,51 @@ fn q4_sample_size_mismatch_skips_callback() {
     let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let c = counter.clone();
     let sub = SvSubscriberBuilder::new()
+        .sample_size(64)
         .listener(move |_| {
             *c.lock().unwrap() += 1;
         })
         .build();
-
-    // The first ASDU locks the sample length at 64.
-    let a1 = make_asdu("sv1", 0, vec![0u8; 64]);
-    sub.dispatch(&SvSubscriberAsdu::from_asdu(&a1));
     assert_eq!(sub.expected_sample_size(), 64);
+
+    // A first ASDU of another length is dropped and does not change the length.
+    let a0 = make_asdu("sv1", 0, vec![0u8; 80]);
+    sub.dispatch(&SvSubscriberAsdu::from_asdu(&a0));
+    assert_eq!(*counter.lock().unwrap(), 0);
+
+    let a1 = make_asdu("sv1", 1, vec![0u8; 64]);
+    sub.dispatch(&SvSubscriberAsdu::from_asdu(&a1));
     assert_eq!(*counter.lock().unwrap(), 1);
 
     // A different length is dropped.
-    let a2 = make_asdu("sv1", 1, vec![0u8; 80]);
+    let a2 = make_asdu("sv1", 2, vec![0u8; 80]);
     sub.dispatch(&SvSubscriberAsdu::from_asdu(&a2));
     assert_eq!(
         *counter.lock().unwrap(),
         1,
         "a differing sample length is not delivered"
     );
+}
+
+/// Without a configured sample length no ASDU, the first one included, decides
+/// the length later ones must have, so a forged first frame cannot shut out the
+/// real stream.
+#[test]
+fn forged_first_frame_does_not_lock_sample_length() {
+    let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let c = counter.clone();
+    let sub = SvSubscriberBuilder::new()
+        .listener(move |_| {
+            *c.lock().unwrap() += 1;
+        })
+        .build();
+
+    let forged = make_asdu("sv1", 0, vec![0u8; 1]);
+    sub.dispatch(&SvSubscriberAsdu::from_asdu(&forged));
+    let real = make_asdu("sv1", 1, vec![0u8; 64]);
+    sub.dispatch(&SvSubscriberAsdu::from_asdu(&real));
+    assert_eq!(*counter.lock().unwrap(), 2);
+    assert_eq!(sub.expected_sample_size(), 0);
 }
 
 #[test]
