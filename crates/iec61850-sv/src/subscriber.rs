@@ -12,7 +12,11 @@
 //! ASDU is delivered with its own sample, whose accessors check bounds, and no
 //! received frame decides the length later frames must have. A smpCnt that
 //! does not follow its predecessor is counted in `missed_count`, which exposes
-//! gaps in the stream; that ASDU is still delivered.
+//! gaps in the stream; that ASDU is still delivered. smpCnt wraps to 0 at the
+//! configured limit, or at a smpRate sent with smpMod samples-per-second;
+//! without either, a smpCnt below its predecessor is taken as the
+//! once-a-second reset of a synchronized stream, and only the samples from 0
+//! up to it count as missed.
 //!
 //! The state a subscriber accumulates is atomic, so one `Arc<SvSubscriber>`
 //! can be shared across threads.
@@ -158,6 +162,7 @@ pub struct SvSubscriberBuilder {
     sv_id_filter: Option<String>,
     dst_mac_filter: Option<[u8; 6]>,
     sample_size: Option<usize>,
+    smp_cnt_limit: Option<u16>,
     listener: Option<SvListener>,
 }
 
@@ -170,6 +175,7 @@ impl Default for SvSubscriberBuilder {
             sv_id_filter: None,
             dst_mac_filter: None,
             sample_size: None,
+            smp_cnt_limit: None,
             listener: None,
         }
     }
@@ -210,6 +216,19 @@ impl SvSubscriberBuilder {
         self
     }
 
+    /// Sets the smpCnt value at which the stream wraps to 0.
+    ///
+    /// IEC 61850-9-2 §8.5.2 Table 14 increments smpCnt with every sample and
+    /// resets it to 0 on synchronization; a stream synchronized once a second,
+    /// as IEC 61850-9-2LE has it, wraps at its number of samples per second,
+    /// for instance 4000 at 80 samples per period and 50 Hz. A step from `limit - 1` to 0 is then
+    /// continuous, and a step to 0 from earlier counts the samples skipped. A
+    /// limit of 0 is ignored.
+    pub fn smp_cnt_limit(mut self, limit: u16) -> Self {
+        self.smp_cnt_limit = Some(limit).filter(|l| *l > 0);
+        self
+    }
+
     /// Sets the listener invoked for each matching ASDU.
     pub fn listener(mut self, cb: impl Fn(&SvSubscriberAsdu<'_>) + Send + Sync + 'static) -> Self {
         self.listener = Some(Arc::new(cb));
@@ -224,6 +243,7 @@ impl SvSubscriberBuilder {
             dst_mac_filter: self.dst_mac_filter,
             listener: self.listener,
             expected_sample_size: self.sample_size,
+            smp_cnt_limit: self.smp_cnt_limit,
             last_smp_cnt: AtomicU16::new(u16::MAX),
             missed_count: AtomicU64::new(0),
             first_received: AtomicBool::new(false),
@@ -247,6 +267,8 @@ pub struct SvSubscriber {
     listener: Option<SvListener>,
     /// Sample length every delivered ASDU must have; `None` accepts any length.
     expected_sample_size: Option<usize>,
+    /// smpCnt value at which the stream wraps to 0, when configured.
+    smp_cnt_limit: Option<u16>,
     /// smpCnt of the most recent ASDU.
     last_smp_cnt: AtomicU16,
     /// Number of samples missed, summed over every detected gap.
@@ -359,11 +381,9 @@ impl SvSubscriber {
             self.first_received.store(true, Ordering::Release);
         } else {
             let prev = self.last_smp_cnt.load(Ordering::Acquire);
-            let expected_next = prev.wrapping_add(1);
-            if cur_cnt != expected_next {
-                // Wrapping subtraction makes the counter wrapping from 65535 to
-                // 0 a gap of zero rather than a gap of 65535.
-                let diff = cur_cnt.wrapping_sub(expected_next) as u64;
+            let limit = self.smp_cnt_limit.or_else(|| announced_limit(asdu_view));
+            let diff = smp_cnt_gap(prev, cur_cnt, limit);
+            if diff != 0 {
                 tracing::warn!(
                     "sv subscriber svid={:?}: smpcnt gap, prev={} cur={} missed={}",
                     asdu_view.sv_id,
@@ -379,6 +399,33 @@ impl SvSubscriber {
         if let Some(ref cb) = self.listener {
             cb(asdu_view);
         }
+    }
+}
+
+/// Returns the smpCnt limit an ASDU announces: its smpRate when smpMod is
+/// samples per second.
+fn announced_limit(asdu: &SvSubscriberAsdu<'_>) -> Option<u16> {
+    match (asdu.smp_mod, asdu.smp_rate) {
+        (Some(SmpMod::SamplesPerSecond), Some(rate)) if rate > 0 => Some(rate),
+        _ => None,
+    }
+}
+
+/// Returns how many samples lie between `prev` and `cur`.
+///
+/// With a limit both counters are taken modulo it. Without one a counter
+/// below its predecessor restarted at 0, by the once-a-second reset or by the
+/// wrap at 65536, so the samples `0..cur` are the ones missed.
+fn smp_cnt_gap(prev: u16, cur: u16, limit: Option<u16>) -> u64 {
+    match limit {
+        Some(l) if prev < l && cur < l => {
+            let l = u32::from(l);
+            let expected = (u32::from(prev) + 1) % l;
+            u64::from((u32::from(cur) + l - expected) % l)
+        }
+        Some(_) => u64::from(cur.wrapping_sub(prev.wrapping_add(1))),
+        None if cur < prev => u64::from(cur),
+        None => u64::from(cur.wrapping_sub(prev.wrapping_add(1))),
     }
 }
 
