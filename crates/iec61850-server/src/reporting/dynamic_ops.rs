@@ -11,12 +11,17 @@
 //! data object name, data attribute name. A fifth and later segment is a
 //! sub-attribute nested inside the data attribute and is descended in order.
 //!
+//! A member is one attribute of a basic type. A member that names a data
+//! object, a sub-data-object, or a constructed attribute is refused: an entry
+//! holds a single value, and the value of such a member lives in the
+//! attributes beneath it.
+//!
 //! Array indices, the `(N)` syntax, are not supported; the `dataset_admin` module
 //! of the client crate rejects them before they reach this module.
 
 use std::sync::{Arc, RwLock};
 
-use iec61850_model::{DoChild, IedModel, MmsValue, FC};
+use iec61850_model::{DataAttributeType, DoChild, IedModel, MmsValue, FC};
 
 use super::dataset::{Dataset, DatasetEntry};
 use super::DatasetRegistry;
@@ -41,8 +46,9 @@ pub enum DatasetError {
         /// The member path that did not resolve.
         path: String,
     },
-    /// The member path is malformed: too few segments, or an unparseable functional
-    /// constraint token.
+    /// The member path is malformed, with too few segments or an unparseable
+    /// functional constraint token, or it names a member form this server does
+    /// not serve: a data object, a sub-data-object, or a constructed attribute.
     MemberInvalidPath {
         /// The malformed member path.
         path: String,
@@ -262,6 +268,13 @@ fn resolve_attr_value(
             .ok_or_else(|| DatasetError::MemberNotFound {
                 path: format!("{domain}/{mms_path}"),
             })?;
+    }
+
+    // A constructed attribute holds no value of its own.
+    if da.ty == DataAttributeType::Constructed || !da.children.is_empty() {
+        return Err(DatasetError::MemberInvalidPath {
+            path: format!("{domain}/{mms_path}"),
+        });
     }
 
     Ok(Arc::clone(&da.value))

@@ -359,6 +359,30 @@ async fn read_resolves_an_attribute_only_under_its_own_fc() {
 
 // ── Data set members ────────────────────────────────────────────────────
 
+/// A constructed attribute holds no value of its own, so a data set member
+/// naming one is refused, while a member naming one of its leaves is
+/// accepted and reads the leaf value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_data_set_refuses_a_constructed_member() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let conn = ied(&handle).await;
+
+    let constructed = t!(conn.create_data_set(
+        "IED1LD0/LLN0.dynCons",
+        &[DataSetMember::new("IED1LD0/GGIO1.AnIn1.mag", FC::Mx)]
+    ));
+    assert!(constructed.is_err(), "{constructed:?}");
+    t!(conn.create_data_set(
+        "IED1LD0/LLN0.dynLeaf",
+        &[DataSetMember::new("IED1LD0/GGIO1.AnIn1.mag.f", FC::Mx)]
+    ))
+    .expect("a leaf member is accepted");
+    let values = t!(conn.get_data_set_values("IED1LD0/LLN0.dynLeaf")).unwrap();
+    assert_eq!(values, [AccessResult::Success(MmsData::Float32(7.0))]);
+    handle.stop().await;
+}
+
 #[derive(Debug)]
 struct Deny;
 impl ReadHandler for Deny {
