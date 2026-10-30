@@ -18,13 +18,18 @@
 //!       ... repeated once per member
 //! ```
 //!
-//! The response is CONTEXT `[11]` IMPLICIT with an empty body: tag `0xab`, length 0.
+//! The response is `defineNamedVariableList [11] IMPLICIT
+//! DefineNamedVariableList-Response`, and `DefineNamedVariableList-Response ::=
+//! NULL` (ISO 9506-2), so it is the primitive tag `0x8b` with length 0.
 //!
 //! ```text
 //! 0xa1 <len>           -- MmsPdu [1] confirmedResponsePdu
 //!   0x02 <len> <id>    -- invokeID
-//!   0xab 0x00          -- defineNamedVariableList [11] IMPLICIT empty SEQUENCE
+//!   0x8b 0x00          -- defineNamedVariableList [11] IMPLICIT NULL
 //! ```
+//!
+//! The decoder also accepts the constructed form `0xab 0x00`, which some
+//! implementations send.
 
 use super::super::error::MmsError;
 use super::common::ObjectName;
@@ -34,9 +39,13 @@ use bytes::BytesMut;
 
 // Tag constants
 
-/// Tag of DefineNamedVariableList inside the ConfirmedService CHOICE.
+/// Tag of DefineNamedVariableList inside the ConfirmedServiceRequest CHOICE.
 /// CONTEXT `[11]` IMPLICIT CONSTRUCTED, that is `0x80 | 0x20 | 11`.
 pub const SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST: u8 = 0xab;
+
+/// Tag of DefineNamedVariableList inside the ConfirmedServiceResponse CHOICE.
+/// CONTEXT `[11]` IMPLICIT NULL, a primitive encoding, that is `0x80 | 11`.
+pub const SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE: u8 = 0x8b;
 
 /// Outer tag of listOfVariable `[0]` IMPLICIT SEQUENCE OF Member.
 const TAG_LIST_OF_VARIABLE: u8 = 0xa0;
@@ -294,24 +303,27 @@ fn decode_member(data: &[u8]) -> Result<DefineNamedVariableEntry, MmsError> {
 
 // Response
 
-/// An MMS DefineNamedVariableListResponse: an empty body encoded as `0xab 0x00`.
+/// An MMS DefineNamedVariableListResponse: a NULL encoded as `0x8b 0x00`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DefineNamedVariableListResponse;
 
 impl DefineNamedVariableListResponse {
-    /// Encodes the complete response, `0xab 0x00`.
+    /// Encodes the complete response, `0x8b 0x00`.
     pub fn encode(&self, buf: &mut BytesMut) {
-        buf.extend_from_slice(&[SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST, 0x00]);
+        buf.extend_from_slice(&[SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE, 0x00]);
     }
 
-    /// Decodes a response; `data` starts at the `0xab` byte.
+    /// Decodes a response; `data` starts at the service tag, `0x8b`, or `0xab`
+    /// for the constructed form.
     pub fn decode(data: &[u8]) -> Result<Self, MmsError> {
         if data.len() < 2 {
             return Err(MmsError::TruncatedPdu);
         }
-        if data[0] != SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST {
+        if data[0] != SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE
+            && data[0] != SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST
+        {
             return Err(MmsError::InvalidTag {
-                expected: SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST,
+                expected: SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE,
                 actual: data[0],
             });
         }
@@ -462,11 +474,28 @@ mod tests {
         let resp = DefineNamedVariableListResponse;
         let mut buf = BytesMut::new();
         encode_confirmed_define_named_variable_list_response(7, &resp, &mut buf);
-        // 0xa1 0x05 0x02 0x01 0x07 0xab 0x00
-        assert_eq!(&buf[..], &[0xa1, 0x05, 0x02, 0x01, 0x07, 0xab, 0x00]);
+        // 0xa1 0x05 0x02 0x01 0x07 0x8b 0x00: the response body is a primitive NULL
+        assert_eq!(&buf[..], &[0xa1, 0x05, 0x02, 0x01, 0x07, 0x8b, 0x00]);
 
         let (invoke_id, _) = decode_confirmed_define_named_variable_list_response(&buf).unwrap();
         assert_eq!(invoke_id, 7);
+    }
+
+    #[test]
+    fn response_in_constructed_form_is_accepted() {
+        let buf = [0xa1, 0x05, 0x02, 0x01, 0x09, 0xab, 0x00];
+        let (invoke_id, _) = decode_confirmed_define_named_variable_list_response(&buf).unwrap();
+        assert_eq!(invoke_id, 9);
+    }
+
+    #[test]
+    fn response_with_another_service_tag_is_rejected() {
+        // a context tag other than [11] belongs to another service
+        let buf = [0xa1, 0x05, 0x02, 0x01, 0x09, 0x8c, 0x00];
+        assert!(matches!(
+            decode_confirmed_define_named_variable_list_response(&buf),
+            Err(MmsError::InvalidTag { .. })
+        ));
     }
 
     #[test]
