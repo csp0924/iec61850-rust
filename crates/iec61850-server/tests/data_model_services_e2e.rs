@@ -357,6 +357,38 @@ async fn read_resolves_an_attribute_only_under_its_own_fc() {
 
 // ── Setting group control block ─────────────────────────────────────────
 
+/// A setting group control block exists only in LLN0: the same path under
+/// another logical node neither reads nor writes, and the control block of
+/// LLN0 keeps its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setting_group_control_block_is_only_in_lln0() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let read = t!(c.read(DOM, "GGIO1$SP$SGCB$ActSG"));
+    assert!(
+        matches!(
+            read,
+            Err(ClientError::DataAccessError(
+                DataAccessError::ObjectNonExistent
+            ))
+        ),
+        "{read:?}"
+    );
+    assert!(t!(c.write(DOM, "GGIO1$SP$SGCB$ActSG", MmsData::Unsigned(2))).is_err());
+    assert_eq!(
+        t!(c.read(DOM, "LLN0$SP$SGCB$ActSG")).unwrap(),
+        MmsData::Unsigned(1)
+    );
+    t!(c.write(DOM, "LLN0$SP$SGCB$ActSG", MmsData::Unsigned(2))).expect("LLN0 is served");
+    assert_eq!(
+        t!(c.read(DOM, "LLN0$SP$SGCB$ActSG")).unwrap(),
+        MmsData::Unsigned(2)
+    );
+    handle.stop().await;
+}
+
 // ── Data set members ────────────────────────────────────────────────────
 
 /// A constructed attribute holds no value of its own, so a data set member

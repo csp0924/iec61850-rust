@@ -623,9 +623,10 @@ impl SgcbField {
 
 /// Parses a domain-specific object name as a setting group control block path.
 ///
-/// Three segments (`<LN>$SP$SGCB`) select the whole block and four select one
-/// field. Any other name yields `None` and the caller continues with its other
-/// routes.
+/// Three segments (`LLN0$SP$SGCB`) select the whole block and four select one
+/// field. A setting group control block exists only in LLN0, so the same path
+/// under any other logical node is not one. Any other name yields `None` and
+/// the caller continues with its other routes.
 pub fn extract_sgcb_target(name: &ObjectName) -> Option<(&str, &str, SgcbField)> {
     let (domain, item_id) = match name {
         ObjectName::DomainSpecific { domain_id, item_id } => (domain_id.as_str(), item_id.as_str()),
@@ -635,13 +636,10 @@ pub fn extract_sgcb_target(name: &ObjectName) -> Option<(&str, &str, SgcbField)>
     if parts.len() < 3 || parts.len() > 4 {
         return None;
     }
-    if parts[1] != "SP" || parts[2] != "SGCB" {
+    if parts[0] != "LLN0" || parts[1] != "SP" || parts[2] != "SGCB" {
         return None;
     }
     let ln_name = parts[0];
-    if ln_name.is_empty() {
-        return None;
-    }
     let field = if parts.len() == 3 {
         SgcbField::Whole
     } else {
@@ -689,8 +687,9 @@ fn snapshot_to_struct(snap: &SgcbSnapshot) -> MmsData {
 /// Answers a read of a setting group control block.
 ///
 /// A domain with no control block answers `ObjectNonExistent`. The logical node
-/// name is not checked: a control block always belongs to LLN0, so the
-/// per-domain registry alone decides.
+/// name is not consulted: [`extract_sgcb_target`] only routes LLN0 here, and a
+/// domain holds at most one control block, so the per-domain registry alone
+/// decides.
 pub fn handle_sgcb_read(
     registry: &SettingGroupRegistry,
     domain: &str,
