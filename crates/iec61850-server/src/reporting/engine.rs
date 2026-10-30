@@ -1338,12 +1338,16 @@ impl ReportingEngine {
     /// unknown receiver drops the connection; an encoding failure also leaves the
     /// anchor untouched.
     ///
+    /// Every report carries, as TimeOfEntry, the time its entry entered the
+    /// buffer, which is also what GetBRCBValues reads back as `TimeofEntry`; the
+    /// send time `_now_ms` does not appear on the wire.
+    ///
     /// Returns the number of entries sent.
     pub fn flush_brcb_pending(
         &self,
         brcb: &Arc<BufferedReportControl>,
         conn_id: ConnectionId,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> usize {
         // Read the anchor and release the state lock before calling
         // brcb_encode_snapshot, which takes the same lock; std mutexes are not
@@ -1423,7 +1427,7 @@ impl ReportingEngine {
                 rpt_id: &snap.rpt_id,
                 opt_flds: snap.opt_flds,
                 sq_num,
-                time_of_entry_ms: entry.time_of_entry_ms.max(now_ms),
+                time_of_entry_ms: entry.time_of_entry_ms,
                 dat_set: &snap.dat_set,
                 conf_rev: snap.conf_rev,
                 entry_id: entry.entry_id,
@@ -2915,5 +2919,36 @@ mod tests {
         assert_eq!(pdus.len(), 1);
         assert!(contains(&pdus[0].1, &reason(0x08)), "integrity");
         assert!(!contains(&pdus[0].1, &reason(0x48)), "no data-change");
+    }
+
+    #[test]
+    fn brcb_report_time_of_entry_is_the_buffering_time() {
+        let (eng, sink, brcb, attr) =
+            brcb_engine(0, TriggerOptions::DATA_CHANGED, OptFlds::TIME_STAMP);
+        let buffered_at = 1_700_000_000_000u64;
+        let sent_at = buffered_at + 3_600_000;
+        brcb.state.lock().unwrap().rpt_ena = false;
+        eng.on_brcb_value_updated(
+            &attr,
+            MmsValue::Integer(2),
+            InclusionFlag::VALUE_CHANGED,
+            buffered_at,
+        );
+        assert_eq!(eng.flush_brcb_pending(&brcb, 5, sent_at), 1);
+        let pdus = sink.pdus.lock().unwrap();
+        let toe = iec61850_mms::binary_time6_from_epoch_ms(buffered_at);
+        assert!(
+            contains(&pdus[0].1, &toe),
+            "TimeOfEntry is the buffering time"
+        );
+        assert!(!contains(
+            &pdus[0].1,
+            &iec61850_mms::binary_time6_from_epoch_ms(sent_at)
+        ));
+        assert_eq!(
+            brcb.state.lock().unwrap().last_sent_time_of_entry_ms,
+            buffered_at,
+            "the same instant TimeofEntry reads back"
+        );
     }
 }
