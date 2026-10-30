@@ -50,7 +50,9 @@ pub struct ClientReport {
     /// it, keeping the previous value for a member the latest report omitted.
     pub data_set_values: Vec<Option<MmsValue>>,
 
-    /// One entry per data set member, empty flags until a report supplies one.
+    /// One entry per data set member: the reason the latest report gives for
+    /// it, or empty flags when that report omits the member or carries no
+    /// reasons.
     pub reasons: Vec<ReasonForInclusion>,
 
     /// One entry per data set member, holding the member's object reference
@@ -114,8 +116,8 @@ pub enum StateError {
 
 /// Applies a parsed report to the subscription state. No IO, no callbacks.
 ///
-/// Members the report omits keep their previous value; those it includes are
-/// replaced outright.
+/// Members the report omits keep their previous value and data reference and
+/// have their reason cleared; those it includes are replaced outright.
 ///
 /// # Errors
 ///
@@ -166,6 +168,12 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
     state.entry_id = parsed.entry_id;
     state.conf_rev = parsed.conf_rev;
     state.segmentation = parsed.segmentation;
+
+    // A reason describes only the report that carries it.
+    state
+        .reasons
+        .iter_mut()
+        .for_each(|r| *r = ReasonForInclusion::empty());
 
     // The report carries one value per included member, in member order.
     // Members that are not included keep the value of the previous report.
@@ -296,6 +304,53 @@ mod tests {
         .unwrap();
         assert_eq!(s.reasons[0], ReasonForInclusion::DATA_CHANGE);
         assert_eq!(s.reasons[1], ReasonForInclusion::GI);
+    }
+
+    #[test]
+    fn omitted_member_reason_is_cleared() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            make_parsed(
+                vec![true, false],
+                vec![MmsValue::Integer(1)],
+                vec![ReasonForInclusion::DATA_CHANGE],
+            ),
+        )
+        .unwrap();
+        apply_report(
+            &mut s,
+            make_parsed(
+                vec![false, true],
+                vec![MmsValue::Integer(2)],
+                vec![ReasonForInclusion::QUALITY_CHANGE],
+            ),
+        )
+        .unwrap();
+        // The first member keeps its value, but the latest report gives it no reason.
+        assert_eq!(s.data_set_values[0], Some(MmsValue::Integer(1)));
+        assert_eq!(s.reasons[0], ReasonForInclusion::empty());
+        assert_eq!(s.reasons[1], ReasonForInclusion::QUALITY_CHANGE);
+    }
+
+    #[test]
+    fn report_without_reasons_clears_previous_reasons() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            make_parsed(
+                vec![true],
+                vec![MmsValue::Integer(1)],
+                vec![ReasonForInclusion::DATA_CHANGE],
+            ),
+        )
+        .unwrap();
+        apply_report(
+            &mut s,
+            make_parsed(vec![true], vec![MmsValue::Integer(2)], vec![]),
+        )
+        .unwrap();
+        assert_eq!(s.reasons[0], ReasonForInclusion::empty());
     }
 
     #[test]

@@ -8,6 +8,14 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`iec61850-client`** — `ClientReport::reasons` now describes only the
+  latest report: a data set member the report omits has empty reasons, where
+  it used to keep the reason of the last report that carried it. A member
+  absent from a report therefore no longer looks as if it had triggered it.
+  `data_set_values` still keeps the previous value of an omitted member.
+
 ## [0.3.1] - 2026-10-31
 
 ### Added
