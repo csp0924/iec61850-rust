@@ -476,6 +476,43 @@ impl ReadHandler for Deny {
     }
 }
 
+/// A read handler applies to a data set member exactly as to a direct read of
+/// it, whether the application or a client defined the data set; the other
+/// members keep their values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_set_values_go_through_the_read_handler() {
+    let m = model(false);
+    let server = server_with(m.clone(), IedServerConfig::default());
+    server.register_dataset(DOM, status_data_set(&m));
+    server
+        .install_read_handler("GGIO1$ST$Ind1$stVal", Arc::new(Deny))
+        .unwrap();
+    let handle = server.start().await.unwrap();
+    let conn = ied(&handle).await;
+
+    assert!(t!(conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St)).is_err());
+    t!(conn.create_data_set(
+        "IED1LD0/LLN0.dynLeak",
+        &[
+            DataSetMember::new("IED1LD0/GGIO1.Ind1.stVal", FC::St),
+            DataSetMember::new("IED1LD0/GGIO1.Ind2.stVal", FC::St),
+        ]
+    ))
+    .unwrap();
+    for ds in ["IED1LD0/LLN0.dsStatus", "IED1LD0/LLN0.dynLeak"] {
+        let values = t!(conn.get_data_set_values(ds)).unwrap();
+        assert_eq!(
+            values,
+            [
+                AccessResult::Failure(DataAccessError::ObjectAccessDenied),
+                AccessResult::Success(MmsData::Boolean(false)),
+            ],
+            "{ds}"
+        );
+    }
+    handle.stop().await;
+}
+
 /// GetDataSetValues of a data set that does not exist fails the service, as
 /// GetDataSetDirectory does, rather than answering one failed member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

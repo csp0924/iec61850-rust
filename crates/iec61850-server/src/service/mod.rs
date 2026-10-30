@@ -927,17 +927,29 @@ fn dispatch_read(
             };
 
             // Each entry snapshots its value under the shared lock and is then
-            // converted to wire data. One budget covers the whole list of
-            // access results, derived from the same negotiated maximum as the
-            // variable-list form of the request, so the same values are
-            // refused at the same size whichever way the read names them.
+            // converted to wire data, after which the read handler of the member
+            // applies exactly as on a direct read of it. One budget covers the
+            // whole list of access results, derived from the same negotiated
+            // maximum as the variable-list form of the request, so the same
+            // values are refused at the same size whichever way the read names
+            // them.
             use crate::service::convert::mms_value_to_mms_data;
             let mut remaining_budget = pdu_budget_for_access_results(negotiated_max_pdu_size);
             let mut results: Vec<AccessResult> = Vec::with_capacity(dataset.entries.len());
             for entry in &dataset.entries {
-                let result = match entry.read_value() {
+                let baseline = match entry.read_value() {
                     Some(v) => AccessResult::Success(mms_value_to_mms_data(&v)),
                     None => AccessResult::Failure(DataAccessError::HardwareFault),
+                };
+                let result = match get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref) {
+                    Some((domain_id, item_id)) => apply_read_handler(
+                        handler_registry,
+                        mms_model,
+                        conn_id,
+                        &iec61850_mms::ObjectName::DomainSpecific { domain_id, item_id },
+                        baseline,
+                    ),
+                    None => baseline,
                 };
                 if let Some(b) = remaining_budget.as_mut() {
                     let used = result.estimated_encoded_size();
@@ -2393,10 +2405,6 @@ fn handle_read_with_co_routing(
         return ReadRoutingOutcome::Result(baseline);
     }
 
-    if handler_registry.ignore_read_access() {
-        return ReadRoutingOutcome::Result(baseline);
-    }
-
     // An alternate-access read bypasses the handler registry: a handler returns
     // a whole-attribute value without the model template, leaving no way to
     // apply a component path to its output. The baseline above already resolved
@@ -2405,25 +2413,59 @@ fn handle_read_with_co_routing(
         return ReadRoutingOutcome::Result(baseline);
     }
 
+    ReadRoutingOutcome::Result(apply_read_handler(
+        handler_registry,
+        mms_model,
+        conn_id,
+        name,
+        baseline,
+    ))
+}
+
+/// Passes the model value read for `name` through the read handler installed
+/// on its attribute path, if any.
+///
+/// A cache hit replaces `baseline`, a miss keeps it, and an error replaces it
+/// with that error. With `ignore_read_access` set, or for a name that is not a
+/// handler path, `baseline` is returned unchanged. Every service that returns
+/// the value of a data attribute goes through this, so an access decision a
+/// handler makes holds whichever service names the attribute.
+#[cfg(any(
+    feature = "reporting",
+    feature = "control",
+    feature = "setting-groups",
+    feature = "goose-mapping",
+    feature = "logging"
+))]
+fn apply_read_handler(
+    handler_registry: &HandlerRegistry,
+    mms_model: &MmsDeviceModel,
+    conn_id: u64,
+    name: &iec61850_mms::mms::pdu::common::ObjectName,
+    baseline: AccessResult,
+) -> AccessResult {
+    if handler_registry.ignore_read_access() {
+        return baseline;
+    }
     let canonical_path = match read_path_canonical_from_object_name(name) {
         Some(p) => p,
         // Not a canonicalizable domain-specific path, so out of registry scope.
-        None => return ReadRoutingOutcome::Result(baseline),
+        None => return baseline,
     };
     let handler = match handler_registry.lookup_read(&canonical_path) {
         Some(h) => h,
-        None => return ReadRoutingOutcome::Result(baseline),
+        None => return baseline,
     };
     let fc = match fc_from_canonical_path(&canonical_path) {
         Some(f) => f,
-        None => return ReadRoutingOutcome::Result(baseline),
+        None => return baseline,
     };
     let ctx = ReadContext {
         path: &canonical_path,
         fc,
         conn_id,
     };
-    let r = match handler.read(&ctx) {
+    match handler.read(&ctx) {
         ReadOutcome::CacheHit(value) => {
             if handler_bit_string_fits(mms_model, name, &value) {
                 AccessResult::Success(crate::service::convert::mms_value_to_mms_data(&value))
@@ -2444,8 +2486,7 @@ fn handle_read_with_co_routing(
             );
             AccessResult::Failure(e)
         }
-    };
-    ReadRoutingOutcome::Result(r)
+    }
 }
 
 /// Reports whether a value a read handler supplies may be sent for `name`: a
