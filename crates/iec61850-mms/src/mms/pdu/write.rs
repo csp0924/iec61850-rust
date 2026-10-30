@@ -160,7 +160,7 @@ fn decode_write_request_inner(data: &[u8], max_depth: u8) -> Result<WriteRequest
     // The variableAccessSpecification CHOICE uses 0xa0 for listOfVariable and 0xa1 for
     // variableListName. listOfData also carries 0xa0, so the two are told apart by
     // position: the access specification is read first, then listOfData.
-    let (vas, vas_consumed) = VariableAccessSpecification::decode(data)?;
+    let (vas, vas_consumed) = VariableAccessSpecification::decode_with_max(data, max_depth)?;
     let rest = &data[vas_consumed..];
 
     // listOfData [0] IMPLICIT SEQUENCE OF Data, tag 0xa0
@@ -989,5 +989,23 @@ mod tests {
             decode_confirmed_write_request_with_negotiated_cap(&buf, None).unwrap();
         assert_eq!(invoke_id, 1);
         assert_eq!(decoded, req);
+    }
+
+    /// The negotiated nesting level bounds the `alternateAccess` component chain of
+    /// a Write request, not only its `listOfData`.
+    #[test]
+    fn write_request_negotiated_cap_bounds_alternate_access() {
+        let buf = build_alt_access_write_request(
+            1,
+            "GGIO1$SP$SetIndArr",
+            super::super::common::AlternateAccess::index_component(0, "a$b$c").unwrap(),
+            MmsData::Boolean(true),
+        );
+        assert!(decode_confirmed_write_request_with_negotiated_cap(&buf, Some(3)).is_ok());
+        assert!(matches!(
+            decode_confirmed_write_request_with_negotiated_cap(&buf, Some(2)),
+            Err(MmsError::NestingLevelExceeded { max: 2, got: 3 })
+        ));
+        assert!(decode_confirmed_write_request(&buf).is_ok());
     }
 }

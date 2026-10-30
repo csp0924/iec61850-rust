@@ -47,7 +47,9 @@
 //! length at the negotiated maximum PDU size.
 
 use super::super::error::MmsError;
-use super::common::{decode_list_of_variable, encode_list_of_variable_seq, ObjectName};
+use super::common::{
+    decode_list_of_variable, encode_list_of_variable_seq, ObjectName, MAX_DATA_NESTING_DEPTH,
+};
 use super::initiate::{decode_length, encode_length};
 use super::ListOfVariableEntry;
 use crate::compat::prelude::*;
@@ -210,7 +212,7 @@ fn decode_response_inner(data: &[u8]) -> Result<GetNamedVariableListAttributesRe
                 mms_deletable = Some(val[0] != 0);
             }
             TAG_LIST_OF_VARIABLE => {
-                list_of_variable = Some(decode_list_of_variable(val)?);
+                list_of_variable = Some(decode_list_of_variable(val, MAX_DATA_NESTING_DEPTH)?);
             }
             TAG_ACCESS_CONTROL_LIST => {
                 tracing::debug!(

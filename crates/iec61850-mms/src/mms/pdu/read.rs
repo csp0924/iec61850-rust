@@ -33,7 +33,9 @@
 //! ReadRequest, where it is required.
 
 use super::super::error::MmsError;
-use super::common::{AccessResult, VariableAccessSpecification};
+use super::common::{
+    effective_nesting_cap, AccessResult, VariableAccessSpecification, MAX_DATA_NESTING_DEPTH,
+};
 use super::initiate::{decode_length, encode_length};
 use crate::compat::prelude::*;
 use bytes::BytesMut;
@@ -107,7 +109,27 @@ impl ReadRequest {
     }
 
     /// Decodes a request; `data` starts at the `0xa4` byte.
+    ///
+    /// The local ceiling `MAX_DATA_NESTING_DEPTH` bounds `alternateAccess` nesting.
+    /// Use `decode_with_negotiated_cap` to apply a negotiated nesting level as well.
     pub fn decode(data: &[u8]) -> Result<Self, MmsError> {
+        Self::decode_inner_from_service_tag(data, MAX_DATA_NESTING_DEPTH)
+    }
+
+    /// Decodes a request under the negotiated `dataStructureNestingLevel`.
+    ///
+    /// The effective ceiling is the smaller of `MAX_DATA_NESTING_DEPTH` and the
+    /// negotiated value; `None` falls back to the local ceiling, which is the case
+    /// before negotiation completes.
+    pub fn decode_with_negotiated_cap(
+        data: &[u8],
+        negotiated: Option<u8>,
+    ) -> Result<Self, MmsError> {
+        let max_depth = effective_nesting_cap(MAX_DATA_NESTING_DEPTH, negotiated);
+        Self::decode_inner_from_service_tag(data, max_depth)
+    }
+
+    fn decode_inner_from_service_tag(data: &[u8], max_depth: u8) -> Result<Self, MmsError> {
         if data.is_empty() {
             return Err(MmsError::TruncatedPdu);
         }
@@ -123,11 +145,11 @@ impl ReadRequest {
             return Err(MmsError::TruncatedPdu);
         }
         let inner = &data[inner_start..inner_start + inner_len];
-        decode_read_request_inner(inner)
+        decode_read_request_inner(inner, max_depth)
     }
 }
 
-fn decode_read_request_inner(data: &[u8]) -> Result<ReadRequest, MmsError> {
+fn decode_read_request_inner(data: &[u8], max_depth: u8) -> Result<ReadRequest, MmsError> {
     let mut pos = 0usize;
     let mut spec_with_result = false;
     let mut vas: Option<VariableAccessSpecification> = None;
@@ -155,7 +177,8 @@ fn decode_read_request_inner(data: &[u8]) -> Result<ReadRequest, MmsError> {
             }
             0xa1 => {
                 // variableAccessSpecification [1] EXPLICIT, whose content is the CHOICE
-                let (decoded_vas, _) = VariableAccessSpecification::decode(val)?;
+                let (decoded_vas, _) =
+                    VariableAccessSpecification::decode_with_max(val, max_depth)?;
                 vas = Some(decoded_vas);
             }
             other => {
@@ -323,6 +346,19 @@ pub fn encode_confirmed_read_response(invoke_id: u32, resp: &ReadResponse, buf: 
 pub fn decode_confirmed_read_request(data: &[u8]) -> Result<(u32, ReadRequest), MmsError> {
     let (invoke_id, service_data) = decode_confirmed_pdu_inner(data, 0xa0)?;
     let req = ReadRequest::decode(service_data)?;
+    Ok((invoke_id, req))
+}
+
+/// Decodes the ReadRequest inside a ConfirmedRequestPdu under the negotiated ceiling.
+///
+/// The effective ceiling is the smaller of `MAX_DATA_NESTING_DEPTH` and the
+/// negotiated value.
+pub fn decode_confirmed_read_request_with_negotiated_cap(
+    data: &[u8],
+    negotiated: Option<u8>,
+) -> Result<(u32, ReadRequest), MmsError> {
+    let (invoke_id, service_data) = decode_confirmed_pdu_inner(data, 0xa0)?;
+    let req = ReadRequest::decode_with_negotiated_cap(service_data, negotiated)?;
     Ok((invoke_id, req))
 }
 
@@ -726,5 +762,22 @@ mod tests {
             has_alt,
             "wire bytes should contain the IndexComponent header"
         );
+    }
+
+    /// The negotiated nesting level bounds the `alternateAccess` component chain of
+    /// a Read request when it is below the local ceiling.
+    #[test]
+    fn read_request_negotiated_cap_bounds_alternate_access() {
+        let buf = build_alt_access_request(
+            1,
+            "GGIO1$ST$Ind1",
+            AlternateAccess::index_component(0, "a$b$c").unwrap(),
+        );
+        assert!(decode_confirmed_read_request_with_negotiated_cap(&buf, Some(3)).is_ok());
+        assert!(matches!(
+            decode_confirmed_read_request_with_negotiated_cap(&buf, Some(2)),
+            Err(MmsError::NestingLevelExceeded { max: 2, got: 3 })
+        ));
+        assert!(decode_confirmed_read_request(&buf).is_ok());
     }
 }

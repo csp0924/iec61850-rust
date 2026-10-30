@@ -5,7 +5,7 @@
 //! - variableListName round trips, both domain-specific and vmd-specific
 //! - the three states of the OPTIONAL specificationWithResult: true, false, absent
 //! - a listOfAccessResult mixing Success and Failure entries
-//! - a nesting depth bomb
+//! - a nesting depth bomb, in an AccessResult and in a request's alternateAccess
 //! - an oversized length field, which must return an error rather than panic
 //! - a 65-byte domainId, which must be rejected
 //! - an invalid floatingpoint size, which must be rejected
@@ -284,6 +284,57 @@ fn access_result_depth_bomb_err() {
         matches!(result, Err(MmsError::NestingLevelExceeded { .. })),
         "a depth bomb must return NestingLevelExceeded, got: {:?}",
         result
+    );
+}
+
+/// A Read request whose alternateAccess nests its component chain past the depth
+/// cap is rejected with `NestingLevelExceeded` instead of recursing without bound.
+#[test]
+fn read_request_alternate_access_depth_bomb_err() {
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 0x1_0000);
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else if content.len() < 0x100 {
+            out.extend_from_slice(&[0x81, content.len() as u8]);
+        } else {
+            out.extend_from_slice(&[0x82, (content.len() >> 8) as u8, content.len() as u8]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    // 33 component segments, one past the local cap of 32:
+    // 0x81 0x01 'a' terminal, each outer level 0xa0 { 0x80 0x01 'a', 0x30 { ... } }
+    let mut chain = vec![0x81, 0x01, b'a'];
+    for _ in 1..33 {
+        let mut sel = vec![0x80, 0x01, b'a'];
+        sel.extend_from_slice(&tlv(0x30, &chain));
+        chain = tlv(0xa0, &sel);
+    }
+    // selectAlternateAccess { accessSelection.index 0, alternateAccess }
+    let mut select = vec![0x81, 0x01, 0x00];
+    select.extend_from_slice(&tlv(0x30, &chain));
+    let alt_access = tlv(0xa5, &tlv(0xa0, &select));
+
+    // ListOfVariableSeq { name [0] domain-specific "LD" / "X", alternateAccess [5] }
+    let mut seq = vec![
+        0xa0, 0x09, 0xa1, 0x07, 0x1a, 0x02, b'L', b'D', 0x1a, 0x01, b'X',
+    ];
+    seq.extend_from_slice(&alt_access);
+    let vas = tlv(0xa1, &tlv(0xa0, &tlv(0x30, &seq)));
+    let mut body = vec![0x02, 0x01, 0x01];
+    body.extend_from_slice(&tlv(0xa4, &vas));
+    let pdu = tlv(0xa0, &body);
+
+    let result = decode_confirmed_read_request(&pdu);
+    assert!(
+        matches!(
+            result,
+            Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+        ),
+        "got {result:?}"
     );
 }
 

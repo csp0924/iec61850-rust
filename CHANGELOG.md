@@ -8,6 +8,25 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+- **`iec61850-mms`** — `AlternateAccess::decode_with_negotiated_cap`, and
+  `ReadRequest::decode_with_negotiated_cap` with its
+  `decode_confirmed_read_request_with_negotiated_cap` wrapper, decoding under
+  the negotiated `dataStructureNestingLevel` as a Write request already can.
+
+### Fixed
+
+- **`iec61850-mms`** — the component chain of an `AlternateAccess` is decoded
+  to a depth of at most 32, and a deeper chain is rejected with
+  `NestingLevelExceeded`. A Read or Write request nesting
+  `selectAlternateAccess` without bound could otherwise exhaust the stack and
+  abort the process. `ReadRequest::decode_with_negotiated_cap`,
+  `WriteRequest::decode_with_negotiated_cap` and
+  `AlternateAccess::decode_with_negotiated_cap` lower the limit to the
+  negotiated nesting level when that is smaller. `AlternateAccess::index_component`
+  refuses a path of more than 32 segments, so every selector it builds decodes.
+
 ## [0.2.0] - 2026-09-06
 
 ### Changed
