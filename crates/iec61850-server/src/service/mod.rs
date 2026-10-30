@@ -2570,6 +2570,7 @@ fn handle_write_with_co_routing(
             };
             return match crate::control::dispatch::write(
                 control_objects,
+                ied_model,
                 &entry,
                 conn_id,
                 &target,

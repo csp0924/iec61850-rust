@@ -6,7 +6,7 @@
 //! driven by events; a timeout only bounds a wait whose event never comes.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
@@ -229,6 +229,21 @@ impl ControlHandler for Gate {
             release.notified().await;
             result
         })
+    }
+}
+
+/// Control handler that records every control value it receives.
+struct Recorder(Arc<Mutex<Vec<MmsValue>>>);
+
+impl ControlHandler for Recorder {
+    fn operate<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        v: &'a MmsValue,
+        _t: bool,
+    ) -> OperateFuture<'a> {
+        self.0.lock().unwrap().push(v.clone());
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -649,6 +664,55 @@ async fn oper_timeout_ends_the_command_with_time_limit_over() {
 }
 
 // ── Type of the written value ───────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operate_with_a_ctl_val_of_the_wrong_type_is_type_inconsistent() {
+    let seen: Arc<Mutex<Vec<MmsValue>>> = Arc::default();
+    let s = server();
+    register(
+        &s,
+        object("SPCSO1", ControlModel::DirectNormal),
+        Arc::new(Recorder(seen.clone())),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    // The ctlVal of an SPC is BOOLEAN.
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(MmsData::Integer(5), 1))
+        .await;
+    assert_eq!(denied(r), DataAccessError::TypeInconsistent);
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 300))
+        .await;
+    assert_eq!(
+        denied(r),
+        DataAccessError::TypeInconsistent,
+        "ctlNum is INT8U"
+    );
+    let MmsData::Structure(mut short) = oper(on(), 1) else {
+        unreachable!()
+    };
+    short.pop();
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", MmsData::Structure(short))
+        .await;
+    assert_eq!(
+        denied(r),
+        DataAccessError::TypeInconsistent,
+        "Check is missing"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the handler saw an ill-typed command"
+    );
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 1))
+        .await
+        .expect("a well-typed Oper");
+    assert_eq!(*seen.lock().unwrap(), vec![MmsValue::Boolean(true)]);
+    h.stop().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_cancel_is_type_inconsistent_and_keeps_the_selection() {

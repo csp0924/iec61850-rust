@@ -21,6 +21,7 @@
 //! - Under enhanced security the outcome of the command travels in the
 //!   CommandTermination that ends it; normal security reports no outcome.
 
+use super::conform::{conforms, declared_co_attribute};
 use super::model::{CancelParams, ControlAddCause, ControlLastApplError, OperParams, OriginValue};
 use super::registry::{ControlObjectEntry, ControlObjectsRegistry};
 use super::service::{
@@ -31,7 +32,7 @@ use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName, WriteOutcome};
 use iec61850_mms::mms::pdu::information_report::{
     encode_information_report, encode_last_appl_error_struct, LastApplErrorRef, OriginRef,
 };
-use iec61850_model::MmsValue;
+use iec61850_model::{IedModel, MmsValue};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,16 +220,36 @@ impl CoTarget<'_> {
 
 /// Runs a write of `SBOw`, `Oper`, or `Cancel` on a registered control object.
 ///
-/// A value that does not have the structure of the service is refused as type
-/// inconsistent. A refusal queues `LastApplError` on the connection before the
-/// caller answers.
+/// The value is checked against the attribute the model declares; an object the
+/// model does not declare is checked against the structure of the service only.
+/// A refusal queues `LastApplError` on the connection before the caller answers.
 pub(crate) fn write(
     registry: &ControlObjectsRegistry,
+    model: &IedModel,
     entry: &ControlObjectEntry,
     conn_id: u64,
     target: &CoTarget<'_>,
     value: &MmsValue,
 ) -> CoWriteResult {
+    if let Some(da) = declared_co_attribute(
+        model,
+        target.domain,
+        target.ln_name,
+        target.do_name,
+        target.attr_name(),
+    ) {
+        if !conforms(da, value) {
+            tracing::warn!(
+                domain = target.domain,
+                ln = target.ln_name,
+                do_name = target.do_name,
+                attr = target.attr_name(),
+                "control write refused: the value does not have the type of the attribute"
+            );
+            return CoWriteResult::TypeInconsistent;
+        }
+    }
+
     let outbox = registry.outbox();
     match target.attr {
         CoAttr::Sbo => CoWriteResult::Refused(ControlAddCause::NotSupported),
