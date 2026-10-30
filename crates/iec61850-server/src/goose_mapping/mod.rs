@@ -308,10 +308,11 @@ pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> MmsData {
 
 /// Applies an MMS write to one GoCB attribute.
 ///
-/// GoEna, a boolean, and GoID, a visible string, are writable. The other seven
-/// attributes are read-only and are refused with `ObjectAccessDenied`. An unknown
-/// attribute is refused with `ObjectNonExistent` and a value of the wrong type with
-/// `ObjectValueInvalid`.
+/// GoEna, a boolean, and GoID, a visible string, are writable; GoID only while
+/// the publisher is disabled, and otherwise it is refused with
+/// `TemporarilyUnavailable`. The other seven attributes are read-only and are
+/// refused with `ObjectAccessDenied`. An unknown attribute is refused with
+/// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
 pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> WriteOutcome {
     match da_name {
         "GoEna" => {
@@ -355,6 +356,12 @@ pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> 
             // The publisher and the handle are both updated, so what is on the wire
             // matches what a read returns.
             if let Ok(mut p) = handle.publisher.lock() {
+                // IEC 61850-7-2 SetGoCBValues: only GoEna may change while the
+                // control block is enabled.
+                if p.enabled() {
+                    tracing::warn!(da_name, "write GoID refused: GoEna is true");
+                    return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
+                }
                 p.set_go_id(Some(s.clone()));
             } else {
                 tracing::warn!(da_name, "write GoID failed: publisher mutex poisoned");
