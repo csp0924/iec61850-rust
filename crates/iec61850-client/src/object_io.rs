@@ -548,6 +548,37 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
             .await
     }
 
+    /// Writes a BIT STRING data attribute.
+    ///
+    /// `data` carries the bits most significant first, as on the wire, and
+    /// `padding` counts the unused low-order bits of the last byte, which are
+    /// sent as zero. A `Dbpos` of 2 (on), for example, is `vec![0x80]` with
+    /// padding 6.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` without sending a request when `padding` is 8
+    /// or more, or nonzero for empty `data`.
+    pub async fn write_bit_string(
+        &self,
+        reference: &str,
+        fc: FC,
+        mut data: Vec<u8>,
+        padding: u8,
+    ) -> Result<(), ClientError> {
+        if padding >= 8 || (data.is_empty() && padding != 0) {
+            return Err(ClientError::InvalidArgument(format!(
+                "bit string padding {padding} is invalid for {} data bytes",
+                data.len()
+            )));
+        }
+        if let Some(last) = data.last_mut() {
+            *last &= u8::MAX.checked_shl(u32::from(padding)).unwrap_or(0);
+        }
+        self.write_object(reference, fc, MmsValue::BitString { padding, data })
+            .await
+    }
+
     /// Writes a VISIBLE STRING data attribute.
     pub async fn write_visible_string(
         &self,

@@ -21,6 +21,11 @@ Every crate in the workspace shares one version number.
   of 2 is stored as `0x80` with padding 6. A rejected update returns
   `TypeMismatch` and leaves the attribute unchanged; an accepted one triggers
   reports as the other typed updates do.
+- **`iec61850-client`** — `IedConnection::write_bit_string`, a typed write of
+  a BIT STRING data attribute from its bytes, most significant bit first, and
+  its padding; the unused bits of the last byte are sent as zero. Padding of 8
+  or more, or nonzero padding with no data, returns `InvalidArgument` without
+  sending a request.
 
 ### Fixed
 
