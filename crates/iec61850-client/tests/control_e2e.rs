@@ -200,11 +200,11 @@ async fn direct_normal_operate_check_rejects() {
     let spc = make_control_handle(&conn, "SPCDN_BLK", ControlModel::DirectNormal);
 
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    // A refused direct-normal command comes back as a confirmed error, which
-    // carries no additional cause, so the client reports Failure(Unknown).
-    assert!(
-        matches!(outcome, ControlOutcome::Failure(_)),
-        "direct-normal with a blocking check should fail, got {outcome:?}"
+    // The refusal carries its cause in the LastApplError ahead of the negative
+    // response.
+    assert_eq!(
+        outcome,
+        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
     );
 
     let _ = conn.disconnect().await;
@@ -261,21 +261,12 @@ async fn direct_enhanced_operate_failure_with_ct_negative() {
     let spc = make_control_handle(&conn, "SPCDE_FAIL", ControlModel::DirectEnhanced);
 
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    // The write itself is answered, so the failure arrives as the negative
-    // command termination that follows; the client reads it and reports the
-    // additional cause it carries.
-    match outcome {
-        ControlOutcome::Failure(c) => {
-            assert!(
-                matches!(
-                    c,
-                    ControlAddCause::BlockedByProcess | ControlAddCause::Unknown
-                ),
-                "direct-enhanced failure should report BlockedByProcess, or Unknown as a fallback, got {c:?}"
-            );
-        }
-        ControlOutcome::Success => panic!("direct-enhanced operate failed but reported success"),
-    }
+    // The write is accepted, so the failure arrives as the negative command
+    // termination that follows, carrying the cause the handler reported.
+    assert_eq!(
+        outcome,
+        ControlOutcome::Failure(ControlAddCause::BlockedByProcess)
+    );
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -329,9 +320,9 @@ async fn sbo_normal_operate_without_select_rejects() {
 
     // Operate without selecting first.
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert!(
-        matches!(outcome, ControlOutcome::Failure(_)),
-        "sbo-normal operate without a selection should fail, got {outcome:?}"
+    assert_eq!(
+        outcome,
+        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
     );
 
     let _ = conn.disconnect().await;
@@ -382,7 +373,7 @@ async fn sbo_enhanced_full_flow_success() {
 // sbo-enhanced, operate with a value the selection did not carry.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sbo_enhanced_inconsistent_params_rejects_with_ct_negative() {
+async fn sbo_enhanced_inconsistent_params_are_refused() {
     let server = build_server();
     register_control_object(
         &server,
@@ -403,23 +394,16 @@ async fn sbo_enhanced_inconsistent_params_rejects_with_ct_negative() {
         .await
         .expect("select_with_value");
 
-    // Operate with false, which the server rejects as inconsistent, with a CT-.
+    // Operate with false, which the server refuses as inconsistent; a refused
+    // command has no command termination.
     let outcome = spc
         .operate(MmsValue::Boolean(false))
         .await
         .expect("operate");
-    match outcome {
-        ControlOutcome::Failure(c) => {
-            assert!(
-                matches!(
-                    c,
-                    ControlAddCause::InconsistentParameters | ControlAddCause::Unknown
-                ),
-                "an inconsistent sbo-enhanced operate should report InconsistentParameters, or Unknown as a fallback, got {c:?}"
-            );
-        }
-        ControlOutcome::Success => panic!("an inconsistent sbo-enhanced operate must not succeed"),
-    }
+    assert_eq!(
+        outcome,
+        ControlOutcome::Failure(ControlAddCause::InconsistentParameters)
+    );
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -448,11 +432,12 @@ async fn sbo_normal_cancel_after_select() {
     let cancel_outcome = spc.cancel(MmsValue::Boolean(true)).await.expect("cancel");
     assert_eq!(cancel_outcome, ControlOutcome::Success);
 
-    // After a cancel the object is unselected, so an operate is refused.
+    // After a cancel the object is unselected, so an operate is refused with
+    // Object-not-selected.
     let after = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert!(
-        matches!(after, ControlOutcome::Failure(_)),
-        "operate after cancel should fail, got {after:?}"
+    assert_eq!(
+        after,
+        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
     );
 
     let _ = conn.disconnect().await;
@@ -493,15 +478,15 @@ async fn sbo_normal_timeout_releases_then_reselect_succeeds() {
     // Wait well past the selection timeout.
     sleep(Duration::from_millis(450)).await;
 
-    // The server releases the expired selection when the operate arrives, so
-    // the object is unselected and the command is refused.
+    // The expired selection leaves the object unselected, so the command is
+    // refused with Object-not-selected.
     let after_timeout = spc
         .operate(MmsValue::Boolean(true))
         .await
         .expect("operate after timeout");
-    assert!(
-        matches!(after_timeout, ControlOutcome::Failure(_)),
-        "operate after the selection expired should fail, got {after_timeout:?}"
+    assert_eq!(
+        after_timeout,
+        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
     );
 
     // The object can be selected again once the selection has been released.

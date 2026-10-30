@@ -490,9 +490,6 @@ async fn late_last_appl_error_of_an_earlier_command_is_not_taken() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO: drop the ignore once the MMS client discards an empty unconfirmed PDU
-// instead of stashing it.
-#[ignore = "the MMS client stashes an empty unconfirmed PDU"]
 async fn empty_information_report_does_not_hide_the_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCEMPTYIR", ControlModel::DirectNormal);
