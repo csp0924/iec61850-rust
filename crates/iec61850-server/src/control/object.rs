@@ -595,8 +595,10 @@ impl ControlObject {
 
     /// Selects the object with a value, returning the add cause of a refusal.
     ///
-    /// A selected or executing object refuses with `LockedByOtherClient`, and a
-    /// malformed origin is refused with `InconsistentParameters`.
+    /// A selected object refuses with `ObjectAlreadySelected`, whichever
+    /// connection holds the selection, an executing one with
+    /// `CommandAlreadyInExecution`, and a malformed origin is refused with
+    /// `InconsistentParameters`.
     pub(crate) fn sbow_select(
         &self,
         conn_id: u64,
@@ -612,7 +614,12 @@ impl ControlObject {
                 state = ?g.state,
                 "select-with-value refused: the object is already selected or executing"
             );
-            return Ok(Err(ControlAddCause::LockedByOtherClient));
+            let cause = if g.state == ControlState::Ready {
+                ControlAddCause::ObjectAlreadySelected
+            } else {
+                ControlAddCause::CommandAlreadyInExecution
+            };
+            return Ok(Err(cause));
         }
 
         // The origin field must be well formed.
@@ -818,6 +825,24 @@ mod tests {
             synchro_check: false,
             interlock_check: true,
         }
+    }
+
+    // ── A second select with value ───────────────────────────────────────
+
+    #[test]
+    fn sbow_select_on_a_selected_object_is_object_already_selected() {
+        let obj = ControlObject::new(make_config(ControlModel::SboEnhanced));
+        let params = make_oper_params(MmsValue::Boolean(true));
+        assert_eq!(obj.sbow_select(1, &params).unwrap(), Ok(()));
+        assert_eq!(
+            obj.sbow_select(1, &params).unwrap(),
+            Err(ControlAddCause::ObjectAlreadySelected)
+        );
+        assert_eq!(
+            obj.sbow_select(2, &params).unwrap(),
+            Err(ControlAddCause::ObjectAlreadySelected)
+        );
+        assert_eq!(obj.state(), ControlState::Ready);
     }
 
     // ── An out-of-range ctlModel is refused ──────────────────────────────

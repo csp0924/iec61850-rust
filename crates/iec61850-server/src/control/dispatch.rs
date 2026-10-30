@@ -425,7 +425,7 @@ pub(crate) fn encode_last_appl_error(
 ) -> Bytes {
     let lae = LastApplErrorRef {
         ctl_obj: cntrl_obj.to_string(),
-        error: ControlLastApplError::NoError as i32,
+        error: last_appl_error_code(cause) as i32,
         origin: origin.clone(),
         ctl_num,
         add_cause: cause as i32,
@@ -436,11 +436,30 @@ pub(crate) fn encode_last_appl_error(
     )])
 }
 
+/// Returns the `Error` member of LastApplError for a command that ended with
+/// `cause`.
+///
+/// A refusal or failure the control state machine reports through its add
+/// cause carries `No Error`; `Unknown`, which marks an internal failure of the
+/// server, carries `Unknown`.
+pub(crate) fn last_appl_error_code(cause: ControlAddCause) -> ControlLastApplError {
+    match cause {
+        ControlAddCause::Unknown => ControlLastApplError::Unknown,
+        _ => ControlLastApplError::NoError,
+    }
+}
+
 /// Maps a control add cause onto the data access error of a negative write
-/// response; the add cause itself travels in `LastApplError`.
+/// response, per the SelectWithValue, Operate, and Cancel mapping of
+/// IEC 61850-8-1; the add cause itself travels in `LastApplError`.
+///
+/// An object that is selected, locked by another client, or executing is
+/// temporarily unavailable; every other refusal denies access to the object.
 pub(crate) fn add_cause_to_data_access_error(cause: ControlAddCause) -> DataAccessError {
     match cause {
-        ControlAddCause::NotSupported => DataAccessError::ObjectAccessUnsupported,
+        ControlAddCause::ObjectAlreadySelected
+        | ControlAddCause::LockedByOtherClient
+        | ControlAddCause::CommandAlreadyInExecution => DataAccessError::TemporarilyUnavailable,
         _ => DataAccessError::ObjectAccessDenied,
     }
 }

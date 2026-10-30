@@ -39,7 +39,7 @@
 //!   enabled is disabled and keeps buffering; a BRCB it reserved stays reserved
 //!   for the same client address until its ResvTms expires.
 
-use crate::control::{ConnectionTerminationEvent, ControlAddCause, ControlLastApplError};
+use crate::control::{ConnectionTerminationEvent, ControlAddCause};
 use crate::error::Result;
 use crate::server::IedServer;
 use crate::ConnectionId;
@@ -1131,11 +1131,12 @@ where
                 oper_len = oper_value.len(),
                 "sending a negative command termination"
             );
+            let (origin, ctl_num) = oper_origin_and_ctl_num(oper_value);
             let last_err = LastApplErrorRef {
                 ctl_obj: format!("{}/{}", domain_id, item_id),
-                error: ControlLastApplError::OperationFailed as i32,
-                origin: OriginRef::default(),
-                ctl_num: 0,
+                error: crate::control::dispatch::last_appl_error_code(*add_cause) as i32,
+                origin,
+                ctl_num,
                 add_cause: cause_to_i32(*add_cause),
             };
             encode_command_termination_negative(&last_err, &domain_id, &item_id, oper_value.clone())
@@ -1170,6 +1171,32 @@ fn deferrable_write(response: &[u8], deferred: &[u64]) -> Option<u32> {
     match resp.outcomes.as_slice() {
         [WriteOutcome::Success] => Some(invoke_id),
         _ => None,
+    }
+}
+
+/// Returns the `origin` and `ctlNum` of the encoded Oper structure a command
+/// termination echoes, which the LastApplError of a negative termination
+/// repeats; a structure that does not decode yields the defaults.
+fn oper_origin_and_ctl_num(oper_value: &[u8]) -> (OriginRef, u8) {
+    use crate::control::OperParams;
+    use crate::service::convert::mms_data_to_mms_value;
+    use iec61850_mms::mms::pdu::common::MmsData;
+
+    let params = MmsData::decode(oper_value)
+        .ok()
+        .and_then(|(data, _)| OperParams::from_mms_value(&mms_data_to_mms_value(&data)));
+    match params {
+        Some(p) => (
+            OriginRef {
+                or_cat: p.origin.or_cat,
+                or_ident: p.origin.or_ident,
+            },
+            p.ctl_num,
+        ),
+        None => {
+            tracing::warn!("command termination: the echoed Oper structure did not decode");
+            (OriginRef::default(), 0)
+        }
     }
 }
 

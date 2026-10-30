@@ -349,12 +349,12 @@ async fn refused_sbow_and_cancel_of_another_client_send_last_appl_error() {
     let r = b
         .write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 10))
         .await;
-    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    assert_eq!(denied(r), DataAccessError::TemporarilyUnavailable);
     let lae = last_appl_error_only(queued_report(&mut b).await);
-    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$SBOw"), 10, 27);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$SBOw"), 10, 19);
 
     let r = b.write(DOMAIN, "GGIO1$CO$SPCSO4$Cancel", cancel(11)).await;
-    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    assert_eq!(denied(r), DataAccessError::TemporarilyUnavailable);
     let lae = last_appl_error_only(queued_report(&mut b).await);
     assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$Cancel"), 11, 27);
 
@@ -363,6 +363,27 @@ async fn refused_sbow_and_cancel_of_another_client_send_last_appl_error() {
         ControlState::Ready,
         "A still holds the selection"
     );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sbow_on_a_selected_object_reports_object_already_selected() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO4", ControlModel::SboEnhanced),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 1))
+        .await
+        .expect("select");
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 2)).await;
+    assert_eq!(denied(r), DataAccessError::TemporarilyUnavailable);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$SBOw"), 2, 19);
     h.stop().await;
 }
 
@@ -426,7 +447,7 @@ async fn enhanced_execution_failure_answers_positively_then_terminates_negativel
     let MmsData::Structure(lae) = &values[0] else {
         panic!("LastApplError is not a structure")
     };
-    assert_eq!(lae[4], MmsData::Integer(9), "AddCause");
+    assert_last_appl_error(lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"), 42, 9);
     assert_eq!(values[1], oper(on(), 42), "the termination echoes the Oper");
     h.stop().await;
 }
@@ -467,7 +488,7 @@ async fn enhanced_operate_is_answered_while_the_command_executes() {
     // executing command.
     a.read(DOMAIN, "GGIO1$ST$SPCSO3$stVal").await.expect("read");
     let r = a.write(DOMAIN, "GGIO1$CO$SPCSO3$Cancel", cancel(5)).await;
-    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    assert_eq!(denied(r), DataAccessError::TemporarilyUnavailable);
     let lae = last_appl_error_only(queued_report(&mut a).await);
     assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Cancel"), 5, 12);
 
@@ -622,7 +643,7 @@ async fn oper_timeout_ends_the_command_with_time_limit_over() {
     let MmsData::Structure(lae) = &values[0] else {
         panic!("LastApplError is not a structure")
     };
-    assert_eq!(lae[4], MmsData::Integer(16), "AddCause");
+    assert_last_appl_error(lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"), 3, 16);
     assert_eq!(obj.state(), ControlState::Unselected);
     h.stop().await;
 }
@@ -698,7 +719,7 @@ async fn object_without_a_control_handler_refuses_operate_with_not_supported() {
     let mut a = connect(&h).await;
 
     let r = a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 4)).await;
-    assert_eq!(denied(r), DataAccessError::ObjectAccessUnsupported);
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
     let lae = last_appl_error_only(queued_report(&mut a).await);
     assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO1$Oper"), 4, 1);
     h.stop().await;
