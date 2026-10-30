@@ -845,9 +845,10 @@ impl ReportingEngine {
         let ds = self.brcb_datasets.get(mms_path)?;
         let n = ds.len();
         let mut snap = EnqueuedSnapshot::new(n);
+        // The entry is flagged as integrity or general interrogation, which
+        // includes every member; no member carries a data-change reason.
         for (i, entry) in ds.entries.iter().enumerate() {
             snap.values[i] = entry.read_value();
-            snap.inclusion_flags[i] = InclusionFlag::VALUE_CHANGED;
         }
         Some(snap)
     }
@@ -2878,5 +2879,41 @@ mod tests {
         let snap = entries[1].snapshot.as_ref().expect("snapshot");
         assert_eq!(snap.values[0], Some(MmsValue::Integer(1)));
         assert_eq!(entries[1].time_of_entry_ms, 1_010);
+    }
+
+    /// The reason-for-inclusion BIT_STRING(6) of one member.
+    fn reason(bits: u8) -> [u8; 4] {
+        [0x84, 0x02, 0x02, bits]
+    }
+
+    #[test]
+    fn brcb_gi_report_reason_is_general_interrogation_only() {
+        let (eng, sink, brcb, _attr) = brcb_engine(
+            0,
+            TriggerOptions::DATA_CHANGED | TriggerOptions::GI,
+            OptFlds::REASON,
+        );
+        brcb.state.lock().unwrap().gi = true;
+        eng.tick_brcb(Instant::now(), 2_000);
+        let entries = brcb.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 1);
+        let snap = entries[0].snapshot.as_ref().expect("snapshot");
+        assert!(snap.inclusion_flags.iter().all(|f| !f.has_trigger()));
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(pdus.len(), 1);
+        assert!(contains(&pdus[0].1, &reason(0x04)), "general-interrogation");
+        assert!(!contains(&pdus[0].1, &reason(0x44)), "no data-change");
+    }
+
+    #[test]
+    fn brcb_integrity_report_reason_is_integrity_only() {
+        let (eng, sink, brcb, _attr) = brcb_engine(0, TriggerOptions::INTEGRITY, OptFlds::REASON);
+        brcb.state.lock().unwrap().intg_pd_ms = 1_000;
+        eng.refresh_brcb_integrity_period(&brcb.mms_path);
+        eng.tick_brcb(Instant::now() + Duration::from_secs(2), 3_000);
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(pdus.len(), 1);
+        assert!(contains(&pdus[0].1, &reason(0x08)), "integrity");
+        assert!(!contains(&pdus[0].1, &reason(0x48)), "no data-change");
     }
 }
