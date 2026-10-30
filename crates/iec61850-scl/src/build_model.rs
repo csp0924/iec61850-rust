@@ -1072,9 +1072,12 @@ pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
 /// declared limit; and an enumeration is looked up by name in its EnumType
 /// before falling back to an integer ordinal.
 ///
-/// Quality, Check, Dbpos, Tcmd, Timestamp, EntryTime, Octet64, EntryID,
-/// OptFlds, TrgOps and PhyComAddr are not parsed here: a value on one of them
-/// is warned about and the attribute keeps its default.
+/// A Dbpos takes the IEC 61850-7-3 value names `intermediate-state`, `off`,
+/// `on` and `bad-state`, and a Tcmd `stop`, `lower`, `higher` and `reserved`;
+/// either becomes the two-bit string of its ordinal. Any other text on them,
+/// and a value on Quality, Check, Timestamp, EntryTime, Octet64, EntryID,
+/// OptFlds, TrgOps or PhyComAddr, is warned about and the attribute keeps its
+/// default.
 ///
 /// Also used by the build-script path through [`crate::__build_internals`], so
 /// the value is parsed once while the build script runs and emitted as a
@@ -1245,10 +1248,33 @@ pub fn parse_val_for_b_type(
             }
             Ok(MmsValue::MmsString(raw.to_string()))
         }
+        // A two-bit coded enumeration, carried most significant bit first.
+        "Dbpos" | "Tcmd" => {
+            let names: [&str; 4] = if b_type == "Dbpos" {
+                ["intermediate-state", "off", "on", "bad-state"]
+            } else {
+                ["stop", "lower", "higher", "reserved"]
+            };
+            match names.iter().position(|n| *n == raw) {
+                Some(ord) => Ok(MmsValue::BitString {
+                    padding: 6,
+                    data: vec![(ord as u8) << 6],
+                }),
+                None => {
+                    tracing::warn!(
+                        "`{}` is not a {} value name, so the attribute keeps its default",
+                        raw,
+                        b_type
+                    );
+                    let dat = b_type_to_dat(b_type, span, path)?;
+                    Ok(MmsValue::default_for(dat))
+                }
+            }
+        }
         // A bType this function does not parse: warn and return the zero value
         // of the corresponding type, which leaves the attribute at its default.
-        "Quality" | "Check" | "Dbpos" | "Tcmd" | "Timestamp" | "EntryTime" | "Octet64"
-        | "EntryID" | "OptFlds" | "TrgOps" | "PhyComAddr" => {
+        "Quality" | "Check" | "Timestamp" | "EntryTime" | "Octet64" | "EntryID" | "OptFlds"
+        | "TrgOps" | "PhyComAddr" => {
             tracing::warn!(
                 "a `<Val>` on bType=\"{}\" is not parsed yet, so the attribute keeps its default",
                 b_type

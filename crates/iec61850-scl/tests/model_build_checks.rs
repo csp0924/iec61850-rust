@@ -484,3 +484,58 @@ fn fcda_resolvable_members_build() {
         build(&wrap(MMXU_MV, &fcda(attrs), MMXU1));
     }
 }
+
+fn coded_enum_scl(doi: &str) -> String {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="C" type="C_T"/></LNodeType>
+    <DOType id="C_T" cdc="DPC">
+      <DA name="pos" fc="ST" bType="Dbpos"/>
+      <DA name="step" fc="ST" bType="Tcmd"/>
+    </DOType>"#;
+    let ln =
+        format!(r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="C">{doi}</DOI></LN>"#);
+    wrap(t, "", &ln)
+}
+
+fn two_bits(ord: u8) -> MmsValue {
+    MmsValue::BitString {
+        padding: 6,
+        data: vec![ord << 6],
+    }
+}
+
+/// A Dbpos or Tcmd `<Val>` written as an IEC 61850-7-3 value name becomes the
+/// two-bit string of its ordinal.
+#[test]
+fn coded_enum_val_names_are_applied() {
+    for (pos, pos_ord, step, step_ord) in [
+        ("intermediate-state", 0, "stop", 0),
+        ("off", 1, "lower", 1),
+        ("on", 2, "higher", 2),
+        ("bad-state", 3, "reserved", 3),
+    ] {
+        let doi = format!(
+            r#"<DAI name="pos"><Val>{pos}</Val></DAI><DAI name="step"><Val>{step}</Val></DAI>"#
+        );
+        let m = build(&coded_enum_scl(&doi));
+        assert_eq!(
+            da(&m, "GGIO1", "C", "pos").snapshot(),
+            two_bits(pos_ord),
+            "{pos}"
+        );
+        assert_eq!(
+            da(&m, "GGIO1", "C", "step").snapshot(),
+            two_bits(step_ord),
+            "{step}"
+        );
+    }
+}
+
+/// Control: a text that is not a value name leaves the default in place.
+#[test]
+fn coded_enum_unknown_val_keeps_the_default() {
+    let m = build(&coded_enum_scl(
+        r#"<DAI name="pos"><Val>closed</Val></DAI>"#,
+    ));
+    assert_eq!(da(&m, "GGIO1", "C", "pos").snapshot(), two_bits(0));
+}
