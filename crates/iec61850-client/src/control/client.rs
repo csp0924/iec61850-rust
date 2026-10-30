@@ -158,7 +158,8 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         self.origin = origin;
     }
 
-    /// Overrides ctlNum. Normally the client increments it on each operate.
+    /// Overrides ctlNum. Normally the client increments it on each
+    /// SelectWithValue, and on each Operate outside the sbo-enhanced model.
     pub fn set_ctl_num(&self, ctl_num: u8) {
         self.ctl_num.store(ctl_num, Ordering::Release);
     }
@@ -313,13 +314,19 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// Operates the object by writing the six-element structure
     /// `<LN>$CO$<DO>$Oper` (ACSI Operate).
     ///
+    /// The ctlNum of an sbo-enhanced Operate is the one `select_with_value`
+    /// carried, as the server requires Oper to match the selection; the other
+    /// models increment ctlNum first.
+    ///
     /// In the normal models the confirmed response concludes the command. In
     /// the enhanced models a positive response is followed by the
-    /// CommandTermination (CT+ or CT-) that the call then awaits. There the
-    /// write and the wait share one lock: releasing it in between would let a
-    /// background report dispatcher consume the command termination and leave
-    /// this call waiting for it. A refused command concludes at the negative
-    /// response in every model, as `Failure` with the AddCause of the server's
+    /// CommandTermination (CT+ or CT-) for this object and ctlNum, which the
+    /// call awaits for up to 5 s. The lock on the shared MMS client is held
+    /// from the write until the termination arrives or the wait expires, so
+    /// other services on the same connection wait meanwhile; releasing it in
+    /// between would let a background report dispatcher consume the
+    /// termination. A refused command concludes at the negative response in
+    /// every model, as `Failure` with the AddCause of the server's
     /// LastApplError, or `Unknown` when the server sent none.
     ///
     /// The wait needs a monotonic deadline, so the enhanced models require
@@ -349,9 +356,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             ));
         }
 
-        // A server requires Oper to match the preceding SBOw exactly, so an
-        // sbo-enhanced command reuses the ctlNum the selection carried; the
-        // caller aligns it with `set_ctl_num`. The other models increment.
         let ctl_num = match self.ctl_model {
             ControlModel::SboEnhanced => self.ctl_num.load(Ordering::Acquire),
             _ => self.next_ctl_num(),
@@ -382,7 +386,11 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
 
         #[cfg(feature = "std")]
         {
-            match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT).await? {
+            let expected = CtMatch {
+                object_ref_oper: format!("{}/{}", self.domain, item),
+                ctl_num,
+            };
+            match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT, &expected).await? {
                 Some(ct) => match ct.last_appl_error {
                     None => Ok(ControlOutcome::Success),
                     Some(err) => {
@@ -587,9 +595,11 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
 
     /// Tries to take one command termination, returning `Ok(None)` on timeout.
     ///
-    /// An InformationReport that is not a command termination, such as a report
-    /// triggered by a data change during the command, is pushed back onto the
-    /// client's pending queue for the report dispatcher, and the wait continues.
+    /// Only a termination of this object's Oper whose ctlNum is the current one
+    /// is taken. An InformationReport that is anything else, such as a report
+    /// triggered by a data change during the command or a late termination of
+    /// an earlier command, is pushed back onto the client's pending queue for
+    /// the report dispatcher, and the wait continues.
     ///
     /// The lock is re-taken on each attempt. A caller that already holds it, to
     /// keep a dispatcher from consuming the termination, uses `recv_ct_locked`.
@@ -600,14 +610,18 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         &self,
         timeout: Duration,
     ) -> Result<Option<CommandTerminationParsed>, ClientError> {
+        let expected = CtMatch {
+            object_ref_oper: format!("{}/{}$Oper", self.domain, self.item_base),
+            ctl_num: self.ctl_num.load(Ordering::Acquire),
+        };
         let mut client = self.mms_client.lock().await;
-        Self::recv_ct_locked(&mut client, timeout).await
+        Self::recv_ct_locked(&mut client, timeout, &expected).await
     }
 
     /// Same as `try_recv_command_termination`, but on an already locked MMS
     /// client, so the lock is held for the whole wait.
     ///
-    /// Reports that are not command terminations are collected locally and
+    /// Reports other than the expected termination are collected locally and
     /// pushed back once, after the termination arrives or the wait expires.
     /// Pushing one back inside the loop would pop the same report again.
     ///
@@ -616,6 +630,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     pub(crate) async fn recv_ct_locked(
         client: &mut MmsClient<T, Tm>,
         timeout: Duration,
+        expected: &CtMatch,
     ) -> Result<Option<CommandTerminationParsed>, ClientError> {
         let deadline = std::time::Instant::now() + timeout;
         let mut deferred: Vec<bytes::Bytes> = Vec::new();
@@ -624,7 +639,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             if remaining.is_zero() {
                 break Ok(None);
             }
-            match Self::recv_ct_step(client, remaining).await {
+            match Self::recv_ct_step(client, remaining, expected).await {
                 Ok(CtStep::Got(ct)) => break Ok(Some(ct)),
                 Ok(CtStep::Timeout) => break Ok(None),
                 Ok(CtStep::PushBackAndRetry(inner)) => {
@@ -640,11 +655,13 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         result
     }
 
-    /// Receives one unconfirmed PDU and tries to read it as a command termination.
+    /// Receives one unconfirmed PDU and tries to read it as the expected
+    /// command termination.
     #[cfg(feature = "std")]
     async fn recv_ct_step(
         client: &mut MmsClient<T, Tm>,
         remaining: Duration,
+        expected: &CtMatch,
     ) -> Result<CtStep, ClientError> {
         let opt_inner = client.recv_unconfirmed_pdu_with_timeout(remaining).await?;
         let Some(inner) = opt_inner else {
@@ -653,7 +670,17 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         let report = decode_information_report(&inner)
             .map_err(|e| ClientError::Mms(format!("cannot decode command termination: {e}")))?;
         match parse_command_termination(&report) {
-            Some(ct) => Ok(CtStep::Got(ct)),
+            Some((ct, ctl_num)) if expected.matches(&ct, ctl_num) => Ok(CtStep::Got(ct)),
+            Some((ct, ctl_num)) => {
+                tracing::warn!(
+                    object = %ct.object_ref_oper,
+                    ?ctl_num,
+                    expected_object = %expected.object_ref_oper,
+                    expected_ctl_num = expected.ctl_num,
+                    "command termination of another command, leaving it for the report dispatcher"
+                );
+                Ok(CtStep::PushBackAndRetry(inner))
+            }
             None => Ok(CtStep::PushBackAndRetry(inner)),
         }
     }
@@ -664,6 +691,24 @@ enum CtStep {
     Got(CommandTerminationParsed),
     Timeout,
     PushBackAndRetry(bytes::Bytes),
+}
+
+/// The command a command termination must belong to.
+#[cfg(feature = "std")]
+pub(crate) struct CtMatch {
+    /// `<LD>/<LN>$CO$<DO>$Oper` of the object operated.
+    object_ref_oper: String,
+    /// ctlNum the Operate carried.
+    ctl_num: u8,
+}
+
+#[cfg(feature = "std")]
+impl CtMatch {
+    /// Reports whether a termination names this object and, when its Oper
+    /// carries a readable ctlNum, this ctlNum.
+    fn matches(&self, ct: &CommandTerminationParsed, ctl_num: Option<u8>) -> bool {
+        ct.object_ref_oper == self.object_ref_oper && ctl_num.is_none_or(|n| n == self.ctl_num)
+    }
 }
 
 /// Reports whether a CntrlObj reference names the control object
@@ -678,7 +723,8 @@ fn names_control_object(ctl_obj: &str, domain: &str, item_base: &str) -> bool {
 
 // CommandTermination parser, reached only from the enhanced control path.
 
-/// Parses an InformationReport as a command termination.
+/// Parses an InformationReport as a command termination, together with the
+/// ctlNum of the Oper structure it carries when that is readable.
 ///
 /// A CT+ names one variable, `<LD>` with `<LN>$CO$<DO>$Oper` and the Oper
 /// structure. A CT- names two, `LastApplError` followed by `Oper`. Anything
@@ -686,7 +732,7 @@ fn names_control_object(ctl_obj: &str, domain: &str, item_base: &str) -> bool {
 #[cfg(feature = "std")]
 fn parse_command_termination(
     report: &iec61850_mms::mms::pdu::information_report::InformationReportInner,
-) -> Option<CommandTerminationParsed> {
+) -> Option<(CommandTerminationParsed, Option<u8>)> {
     let names = match &report.variable_access_spec {
         VariableAccessSpec::ListOfVariable(names) => names,
         _ => return None,
@@ -706,6 +752,10 @@ fn parse_command_termination(
         }
         _ => return None,
     };
+    let ctl_num = report
+        .list_of_access_result
+        .get(oper_idx)
+        .and_then(oper_ctl_num);
 
     // In a CT- the first variable is the VMD-specific `LastApplError`.
     let last_appl = if names.len() == 2 {
@@ -722,10 +772,30 @@ fn parse_command_termination(
         None
     };
 
-    Some(CommandTerminationParsed {
-        object_ref_oper: format!("{oper_name}$Oper"),
-        last_appl_error: last_appl,
-    })
+    Some((
+        CommandTerminationParsed {
+            object_ref_oper: format!("{oper_name}$Oper"),
+            last_appl_error: last_appl,
+        },
+        ctl_num,
+    ))
+}
+
+/// Reads ctlNum from an Oper structure.
+///
+/// Oper ends with ctlNum, T, Test and Check whether or not it carries operTm,
+/// so ctlNum is the fourth element from the end.
+#[cfg(feature = "std")]
+fn oper_ctl_num(d: &MmsData) -> Option<u8> {
+    let MmsData::Structure(items) = d else {
+        return None;
+    };
+    let idx = items.len().checked_sub(4)?;
+    match items.get(idx)? {
+        MmsData::Unsigned(n) => u8::try_from(*n).ok(),
+        MmsData::Integer(n) => u8::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 /// Parses the five-element LastApplError structure.

@@ -65,6 +65,19 @@ fn split_item(item: &str) -> (String, String) {
     }
 }
 
+/// Returns an Oper structure with ctlNum replaced.
+fn with_ctl_num(value: &MmsData, ctl_num: u8) -> MmsData {
+    match value {
+        MmsData::Structure(items) if items.len() >= 4 => {
+            let mut items = items.clone();
+            let idx = items.len() - 4;
+            items[idx] = MmsData::Unsigned(u64::from(ctl_num));
+            MmsData::Structure(items)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Reads ctlNum and origin from an Oper, SBOw or Cancel structure.
 ///
 /// Oper and SBOw end with origin, ctlNum, T, Test and Check; Cancel ends with
@@ -249,6 +262,30 @@ fn script_write(invoke_id: u32, item: &str, value: &MmsData, seq: u32) -> Plan {
         "SPCSTRAYCT" => Plan {
             reply: Some(write_response(invoke_id, WriteOutcome::Success)),
             after: vec![ct_positive("SPCSTRAYCT", value)],
+            ..Plan::default()
+        },
+        // Accepted; a CT+ of another object precedes this object's CT- with
+        // BlockedByProcess.
+        "SPCOTHERCT" => Plan {
+            reply: Some(write_response(invoke_id, WriteOutcome::Success)),
+            after: vec![
+                ct_positive("SPCELSE", value),
+                ct_negative("SPCOTHERCT", value, 9),
+            ],
+            ..Plan::default()
+        },
+        // Accepted; a CT- of the previous ctlNum with TimeLimitOver precedes
+        // this command's CT+.
+        "SPCLATECT" => Plan {
+            reply: Some(write_response(invoke_id, WriteOutcome::Success)),
+            after: vec![
+                ct_negative(
+                    "SPCLATECT",
+                    &with_ctl_num(value, ctl_num.wrapping_sub(1)),
+                    16,
+                ),
+                ct_positive("SPCLATECT", value),
+            ],
             ..Plan::default()
         },
         // Accepted, with a CT+ for an enhanced model.
@@ -526,6 +563,35 @@ async fn refused_enhanced_operate_does_not_wait_for_a_command_termination() {
         outcome,
         ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
     );
+    // The stray CT- carries the previous ctlNum, so the next command's
+    // termination is the CT+ that follows its own response.
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    assert_eq!(outcome, ControlOutcome::Success);
+}
+
+// An enhanced command concludes at its own command termination.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_operate_reports_a_negative_command_termination() {
+    let conn = connect(start_server().await, 3_000).await;
+    let spc = handle(&conn, "SPCOTHERCT", ControlModel::DirectEnhanced);
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    // The CT+ of another object ahead of it is not this command's.
+    assert_eq!(
+        outcome,
+        ControlOutcome::Failure(ControlAddCause::BlockedByProcess)
+    );
+    let e = spc.last_appl_error().expect("last appl error");
+    assert_eq!(e.add_cause, ControlAddCause::BlockedByProcess);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_operate_skips_a_late_termination_of_an_earlier_command() {
+    let conn = connect(start_server().await, 3_000).await;
+    let spc = handle(&conn, "SPCLATECT", ControlModel::DirectEnhanced);
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    assert_eq!(outcome, ControlOutcome::Success);
+    assert_eq!(spc.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
