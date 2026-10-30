@@ -563,7 +563,9 @@ impl IedServer {
     /// The check and the write happen under one write lock, so the attribute is
     /// unchanged when `build` fails. The report trigger follows the attribute's
     /// trigger options: a quality change for an attribute that names `qchg` and
-    /// not `dchg`, a data change for every other attribute.
+    /// not `dchg`, a data change for every other attribute. The same trigger
+    /// writes a log entry through every enabled log control block whose data
+    /// set holds the attribute.
     fn update_with(
         &self,
         da: &DataAttribute,
@@ -591,6 +593,7 @@ impl IedServer {
             new_value
         };
         // The write lock is released before the reporting engine is triggered.
+        self.log_update(ptr_key, change_flag(da), &new_value);
         let attr_ref_opt = self
             .inner
             .attr_ref_index
@@ -621,6 +624,99 @@ impl IedServer {
         // case and needs no report.
 
         Ok(())
+    }
+
+    /// Writes one log entry for an updated attribute through every enabled log
+    /// control block whose data set holds it.
+    ///
+    /// `ptr_key` identifies the attribute by the address of its shared value,
+    /// which is how a data set member refers to it. A control block writes an
+    /// entry when its TrgOps holds the trigger of `flag`, data-change or
+    /// quality-change, and its DatSet names a registered data set of the
+    /// domain, as `<LN>$<name>` or `<LD>/<LN>$<name>`, with the attribute as a
+    /// member. The entry carries the member reference, the new value and the
+    /// matching reason code. A control block registered under several keys
+    /// writes once.
+    fn log_update(&self, ptr_key: usize, flag: crate::reporting::InclusionFlag, value: &MmsValue) {
+        use crate::reporting::{InclusionFlag, TriggerOptions};
+        let (trigger, reason_code) = if flag.contains(InclusionFlag::VALUE_CHANGED) {
+            (TriggerOptions::DATA_CHANGED, LOG_REASON_DATA_CHANGE)
+        } else if flag.contains(InclusionFlag::QUALITY_CHANGED) {
+            (TriggerOptions::QUALITY_CHANGED, LOG_REASON_QUALITY_CHANGE)
+        } else {
+            return;
+        };
+        let mut controls: Vec<Arc<crate::logging::LogControl>> =
+            match self.inner.log_controls.read() {
+                Ok(g) => g.values().cloned().collect(),
+                Err(_) => {
+                    tracing::warn!(
+                        "the log control registry lock is poisoned, the update was not logged"
+                    );
+                    return;
+                }
+            };
+        controls.sort_by_key(|lc| Arc::as_ptr(lc) as usize);
+        controls.dedup_by_key(|lc| Arc::as_ptr(lc) as usize);
+        let mut now_ms: Option<u64> = None;
+        for lc in controls {
+            let data_set = match lc.state.lock() {
+                Ok(state)
+                    if matches!(state.log_ena, crate::logging::LogState::Enabled)
+                        && state.trg_ops.contains(trigger) =>
+                {
+                    state.data_set.clone()
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    tracing::warn!(
+                        mms_path = %lc.mms_path,
+                        "the log control block state is poisoned, the update was not logged"
+                    );
+                    continue;
+                }
+            };
+            let Some(data_set) = data_set else {
+                continue;
+            };
+            let Some(lcb_domain) = lc.mms_path.split_once('/').map(|(d, _)| d) else {
+                continue;
+            };
+            let key = match data_set.split_once('/') {
+                Some((domain, name)) => (domain.to_string(), name.to_string()),
+                None => (lcb_domain.to_string(), data_set),
+            };
+            let member = match self.inner.dataset_registry.read() {
+                Ok(g) => g.get(&key).and_then(|ds| {
+                    ds.entries
+                        .iter()
+                        .find(|e| Arc::as_ptr(&e.value) as usize == ptr_key)
+                        .map(|e| e.attr_ref.clone())
+                }),
+                Err(_) => {
+                    tracing::warn!(
+                        "the data set registry lock is poisoned, the update was not logged"
+                    );
+                    return;
+                }
+            };
+            let Some(data_ref) = member else {
+                continue;
+            };
+            let time_ms = *now_ms.get_or_insert_with(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            });
+            if let Err(e) = lc.log_single_value(time_ms, &data_ref, value.clone(), reason_code) {
+                tracing::warn!(
+                    mms_path = %lc.mms_path,
+                    error = %e,
+                    "the log storage backend failed, the update was not logged"
+                );
+            }
+        }
     }
 
     /// Registers an association once it is established.
@@ -1059,6 +1155,12 @@ impl IedServer {
         })
     }
 }
+
+/// Log reason code of a data change: bit 1 of ReasonForInclusionInLog.
+const LOG_REASON_DATA_CHANGE: u8 = 0x02;
+
+/// Log reason code of a quality change: bit 2 of ReasonForInclusionInLog.
+const LOG_REASON_QUALITY_CHANGE: u8 = 0x04;
 
 /// Chooses the report trigger for an update from the attribute's trigger
 /// options: a quality change for a `qchg` attribute without `dchg`, a data
