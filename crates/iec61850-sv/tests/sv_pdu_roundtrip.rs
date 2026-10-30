@@ -157,10 +157,10 @@ fn no_asdu_11_rejected() {
     );
 }
 
-/// A publisher that sends smpMod in two bytes must still be decoded, taking the
-/// last byte as the value.
+/// smpMod in two octets, the INT16U form IEC 61850-9-2 defines, decodes to its
+/// value.
 #[test]
-fn smp_mod_legacy_2byte_tolerant() {
+fn smp_mod_two_octets_decode() {
     use iec61850_asn1::encode_length;
 
     let mut inner_asdu = BytesMut::new();
@@ -253,9 +253,9 @@ fn nine_two_le_64_byte_sample_roundtrip() {
     assert_eq!(decoded_sv, sv);
 }
 
-/// Robustness regression: smpMod is always encoded in exactly one byte.
+/// smpMod is encoded as an INT16U in two octets, the last member here.
 #[test]
-fn smp_mod_encodes_one_byte() {
+fn smp_mod_encodes_two_octets() {
     let pdu = SavPdu {
         asdus: vec![Asdu {
             sv_id: "sv1".to_owned(),
@@ -272,21 +272,7 @@ fn smp_mod_encodes_one_byte() {
     };
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).unwrap();
-    let bytes = &buf[..];
-    let mut found = false;
-    for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == 0x88 {
-            assert_eq!(
-                bytes[i + 1],
-                0x01,
-                "smpmod ber length is 1, got {}",
-                bytes[i + 1]
-            );
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "smpmod tag 0x88 is present in the encoding");
+    assert_eq!(&buf[buf.len() - 4..], &[0x88, 0x02, 0x00, 0x01]);
 }
 
 /// Robustness regression: a sample longer than 127 bytes uses a

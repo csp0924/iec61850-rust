@@ -19,19 +19,21 @@
 //!        85 01 <smpSynch>       OCTET_STRING(1)
 //!        [86 02 <smpRate>]      OCTET_STRING(2), big-endian u16, optional
 //!        87 LL <sample>         OCTET_STRING, raw sample bytes
-//!        [88 01 <smpMod>]       OCTET_STRING(1), optional
+//!        [88 02 <smpMod>]       OCTET_STRING(2), big-endian INT16U, optional
 //!        [89 08 <gmIdentity>]   OCTET_STRING(8), optional
 //! ```
 //!
 //! ## Robustness cases
 //!
-//! - smpMod is encoded in exactly one byte, as the standard defines. Some
-//!   publishers in the field send two; decoding accepts that and takes the last
-//!   byte as the value.
+//! - smpMod is encoded in two octets, as IEC 61850-9-2 §8.5.2 Table 14
+//!   defines. Some publishers send one; decoding accepts it as the same value
+//!   and logs it once.
 //! - `encode_length` emits a multi-byte BER length whenever a payload exceeds
 //!   127 bytes, so a large sample field is not truncated.
 //! - Every decode path propagates length errors with `?`, so a corrupt length
 //!   ends the parse instead of looping.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
 use iec61850_asn1::{decode_length, encode_length};
@@ -119,9 +121,11 @@ impl SmpSynch {
     }
 }
 
-/// Sampling mode, the one-byte smpMod field.
+/// Sampling mode, the smpMod field.
 ///
-/// Unassigned values are preserved rather than rejected.
+/// IEC 61850-9-2 §8.5.2 Table 14 carries smpMod as a 2-octet INT16U. The
+/// defined values fit one octet, so the variants map to the low octet;
+/// unassigned values up to 255 are preserved rather than rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmpMod {
     /// 0: samples per nominal period, the default.
@@ -135,7 +139,7 @@ pub enum SmpMod {
 }
 
 impl SmpMod {
-    /// Decodes the wire byte.
+    /// Decodes the value from its low octet.
     pub fn from_byte(b: u8) -> Self {
         match b {
             0 => SmpMod::PerNominalPeriod,
@@ -145,7 +149,7 @@ impl SmpMod {
         }
     }
 
-    /// Returns the wire byte.
+    /// Returns the low octet of the value; the high octet is 0.
     pub fn to_byte(self) -> u8 {
         match self {
             SmpMod::PerNominalPeriod => 0,
@@ -229,9 +233,9 @@ fn asdu_contents_size(asdu: &Asdu) -> usize {
     let sample_len = asdu.sample.len();
     size += 1 + length_size(sample_len) + sample_len;
 
-    // smpMod: tag, length, and exactly 1 value byte.
+    // smpMod: tag, length, and 2 value bytes.
     if asdu.smp_mod.is_some() {
-        size += 3;
+        size += 4;
     }
 
     // gmIdentity: tag, length, and 8 value bytes.
@@ -339,10 +343,9 @@ fn encode_asdu(asdu: &Asdu, buf: &mut BytesMut) -> Result<(), SvError> {
     encode_length(asdu.sample.len(), buf);
     buf.extend_from_slice(&asdu.sample);
 
-    // smpMod is one byte; some publishers in the field send two, which the
-    // decoder tolerates but this encoder never emits.
+    // smpMod is an INT16U in two octets.
     if let Some(smp_mod) = asdu.smp_mod {
-        buf.extend_from_slice(&[TAG_SMP_MOD, 0x01, smp_mod.to_byte()]);
+        buf.extend_from_slice(&[TAG_SMP_MOD, 0x02, 0x00, smp_mod.to_byte()]);
     }
 
     if let Some(ref gm) = asdu.gm_identity {
@@ -677,25 +680,7 @@ fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
                 sample = Some(value.to_vec());
             }
             TAG_SMP_MOD => {
-                // The standard defines one byte; some publishers in the field
-                // send two, so the last byte is taken as the value.
-                let byte_val = match field_len {
-                    1 => value[0],
-                    2 => {
-                        tracing::warn!(
-                            "smpmod field is 2 bytes, taking the last byte as the value"
-                        );
-                        value[1]
-                    }
-                    _ => {
-                        return Err(SvError::InvalidFieldLength {
-                            tag: TAG_SMP_MOD,
-                            expected: 1,
-                            actual: field_len,
-                        });
-                    }
-                };
-                smp_mod = Some(SmpMod::from_byte(byte_val));
+                smp_mod = decode_smp_mod(value)?;
             }
             TAG_GM_IDENTITY => {
                 // An optional field of the wrong length is dropped rather than
@@ -750,6 +735,54 @@ fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
         smp_mod,
         gm_identity,
     })
+}
+
+/// Set once a one-octet smpMod has been reported, so a stream that sends it
+/// in every ASDU logs it once.
+static ONE_OCTET_SMP_MOD_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Set once an smpMod above 255 has been reported, for the same reason.
+static WIDE_SMP_MOD_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Decodes smpMod, an INT16U in two octets.
+///
+/// A one-octet value, which some publishers send, is accepted as the same
+/// value and reported once per process. A value above 255 has no `SmpMod`
+/// representation and the field is dropped, like any other unusable optional
+/// field; that too is reported once per process.
+///
+/// # Errors
+///
+/// Returns `InvalidFieldLength` for a length other than 1 or 2.
+fn decode_smp_mod(value: &[u8]) -> Result<Option<SmpMod>, SvError> {
+    let v = match *value {
+        [hi, lo] => u16::from_be_bytes([hi, lo]),
+        [b] => {
+            if !ONE_OCTET_SMP_MOD_REPORTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("smpmod is 1 octet instead of 2, accepting it");
+            }
+            u16::from(b)
+        }
+        _ => {
+            return Err(SvError::InvalidFieldLength {
+                tag: TAG_SMP_MOD,
+                expected: 2,
+                actual: value.len(),
+            });
+        }
+    };
+    match u8::try_from(v) {
+        Ok(b) => Ok(Some(SmpMod::from_byte(b))),
+        Err(_) => {
+            if !WIDE_SMP_MOD_REPORTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "smpmod value {} is unassigned, dropping the field; later ones are not logged",
+                    v
+                );
+            }
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1050,11 +1083,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn smp_mod_legacy_2byte_decode_tolerant() {
-        // A publisher that sends smpMod in two bytes must still be decoded.
-        let extra = vec![TAG_SMP_MOD, 0x02, 0x00, 0x01];
-
+    /// Wraps the smpMod member `smp_mod` in a one-ASDU savPdu.
+    fn sav_pdu_with_smp_mod(smp_mod: &[u8]) -> BytesMut {
         let mut inner_asdu = BytesMut::new();
         inner_asdu.extend_from_slice(&[TAG_SV_ID, 0x03, b's', b'v', b'1']);
         inner_asdu.extend_from_slice(&[TAG_SMP_CNT, 0x02, 0x00, 0x00]);
@@ -1062,7 +1092,7 @@ mod tests {
         inner_asdu.extend_from_slice(&[TAG_SMP_SYNCH, 0x01, 0x00]);
         inner_asdu.extend_from_slice(&[TAG_SAMPLE, 0x08]);
         inner_asdu.extend_from_slice(&[0u8; 8]);
-        inner_asdu.extend_from_slice(&extra);
+        inner_asdu.extend_from_slice(smp_mod);
 
         let mut asdu_tlv = BytesMut::new();
         asdu_tlv.extend_from_slice(&[TAG_ASDU]);
@@ -1083,11 +1113,39 @@ mod tests {
         encode_length(contents_len, &mut final_buf);
         final_buf.extend_from_slice(&no_asdu_bytes);
         final_buf.extend_from_slice(&seq_tlv);
+        final_buf
+    }
 
-        let decoded = decode_sav_pdu(&final_buf).unwrap();
-        assert_eq!(decoded.asdus.len(), 1);
-        // The last byte, 0x01, is the value.
+    #[test]
+    fn smp_mod_two_octets_decode_as_int16u() {
+        let decoded =
+            decode_sav_pdu(&sav_pdu_with_smp_mod(&[TAG_SMP_MOD, 0x02, 0x00, 0x02])).unwrap();
+        assert_eq!(decoded.asdus[0].smp_mod, Some(SmpMod::SecondsPerSample));
+    }
+
+    #[test]
+    fn smp_mod_one_octet_is_tolerated() {
+        let decoded = decode_sav_pdu(&sav_pdu_with_smp_mod(&[TAG_SMP_MOD, 0x01, 0x01])).unwrap();
         assert_eq!(decoded.asdus[0].smp_mod, Some(SmpMod::SamplesPerSecond));
+    }
+
+    #[test]
+    fn smp_mod_above_255_is_dropped() {
+        let decoded =
+            decode_sav_pdu(&sav_pdu_with_smp_mod(&[TAG_SMP_MOD, 0x02, 0x01, 0x00])).unwrap();
+        assert_eq!(decoded.asdus[0].smp_mod, None);
+    }
+
+    #[test]
+    fn smp_mod_of_three_octets_is_rejected() {
+        let r = decode_sav_pdu(&sav_pdu_with_smp_mod(&[
+            TAG_SMP_MOD,
+            0x03,
+            0x00,
+            0x00,
+            0x01,
+        ]));
+        assert!(r.is_err());
     }
 
     #[test]
@@ -1111,9 +1169,9 @@ mod tests {
         assert_eq!(decoded.asdus[0].smp_synch, SmpSynch::LocalIdentified(100));
     }
 
-    /// Robustness regression: smpMod is always encoded in exactly one byte.
+    /// smpMod is encoded as an INT16U in two octets.
     #[test]
-    fn smp_mod_encodes_one_byte() {
+    fn smp_mod_encodes_two_octets() {
         let asdu = Asdu {
             sv_id: "sv1".to_owned(),
             dat_set: None,
@@ -1129,21 +1187,14 @@ mod tests {
         let pdu = SavPdu { asdus: vec![asdu] };
         let mut buf = BytesMut::new();
         encode_sav_pdu(&pdu, &mut buf).unwrap();
+        // The sample is the last member before smpMod: 87 04 00 00 00 00.
         let bytes = &buf[..];
-        let mut found = false;
-        for i in 0..bytes.len().saturating_sub(1) {
-            if bytes[i] == TAG_SMP_MOD {
-                assert_eq!(
-                    bytes[i + 1],
-                    0x01,
-                    "smpmod ber length is 1, got {}",
-                    bytes[i + 1]
-                );
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "smpmod tag 0x88 is present in the encoding");
+        let at = bytes
+            .windows(6)
+            .position(|w| w == [TAG_SAMPLE, 0x04, 0, 0, 0, 0])
+            .expect("sample member")
+            + 6;
+        assert_eq!(&bytes[at..at + 4], &[TAG_SMP_MOD, 0x02, 0x00, 0x01]);
     }
 
     /// Robustness regression: a sample longer than 127 bytes uses a

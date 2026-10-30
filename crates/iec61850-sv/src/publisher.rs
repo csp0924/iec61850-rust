@@ -79,7 +79,8 @@ struct AsduConfig {
     has_refr_tm: bool,
     /// smpRate; fixed for the life of the publisher.
     smp_rate: Option<u16>,
-    /// smpMod; fixed for the life of the publisher and encoded in one byte.
+    /// smpMod; fixed for the life of the publisher and encoded as an INT16U
+    /// in two octets, the high one 0.
     smp_mod: Option<u8>,
     /// Initial gmIdentity; when present the field can also be rewritten after
     /// setup.
@@ -596,9 +597,9 @@ fn asdu_contents_size(cfg: &AsduConfig) -> usize {
 
     size += 1 + ber_len_size(cfg.sample_size) + cfg.sample_size;
 
-    // smpMod: tag, length, and exactly 1 value byte.
+    // smpMod: tag, length, and 2 value bytes.
     if cfg.smp_mod.is_some() {
-        size += 3;
+        size += 4;
     }
 
     // gmIdentity: tag, length, and 8 value bytes.
@@ -742,7 +743,7 @@ fn write_pdu_to_buffer(
         bm.extend_from_slice(&zeroes);
 
         if let Some(smp_mod) = cfg.smp_mod {
-            bm.extend_from_slice(&[TAG_SMP_MOD, 0x01, smp_mod]);
+            bm.extend_from_slice(&[TAG_SMP_MOD, 0x02, 0x00, smp_mod]);
         }
 
         let gm_identity_offset = if let Some(ref gm) = cfg.gm_identity {
