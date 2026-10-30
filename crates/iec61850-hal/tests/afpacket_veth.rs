@@ -101,3 +101,33 @@ fn given_source_is_sent_unchanged() {
     let got = recv_marked(&mut rx, 2, 1522).expect("recv");
     assert_eq!(&got[6..12], &src);
 }
+
+#[test]
+#[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
+fn vlan_tag_is_delivered_in_the_frame() {
+    let (mut tx, mut rx) = pair();
+    let sent = frame([0x02, 0, 0, 0, 0, 1], Some(0x8064), 3, 64);
+    tx.send(&sent).expect("send");
+    let got = recv_marked(&mut rx, 3, 1522).expect("recv");
+    assert_eq!(
+        got, sent,
+        "the receiver saw the frame differently from the wire"
+    );
+}
+
+#[test]
+#[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
+fn largest_tagged_frame_fits_and_a_larger_buffer_need_is_reported() {
+    let (mut tx, mut rx) = pair();
+    let sent = frame([0x02, 0, 0, 0, 0, 1], Some(0x0064), 4, 1518);
+    tx.send(&sent).expect("send");
+    let got = recv_marked(&mut rx, 4, 1518).expect("recv");
+    assert_eq!(got, sent);
+
+    tx.send(&frame([0x02, 0, 0, 0, 0, 1], None, 5, 200))
+        .expect("send");
+    match recv_marked(&mut rx, 5, 64) {
+        Err(EthernetError::Os(msg)) => assert!(msg.contains("does not fit"), "{msg}"),
+        other => panic!("a frame over the buffer was not reported: {other:?}"),
+    }
+}

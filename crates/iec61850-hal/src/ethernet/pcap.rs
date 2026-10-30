@@ -25,7 +25,8 @@
 //! Multicast groups are not joined explicitly, because libpcap has no
 //! portable join API; the backend relies on the OS and NIC defaults.
 //!
-//! On Linux, `send` replaces an all-zero source address with the
+//! A frame longer than the caller's buffer is dropped rather than returned
+//! truncated. On Linux, `send` replaces an all-zero source address with the
 //! interface address read from sysfs; elsewhere the caller supplies it.
 //!
 //! TODO: filter on EtherType with BPF to cut per-frame callback overhead.
@@ -134,13 +135,24 @@ impl PcapSocket {
 }
 
 impl EthernetSource for PcapSocket {
+    /// Receives one frame.
+    ///
+    /// A frame that does not fit `buf` is dropped and reported as
+    /// [`EthernetError::Os`] naming both lengths, so no truncated frame
+    /// reaches a decoder.
     fn recv(&mut self, buf: &mut [u8], _timeout: Option<Duration>) -> Result<usize, EthernetError> {
         // The timeout is fixed when the capture is opened, so the argument
         // cannot be honored here; callers set it through EthernetConfig.
         match self.cap.next_packet() {
             Ok(packet) => {
-                let n = packet.data.len().min(buf.len());
-                buf[..n].copy_from_slice(&packet.data[..n]);
+                let n = packet.data.len();
+                let Some(dst) = buf.get_mut(..n) else {
+                    return Err(EthernetError::Os(format!(
+                        "dropped a {n} byte frame that does not fit the {} byte buffer",
+                        buf.len()
+                    )));
+                };
+                dst.copy_from_slice(packet.data);
                 Ok(n)
             }
             Err(PcapError::TimeoutExpired) => Err(EthernetError::Timeout),

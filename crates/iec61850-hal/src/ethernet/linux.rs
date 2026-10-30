@@ -15,10 +15,14 @@
 //! Implemented here: `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` bound to
 //! an interface index, multicast join through `PACKET_ADD_MEMBERSHIP` with
 //! `packet_mreq`, blocking and timed receive through `SO_RCVTIMEO`, send, and
-//! promiscuous mode through `PACKET_MR_PROMISC`. `send` replaces an all-zero
-//! source address with the address of the bound interface.
+//! promiscuous mode through `PACKET_MR_PROMISC`.
 //!
-//! TODO: VLAN tag inject and strip for the GOOSE 5-tuple.
+//! The kernel moves an 802.1Q tag out of a received frame into
+//! `PACKET_AUXDATA`; `recv` puts it back, so a caller sees the frame as it was
+//! on the wire. A frame longer than the caller's buffer is dropped rather than
+//! returned truncated. `send` replaces an all-zero source address with the
+//! address of the bound interface.
+//!
 //! TODO: PACKET_MMAP zero-copy fast path.
 //! TODO: RX timestamping (SO_TIMESTAMPING) for SV jitter measurement.
 
@@ -28,10 +32,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use libc::{
-    bind, c_int, c_void, close, getsockname, if_nametoindex, packet_mreq, recv, send, setsockopt,
-    sockaddr_ll, socket, socklen_t, timeval, AF_PACKET, ETH_P_ALL, PACKET_ADD_MEMBERSHIP,
-    PACKET_DROP_MEMBERSHIP, PACKET_MR_MULTICAST, PACKET_MR_PROMISC, SOCK_RAW, SOL_PACKET,
-    SOL_SOCKET, SO_RCVTIMEO,
+    bind, c_int, c_void, close, getsockname, if_nametoindex, iovec, msghdr, packet_mreq, recvmsg,
+    send, setsockopt, sockaddr_ll, socket, socklen_t, timeval, tpacket_auxdata, AF_PACKET,
+    ETH_P_ALL, MSG_TRUNC, PACKET_ADD_MEMBERSHIP, PACKET_AUXDATA, PACKET_DROP_MEMBERSHIP,
+    PACKET_MR_MULTICAST, PACKET_MR_PROMISC, SOCK_RAW, SOL_PACKET, SOL_SOCKET, SO_RCVTIMEO,
+    TP_STATUS_VLAN_TPID_VALID, TP_STATUS_VLAN_VALID,
 };
 
 use super::{EthernetAddr, EthernetConfig, EthernetError, EthernetSink, EthernetSource};
@@ -86,6 +91,22 @@ impl AfPacketSocket {
                 fd.as_raw_fd(),
                 &sll as *const sockaddr_ll as *const _,
                 size_of::<sockaddr_ll>() as socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(EthernetError::Os(io::Error::last_os_error().to_string()));
+        }
+
+        let on: c_int = 1;
+        // SAFETY: `fd` is an open packet socket and `on` is a live `c_int` whose
+        // size is the option length passed.
+        let rc = unsafe {
+            setsockopt(
+                fd.as_raw_fd(),
+                SOL_PACKET,
+                PACKET_AUXDATA,
+                &on as *const c_int as *const c_void,
+                size_of::<c_int>() as socklen_t,
             )
         };
         if rc < 0 {
@@ -195,19 +216,34 @@ impl AfPacketSocket {
 }
 
 impl EthernetSource for AfPacketSocket {
+    /// Receives one frame, with an 802.1Q tag the kernel moved into
+    /// `PACKET_AUXDATA` written back after the source address.
+    ///
+    /// A frame that does not fit `buf`, counting a restored tag, is dropped
+    /// and reported as [`EthernetError::Os`] naming both lengths, so no
+    /// truncated frame reaches a decoder.
     fn recv(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, EthernetError> {
         if let Some(d) = timeout {
             self.set_recv_timeout(d)?;
         }
 
-        let n = unsafe {
-            recv(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len(),
-                0,
-            )
+        // Aligned for `cmsghdr`; room for one `tpacket_auxdata` message.
+        let mut control = [0u64; 8];
+        let mut iov = iovec {
+            iov_base: buf.as_mut_ptr() as *mut c_void,
+            iov_len: buf.len(),
         };
+        // SAFETY: `msghdr` is a plain C struct; all-zero bytes are a valid value,
+        // null pointers with zero lengths, before the fields are set below.
+        let mut msg: msghdr = unsafe { zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut c_void;
+        msg.msg_controllen = size_of_val(&control) as _;
+
+        // SAFETY: `msg` points at `iov`, which covers exactly `buf`, and at
+        // `control`; all three outlive the call.
+        let n = unsafe { recvmsg(self.fd.as_raw_fd(), &mut msg, MSG_TRUNC) };
         if n < 0 {
             let err = io::Error::last_os_error();
             // SO_RCVTIMEO reports expiry as EAGAIN, EWOULDBLOCK on Linux.
@@ -216,7 +252,24 @@ impl EthernetSource for AfPacketSocket {
             }
             return Err(EthernetError::Os(err.to_string()));
         }
-        Ok(n as usize)
+        // With MSG_TRUNC a packet socket returns the length on the wire.
+        let len = n as usize;
+
+        // SAFETY: the kernel filled `msg_controllen` bytes of `control`, and
+        // the CMSG macros stay within the length recorded in `msg`.
+        let vlan = unsafe { auxdata_vlan(&msg) };
+
+        let total = len + if vlan.is_some() { 4 } else { 0 };
+        if total > buf.len() {
+            return Err(EthernetError::Os(format!(
+                "dropped a {total} byte frame that does not fit the {} byte buffer",
+                buf.len()
+            )));
+        }
+        match vlan {
+            Some((tpid, tci)) => Ok(insert_vlan_tag(buf, len, tpid, tci)),
+            None => Ok(len),
+        }
     }
 }
 
@@ -271,6 +324,60 @@ fn bound_hw_addr(fd: &OwnedFd) -> Option<EthernetAddr> {
     }
     let addr = EthernetAddr::from_slice(sll.sll_addr.get(..6)?)?;
     (addr.0 != [0; 6]).then_some(addr)
+}
+
+/// Returns the TPID and TCI of a VLAN tag reported in `PACKET_AUXDATA`.
+///
+/// # Safety
+///
+/// `msg` must be a `msghdr` that `recvmsg` has just filled, with its control
+/// buffer still alive.
+unsafe fn auxdata_vlan(msg: &msghdr) -> Option<(u16, u16)> {
+    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+    while !cmsg.is_null() {
+        let hdr = &*cmsg;
+        let data_len = (hdr.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+        if hdr.cmsg_level == SOL_PACKET
+            && hdr.cmsg_type == PACKET_AUXDATA
+            && data_len >= size_of::<tpacket_auxdata>()
+        {
+            let aux = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const tpacket_auxdata);
+            return vlan_from_auxdata(&aux);
+        }
+        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+    }
+    None
+}
+
+/// Returns the TPID and TCI the kernel recorded for a stripped tag.
+///
+/// A kernel that predates `TP_STATUS_VLAN_VALID` signals a tag only by a
+/// non-zero TCI; a TPID it does not report is 802.1Q's 0x8100.
+fn vlan_from_auxdata(aux: &tpacket_auxdata) -> Option<(u16, u16)> {
+    if aux.tp_status & TP_STATUS_VLAN_VALID == 0 && aux.tp_vlan_tci == 0 {
+        return None;
+    }
+    let tpid = if aux.tp_status & TP_STATUS_VLAN_TPID_VALID != 0 {
+        aux.tp_vlan_tpid
+    } else {
+        0x8100
+    };
+    Some((tpid, aux.tp_vlan_tci))
+}
+
+/// Writes a VLAN tag after the source address of the `len`-byte frame in
+/// `buf` and returns the new length.
+///
+/// A frame shorter than the two addresses is returned unchanged. The caller
+/// guarantees `len + 4 <= buf.len()`.
+fn insert_vlan_tag(buf: &mut [u8], len: usize, tpid: u16, tci: u16) -> usize {
+    if len < 12 || len + 4 > buf.len() {
+        return len;
+    }
+    buf.copy_within(12..len, 16);
+    buf[12..14].copy_from_slice(&tpid.to_be_bytes());
+    buf[14..16].copy_from_slice(&tci.to_be_bytes());
+    len + 4
 }
 
 /// Returns whether `frame` carries an all-zero source address.
@@ -357,6 +464,60 @@ impl Drop for AfPacketSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aux(status: u32, tci: u16, tpid: u16) -> tpacket_auxdata {
+        let mut a: tpacket_auxdata = unsafe { zeroed() };
+        a.tp_status = status;
+        a.tp_vlan_tci = tci;
+        a.tp_vlan_tpid = tpid;
+        a
+    }
+
+    #[test]
+    fn auxdata_without_a_tag_reports_none() {
+        assert_eq!(vlan_from_auxdata(&aux(0, 0, 0)), None);
+    }
+
+    #[test]
+    fn auxdata_tag_with_tpid_is_reported() {
+        let a = aux(
+            TP_STATUS_VLAN_VALID | TP_STATUS_VLAN_TPID_VALID,
+            0x8064,
+            0x88a8,
+        );
+        assert_eq!(vlan_from_auxdata(&a), Some((0x88a8, 0x8064)));
+    }
+
+    #[test]
+    fn auxdata_tag_without_tpid_defaults_to_8021q() {
+        assert_eq!(
+            vlan_from_auxdata(&aux(TP_STATUS_VLAN_VALID, 0, 0)),
+            Some((0x8100, 0))
+        );
+        assert_eq!(
+            vlan_from_auxdata(&aux(0, 0x0064, 0)),
+            Some((0x8100, 0x0064))
+        );
+    }
+
+    #[test]
+    fn vlan_tag_is_inserted_after_the_source_address() {
+        let mut buf = [0u8; 24];
+        let frame: Vec<u8> = (1..=18).collect();
+        buf[..18].copy_from_slice(&frame);
+        let n = insert_vlan_tag(&mut buf, 18, 0x8100, 0x8064);
+        assert_eq!(n, 22);
+        assert_eq!(&buf[..12], &frame[..12]);
+        assert_eq!(&buf[12..16], &[0x81, 0x00, 0x80, 0x64]);
+        assert_eq!(&buf[16..22], &frame[12..18]);
+    }
+
+    #[test]
+    fn vlan_tag_that_does_not_fit_leaves_the_frame() {
+        let mut buf = [7u8; 20];
+        assert_eq!(insert_vlan_tag(&mut buf, 18, 0x8100, 1), 18);
+        assert_eq!(buf, [7u8; 20]);
+    }
 
     #[test]
     fn zero_source_is_detected() {

@@ -30,6 +30,10 @@ use crate::frame::{SvFrame, SV_ETHER_TYPE};
 use crate::pdu::decode_sav_pdu;
 use crate::subscriber::{SvSubscriber, SvSubscriberAsdu};
 
+/// Size of the receive buffer: the largest IEEE 802.1Q tagged frame counting
+/// its frame check sequence, which some NICs pass up.
+const ETH_BUFFER_LENGTH: usize = 1522;
+
 /// Typestate for a receiver that accepts subscribers but no frames.
 pub struct Idle;
 
@@ -134,7 +138,7 @@ impl SvReceiver<Idle> {
         let join = thread::Builder::new()
             .name("sv-receiver".into())
             .spawn(move || {
-                let mut buf = vec![0u8; 1518];
+                let mut buf = vec![0u8; ETH_BUFFER_LENGTH];
                 while running_clone.load(Ordering::Acquire) {
                     match source.recv(&mut buf, Some(Duration::from_millis(100))) {
                         Ok(0) => {}

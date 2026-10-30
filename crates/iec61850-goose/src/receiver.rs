@@ -30,8 +30,9 @@ use crate::frame::GooseFrame;
 use crate::pdu::GoosePdu;
 use crate::subscriber::{GooseSubscriber, GooseSubscriberState};
 
-/// Size of the receive buffer, the maximum untagged Ethernet frame.
-const ETH_BUFFER_LENGTH: usize = 1518;
+/// Size of the receive buffer: the largest IEEE 802.1Q tagged frame counting
+/// its frame check sequence, which some NICs pass up.
+const ETH_BUFFER_LENGTH: usize = 1522;
 
 /// Typestate for a receiver that accepts subscribers but no frames.
 pub struct Idle;
