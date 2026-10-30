@@ -254,6 +254,34 @@ async fn nothing_is_logged_by_a_disabled_lcb_or_for_a_non_member() {
     assert_eq!(enabled.count(), 1, "only the data set member is logged");
 }
 
+/// A control block registered under its own path and under the name of its
+/// log writes one entry per update, not one per key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_lcb_registered_under_two_keys_logs_each_update_once() {
+    let m = model();
+    let srv = server(m.clone());
+    register_data_set(&srv, &m);
+    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+    let lc = LogControl::new(
+        format!("{DOM}/{LCB_ITEM}"),
+        lcb(TriggerOptions::DATA_CHANGED),
+    )
+    .with_storage(storage.clone());
+    lc.set_log_ena(true).unwrap();
+    let lc = Arc::new(lc);
+    srv.register_log_control(DOM, LCB_ITEM, Arc::clone(&lc));
+    srv.register_log_control(DOM, EVENT_LOG, lc);
+    let h = srv.start().await.unwrap();
+
+    srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
+    assert_eq!(storage.count(), 1);
+
+    let mut c = client(h.bound_addr.port()).await;
+    assert_eq!(read_all(&mut c, EVENT_LOG).await.entries.len(), 1);
+    c.disconnect().await.ok();
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_lcb_with_an_unregistered_data_set_logs_nothing() {
     let m = model();
