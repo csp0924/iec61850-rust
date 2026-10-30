@@ -28,7 +28,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, template_initial_value, MmsValue,
+    fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, template_initial_value,
+    MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -556,21 +557,18 @@ fn emit_fcda_expr(
     let fc = parse_fc(&f.fc, f.span, "FCDA").map_err(CompileError::ResolveScl)?;
     let fc_tok = emit_fc_value(fc);
 
-    // do_path splits doName on `.`; daName becomes the final segment.
-    let mut do_path: Vec<String> = Vec::new();
-    if let Some(do_name) = &f.do_name {
-        for seg in do_name.split('.') {
-            if !seg.is_empty() {
-                do_path.push(seg.to_string());
-            }
-        }
-    }
-    if let Some(da_name) = &f.da_name {
-        do_path.push(da_name.clone());
-    }
+    // do_path and the array index come from the runtime helper.
+    let (do_path, array_index) = fcda_do_path(
+        f.do_name.as_deref(),
+        f.da_name.as_deref(),
+        f.ix,
+        f.span,
+        "FCDA",
+    )
+    .map_err(CompileError::ResolveScl)?;
     let do_path_lits: Vec<&str> = do_path.iter().map(|s| s.as_str()).collect();
 
-    let array_index_tok = match f.ix {
+    let array_index_tok = match array_index {
         Some(i) => quote! { ::std::option::Option::Some(#i) },
         None => quote! { ::std::option::Option::None },
     };
@@ -1386,6 +1384,37 @@ mod tests {
         assert_eq!(go_id, "events");
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         let expected = quote! { go_id: ::std::string::String::from(#go_id) }.to_string();
+        assert!(emitted.contains(&expected), "{emitted}");
+    }
+
+    /// The generated data set entry carries the same path segments and array
+    /// index as the runtime one.
+    #[test]
+    fn emitted_fcda_path_matches_runtime() {
+        let xml = r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
+      <DataSet name="DS1"><FCDA ldInst="LD0" lnClass="LLN0" doName="W" daName="mag(2).f" fc="MX"/></DataSet>
+    </LN0>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="W" type="MV_T"/></LNodeType>
+    <DOType id="MV_T" cdc="MV"><DA name="mag" fc="MX" bType="Struct" type="AV"/></DOType>
+    <DAType id="AV"><BDA name="f" bType="FLOAT32"/></DAType>
+  </DataTypeTemplates>
+</SCL>"#;
+        let resolved = parse_scl(xml).unwrap().resolve().unwrap();
+        let runtime = resolved.build_model("IED1").unwrap();
+        let entry = runtime.lds[0].lns[0].datasets[0].entries[0].clone();
+        assert_eq!(entry.do_path, vec!["W", "mag", "f"]);
+        assert_eq!(entry.array_index, Some(2));
+        let segs = entry.do_path.iter().map(|s| s.as_str());
+        let expected = quote! {
+            do_path: ::std::vec![ #( ::std::string::String::from(#segs) ),* ],
+            array_index: ::std::option::Option::Some(2u32),
+        }
+        .to_string();
+        let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         assert!(emitted.contains(&expected), "{emitted}");
     }
 

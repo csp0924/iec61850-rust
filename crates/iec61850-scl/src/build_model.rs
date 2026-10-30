@@ -466,12 +466,13 @@ pub fn template_initial_value(
 ///
 /// An FCDA `doName` is a path of data object and sub-object names joined with
 /// `.` (IEC 61850-6 §9.3.5), so `Pos.stVal` names `stVal` under the sub-object
-/// `Pos`. `daName`, when present, is the final data attribute name.
+/// `Pos`, and `daName` is a path of a data attribute and its components; see
+/// [`fcda_do_path`].
 ///
 /// # Errors
 ///
 /// [`SclParseError`] when an FCDA carries an unrecognized functional
-/// constraint.
+/// constraint or a malformed name.
 fn build_dataset(
     raw_ds: &RawDataSet,
     ld_inst: &str,
@@ -510,28 +511,107 @@ fn build_fcda(
         ln_name.push_str(i);
     }
 
-    // do_path splits doName on `.`, and daName becomes the final segment. An
-    // empty doName means the entry covers the whole logical node.
-    let mut do_path = Vec::new();
-    if let Some(do_name) = &fcda.do_name {
-        for seg in do_name.split('.') {
-            if !seg.is_empty() {
-                do_path.push(seg.to_string());
-            }
-        }
-    }
-    if let Some(da_name) = &fcda.da_name {
-        do_path.push(da_name.clone());
-    }
+    let (do_path, array_index) = fcda_do_path(
+        fcda.do_name.as_deref(),
+        fcda.da_name.as_deref(),
+        fcda.ix,
+        fcda.span,
+        &path,
+    )?;
 
     Ok(DataSetEntry {
         ld_inst: fcda.ld_inst.clone(),
         ln_name,
         fc,
         do_path,
-        array_index: fcda.ix,
+        array_index,
         component: None,
     })
+}
+
+/// Splits the `doName` and `daName` of an `<FCDA>` into the segments of
+/// [`DataSetEntry::do_path`], and works out the entry's array index.
+///
+/// Both names are paths joined with `.` (IEC 61850-6), so `doName="A.phsA"`
+/// with `daName="cVal.mag.f"` yields `["A", "phsA", "cVal", "mag", "f"]`. A
+/// segment written with an element index, such as `phsAHar(9)`, contributes
+/// its name, and the index becomes the array index when the `ix` attribute is
+/// absent.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+///
+/// # Errors
+///
+/// [`ErrorKind::AttributeValueInvalid`] when a segment is empty or carries a
+/// malformed index, when the names carry more than one index, or when an index
+/// disagrees with `ix`.
+#[doc(hidden)]
+pub fn fcda_do_path(
+    do_name: Option<&str>,
+    da_name: Option<&str>,
+    ix: Option<u32>,
+    span: SourceSpan,
+    path: &str,
+) -> Result<(Vec<String>, Option<u32>), SclParseError> {
+    let invalid = |name: &str, raw: &str, cause: String| {
+        SclParseError::at(
+            span,
+            path.to_string(),
+            ErrorKind::AttributeValueInvalid {
+                name: name.to_string(),
+                expected_type: "names joined with `.`, each optionally indexed as `name(n)`"
+                    .to_string(),
+                raw_value: raw.to_string(),
+                cause: Some(cause),
+            },
+        )
+        .with_attribute(name)
+    };
+
+    let mut do_path = Vec::new();
+    let mut index: Option<u32> = None;
+    for (attr, value) in [("doName", do_name), ("daName", da_name)] {
+        // An absent or empty name contributes no segment.
+        let Some(value) = value.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        for seg in value.split('.') {
+            let (name, seg_index) = match seg.split_once('(') {
+                None => (seg, None),
+                Some((name, tail)) => {
+                    let digits = tail
+                        .strip_suffix(')')
+                        .ok_or_else(|| invalid(attr, value, format!("`{seg}` is not closed")))?;
+                    let n = digits
+                        .parse::<u32>()
+                        .map_err(|e| invalid(attr, value, format!("index of `{seg}`: {e}")))?;
+                    (name, Some(n))
+                }
+            };
+            if name.is_empty() {
+                return Err(invalid(attr, value, "an empty name segment".to_string()));
+            }
+            if let Some(n) = seg_index {
+                if index.is_some() {
+                    return Err(invalid(
+                        attr,
+                        value,
+                        "more than one element index".to_string(),
+                    ));
+                }
+                index = Some(n);
+            }
+            do_path.push(name.to_string());
+        }
+    }
+    match (index, ix) {
+        (Some(n), Some(i)) if n != i => Err(invalid(
+            "ix",
+            &i.to_string(),
+            format!("the names index element {n}"),
+        )),
+        (n, i) => Ok((do_path, i.or(n))),
+    }
 }
 
 /// Converts a `<ReportControl>` into a [`ReportControlBlock`].

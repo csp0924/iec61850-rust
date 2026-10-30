@@ -373,3 +373,83 @@ fn setting_control_in_range_is_accepted() {
         assert_eq!(ln0.sgcb.as_ref().unwrap().act_sg, act);
     }
 }
+
+const MMXU_MV: &str = r#"
+    <LNodeType id="MMXU_T" lnClass="MMXU">
+      <DO name="TotW" type="MV_T"/>
+      <DO name="Har" type="HAR_T"/>
+    </LNodeType>
+    <DOType id="MV_T" cdc="MV">
+      <DA name="mag" fc="MX" bType="Struct" type="AV"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+    </DOType>
+    <DOType id="HAR_T" cdc="HWYE">
+      <SDO name="phsAHar" type="CMV_T"/>
+    </DOType>
+    <DOType id="CMV_T" cdc="CMV">
+      <DA name="cVal" fc="MX" bType="Struct" type="VEC"/>
+    </DOType>
+    <DAType id="AV"><BDA name="f" bType="FLOAT32"/></DAType>
+    <DAType id="VEC"><BDA name="mag" bType="Struct" type="AV"/></DAType>"#;
+
+const MMXU1: &str = r#"<LN lnClass="MMXU" inst="1" lnType="MMXU_T"/>"#;
+
+fn first_entry(m: &IedModel) -> iec61850_model::tree::DataSetEntry {
+    let ln0 = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
+    ln0.datasets[0].entries[0].clone()
+}
+
+fn fcda(attrs: &str) -> String {
+    format!(
+        r#"<DataSet name="DS1"><FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" fc="MX" {attrs}/></DataSet>"#
+    )
+}
+
+/// An FCDA `daName` names nested attributes joined with `.`, so `mag.f` is
+/// two path segments, matching the `["DO", "DA", "SDA", ...]` contract of
+/// `DataSetEntry::do_path`.
+#[test]
+fn fcda_dotted_da_name_splits_into_segments() {
+    let m = build(&wrap(
+        MMXU_MV,
+        &fcda(r#"doName="TotW" daName="mag.f""#),
+        MMXU1,
+    ));
+    assert_eq!(first_entry(&m).do_path, vec!["TotW", "mag", "f"]);
+}
+
+/// An element index written into a name, as in `phsAHar(9).cVal`, is taken
+/// off the segment and becomes the array index when `ix` is absent.
+#[test]
+fn fcda_indexed_segment_yields_the_array_index() {
+    let m = build(&wrap(
+        MMXU_MV,
+        &fcda(r#"doName="Har" daName="phsAHar(9).cVal.mag.f" ix="9""#),
+        MMXU1,
+    ));
+    let e = first_entry(&m);
+    assert_eq!(e.do_path, vec!["Har", "phsAHar", "cVal", "mag", "f"]);
+    assert_eq!(e.array_index, Some(9));
+    let m = build(&wrap(MMXU_MV, &fcda(r#"doName="Har.phsAHar(3)""#), MMXU1));
+    let e = first_entry(&m);
+    assert_eq!(e.do_path, vec!["Har", "phsAHar"]);
+    assert_eq!(e.array_index, Some(3));
+}
+
+/// A malformed or contradictory index, and an empty name segment, are
+/// rejected.
+#[test]
+fn fcda_malformed_name_is_rejected() {
+    for attrs in [
+        r#"doName="Har" daName="phsAHar(9.cVal""#,
+        r#"doName="Har" daName="phsAHar(x)""#,
+        r#"doName="Har" daName="phsAHar(9)" ix="8""#,
+        r#"doName="Har" daName="phsAHar(1).cVal(2)""#,
+        r#"doName="TotW" daName="mag..f""#,
+    ] {
+        assert!(
+            try_build(&wrap(MMXU_MV, &fcda(attrs), MMXU1)).is_err(),
+            "{attrs} accepted"
+        );
+    }
+}

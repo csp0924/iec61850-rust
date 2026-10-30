@@ -95,8 +95,8 @@ pub mod __rt {
 #[doc(hidden)]
 pub mod __build_internals {
     pub use crate::build_model::{
-        b_type_to_dat, opt_fields_to_model, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup,
-        report_trg_ops_to_model, template_initial_value, trg_ops_to_model,
+        b_type_to_dat, fcda_do_path, opt_fields_to_model, parse_fc, parse_val_for_b_type,
+        pick_val_for_no_sgroup, report_trg_ops_to_model, template_initial_value, trg_ops_to_model,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};
