@@ -36,66 +36,84 @@ impl OriginValue {
 
 /// Additional cause reported with a failed control command.
 ///
-/// Values as defined in IEC 61850-7-2 §20.1.4.
+/// Values and names as defined in IEC 61850-8-1 Table 110; each variant
+/// documents the standard name and its wire value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 pub enum ControlAddCause {
-    /// No cause was reported, or the reported value is not defined.
+    /// `Unknown` (0): the cause is not known; a value the standard does not
+    /// define also maps here.
     #[default]
     Unknown = 0,
-    /// The requested control operation is not supported by the object.
+    /// `Not-supported` (1): the object does not support the requested control.
     NotSupported = 1,
-    /// The switching hierarchy denies control from this originator.
+    /// `Blocked-by-switching-hierarchy` (2): the switching hierarchy does not
+    /// permit control from this originator.
     BlockedBySwitchingHierarchy = 2,
-    /// The object could not be selected.
+    /// `Select-failed` (3): the selection failed.
     SelectFailed = 3,
-    /// The object is in a position from which the command is not valid.
+    /// `Invalid-position` (4): the object is in a position from which the
+    /// command is not valid.
     InvalidPosition = 4,
-    /// The object already occupies the commanded position.
+    /// `Position-reached` (5): the object already occupies the commanded
+    /// position.
     PositionReached = 5,
-    /// A parameter change is in progress on the object.
+    /// `Parameter-change-in-execution` (6): a parameter change is in progress
+    /// on the object.
     ParameterChangeInExecution = 6,
-    /// The step limit of the object has been reached.
+    /// `Step-limit` (7): the step limit of the object has been reached.
     StepLimit = 7,
-    /// The mode of the logical node blocks the command.
+    /// `Blocked-by-Mode` (8): the mode of the logical node blocks the command.
     BlockedByMode = 8,
-    /// The process condition blocks the command.
+    /// `Blocked-by-process` (9): a process condition blocks the command.
     BlockedByProcess = 9,
-    /// An interlocking condition blocks the command.
+    /// `Blocked-by-interlocking` (10): an interlocking condition blocks the
+    /// command.
     BlockedByInterlocking = 10,
-    /// The synchrocheck condition blocks the command.
+    /// `Blocked-by-synchrocheck` (11): the synchrocheck condition blocks the
+    /// command.
     BlockedBySynchroCheck = 11,
-    /// Another command on the object is still in execution.
+    /// `Command-already-in-execution` (12): another command on the object is
+    /// still in execution.
     CommandAlreadyInExecution = 12,
-    /// The health of the logical node blocks the command.
+    /// `Blocked-by-health` (13): the health of the logical node blocks the
+    /// command.
     BlockedByHealth = 13,
-    /// Another object of the same one-of-n group is under control.
+    /// `1-of-n-control` (14): another object of the same one-of-n group is
+    /// under control.
     OneOfNControl = 14,
-    /// The command was aborted by a Cancel request.
+    /// `Abortion-by-cancel` (15): the command was aborted by a Cancel.
     AbortionByCancel = 15,
-    /// The command exceeded its time limit.
+    /// `Time-limit-over` (16): the command exceeded its time limit.
     TimeLimitOver = 16,
-    /// The command was aborted by a trip.
+    /// `Abortion-by-trip` (17): the command was aborted by a trip.
     AbortionByTrip = 17,
-    /// The object was not selected before the operate.
+    /// `Object-not-selected` (18): the object was not selected before the
+    /// command.
     ObjectNotSelected = 18,
-    /// The object is already selected by another association.
+    /// `Object-already-selected` (19): the object is already selected.
     ObjectAlreadySelected = 19,
-    /// The originator has no access authority for the object.
+    /// `No-access-authority` (20): the originator has no access authority for
+    /// the object.
     NoAccessAuthority = 20,
-    /// The operation ended past the commanded position.
+    /// `Ended-with-overshoot` (21): the operation ended past the commanded
+    /// position.
     EndedWithOvershoot = 21,
-    /// The operation was aborted because the deviation grew too large.
+    /// `Abortion-due-to-deviation` (22): the operation was aborted because the
+    /// deviation grew too large.
     AbortionDueToDeviation = 22,
-    /// The operation was aborted when communication was lost.
+    /// `Abortion-by-communication-loss` (23): the operation was aborted when
+    /// communication was lost.
     AbortionByCommunicationLoss = 23,
-    /// The operation was aborted by a further command.
+    /// `Blocked-by-command` (24): a command blocks this one. The variant name
+    /// differs from the standard name.
     AbortionByCommand = 24,
-    /// The command failed for a reason that carries no additional cause.
+    /// `None` (25): the command failed without an additional cause.
     None = 25,
-    /// The operate parameters do not match those of the selection.
+    /// `Inconsistent-parameters` (26): the parameters of the command do not
+    /// match those of the selection.
     InconsistentParameters = 26,
-    /// The object is locked by another client.
+    /// `Locked-by-other-client` (27): another client holds the object.
     LockedByOtherClient = 27,
 }
 
@@ -135,18 +153,24 @@ impl ControlAddCause {
     }
 }
 
-/// The error field of a LastApplError structure.
+/// The Error field of a LastApplError structure, as defined in
+/// IEC 61850-8-1; the AddCause carries the cause of the failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 pub enum ControlLastApplError {
-    /// The command completed without error.
+    /// `No Error` (0): no internal error; the AddCause reports why the
+    /// command was refused.
     #[default]
     NoError = 0,
-    /// The reported value is not one this implementation knows.
+    /// `Unknown` (1): an internal error occurred before a test of the control
+    /// state machine could refuse the command; a value the standard does not
+    /// define also maps here.
     Unknown = 1,
-    /// The command timed out.
+    /// `Timeout Test Not OK` (2): a time-activated command failed its test.
+    /// The variant name differs from the standard name.
     TimeoutTest = 2,
-    /// The operation itself failed.
+    /// `Operator Test Not OK` (3): an Operate command failed its test. The
+    /// variant name differs from the standard name.
     OperationFailed = 3,
 }
 
