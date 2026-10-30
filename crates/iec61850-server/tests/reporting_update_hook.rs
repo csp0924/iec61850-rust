@@ -9,7 +9,9 @@ use iec61850_model::{
     MmsValue, TrgOps, FC,
 };
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
-use iec61850_server::{Dataset, DatasetEntry, IedServer, Rcb, ReportControl, TriggerOptions};
+use iec61850_server::{
+    Dataset, DatasetEntry, IedServer, InclusionFlag, Rcb, ReportControl, TriggerOptions,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -387,4 +389,155 @@ fn register_brcb_defaults_empty_rpt_id_to_mms_path() {
         brc_arc.brcb.rpt_id, mms_path,
         "the template RptID must be defaulted as well"
     );
+}
+
+// The report trigger follows the trigger options of the updated attribute.
+
+/// Registers an enabled unbuffered control block over one attribute, updates
+/// it through `update`, and returns the inclusion flag of the pending entry, or
+/// `None` when the control block was not triggered.
+fn trigger_of(
+    da: &DataAttribute,
+    trg_ops: TriggerOptions,
+    update: impl FnOnce(&IedServer, &DataAttribute),
+) -> Option<InclusionFlag> {
+    let server = build_server();
+    let mut ds = Dataset::new("GGIO1$ds1");
+    ds.push(DatasetEntry::new(
+        "IED1LD0/GGIO1$ST$Ind1$stVal".to_string(),
+        Arc::clone(&da.value),
+    ));
+    let mms_path = "IED1LD0/GGIO1$RP$urcb01";
+    let rcb = Rcb::new("urcb01", "GGIO1$ds1").with_trg_ops(trg_ops);
+    server
+        .register_urcb(ReportControl::new(mms_path, rcb), ds)
+        .expect("register_urcb");
+    {
+        let engine = server.reporting_engine();
+        let engine_g = engine.lock().unwrap();
+        let rc_arc = engine_g.get_rcb(mms_path).unwrap();
+        let rc_g = rc_arc.lock().unwrap();
+        let mut state = rc_g.state.lock().unwrap();
+        state.rpt_ena = true;
+        state.client_conn_id = Some(1);
+    }
+
+    update(&server, da);
+
+    let engine = server.reporting_engine();
+    let engine_g = engine.lock().unwrap();
+    let rc_arc = engine_g.get_rcb(mms_path).unwrap();
+    let rc_g = rc_arc.lock().unwrap();
+    let state = rc_g.state.lock().unwrap();
+    if !state.triggered {
+        return None;
+    }
+    state.pending.as_ref().map(|p| p.inclusion_flags[0])
+}
+
+/// An update of an attribute whose trigger options name `qchg` and not `dchg`
+/// triggers a quality change.
+#[test]
+fn update_of_qchg_attribute_triggers_quality_change() {
+    let da = DataAttribute::new(
+        "q",
+        FC::St,
+        DataAttributeType::Int32,
+        TrgOps::QCHG,
+        MmsValue::Integer(0),
+    );
+    let flag = trigger_of(&da, TriggerOptions::QUALITY_CHANGED, |s, da| {
+        s.update_int32(da, 1).expect("update_int32");
+    })
+    .expect("a qchg control block must be triggered");
+    assert!(flag.contains(InclusionFlag::QUALITY_CHANGED));
+    assert!(!flag.contains(InclusionFlag::VALUE_CHANGED));
+}
+
+/// A control block enabled for `dchg` alone ignores an update of a `qchg`
+/// attribute.
+#[test]
+fn update_of_qchg_attribute_skips_dchg_only_rcb() {
+    let da = DataAttribute::new(
+        "q",
+        FC::St,
+        DataAttributeType::Int32,
+        TrgOps::QCHG,
+        MmsValue::Integer(0),
+    );
+    let flag = trigger_of(&da, TriggerOptions::DATA_CHANGED, |s, da| {
+        s.update_int32(da, 1).expect("update_int32");
+    });
+    assert!(flag.is_none(), "{flag:?}");
+}
+
+/// An update of any attribute other than a `qchg` one without `dchg` triggers
+/// a data change: one that names `dchg`, with or without `qchg`, and one that
+/// names only `dupd` or no trigger option at all.
+#[test]
+fn update_of_other_attributes_triggers_data_change() {
+    let both = TriggerOptions::DATA_CHANGED | TriggerOptions::QUALITY_CHANGED;
+    for (trg_ops, rcb_trg_ops) in [
+        (TrgOps::DCHG, both),
+        (TrgOps::DCHG | TrgOps::QCHG, both),
+        (TrgOps::NONE, TriggerOptions::DATA_CHANGED),
+        (TrgOps::DUPD, TriggerOptions::DATA_CHANGED),
+    ] {
+        let da = DataAttribute::new(
+            "stVal",
+            FC::St,
+            DataAttributeType::Boolean,
+            trg_ops,
+            MmsValue::Boolean(false),
+        );
+        let flag = trigger_of(&da, rcb_trg_ops, |s, da| {
+            s.update_boolean(da, true).expect("update_boolean");
+        })
+        .expect("a dchg control block must be triggered");
+        assert!(flag.contains(InclusionFlag::VALUE_CHANGED), "{trg_ops:?}");
+        assert!(
+            !flag.contains(InclusionFlag::QUALITY_CHANGED),
+            "{trg_ops:?}"
+        );
+    }
+}
+
+/// A buffered control block enabled for `qchg` alone buffers an update of a
+/// `qchg` attribute as a quality change.
+#[test]
+fn update_of_qchg_attribute_buffers_quality_change() {
+    let server = build_server();
+    let da = DataAttribute::new(
+        "q",
+        FC::St,
+        DataAttributeType::Int32,
+        TrgOps::QCHG,
+        MmsValue::Integer(0),
+    );
+    let mut ds = Dataset::new("GGIO1$ds1");
+    ds.push(DatasetEntry::new(
+        "IED1LD0/GGIO1$ST$Ind1$q".to_string(),
+        Arc::clone(&da.value),
+    ));
+    let mms_path = "IED1LD0/GGIO1$BR$brcb01";
+    let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_trg_ops(TriggerOptions::QUALITY_CHANGED);
+    server
+        .register_brcb(BufferedReportControl::new(mms_path, brcb), ds)
+        .expect("register_brcb");
+
+    let engine = server.reporting_engine();
+    let brc_arc = engine.lock().unwrap().get_brcb(mms_path).unwrap();
+    {
+        let mut state = brc_arc.state.lock().unwrap();
+        state.rpt_ena = true;
+        state.is_buffering = true;
+    }
+
+    server.update_int32(&da, 1).expect("update_int32");
+
+    let entries = brc_arc.lock_buffer().unwrap().iter_entries();
+    assert_eq!(entries.len(), 1, "one entry must be buffered");
+    let snapshot = entries[0].snapshot.as_ref().expect("entry snapshot");
+    assert!(snapshot.inclusion_flags[0].contains(InclusionFlag::QUALITY_CHANGED));
+    assert!(!snapshot.inclusion_flags[0].contains(InclusionFlag::VALUE_CHANGED));
 }

@@ -27,7 +27,7 @@ use crate::reporting::{
 };
 use crate::service::MmsModelDispatcher;
 use iec61850_mms::mms::server::MmsServiceDispatcher;
-use iec61850_model::{DataAttribute, IedModel, MmsValue};
+use iec61850_model::{DataAttribute, IedModel, MmsValue, TrgOps};
 #[cfg(feature = "tls")]
 use iec61850_tls::TlsAcceptor;
 use std::collections::HashMap;
@@ -442,6 +442,10 @@ impl IedServer {
 
     /// Checks that the attribute currently holds the same variant as the new
     /// value, writes it, and triggers any report that watches the attribute.
+    ///
+    /// The report trigger follows the attribute's trigger options: a quality
+    /// change for an attribute that names `qchg` and not `dchg`, a data change
+    /// for every other attribute.
     fn update_typed(
         &self,
         da: &DataAttribute,
@@ -482,20 +486,11 @@ impl IedServer {
                 .as_millis() as u64;
 
             if let Ok(engine) = self.inner.reporting_engine.lock() {
-                engine.on_value_updated(
-                    &attr_ref,
-                    new_value.clone(),
-                    crate::reporting::InclusionFlag::VALUE_CHANGED,
-                    now_ms,
-                );
+                let flag = change_flag(da);
+                engine.on_value_updated(&attr_ref, new_value.clone(), flag, now_ms);
                 // The buffered path is always tried too; it returns at once
                 // when no buffered control block watches the attribute.
-                engine.on_brcb_value_updated(
-                    &attr_ref,
-                    new_value,
-                    crate::reporting::InclusionFlag::VALUE_CHANGED,
-                    now_ms,
-                );
+                engine.on_brcb_value_updated(&attr_ref, new_value, flag, now_ms);
             } else {
                 tracing::warn!(
                     attr_ref = %attr_ref,
@@ -943,6 +938,17 @@ impl IedServer {
         rt.force_active_sg(sg).map_err(|e| {
             ServerError::InvalidModel(format!("setting group {} is out of range: {:?}", sg, e))
         })
+    }
+}
+
+/// Chooses the report trigger for an update from the attribute's trigger
+/// options: a quality change for a `qchg` attribute without `dchg`, a data
+/// change otherwise.
+fn change_flag(da: &DataAttribute) -> crate::reporting::InclusionFlag {
+    if da.trg_ops.contains(TrgOps::QCHG) && !da.trg_ops.contains(TrgOps::DCHG) {
+        crate::reporting::InclusionFlag::QUALITY_CHANGED
+    } else {
+        crate::reporting::InclusionFlag::VALUE_CHANGED
     }
 }
 

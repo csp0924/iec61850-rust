@@ -8,6 +8,15 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`iec61850-server`** — a typed `update_*` call triggers reports by the
+  trigger options of the attribute it updates. An attribute whose trigger
+  options name `qchg` and not `dchg`, such as the `q` of a common data class,
+  triggers a quality change, so a report control block enabled for `qchg`
+  reports it and one enabled for `dchg` alone does not; every update used to
+  trigger a data change. Every other attribute still triggers a data change.
+
 ## [0.3.0] - 2026-10-30
 
 ### Changed
