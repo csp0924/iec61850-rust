@@ -15,11 +15,13 @@
 //!     [0] SEQUENCE {                                    // listOfAccessResult
 //!       VisibleString     RptID          -- always present
 //!       BIT_STRING(-10)   OptFlds        -- always present
-//!       UNSIGNED(8)       SqNum          -- if optFlds bit0 (SEQ_NUM)
+//!       UNSIGNED          SqNum          -- if optFlds bit0 (SEQ_NUM)
 //!       BinaryTime(6)     TimeOfEntry    -- if optFlds bit1 (TIME_STAMP)
 //!       VisibleString     DatSet         -- if optFlds bit3 (DATA_SET)
-//!       UNSIGNED(32)      ConfRev        -- if optFlds bit7 (CONF_REV)
-//!       UNSIGNED(16)      subSeqNum  }   -- if optFlds bit8 (SEGMENTATION)
+//!       UNSIGNED          ConfRev        -- if optFlds bit7 (CONF_REV)
+//!       BOOLEAN           BufOvfl        -- if optFlds bit5 (BUFFER_OVERFLOW), BRCB only
+//!       OCTET STRING(8)   EntryID        -- if optFlds bit6 (ENTRY_ID), BRCB only
+//!       UNSIGNED          subSeqNum      -- if optFlds bit8 (SEGMENTATION)
 //!       BOOLEAN           moreFollows    -- if optFlds bit8 (SEGMENTATION)
 //!       BIT_STRING(N)     inclusionField -- N = data set element count
 //!       -- if optFlds bit4 (DATA_REFERENCE): one VisibleString per included entry
@@ -40,12 +42,14 @@
 //!
 //! ## Segmentation
 //!
-//! `encode_report_pdus` splits a report that would exceed `max_pdu_size` into
+//! `encode_report_pdus` splits a report that would exceed the PDU limit into
 //! segments. Every segment repeats the full header (RptID, OptFlds, SqNum,
 //! TimeOfEntry, and so on), numbers itself with a zero-based `subSeqNum`, and
-//! sets `moreFollows` on every segment but the last. A report larger than the
-//! negotiated PDU size is split rather than emitted as one oversized PDU, so a
-//! client is never handed a PDU it cannot receive.
+//! sets `moreFollows` on every segment but the last. The limit is the smaller of
+//! the maximum PDU size the caller passes and 65535 bytes. The size of a PDU is
+//! computed before it is encoded, so a report larger than the limit is split
+//! rather than emitted as one oversized PDU, and a client is never handed a PDU
+//! it cannot receive.
 //!
 //! ## variableAccessSpecification
 //!
@@ -142,208 +146,342 @@ pub struct ReportEncodeParams<'a> {
 
 /// Encodes one report into one or more MMS unconfirmedPDU byte strings.
 ///
-/// A report larger than `max_pdu_size_bytes` is segmented: the SEGMENTATION bit is
-/// set in OptFlds, each segment carries a zero-based `subSeqNum` and a
-/// `moreFollows` boolean, and the last segment clears `moreFollows`. Robustness
-/// Every segment is at most `max_pdu_size_bytes` long, so a large
-/// report never produces a PDU the client cannot receive.
+/// A report larger than the PDU limit is segmented: the SEGMENTATION bit is set
+/// in OptFlds, each segment carries a zero-based `subSeqNum` and a `moreFollows`
+/// boolean, and the last segment clears `moreFollows`. The limit is the smaller
+/// of `max_pdu_size_bytes` and 65535 bytes, so every BER length in a PDU fits the
+/// two-byte long form. The size of each candidate PDU is computed before it is
+/// encoded, and no PDU longer than the limit is ever built.
 ///
 /// Each element of the returned vector is a complete PDU including the outer
 /// `0xa3`.
 ///
 /// # Errors
 ///
-/// Returns `ReportEncodeError::PduTooSmall` when even a single data set element
-/// does not fit within `max_pdu_size_bytes`. The caller must not advance sqNum on
-/// that error.
+/// Returns `ReportEncodeError::PduTooSmall` when the report fields together with
+/// a single data set element do not fit within the limit, or when a report would
+/// need more segments than `subSeqNum` can number. The caller must not advance
+/// sqNum on that error.
 pub fn encode_report_pdus(
     params: &ReportEncodeParams<'_>,
 ) -> Result<Vec<Bytes>, ReportEncodeError> {
-    let n = params.dataset.len();
-    // Select the entries that have to be included.
-    let included_indices: Vec<usize> = (0..n)
-        .filter(|&i| {
-            params
-                .pending
-                .inclusion_flags
-                .get(i)
-                .map(|f| f.has_trigger())
-                .unwrap_or(false)
-                || params.pending.is_integrity
-                || params.pending.is_gi
-        })
-        .collect();
-
-    // Try a single unsegmented PDU first.
-    let opt_flds = params.opt_flds.mask_urcb();
-    let single = encode_single_segment(params, opt_flds, &included_indices, 0, false);
-    if single.len() <= params.max_pdu_size_bytes {
-        return Ok(vec![single]);
-    }
-
-    // Too large: segment, which also sets the SEGMENTATION bit.
-    let opt_flds_seg = opt_flds | OptFlds::SEGMENTATION;
-    let mut result = Vec::new();
-    let mut sub_seq_num: u16 = 0;
-    let mut start = 0;
-
-    loop {
-        // Binary search for how many entries fit into this segment.
-        let remaining = &included_indices[start..];
-        if remaining.is_empty() {
-            break;
-        }
-
-        let mut end = remaining.len();
-        loop {
-            let more_follows = start + end < included_indices.len();
-            let params_seg = ReportEncodeParams {
-                opt_flds: opt_flds_seg,
-                ..*params
-            };
-            let seg = encode_segment(
-                &params_seg,
-                opt_flds_seg,
-                &included_indices[start..start + end],
-                sub_seq_num,
-                more_follows,
-            );
-            if seg.len() <= params.max_pdu_size_bytes || end == 1 {
-                // Even a single entry does not fit: report it rather than skipping.
-                if seg.len() > params.max_pdu_size_bytes {
-                    return Err(ReportEncodeError::PduTooSmall {
-                        needed: seg.len(),
-                        max: params.max_pdu_size_bytes,
-                    });
-                }
-                result.push(seg);
-                start += end;
-                sub_seq_num += 1;
-                break;
-            }
-            end /= 2;
-            if end == 0 {
-                end = 1;
-            }
-        }
-    }
-
-    Ok(result)
+    let header = ReportHeader {
+        rpt_id: params.rpt_id,
+        opt_flds: params.opt_flds.mask_urcb(),
+        sq_num: u64::from(params.sq_num),
+        time_of_entry_ms: params.time_of_entry_ms,
+        dat_set: params.dat_set,
+        conf_rev: params.conf_rev,
+        buf_ovfl: false,
+        entry_id: EntryId::ZERO,
+    };
+    encode_pdus(
+        &header,
+        params.dataset,
+        params.pending,
+        params.max_pdu_size_bytes,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Encodes an unsegmented PDU.
-fn encode_single_segment(
-    params: &ReportEncodeParams<'_>,
+/// Largest report PDU the encoder emits, in bytes, whatever the negotiated size.
+const MAX_REPORT_PDU_BYTES: usize = 0xFFFF;
+
+/// Encoded size of the OptFlds BIT_STRING(10): tag, length, padding, two bytes.
+const OPT_FLDS_TLV_LEN: usize = 5;
+
+/// Encoded size of a BOOLEAN: tag, length, value.
+const BOOLEAN_TLV_LEN: usize = 3;
+
+/// Encoded size of an EntryID OCTET STRING(8): tag, length, eight bytes.
+const ENTRY_ID_TLV_LEN: usize = 10;
+
+/// Encoded size of a reason-for-inclusion BIT_STRING(6): tag, length, padding,
+/// one byte.
+const REASON_TLV_LEN: usize = 4;
+
+/// Encoded size of the empty Structure sent for a member without a value.
+const EMPTY_VALUE_TLV_LEN: usize = 2;
+
+/// The report fields that precede the segmentation fields.
+///
+/// They are written in this order: RptID, OptFlds, SqNum, TimeOfEntry, DatSet,
+/// ConfRev, BufOvfl, EntryID. A URCB header has the
+/// buffered-only OptFlds bits masked off, so it never carries BufOvfl or
+/// EntryID.
+struct ReportHeader<'a> {
+    rpt_id: &'a str,
+    /// OptFlds as configured; the SEGMENTATION bit is added per segment.
     opt_flds: OptFlds,
-    included_indices: &[usize],
-    sub_seq_num: u16,
-    more_follows: bool,
-) -> Bytes {
-    encode_segment(
-        params,
-        opt_flds,
-        included_indices,
-        sub_seq_num,
-        more_follows,
-    )
+    sq_num: u64,
+    time_of_entry_ms: u64,
+    dat_set: &'a str,
+    conf_rev: u32,
+    buf_ovfl: bool,
+    entry_id: EntryId,
 }
 
-/// Encodes one report segment, which may also be a complete single PDU.
-fn encode_segment(
-    params: &ReportEncodeParams<'_>,
-    opt_flds: OptFlds,
-    included_indices: &[usize],
+impl ReportHeader<'_> {
+    /// Returns the OptFlds value a PDU carries.
+    fn opt_flds(&self, segmented: bool) -> OptFlds {
+        if segmented {
+            self.opt_flds | OptFlds::SEGMENTATION
+        } else {
+            self.opt_flds
+        }
+    }
+
+    /// Returns the encoded size of the fields from RptID through ConfRev.
+    fn encoded_len(&self) -> usize {
+        let f = self.opt_flds;
+        let mut n = tlv_len(self.rpt_id.len()) + OPT_FLDS_TLV_LEN;
+        if f.contains(OptFlds::SEQ_NUM) {
+            n += unsigned_tlv_len(self.sq_num);
+        }
+        if f.contains(OptFlds::TIME_STAMP) {
+            n += tlv_len(BINARY_TIME_LEN);
+        }
+        if f.contains(OptFlds::DATA_SET) {
+            n += tlv_len(self.dat_set.len());
+        }
+        if f.contains(OptFlds::CONF_REV) {
+            n += unsigned_tlv_len(u64::from(self.conf_rev));
+        }
+        if f.contains(OptFlds::BUFFER_OVERFLOW) {
+            n += BOOLEAN_TLV_LEN;
+        }
+        if f.contains(OptFlds::ENTRY_ID) {
+            n += ENTRY_ID_TLV_LEN;
+        }
+        n
+    }
+
+    /// Returns the encoded size of the segmentation fields of segment
+    /// `sub_seq_num`, or zero when the PDU carries none.
+    fn segmentation_len(&self, segmented: bool, sub_seq_num: u16) -> usize {
+        if self.opt_flds(segmented).contains(OptFlds::SEGMENTATION) {
+            unsigned_tlv_len(u64::from(sub_seq_num)) + BOOLEAN_TLV_LEN
+        } else {
+            0
+        }
+    }
+
+    /// Writes the fields from RptID through the segmentation fields.
+    fn encode(&self, segmented: bool, sub_seq_num: u16, more_follows: bool, buf: &mut BytesMut) {
+        let f = self.opt_flds(segmented);
+        encode_visible_string(self.rpt_id, buf);
+        encode_opt_flds_unmasked(f, buf);
+        if f.contains(OptFlds::SEQ_NUM) {
+            encode_unsigned(self.sq_num, buf);
+        }
+        if f.contains(OptFlds::TIME_STAMP) {
+            encode_binary_time(self.time_of_entry_ms, buf);
+        }
+        if f.contains(OptFlds::DATA_SET) {
+            encode_visible_string(self.dat_set, buf);
+        }
+        if f.contains(OptFlds::CONF_REV) {
+            encode_unsigned(u64::from(self.conf_rev), buf);
+        }
+        if f.contains(OptFlds::BUFFER_OVERFLOW) {
+            encode_boolean(self.buf_ovfl, buf);
+        }
+        if f.contains(OptFlds::ENTRY_ID) {
+            encode_octet_string_8(&self.entry_id.0, buf);
+        }
+        if f.contains(OptFlds::SEGMENTATION) {
+            encode_unsigned(u64::from(sub_seq_num), buf);
+            encode_boolean(more_follows, buf);
+        }
+    }
+}
+
+/// One data set member a report includes, prepared for encoding.
+struct IncludedMember<'a> {
+    /// Position in the data set, which selects the inclusion bit.
+    index: usize,
+    /// Data reference, present when OptFlds requests DATA_REFERENCE.
+    reference: Option<&'a str>,
+    /// Value to send; `None` is sent as an empty Structure.
+    value: Option<iec61850_mms::mms::pdu::common::MmsData>,
+    /// Reason for inclusion, present when OptFlds requests REASON.
+    reason: Option<[u8; 2]>,
+}
+
+impl IncludedMember<'_> {
+    /// Returns the encoded size this member adds to a PDU.
+    fn encoded_len(&self) -> usize {
+        let reference = self.reference.map_or(0, |r| tlv_len(r.len()));
+        let value = self
+            .value
+            .as_ref()
+            .map_or(EMPTY_VALUE_TLV_LEN, |v| v.estimated_encoded_size());
+        let reason = if self.reason.is_some() {
+            REASON_TLV_LEN
+        } else {
+            0
+        };
+        reference + value + reason
+    }
+}
+
+/// Encodes a report as one PDU, or as segments when it exceeds the limit.
+fn encode_pdus(
+    header: &ReportHeader<'_>,
+    dataset: &Dataset,
+    pending: &PendingReport,
+    max_pdu_size_bytes: usize,
+) -> Result<Vec<Bytes>, ReportEncodeError> {
+    let limit = max_pdu_size_bytes.min(MAX_REPORT_PDU_BYTES);
+    let ds_len = dataset.len();
+    let all_included = pending.is_integrity || pending.is_gi;
+    let with_reference = header.opt_flds.contains(OptFlds::DATA_REFERENCE);
+    let with_reason = header.opt_flds.contains(OptFlds::REASON);
+
+    let members: Vec<IncludedMember<'_>> = (0..ds_len)
+        .filter(|&i| {
+            all_included
+                || pending
+                    .inclusion_flags
+                    .get(i)
+                    .map(|f| f.has_trigger())
+                    .unwrap_or(false)
+        })
+        .map(|i| {
+            let value = pending
+                .snapshot
+                .get(i)
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .or_else(|| dataset.entry(i).and_then(|e| e.read_value()));
+            let flag = pending
+                .inclusion_flags
+                .get(i)
+                .copied()
+                .unwrap_or(InclusionFlag::NONE);
+            IncludedMember {
+                index: i,
+                reference: if with_reference {
+                    dataset.entry(i).map(|e| e.attr_ref.as_str())
+                } else {
+                    None
+                },
+                value: value.as_ref().map(mms_value_to_mms_data),
+                reason: with_reason
+                    .then(|| flag.to_reason_bit_string(pending.is_integrity, pending.is_gi)),
+            }
+        })
+        .collect();
+    let costs: Vec<usize> = members.iter().map(IncludedMember::encoded_len).collect();
+    let fixed_len = header.encoded_len() + inclusion_tlv_len(ds_len);
+
+    let unsegmented =
+        pdu_len(fixed_len + header.segmentation_len(false, 0) + costs.iter().sum::<usize>());
+    if unsegmented <= limit {
+        return Ok(vec![encode_pdu(
+            header,
+            false,
+            0,
+            false,
+            ds_len,
+            all_included,
+            &members,
+        )]);
+    }
+    if members.is_empty() {
+        return Err(ReportEncodeError::PduTooSmall {
+            needed: unsegmented,
+            max: limit,
+        });
+    }
+
+    // Each segment takes as many of the remaining members as fit within the limit.
+    let mut result = Vec::new();
+    let mut sub_seq_num: u16 = 0;
+    let mut start = 0;
+    while start < members.len() {
+        let seg_fixed = fixed_len + header.segmentation_len(true, sub_seq_num);
+        let mut end = start;
+        let mut content = seg_fixed;
+        while end < members.len() && pdu_len(content + costs[end]) <= limit {
+            content += costs[end];
+            end += 1;
+        }
+        if end == start {
+            return Err(ReportEncodeError::PduTooSmall {
+                needed: pdu_len(seg_fixed + costs[start]),
+                max: limit,
+            });
+        }
+        let more_follows = end < members.len();
+        result.push(encode_pdu(
+            header,
+            true,
+            sub_seq_num,
+            more_follows,
+            ds_len,
+            all_included,
+            &members[start..end],
+        ));
+        if more_follows {
+            sub_seq_num = sub_seq_num
+                .checked_add(1)
+                .ok_or(ReportEncodeError::PduTooSmall {
+                    needed: unsegmented,
+                    max: limit,
+                })?;
+        }
+        start = end;
+    }
+
+    Ok(result)
+}
+
+/// Encodes one report PDU, which is either the whole report or one segment.
+fn encode_pdu(
+    header: &ReportHeader<'_>,
+    segmented: bool,
     sub_seq_num: u16,
     more_follows: bool,
+    ds_len: usize,
+    all_included: bool,
+    members: &[IncludedMember<'_>],
 ) -> Bytes {
     let mut access_result = BytesMut::new();
 
-    // 1. RptID, always present: VisibleString, tag 0x8a.
-    encode_visible_string(params.rpt_id, &mut access_result);
+    // RptID, OptFlds, the optional header fields, and the segmentation fields.
+    header.encode(segmented, sub_seq_num, more_follows, &mut access_result);
 
-    // 2. OptFlds, always present: BIT_STRING(10), tag 0x84. The caller decides
-    //    whether opt_flds already carries the SEGMENTATION bit.
-    encode_opt_flds(opt_flds, &mut access_result);
-
-    // 3. SqNum if SEQ_NUM: UNSIGNED(8), tag 0x86.
-    if opt_flds.contains(OptFlds::SEQ_NUM) {
-        encode_unsigned8(params.sq_num, &mut access_result);
-    }
-
-    // 4. TimeOfEntry if TIME_STAMP: BinaryTime, six bytes, tag 0x8c.
-    if opt_flds.contains(OptFlds::TIME_STAMP) {
-        encode_binary_time(params.time_of_entry_ms, &mut access_result);
-    }
-
-    // 5. DatSet if DATA_SET: VisibleString, tag 0x8a.
-    if opt_flds.contains(OptFlds::DATA_SET) {
-        encode_visible_string(params.dat_set, &mut access_result);
-    }
-
-    // 6. ConfRev if CONF_REV: UNSIGNED(32), tag 0x86.
-    if opt_flds.contains(OptFlds::CONF_REV) {
-        encode_unsigned32(params.conf_rev, &mut access_result);
-    }
-
-    // 7. Segmentation fields if SEGMENTATION.
-    if opt_flds.contains(OptFlds::SEGMENTATION) {
-        encode_unsigned16(sub_seq_num, &mut access_result);
-        encode_boolean(more_follows, &mut access_result);
-    }
-
-    // 8. inclusionField: BIT_STRING(N), N = data set length.
-    let ds_len = params.dataset.len();
+    // inclusionField: BIT_STRING(N), N = data set length.
     encode_inclusion_field(
-        params.pending,
-        included_indices,
+        members.iter().map(|m| m.index),
         ds_len,
-        params.pending.is_integrity || params.pending.is_gi,
+        all_included,
         &mut access_result,
     );
 
-    // 9. One VisibleString per included entry if DATA_REFERENCE.
-    if opt_flds.contains(OptFlds::DATA_REFERENCE) {
-        for &idx in included_indices {
-            if let Some(entry) = params.dataset.entry(idx) {
-                encode_visible_string(&entry.attr_ref, &mut access_result);
-            }
+    // One VisibleString per included member if DATA_REFERENCE.
+    for m in members {
+        if let Some(r) = m.reference {
+            encode_visible_string(r, &mut access_result);
         }
     }
 
-    // 10. The value of every included entry, taken from the snapshot.
-    for &idx in included_indices {
-        let val = params
-            .pending
-            .snapshot
-            .get(idx)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .or_else(|| params.dataset.entry(idx).and_then(|e| e.read_value()));
-        if let Some(v) = val {
-            encode_mms_value(&v, &mut access_result);
-        } else {
-            // Neither a snapshot value nor a live value: emit an empty Structure so
-            // the client can still parse the PDU.
-            access_result.extend_from_slice(&[0xa2, 0x00]);
+    // The value of every included member. A member without a value is sent as
+    // an empty Structure so the client can still parse the PDU.
+    for m in members {
+        match &m.value {
+            Some(v) => v.encode(&mut access_result),
+            None => access_result.extend_from_slice(&[0xa2, 0x00]),
         }
     }
 
-    // 11. One BIT_STRING(6) reason per included entry if REASON.
-    if opt_flds.contains(OptFlds::REASON) {
-        for &idx in included_indices {
-            let flag = params
-                .pending
-                .inclusion_flags
-                .get(idx)
-                .copied()
-                .unwrap_or(InclusionFlag::NONE);
-            let reason =
-                flag.to_reason_bit_string(params.pending.is_integrity, params.pending.is_gi);
-            // BIT_STRING tag 0x84, length 2, including the padding byte.
+    // One BIT_STRING(6) reason per included member if REASON.
+    for m in members {
+        if let Some(reason) = m.reason {
             access_result.extend_from_slice(&[0x84, 0x02]);
             access_result.extend_from_slice(&reason);
         }
@@ -376,6 +514,51 @@ fn encode_segment(
     buf.freeze()
 }
 
+/// Returns the number of bytes a BER definite-form length occupies, matching
+/// `encode_length`.
+fn length_len(len: usize) -> usize {
+    if len < 128 {
+        1
+    } else if len <= 0xff {
+        2
+    } else {
+        3
+    }
+}
+
+/// Returns the encoded size of a tag-length-value whose content is `content`
+/// bytes long.
+fn tlv_len(content: usize) -> usize {
+    1 + length_len(content) + content
+}
+
+/// Returns the size of a complete report PDU whose listOfAccessResult content
+/// is `content` bytes long.
+fn pdu_len(content: usize) -> usize {
+    let list_of_ar = tlv_len(content);
+    let combined = tlv_len(VAR_ACCESS_SPEC.len() + list_of_ar);
+    tlv_len(combined)
+}
+
+/// Returns the encoded size of an UNSIGNED field holding `v`.
+fn unsigned_tlv_len(v: u64) -> usize {
+    2 + unsigned_content(v).len()
+}
+
+/// Returns the big-endian octets of `v` without leading zero octets; zero is one
+/// zero octet.
+fn unsigned_content(v: u64) -> Vec<u8> {
+    let bytes = v.to_be_bytes();
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+    bytes[start..].to_vec()
+}
+
+/// Returns the encoded size of the inclusionField of a data set of `ds_len`
+/// members.
+fn inclusion_tlv_len(ds_len: usize) -> usize {
+    tlv_len(1 + ds_len.div_ceil(8))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Field encoders
 // ─────────────────────────────────────────────────────────────────────────────
@@ -388,54 +571,11 @@ fn encode_visible_string(s: &str, buf: &mut BytesMut) {
     buf.extend_from_slice(bytes);
 }
 
-/// Encodes OptFlds as a BIT_STRING(10), tag 0x84, whose content is a padding byte
-/// followed by two data bytes.
-fn encode_opt_flds(opt_flds: OptFlds, buf: &mut BytesMut) {
-    let wire = opt_flds.to_ber_bit_string();
-    buf.extend_from_slice(&[0x84, 0x03]);
-    buf.extend_from_slice(&wire);
-}
-
-/// Encodes an 8-bit UNSIGNED (SqNum), tag 0x86.
-fn encode_unsigned8(v: u8, buf: &mut BytesMut) {
-    buf.extend_from_slice(&[0x86, 0x01, v]);
-}
-
-/// Encodes a 16-bit UNSIGNED (subSeqNum), tag 0x86.
-fn encode_unsigned16(v: u16, buf: &mut BytesMut) {
-    if v <= 0xff {
-        buf.extend_from_slice(&[0x86, 0x01, v as u8]);
-    } else {
-        buf.extend_from_slice(&[0x86, 0x02, (v >> 8) as u8, (v & 0xff) as u8]);
-    }
-}
-
-/// Encodes a 32-bit UNSIGNED (ConfRev), tag 0x86.
-fn encode_unsigned32(v: u32, buf: &mut BytesMut) {
-    if v == 0 {
-        buf.extend_from_slice(&[0x86, 0x01, 0x00]);
-    } else if v <= 0xff {
-        buf.extend_from_slice(&[0x86, 0x01, v as u8]);
-    } else if v <= 0xffff {
-        buf.extend_from_slice(&[0x86, 0x02, (v >> 8) as u8, (v & 0xff) as u8]);
-    } else if v <= 0xffffff {
-        buf.extend_from_slice(&[
-            0x86,
-            0x03,
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            (v & 0xff) as u8,
-        ]);
-    } else {
-        buf.extend_from_slice(&[
-            0x86,
-            0x04,
-            (v >> 24) as u8,
-            (v >> 16) as u8,
-            (v >> 8) as u8,
-            (v & 0xff) as u8,
-        ]);
-    }
+/// Encodes an UNSIGNED (SqNum, ConfRev, subSeqNum), tag 0x86.
+fn encode_unsigned(v: u64, buf: &mut BytesMut) {
+    let content = unsigned_content(v);
+    buf.extend_from_slice(&[0x86, content.len() as u8]);
+    buf.extend_from_slice(&content);
 }
 
 /// Encodes a BOOLEAN (moreFollows), tag 0x83.
@@ -457,10 +597,9 @@ fn encode_binary_time(ms: u64, buf: &mut BytesMut) {
 /// Encodes the inclusionField as a BIT_STRING(N), N = data set length.
 ///
 /// A general interrogation or integrity report sets every bit; a data-change
-/// report sets only the bits of the entries that changed.
+/// report sets only the bits of the members in `included`.
 fn encode_inclusion_field(
-    pending: &PendingReport,
-    included_indices: &[usize],
+    included: impl Iterator<Item = usize>,
     ds_len: usize,
     all_included: bool,
     buf: &mut BytesMut,
@@ -479,7 +618,7 @@ fn encode_inclusion_field(
             bitmap[n_bytes - 1] &= 0xff << padding;
         }
     } else {
-        for &idx in included_indices {
+        for idx in included {
             if idx < ds_len {
                 let byte_idx = idx / 8;
                 let bit_idx = 7 - (idx % 8); // most significant bit first
@@ -487,22 +626,12 @@ fn encode_inclusion_field(
             }
         }
     }
-    let _ = pending; // pending carries no information on this path
 
     // BIT_STRING tag 0x84; the content is the padding byte then the bitmap.
     buf.extend_from_slice(&[0x84]);
     encode_length(1 + n_bytes, buf);
     buf.put_u8(padding);
     buf.extend_from_slice(&bitmap);
-}
-
-/// Encodes an `MmsValue` as an AccessResult, using the context-implicit MmsData
-/// wire tags of IEC 61850-8-1.
-///
-/// The encoding itself is delegated to `MmsData` in `iec61850-mms`.
-fn encode_mms_value(v: &iec61850_model::MmsValue, buf: &mut BytesMut) {
-    let data = mms_value_to_mms_data(v);
-    data.encode(buf);
 }
 
 /// Converts an `iec61850_model::MmsValue` into an `iec61850_mms` `MmsData`.
@@ -537,9 +666,8 @@ fn mms_value_to_mms_data(v: &iec61850_model::MmsValue) -> iec61850_mms::mms::pdu
 /// BER length encoding, re-exported from `iec61850_asn1`.
 ///
 /// The shared encoder emits at most the two-byte long form (`0x82`), which is what
-/// the decoder in `iec61850-mms` accepts. Reports stay well below 65535 bytes
-/// because COTP and TPKT segment beneath this layer, so the limit does not
-/// constrain the reporting path.
+/// the decoder in `iec61850-mms` accepts. The report encoder keeps every PDU
+/// within `MAX_REPORT_PDU_BYTES`, so no length it writes exceeds that form.
 use iec61850_asn1::encode_length;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -586,198 +714,37 @@ pub struct BrcbReportEncodeParams<'a> {
 
 /// Encodes one BRCB report into one or more MMS unconfirmedPDU byte strings.
 ///
-/// Two fields extend the URCB form:
+/// Two fields extend the URCB form, both after ConfRev:
 /// - `BufOvfl`, a BOOLEAN, when OptFlds requests buffer overflow
 /// - `EntryID`, an OCTET STRING(8), when OptFlds requests the entry identifier
 ///
-/// Segmentation behaves exactly as for a URCB and uses the same wire bit.
+/// Segmentation and the PDU limit behave exactly as for a URCB and use the same
+/// wire bit.
 ///
 /// # Errors
 ///
-/// Returns `ReportEncodeError::PduTooSmall` when even a single data set element
-/// does not fit within `max_pdu_size_bytes`.
+/// Returns `ReportEncodeError::PduTooSmall` when the report fields together with
+/// a single data set element do not fit within the limit.
 pub fn encode_brcb_report_pdus(
     params: &BrcbReportEncodeParams<'_>,
 ) -> Result<Vec<Bytes>, ReportEncodeError> {
-    let n = params.dataset.len();
-    let included_indices: Vec<usize> = (0..n)
-        .filter(|&i| {
-            params
-                .pending
-                .inclusion_flags
-                .get(i)
-                .map(|f| f.has_trigger())
-                .unwrap_or(false)
-                || params.pending.is_integrity
-                || params.pending.is_gi
-        })
-        .collect();
-
-    // Try a single unsegmented PDU first.
-    let opt_flds = params.opt_flds; // a BRCB does not mask OptFlds
-    let single = encode_brcb_segment(params, opt_flds, &included_indices, 0, false);
-    if single.len() <= params.max_pdu_size_bytes {
-        return Ok(vec![single]);
-    }
-
-    // Too large: segment, which also sets the SEGMENTATION bit.
-    let opt_flds_seg = opt_flds | OptFlds::SEGMENTATION;
-    let mut result = Vec::new();
-    let mut sub_seq_num: u16 = 0;
-    let mut start = 0;
-
-    loop {
-        let remaining = &included_indices[start..];
-        if remaining.is_empty() {
-            break;
-        }
-        let mut end = remaining.len();
-        loop {
-            let more_follows = start + end < included_indices.len();
-            let seg = encode_brcb_segment(
-                params,
-                opt_flds_seg,
-                &included_indices[start..start + end],
-                sub_seq_num,
-                more_follows,
-            );
-            if seg.len() <= params.max_pdu_size_bytes || end == 1 {
-                if seg.len() > params.max_pdu_size_bytes {
-                    return Err(ReportEncodeError::PduTooSmall {
-                        needed: seg.len(),
-                        max: params.max_pdu_size_bytes,
-                    });
-                }
-                result.push(seg);
-                start += end;
-                sub_seq_num += 1;
-                break;
-            }
-            end /= 2;
-            if end == 0 {
-                end = 1;
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Encodes one BRCB report segment.
-///
-/// Follows the URCB layout with two extra fields, in the IEC 61850-8-1 wire order:
-/// BufOvfl after ConfRev when the buffer overflow bit is set, and EntryID after
-/// BufOvfl and before the segmentation fields when the entry identifier bit is set.
-fn encode_brcb_segment(
-    params: &BrcbReportEncodeParams<'_>,
-    opt_flds: OptFlds,
-    included_indices: &[usize],
-    sub_seq_num: u16,
-    more_follows: bool,
-) -> Bytes {
-    let mut access_result = BytesMut::new();
-
-    // 1. RptID, always present.
-    encode_visible_string(params.rpt_id, &mut access_result);
-    // 2. OptFlds, always present; a BRCB does not mask.
-    encode_opt_flds_unmasked(opt_flds, &mut access_result);
-    // 3. SqNum if SEQ_NUM: 16 bits for a BRCB, unlike the URCB 8-bit field.
-    if opt_flds.contains(OptFlds::SEQ_NUM) {
-        encode_unsigned16(params.sq_num, &mut access_result);
-    }
-    // 4. TimeOfEntry if TIME_STAMP.
-    if opt_flds.contains(OptFlds::TIME_STAMP) {
-        encode_binary_time(params.time_of_entry_ms, &mut access_result);
-    }
-    // 5. DatSet if DATA_SET.
-    if opt_flds.contains(OptFlds::DATA_SET) {
-        encode_visible_string(params.dat_set, &mut access_result);
-    }
-    // 6. ConfRev if CONF_REV.
-    if opt_flds.contains(OptFlds::CONF_REV) {
-        encode_unsigned32(params.conf_rev, &mut access_result);
-    }
-    // 7. BRCB only: BufOvfl if BUFFER_OVERFLOW.
-    if opt_flds.contains(OptFlds::BUFFER_OVERFLOW) {
-        encode_boolean(params.is_overflow, &mut access_result);
-    }
-    // 8. BRCB only: EntryID if ENTRY_ID, as an OCTET STRING(8).
-    if opt_flds.contains(OptFlds::ENTRY_ID) {
-        encode_octet_string_8(&params.entry_id.0, &mut access_result);
-    }
-    // 9. Segmentation fields if SEGMENTATION: subSeqNum and moreFollows.
-    if opt_flds.contains(OptFlds::SEGMENTATION) {
-        encode_unsigned16(sub_seq_num, &mut access_result);
-        encode_boolean(more_follows, &mut access_result);
-    }
-    // 10. inclusionField, a BIT_STRING(N).
-    let ds_len = params.dataset.len();
-    encode_inclusion_field(
+    let header = ReportHeader {
+        rpt_id: params.rpt_id,
+        // A BRCB does not mask OptFlds, so BUFFER_OVERFLOW and ENTRY_ID are kept.
+        opt_flds: params.opt_flds,
+        sq_num: u64::from(params.sq_num),
+        time_of_entry_ms: params.time_of_entry_ms,
+        dat_set: params.dat_set,
+        conf_rev: params.conf_rev,
+        buf_ovfl: params.is_overflow,
+        entry_id: params.entry_id,
+    };
+    encode_pdus(
+        &header,
+        params.dataset,
         params.pending,
-        included_indices,
-        ds_len,
-        params.pending.is_integrity || params.pending.is_gi,
-        &mut access_result,
-    );
-    // 11. One VisibleString per included entry if DATA_REFERENCE.
-    if opt_flds.contains(OptFlds::DATA_REFERENCE) {
-        for &idx in included_indices {
-            if let Some(entry) = params.dataset.entry(idx) {
-                encode_visible_string(&entry.attr_ref, &mut access_result);
-            }
-        }
-    }
-    // 12. The value of every included entry.
-    for &idx in included_indices {
-        let val = params
-            .pending
-            .snapshot
-            .get(idx)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .or_else(|| params.dataset.entry(idx).and_then(|e| e.read_value()));
-        if let Some(v) = val {
-            encode_mms_value(&v, &mut access_result);
-        } else {
-            access_result.extend_from_slice(&[0xa2, 0x00]);
-        }
-    }
-    // 13. One reason bit string per included entry if REASON.
-    if opt_flds.contains(OptFlds::REASON) {
-        for &idx in included_indices {
-            let flag = params
-                .pending
-                .inclusion_flags
-                .get(idx)
-                .copied()
-                .unwrap_or(InclusionFlag::NONE);
-            let reason =
-                flag.to_reason_bit_string(params.pending.is_integrity, params.pending.is_gi);
-            access_result.extend_from_slice(&[0x84, 0x02]);
-            access_result.extend_from_slice(&reason);
-        }
-    }
-
-    // Wrap in listOfAccessResult [0].
-    let mut list_of_ar = BytesMut::new();
-    list_of_ar.extend_from_slice(&[0xa0]);
-    encode_length(access_result.len(), &mut list_of_ar);
-    list_of_ar.extend_from_slice(&access_result);
-
-    let mut info_report_body = BytesMut::new();
-    info_report_body.extend_from_slice(VAR_ACCESS_SPEC);
-    info_report_body.extend_from_slice(&list_of_ar);
-
-    let mut combined = BytesMut::new();
-    combined.extend_from_slice(&[0xa0]);
-    encode_length(info_report_body.len(), &mut combined);
-    combined.extend_from_slice(&info_report_body);
-
-    let mut buf = BytesMut::new();
-    buf.extend_from_slice(&[0xa3]);
-    encode_length(combined.len(), &mut buf);
-    buf.extend_from_slice(&combined);
-
-    buf.freeze()
+        params.max_pdu_size_bytes,
+    )
 }
 
 /// Encodes an eight-byte OctetString (EntryID) as an AccessResult.
@@ -789,10 +756,12 @@ fn encode_octet_string_8(bytes: &[u8; 8], buf: &mut BytesMut) {
     buf.extend_from_slice(bytes);
 }
 
-/// Encodes OptFlds for a BRCB, keeping the BUFFER_OVERFLOW and ENTRY_ID bits.
+/// Encodes OptFlds as a BIT_STRING(10), tag 0x84, keeping the BUFFER_OVERFLOW
+/// and ENTRY_ID bits.
 ///
 /// `OptFlds::to_ber_bit_string` masks those two bits off for URCB use, so the wire
-/// bytes are assembled here instead of calling it.
+/// bytes are assembled here instead of calling it; a URCB header is masked
+/// before it gets here.
 fn encode_opt_flds_unmasked(opt_flds: OptFlds, buf: &mut BytesMut) {
     let v = opt_flds.0;
     // Same bit mapping as OptFlds::to_ber_bit_string, without the URCB mask.
@@ -1188,18 +1157,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_unsigned32_boundary() {
+    fn encode_unsigned_boundary() {
         let mut buf = BytesMut::new();
-        encode_unsigned32(0, &mut buf);
+        encode_unsigned(0, &mut buf);
         assert_eq!(buf[1], 1, "zero must encode in one byte");
         buf.clear();
-        encode_unsigned32(0xff, &mut buf);
+        encode_unsigned(0xff, &mut buf);
         assert_eq!(buf[1], 1);
         buf.clear();
-        encode_unsigned32(0x100, &mut buf);
+        encode_unsigned(0x100, &mut buf);
         assert_eq!(buf[1], 2);
         buf.clear();
-        encode_unsigned32(u32::MAX, &mut buf);
+        encode_unsigned(u64::from(u32::MAX), &mut buf);
         assert_eq!(buf[1], 4);
     }
 
@@ -1388,6 +1357,141 @@ mod tests {
         params.max_pdu_size_bytes = 32;
         let res = encode_report_pdus(&params);
         assert!(matches!(res, Err(ReportEncodeError::PduTooSmall { .. })));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Field order, UNSIGNED encoding, and the PDU limit
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A GI report over `n` members with long data references.
+    fn large_gi(n: usize) -> (Dataset, PendingReport) {
+        let mut ds = Dataset::new("big");
+        let mut snapshots = Vec::new();
+        let tail = "x".repeat(120);
+        for i in 0..n {
+            ds.push(make_entry(
+                &format!("IED1LD0/GGIO1$ST$Ind{i:04}$stVal_{tail}"),
+                MmsValue::Integer(i as i64),
+            ));
+            snapshots.push(MmsValue::Integer(i as i64));
+        }
+        (ds, make_gi_pending(n, snapshots))
+    }
+
+    /// Returns the size the outer `0xa3` header of `pdu` declares, the header
+    /// included.
+    fn declared_len(pdu: &[u8]) -> usize {
+        let (len, hdr) = iec61850_asn1::decode_length(&pdu[1..]).expect("outer length");
+        1 + hdr + len
+    }
+
+    #[test]
+    fn report_over_65535_bytes_is_segmented_within_the_limit() {
+        let (ds, pending) = large_gi(500);
+        for max in [65_000usize, 65_535, 70_000, usize::MAX] {
+            let params = ReportEncodeParams {
+                opt_flds: OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::DATA_REFERENCE,
+                max_pdu_size_bytes: max,
+                ..base_params(&ds, &pending)
+            };
+            let pdus = encode_report_pdus(&params).expect("segmented");
+            assert!(pdus.len() > 1, "max {max}: segmented");
+            for pdu in &pdus {
+                assert!(
+                    pdu.len() <= max.min(65_535),
+                    "max {max}: {} bytes",
+                    pdu.len()
+                );
+                assert_eq!(declared_len(pdu), pdu.len(), "max {max}: outer length");
+            }
+            let id = EntryId::from_ms(1);
+            let mut brcb = brcb_base_params(&ds, &pending, id, false);
+            brcb.opt_flds |= OptFlds::DATA_REFERENCE | OptFlds::CONF_REV;
+            brcb.max_pdu_size_bytes = max;
+            let pdus = encode_brcb_report_pdus(&brcb).expect("segmented");
+            assert!(pdus.len() > 1, "brcb max {max}: segmented");
+            for pdu in &pdus {
+                assert!(
+                    pdu.len() <= max.min(65_535),
+                    "brcb max {max}: {} bytes",
+                    pdu.len()
+                );
+                assert_eq!(declared_len(pdu), pdu.len(), "brcb max {max}: outer length");
+            }
+        }
+    }
+
+    #[test]
+    fn member_larger_than_the_limit_is_an_error() {
+        let blob = MmsValue::OctetString(vec![0x5a; 70_000]);
+        let mut ds = Dataset::new("ds");
+        ds.push(make_entry("IED1LD0/GGIO1$ST$Blob$stVal", blob.clone()));
+        let pending = make_gi_pending(1, vec![blob]);
+        let params = ReportEncodeParams {
+            max_pdu_size_bytes: usize::MAX,
+            ..base_params(&ds, &pending)
+        };
+        assert!(matches!(
+            encode_report_pdus(&params),
+            Err(ReportEncodeError::PduTooSmall { max: 65_535, .. })
+        ));
+    }
+
+    #[test]
+    fn report_exactly_at_the_limit_is_not_segmented() {
+        let flds = [
+            OptFlds::SEQ_NUM,
+            OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON,
+            OptFlds::DATA_SET | OptFlds::CONF_REV | OptFlds::DATA_REFERENCE,
+            OptFlds::SEQ_NUM
+                | OptFlds::DATA_SET
+                | OptFlds::REASON
+                | OptFlds::DATA_REFERENCE
+                | OptFlds::BUFFER_OVERFLOW
+                | OptFlds::ENTRY_ID
+                | OptFlds::CONF_REV,
+        ];
+        let mut checked = 0;
+        for n in [1usize, 7, 8, 9, 40, 130, 400] {
+            let (ds, pending) = large_gi(n);
+            for f in flds {
+                let id = EntryId::from_ms(7);
+                let mut brcb = brcb_base_params(&ds, &pending, id, true);
+                brcb.opt_flds = f;
+                brcb.max_pdu_size_bytes = usize::MAX;
+                let whole = match encode_brcb_report_pdus(&brcb) {
+                    Ok(p) if p.len() == 1 => p[0].len(),
+                    _ => continue,
+                };
+                brcb.max_pdu_size_bytes = whole;
+                let at = encode_brcb_report_pdus(&brcb).expect("at the limit");
+                assert_eq!(at.len(), 1, "n {n}, {f:?}: fits exactly");
+                assert_eq!(at[0].len(), whole);
+                brcb.max_pdu_size_bytes = whole - 1;
+                if let Ok(below) = encode_brcb_report_pdus(&brcb) {
+                    assert!(below.len() > 1, "n {n}, {f:?}: one byte short segments");
+                    for pdu in &below {
+                        assert!(pdu.len() < whole, "n {n}, {f:?}");
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "only {checked} cases fit in one PDU");
+    }
+
+    #[test]
+    fn report_with_no_member_too_large_for_the_limit_is_an_error() {
+        let ds = make_dataset(1);
+        let pending = PendingReport::new_empty(1, 0);
+        let params = ReportEncodeParams {
+            max_pdu_size_bytes: 16,
+            ..base_params(&ds, &pending)
+        };
+        assert!(matches!(
+            encode_report_pdus(&params),
+            Err(ReportEncodeError::PduTooSmall { .. })
+        ));
     }
 
     #[test]
