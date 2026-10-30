@@ -1050,3 +1050,46 @@ async fn last_appl_error_arrives_before_the_negative_response() {
     }
     h.stop().await;
 }
+
+// ── SelectWithValue on an executing object ─────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sbow_on_an_executing_object_reports_command_already_in_execution() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let s = server();
+    let obj = object("SPCSO4", ControlModel::SboEnhanced);
+    register(
+        &s,
+        obj.clone(),
+        Arc::new(Gate {
+            entered: entered.clone(),
+            release: release.clone(),
+            result: Ok(()),
+        }),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 61))
+        .await
+        .expect("select");
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO4$Oper", oper(on(), 61))
+        .await;
+    if r.is_err() {
+        release.notify_one();
+    }
+    r.expect("answered positively");
+    entered.notified().await;
+    assert_eq!(obj.state(), ControlState::Operate);
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 62))
+        .await;
+    release.notify_one();
+    assert_eq!(denied(r), DataAccessError::TemporarilyUnavailable);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$SBOw"), 62, 12);
+    h.stop().await;
+}
