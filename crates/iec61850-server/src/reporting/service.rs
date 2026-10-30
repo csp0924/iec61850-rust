@@ -234,6 +234,11 @@ pub fn handle_set_rcb_field(
             }
             state.rpt_ena = true;
             state.sq_num = 0;
+            // The integrity period runs from the moment reporting is enabled.
+            state.next_intg_report = (state.intg_pd_ms > 0).then(|| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(u64::from(state.intg_pd_ms))
+            });
         } else {
             // Disabling clears the pending report and the reservation.
             if !state.rpt_ena {
@@ -556,8 +561,19 @@ fn set_brcb_field(
         // PurgeBuf.
         RcbField::Unknown(ref n) if n == "PurgeBuf" => set_brcb_purge_buf(&brcb, value),
 
-        // RptEna: enable or disable.
-        RcbField::RptEna => set_brcb_rpt_ena(&brcb, value, conn_id),
+        // RptEna: enable or disable; the integrity period runs from the moment
+        // reporting is enabled.
+        RcbField::RptEna => match set_brcb_rpt_ena(&brcb, value, conn_id) {
+            Ok(true) => {
+                match engine.lock() {
+                    Ok(eng) => eng.refresh_brcb_integrity_period(mms_path),
+                    Err(_) => return Some(Err(DataAccessError::HardwareFault)),
+                }
+                Some(Ok(()))
+            }
+            Ok(false) => Some(Ok(())),
+            Err(e) => Some(Err(e)),
+        },
 
         // GI: trigger a general interrogation.
         RcbField::Gi => set_brcb_gi(&brcb, value),
@@ -691,18 +707,19 @@ fn set_brcb_purge_buf(
     }
 }
 
+/// Applies a RptEna write; returns whether the write enabled the BRCB.
 fn set_brcb_rpt_ena(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
     conn_id: Option<ConnectionId>,
-) -> Option<Result<(), DataAccessError>> {
+) -> Result<bool, DataAccessError> {
     let v = match value {
         RcbWriteValue::Bool(b) => b,
-        _ => return Some(Err(DataAccessError::TypeInconsistent)),
+        _ => return Err(DataAccessError::TypeInconsistent),
     };
     let mut state = match brcb.lock_state() {
         Ok(s) => s,
-        Err(_) => return Some(Err(DataAccessError::HardwareFault)),
+        Err(_) => return Err(DataAccessError::HardwareFault),
     };
     if let (true, Some(writer), Some(holder)) = (state.rpt_ena, conn_id, state.client_conn_id) {
         if writer != holder {
@@ -711,7 +728,7 @@ fn set_brcb_rpt_ena(
                 conn_id = writer,
                 "SetBRCBValues RptEna: the control block is enabled for another client"
             );
-            return Some(Err(DataAccessError::ObjectAccessDenied));
+            return Err(DataAccessError::ObjectAccessDenied);
         }
     }
     if v {
@@ -720,13 +737,13 @@ fn set_brcb_rpt_ena(
                 mms_path = %brcb.mms_path,
                 "SetBRCBValues RptEna=true: DatSet is empty"
             );
-            return Some(Err(DataAccessError::TemporarilyUnavailable));
+            return Err(DataAccessError::TemporarilyUnavailable);
         }
         if conn_id.is_some() {
             state.client_conn_id = conn_id;
         }
         if state.rpt_ena {
-            return Some(Ok(()));
+            return Ok(false);
         }
         state.rpt_ena = true;
         // A client that enables reporting without writing EntryID first receives
@@ -738,14 +755,14 @@ fn set_brcb_rpt_ena(
         // naturally, unlike the URCB counter.
     } else {
         if !state.rpt_ena {
-            return Some(Ok(()));
+            return Ok(false);
         }
         state.rpt_ena = false;
         // Disabling a BRCB keeps the buffer; only the overflow indication matters,
         // and the send path already implies it for a from-head or unset anchor, so
         // the backend is left untouched here.
     }
-    Some(Ok(()))
+    Ok(v)
 }
 
 fn set_brcb_gi(
@@ -927,6 +944,7 @@ mod tests {
     use crate::reporting::rcb::Rcb;
     use iec61850_model::MmsValue;
     use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
 
     fn make_engine_with_rcb(
         rcb_name: &str,
@@ -1711,5 +1729,198 @@ mod tests {
         assert_eq!(set(false, 3), Some(Ok(())));
         assert_eq!(set(true, 4), Some(Ok(())));
         assert_eq!(brcb_state(&engine, &path).0, Some(4));
+    }
+
+    // ── Integrity period of a control block enabled over MMS ────────────────
+
+    const URCB_CONN: ConnectionId = 1;
+    const BRCB_CONN: ConnectionId = 2;
+
+    struct IntegrityFixture {
+        engine: Arc<Mutex<ReportingEngine>>,
+        sink: Arc<super::super::engine::CollectReportSink>,
+        urcb: String,
+        brcb: String,
+    }
+
+    /// A URCB and a BRCB over one data set, both with `trg_ops` and an IntgPd of
+    /// `intg_pd_ms`, neither enabled.
+    fn integrity_fixture(trg_ops: TriggerOptions, intg_pd_ms: u32) -> IntegrityFixture {
+        use super::super::brcb::{Brcb, BufferedReportControl};
+        let sink = Arc::new(super::super::engine::CollectReportSink::default());
+        let mut engine = ReportingEngine::new(sink.clone());
+        let value = Arc::new(RwLock::new(MmsValue::Boolean(false)));
+        let data_set = || {
+            let mut ds = Dataset::new("GGIO1$ds1");
+            ds.push(DatasetEntry::new(
+                "IED1LD0/GGIO1$ST$Ind1$stVal",
+                value.clone(),
+            ));
+            ds
+        };
+        let urcb = "IED1LD0/GGIO1$RP$urcbIntg".to_string();
+        let rcb = Rcb::new("urcbIntg", "GGIO1$ds1")
+            .with_trg_ops(trg_ops)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::REASON)
+            .with_intg_pd_ms(intg_pd_ms);
+        engine
+            .register_rcb(
+                super::super::rcb::ReportControl::new(&urcb, rcb),
+                data_set(),
+            )
+            .unwrap();
+        let brcb = "IED1LD0/GGIO1$BR$brcbIntg".to_string();
+        let brc = Brcb::new("brcbIntg", "GGIO1$ds1")
+            .with_trg_ops(trg_ops)
+            .with_intg_pd_ms(intg_pd_ms);
+        engine
+            .register_brcb_with_dataset(BufferedReportControl::new(&brcb, brc), data_set())
+            .unwrap();
+        IntegrityFixture {
+            engine: Arc::new(Mutex::new(engine)),
+            sink,
+            urcb,
+            brcb,
+        }
+    }
+
+    impl IntegrityFixture {
+        fn write_intg_pd(&self, intg_pd_ms: u32) {
+            let urcb_res = handle_set_rcb_field(
+                &self.engine,
+                &self.urcb,
+                RcbField::IntgPd,
+                RcbWriteValue::Unsigned(intg_pd_ms),
+                URCB_CONN,
+            );
+            assert_eq!(urcb_res, Ok(()));
+            let brcb_res = handle_set_brcb_field_for_connection(
+                &self.engine,
+                &self.brcb,
+                RcbField::IntgPd,
+                RcbWriteValue::Unsigned(intg_pd_ms),
+                BRCB_CONN,
+            );
+            assert_eq!(brcb_res, Some(Ok(())));
+        }
+
+        fn reserve_urcb(&self) {
+            let res = handle_set_rcb_field(
+                &self.engine,
+                &self.urcb,
+                RcbField::Resv,
+                RcbWriteValue::Bool(true),
+                URCB_CONN,
+            );
+            assert_eq!(res, Ok(()));
+        }
+
+        /// Writes RptEna to both control blocks over MMS.
+        fn set_rpt_ena(&self, on: bool) {
+            let urcb_res = handle_set_rcb_field(
+                &self.engine,
+                &self.urcb,
+                RcbField::RptEna,
+                RcbWriteValue::Bool(on),
+                URCB_CONN,
+            );
+            assert_eq!(urcb_res, Ok(()));
+            let brcb_res = handle_set_brcb_field_for_connection(
+                &self.engine,
+                &self.brcb,
+                RcbField::RptEna,
+                RcbWriteValue::Bool(on),
+                BRCB_CONN,
+            );
+            assert_eq!(brcb_res, Some(Ok(())));
+        }
+
+        /// Enables both control blocks and returns the clock readings taken
+        /// just before and just after.
+        fn enable(&self) -> (Instant, Instant) {
+            let before = Instant::now();
+            self.set_rpt_ena(true);
+            (before, Instant::now())
+        }
+
+        /// Ticks the engine at `now` and returns how many reports each control
+        /// block sent, URCB first.
+        fn tick(&self, now: Instant) -> (usize, usize) {
+            let eng = self.engine.lock().unwrap();
+            eng.tick_at(now, 1_000);
+            eng.tick_brcb(now, 1_000);
+            drop(eng);
+            let pdus = std::mem::take(&mut *self.sink.pdus.lock().unwrap());
+            let count = |conn| pdus.iter().filter(|(c, _)| *c == conn).count();
+            (count(URCB_CONN), count(BRCB_CONN))
+        }
+    }
+
+    #[test]
+    fn integrity_reports_follow_the_period_of_a_block_enabled_over_mms() {
+        let f = integrity_fixture(TriggerOptions::INTEGRITY, 100);
+        let period = Duration::from_millis(100);
+        f.reserve_urcb();
+        let (before, after) = f.enable();
+
+        assert_eq!(f.tick(before + period - Duration::from_millis(1)), (0, 0));
+        assert_eq!(f.tick(after + period), (1, 1));
+        assert_eq!(
+            f.tick(after + period + period - Duration::from_millis(1)),
+            (0, 0)
+        );
+        assert_eq!(f.tick(after + period + period), (1, 1));
+
+        f.set_rpt_ena(false);
+        assert_eq!(f.tick(after + period * 10), (0, 0));
+    }
+
+    #[test]
+    fn integrity_period_restarts_with_the_intg_pd_in_force_when_enabled() {
+        let f = integrity_fixture(TriggerOptions::INTEGRITY, 100);
+        f.reserve_urcb();
+        f.enable();
+        f.set_rpt_ena(false);
+        f.reserve_urcb();
+        f.write_intg_pd(40);
+        let (before, after) = f.enable();
+
+        let new_period = Duration::from_millis(40);
+        assert_eq!(
+            f.tick(before + new_period - Duration::from_millis(1)),
+            (0, 0)
+        );
+        assert_eq!(f.tick(after + new_period), (1, 1));
+    }
+
+    #[test]
+    fn rewriting_rpt_ena_true_keeps_the_integrity_period() {
+        let f = integrity_fixture(TriggerOptions::INTEGRITY, 100);
+        let period = Duration::from_millis(100);
+        f.reserve_urcb();
+        let (_, after) = f.enable();
+        // The rewrite happens strictly later than `after`, so a period restarted
+        // by it would not yet be due at `after + period`.
+        while Instant::now() <= after {
+            std::hint::spin_loop();
+        }
+        f.set_rpt_ena(true);
+        assert_eq!(f.tick(after + period), (1, 1));
+    }
+
+    #[test]
+    fn no_integrity_report_without_the_trigger_option() {
+        let f = integrity_fixture(TriggerOptions::DATA_CHANGED, 100);
+        f.reserve_urcb();
+        let (_, after) = f.enable();
+        assert_eq!(f.tick(after + Duration::from_millis(1_000)), (0, 0));
+    }
+
+    #[test]
+    fn no_integrity_report_with_a_zero_period() {
+        let f = integrity_fixture(TriggerOptions::INTEGRITY, 0);
+        f.reserve_urcb();
+        let (_, after) = f.enable();
+        assert_eq!(f.tick(after + Duration::from_millis(1_000)), (0, 0));
     }
 }

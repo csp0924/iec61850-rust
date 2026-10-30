@@ -809,9 +809,11 @@ impl ReportingEngine {
     /// Implements the report event processing of IEC 61850-7-2. A 1 ms interval
     /// keeps `BufTm = 0` reports effectively immediate.
     pub fn tick(&self) {
-        let now = Instant::now();
-        let now_ms = current_time_ms();
+        self.tick_at(Instant::now(), current_time_ms());
+    }
 
+    /// Runs one `tick` against the clock readings `now` and `now_ms`.
+    pub(crate) fn tick_at(&self, now: Instant, now_ms: u64) {
         // Connections to drop are collected and handled after the per-control-block
         // locks are released: flush_pending cannot call on_connection_dropped itself
         // because std mutexes are not reentrant.

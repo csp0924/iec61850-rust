@@ -25,6 +25,13 @@ Every crate in the workspace shares one version number.
   `object-access-denied`. When the association ends the BRCB is disabled and
   keeps buffering, its `ResvTms` reservation kept, so a client that
   enables it again receives the entries buffered after the last one sent.
+- **`iec61850-server`** — A URCB or BRCB a client enables over MMS sends an
+  integrity report every `IntgPd` when its `TrgOps` include integrity; the
+  period runs from the moment `RptEna` is written true and restarts, with the
+  `IntgPd` then in force, each time the control block is enabled again. The
+  period used to be started only after an integrity report had been sent, so
+  none was ever sent. An `IntgPd` of 0 or `TrgOps` without integrity still send
+  no integrity report.
 - **`iec61850-client`** — `ClientReport::reasons` now describes only the
   latest report: a data set member the report omits has empty reasons, where
   it used to keep the reason of the last report that carried it. A member
