@@ -85,6 +85,15 @@ Every crate in the workspace shares one version number.
   socket closed, before the PDU reaches the dispatcher. A confirmed request
   carried there used to be executed even though the association was then
   refused.
+- **`iec61850-server`** — a connection that ends on a transport or protocol
+  error releases what its association holds as the connection task ends: URCB
+  reservations, control selects, the command termination and report senders,
+  and the setting group edit session. These used to be released only after an
+  orderly close, so a peer that reset its socket after writing `Resv` kept the
+  URCB reserved for a connection that no longer existed. The setting group edit
+  session is now released on every close, where it used to be held until its
+  reservation time expired. A BRCB reservation is still kept until its
+  `ResvTms` expires, so the client can resume after reconnecting.
 
 ## [0.2.0] - 2026-09-06
 

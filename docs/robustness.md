@@ -72,6 +72,7 @@ buffer, never loop without bound, and never leave partial state behind.
 | An update whose value type does not match the data attribute's current type | `TypeMismatch` at run time, rather than an assertion a release build would drop | `update_boolean_type_mismatch_returns_err_no_engine_trigger` in `crates/iec61850-server/tests/reporting_update_hook.rs` |
 | A SetDataSetValues whose data set includes a member the write access policy refuses, or whose value for a member has the wrong type | Each member is written through the single-write path and answered as a Write naming it alone would be; a refused member keeps its value | `set_data_set_values_applies_member_write_access`, `set_data_set_values_refuses_a_mistyped_member` in `crates/iec61850-server/src/service/mod.rs` |
 | An AARQ whose user information is a confirmed request rather than an Initiate-RequestPDU | Answered with an associate reject and the socket closed; the request is never dispatched | `request_in_place_of_initiate_is_not_executed` in `crates/iec61850-server/tests/association_lifecycle.rs` |
+| A peer that resets its socket, or sends a malformed TPKT, after reserving a URCB, opening a setting group edit session or selecting a control object | All are released when the connection task ends, whichever layer ended it | `transport_error_releases_association_state` in `crates/iec61850-server/tests/association_lifecycle.rs` |
 
 ## `iec61850-client`
 

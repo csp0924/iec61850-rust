@@ -23,6 +23,10 @@
 //!   bounded time, 10 seconds by default, and then closes the socket itself.
 //! - An AARQ that fails authentication is answered with an AARE carrying a
 //!   rejected result.
+//! - However the connection ends, including a transport error, the
+//!   association's URCB reservations, control selects and setting group edit
+//!   session are released as the connection task ends. A BRCB reservation is
+//!   kept until its ResvTms expires.
 
 use crate::control::{ConnectionTerminationEvent, ControlAddCause, ControlLastApplError};
 use crate::error::Result;
@@ -283,6 +287,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let conn_id = server.next_connection_id();
+    let _teardown = AssociationTeardown {
+        server: server.clone(),
+        conn_id,
+    };
     tracing::debug!(conn_id, ?peer, "connection task started");
 
     match run_connection(server.clone(), stream, peer, conn_id).await {
@@ -293,8 +301,38 @@ where
             tracing::warn!(conn_id, ?peer, error = %e, "connection closed after an error");
         }
     }
+}
 
-    let _ = server.remove_connection(conn_id);
+/// Releases everything an association holds when its connection task ends,
+/// whichever way it ends: an orderly close, an error from any layer, or the
+/// task being dropped.
+///
+/// Every release is idempotent and tolerates a connection id that never
+/// registered, so the guard is armed before the association is established.
+struct AssociationTeardown {
+    server: IedServer,
+    conn_id: ConnectionId,
+}
+
+impl Drop for AssociationTeardown {
+    fn drop(&mut self) {
+        let conn_id = self.conn_id;
+        // The command termination and report senders go first, so nothing new
+        // is queued for the association while its state is being released.
+        self.server.ct_sink().deregister(conn_id);
+        self.server.report_sink().deregister(conn_id);
+        self.server.control_objects().release_connection(conn_id);
+        if let Ok(engine) = self.server.reporting_engine().lock() {
+            engine.on_connection_dropped(conn_id);
+        } else {
+            tracing::warn!(
+                conn_id,
+                "the reporting engine lock is poisoned, the association could not be deregistered from it"
+            );
+        }
+        self.server.setting_groups().release_all_for_conn(conn_id);
+        let _ = self.server.remove_connection(conn_id);
+    }
 }
 
 async fn run_connection<S>(
@@ -678,23 +716,6 @@ where
     }
 
     let _ = (session, pres);
-
-    // Release the command termination sender and any select this association
-    // still holds.
-    ct_sink.deregister(conn_id);
-    server.control_objects().release_connection(conn_id);
-
-    // Release the report sender and tell the engine the association is gone.
-    report_sink.deregister(conn_id);
-    if let Ok(engine) = server.reporting_engine().lock() {
-        engine.on_connection_dropped(conn_id);
-    } else {
-        tracing::warn!(
-            conn_id,
-            "the reporting engine lock is poisoned, the association could not be deregistered from it"
-        );
-    }
-
     Ok(())
 }
 
