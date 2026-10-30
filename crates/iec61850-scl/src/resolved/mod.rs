@@ -149,6 +149,10 @@ impl ResolvedScl {
             }
         }
 
+        // Sub-object chains between DOTypes must be acyclic: the model builder
+        // expands a sub-object by recursing into its DOType.
+        check_do_type_cycles(dtt)?;
+
         // Nested attributes inside each DAType, plus cycle detection.
         //
         // `visited` is a stack of DAType identifiers: one is pushed on entry
@@ -195,6 +199,57 @@ impl ResolvedScl {
     ) -> Result<iec61850_model::tree::IedModel, SclParseError> {
         crate::build_model::build_ied_model(&self.raw, ied_name)
     }
+}
+
+/// Rejects a cycle among DOTypes formed by their `<SDO>` references.
+///
+/// Runs a depth-first walk over the sub-object graph, visiting each DOType
+/// once. A reference back to a DOType still on the walk stack is a cycle and
+/// yields [`ErrorKind::SemanticConflict`] naming the chain, at the span of the
+/// `<SDO>` that closes it. Every `do_type_ref` must already be known to exist.
+fn check_do_type_cycles(dtt: &crate::raw::DataTypeTemplates) -> Result<(), SclParseError> {
+    // Each frame is a DOType identifier and the index of its next SDO to visit.
+    let mut done: BTreeMap<&str, ()> = BTreeMap::new();
+    for root in dtt.do_types.keys() {
+        if done.contains_key(root.as_str()) {
+            continue;
+        }
+        let mut stack: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
+        while let Some(top) = stack.last_mut() {
+            let (id, index) = *top;
+            top.1 += 1;
+            let sdos = dtt
+                .do_types
+                .get(id)
+                .map(|t| t.sdos.as_slice())
+                .unwrap_or(&[]);
+            let Some(sdo) = sdos.get(index) else {
+                done.insert(id, ());
+                stack.pop();
+                continue;
+            };
+            let target = sdo.do_type_ref.as_str();
+            if stack.iter().any(|(on_stack, _)| *on_stack == target) {
+                let mut cycle: Vec<&str> = stack.iter().map(|(s, _)| *s).collect();
+                cycle.push(target);
+                return Err(SclParseError::at(
+                    sdo.span,
+                    format!(
+                        "SCL/DataTypeTemplates/DOType[id=\"{}\"]/SDO[name=\"{}\"]",
+                        id, sdo.name
+                    ),
+                    ErrorKind::SemanticConflict {
+                        detail: format!("DOType cycle: {}", cycle.join(" -> ")),
+                    },
+                )
+                .with_attribute("type"));
+            }
+            if !done.contains_key(target) && dtt.do_types.contains_key(target) {
+                stack.push((target, 0));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Checks the `type_ref` of a data attribute: it must name an `enum_types`
