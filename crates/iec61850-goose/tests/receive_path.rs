@@ -10,6 +10,9 @@ use iec61850_goose::GoosePdu;
 use iec61850_goose::{GooseEvent, GooseReceiver, GooseSubscriber, GooseSubscriberBuilder};
 use iec61850_model::MmsValue;
 
+mod log_capture;
+use log_capture::warnings_containing;
+
 const DST: [u8; 6] = [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01];
 
 fn pdu(gocb: &str, st: u32, sq: u32) -> GoosePdu {
@@ -372,4 +375,171 @@ fn dst_mac_filter_holds_alongside_an_observer() {
         vec![1, 0],
         "a subscriber on another destination received the frame"
     );
+}
+fn pdu_rev(gocb: &str, st: u32, sq: u32, conf_rev: u32) -> GoosePdu {
+    GoosePdu {
+        conf_rev,
+        ..pdu(gocb, st, sq)
+    }
+}
+
+#[test]
+fn observer_keeps_sequence_state_per_gocb_ref() {
+    let (obs, seen) = recording(GooseSubscriberBuilder::new().observer());
+    let confs = Arc::new(Mutex::new(Vec::new()));
+    let c = confs.clone();
+    let obs2 = GooseSubscriberBuilder::new()
+        .observer()
+        .listener(move |e: GooseEvent| {
+            if let GooseEvent::NewState { parse_result, .. }
+            | GooseEvent::Retransmission { parse_result, .. } = e
+            {
+                c.lock().unwrap().push(parse_result.is_ok());
+            }
+        })
+        .build();
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(obs);
+    rx.add_subscriber(obs2);
+    let mut rx = rx.start();
+    let (a, b) = ("LD/LLN0$GO$a", "LD/LLN0$GO$b");
+    let t0 = Instant::now();
+    let seq = [
+        pdu_rev(a, 1, 0, 1),
+        pdu_rev(b, 7, 3, 2),
+        pdu_rev(a, 1, 1, 1),
+        pdu_rev(b, 7, 4, 2),
+        pdu_rev(a, 2, 0, 1),
+        pdu_rev(b, 7, 5, 2),
+    ];
+    for (i, p) in seq.iter().enumerate() {
+        rx.handle_message_at(&frame_of(p, 0x1000), t0 + Duration::from_millis(i as u64));
+    }
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![
+            Seen::New(a.into(), 1, true),
+            Seen::New(b.into(), 7, true),
+            Seen::Retx(a.into(), 1, true),
+            Seen::Retx(b.into(), 7, true),
+            Seen::New(a.into(), 2, true),
+            Seen::Retx(b.into(), 7, true),
+        ]
+    );
+    assert!(
+        confs.lock().unwrap().iter().all(|ok| *ok),
+        "a confrev of another publication was reported as a change"
+    );
+}
+
+#[test]
+fn observer_expires_each_publication_on_its_own() {
+    let (obs, seen) = recording(GooseSubscriberBuilder::new().observer());
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(obs);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    rx.handle_message_at(&frame_of(&pdu("LD/LLN0$GO$a", 1, 0), 0x1000), t0);
+    let later = t0 + Duration::from_millis(1500);
+    rx.handle_message_at(&frame_of(&pdu("LD/LLN0$GO$b", 1, 0), 0x1000), later);
+    rx.tick_at(None, t0 + Duration::from_millis(2001));
+    let expired: Vec<Seen> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| matches!(s, Seen::Expired(_)))
+        .cloned()
+        .collect();
+    assert_eq!(expired, vec![Seen::Expired("LD/LLN0$GO$a".into())]);
+}
+
+#[test]
+fn observer_forgets_the_least_recent_publication_when_full() {
+    let (obs, seen) = recording(GooseSubscriberBuilder::new().observer().max_streams(2));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(obs);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    for (i, g) in ["LD/LLN0$GO$a", "LD/LLN0$GO$b", "LD/LLN0$GO$c"]
+        .iter()
+        .enumerate()
+    {
+        rx.handle_message_at(
+            &frame_of(&pdu(g, 3, 0), 0x1000),
+            t0 + Duration::from_millis(i as u64),
+        );
+    }
+    // b is still tracked, a was forgotten and starts over.
+    rx.handle_message_at(
+        &frame_of(&pdu("LD/LLN0$GO$b", 3, 1), 0x1000),
+        t0 + Duration::from_millis(3),
+    );
+    rx.handle_message_at(
+        &frame_of(&pdu("LD/LLN0$GO$a", 3, 1), 0x1000),
+        t0 + Duration::from_millis(4),
+    );
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got[3], Seen::Retx("LD/LLN0$GO$b".into(), 3, true));
+    assert_eq!(got[4], Seen::New("LD/LLN0$GO$a".into(), 3, true));
+}
+
+#[test]
+fn duplicate_frame_after_expiry_does_not_rearm_it() {
+    let (sub, seen) = recording(GooseSubscriberBuilder::new().gocb_ref("LD/LLN0$GO$g"));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    rx.handle_message_at(&frame, t0);
+    rx.tick_at(None, t0 + Duration::from_millis(2001));
+    assert_eq!(expired_count(&seen), 1);
+
+    // The same stNum and sqNum again is no new publication.
+    let again = t0 + Duration::from_millis(2100);
+    rx.handle_message_at(&frame, again);
+    rx.tick_at(None, again + Duration::from_millis(2001));
+    assert_eq!(expired_count(&seen), 1, "expired fired twice for one state");
+}
+
+#[test]
+fn observer_forgets_the_least_recently_heard_rather_than_the_oldest() {
+    let (obs, seen) = recording(GooseSubscriberBuilder::new().observer().max_streams(2));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(obs);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    let order = [
+        pdu("LD/LLN0$GO$a", 3, 0),
+        pdu("LD/LLN0$GO$b", 3, 0),
+        pdu("LD/LLN0$GO$a", 3, 1),
+        // b is the least recently heard and makes room for c.
+        pdu("LD/LLN0$GO$c", 3, 0),
+        pdu("LD/LLN0$GO$a", 3, 2),
+        pdu("LD/LLN0$GO$b", 3, 1),
+    ];
+    for (i, p) in order.iter().enumerate() {
+        rx.handle_message_at(&frame_of(p, 0x1000), t0 + Duration::from_millis(i as u64));
+    }
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got[4], Seen::Retx("LD/LLN0$GO$a".into(), 3, true));
+    assert_eq!(got[5], Seen::New("LD/LLN0$GO$b".into(), 3, true));
+}
+
+#[test]
+fn observer_evictions_are_logged_once() {
+    let (obs, _) = recording(GooseSubscriberBuilder::new().observer().max_streams(1));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(obs);
+    let mut rx = rx.start();
+    let frames: Vec<Vec<u8>> = (0..10)
+        .map(|i| frame_of(&pdu(&format!("LD/LLN0$GO$g{i}"), 1, 0), 0x1000))
+        .collect();
+    let logged = warnings_containing("forgetting gocbref", || {
+        for f in &frames {
+            rx.handle_message(f);
+        }
+    });
+    assert_eq!(logged, 1);
 }

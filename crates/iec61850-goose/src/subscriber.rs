@@ -5,6 +5,10 @@
 //! the decoded PDU; the subscriber tracks stNum and sqNum and calls the
 //! listener with a `GooseEvent`.
 //!
+//! Sequence state is kept per gocbRef, so an observer that sees several
+//! publications checks each one against its own predecessor; the number of
+//! publications an observer tracks is bounded.
+//!
 //! Each event carries an owned `Arc<GooseSubscriberState>` snapshot rather than
 //! a borrow of subscriber internals, so a listener may keep or move it. State
 //! anomalies are reported, never hidden: an stNum that moves backwards or a
@@ -23,6 +27,9 @@ use crate::frame::VlanTag;
 /// Maximum length in bytes of the gocbRef, datSet, and goID fields, per
 /// IEC 61850-8-1 §A.2.
 pub const GOOSE_STRING_MAX_LEN: usize = 129;
+
+/// Default number of publications an observer tracks separately.
+pub const DEFAULT_OBSERVER_MAX_STREAMS: usize = 64;
 
 /// Snapshot of one decoded GOOSE publication.
 ///
@@ -104,6 +111,7 @@ pub struct GooseSubscriberBuilder {
     app_id: Option<u16>,
     dst_mac: Option<[u8; 6]>,
     is_observer: bool,
+    max_streams: Option<usize>,
     listener: Option<Box<dyn Fn(GooseEvent) + Send + Sync + 'static>>,
 }
 
@@ -137,6 +145,19 @@ impl GooseSubscriberBuilder {
         self
     }
 
+    /// Sets how many publications an observer tracks, each with its own
+    /// sequence state and expiry; the default is
+    /// [`DEFAULT_OBSERVER_MAX_STREAMS`] and the minimum 1.
+    ///
+    /// When a publication arrives with every slot taken, the one heard from
+    /// least recently, in the order frames were handed to the subscriber, is
+    /// forgotten, and its next frame counts as a first publication; the first
+    /// eviction is logged. A subscription on one gocbRef tracks a single publication.
+    pub fn max_streams(mut self, n: usize) -> Self {
+        self.max_streams = Some(n);
+        self
+    }
+
     /// Sets the listener invoked for each event.
     pub fn listener(mut self, cb: impl Fn(GooseEvent) + Send + Sync + 'static) -> Self {
         self.listener = Some(Box::new(cb));
@@ -152,9 +173,15 @@ impl GooseSubscriberBuilder {
             app_id: self.app_id,
             dst_mac: self.dst_mac,
             is_observer,
+            max_streams: self
+                .max_streams
+                .unwrap_or(DEFAULT_OBSERVER_MAX_STREAMS)
+                .max(1),
             listener: self.listener,
             last_state: None,
-            expired_fired: false,
+            streams: Vec::new(),
+            clock: 0,
+            eviction_reported: false,
         }
     }
 }
@@ -171,13 +198,30 @@ pub struct GooseSubscriber {
     pub(crate) dst_mac: Option<[u8; 6]>,
     /// Observer mode, which bypasses every filter.
     pub(crate) is_observer: bool,
+    /// Upper bound on `streams`.
+    pub(crate) max_streams: usize,
     /// Listener invoked for each event.
     pub(crate) listener: Option<Box<dyn Fn(GooseEvent) + Send + Sync + 'static>>,
-    /// Most recent state snapshot.
+    /// Most recent state snapshot over every tracked publication.
     pub(crate) last_state: Option<Arc<GooseSubscriberState>>,
-    /// Whether `Expired` has already fired for the current state; cleared when
-    /// a new publication arrives.
-    pub(crate) expired_fired: bool,
+    /// Per-gocbRef sequence state, at most `max_streams` entries.
+    pub(crate) streams: Vec<StreamTrack>,
+    /// Publication counter, the recency stamp of `StreamTrack::last_seen`.
+    pub(crate) clock: u64,
+    /// Whether an eviction has been logged; later ones are not, so a peer
+    /// cycling through gocbRefs cannot flood the log.
+    pub(crate) eviction_reported: bool,
+}
+
+/// Sequence and expiry state of one publication.
+pub(crate) struct StreamTrack {
+    /// Most recent snapshot of this publication.
+    last: Arc<GooseSubscriberState>,
+    /// Whether `Expired` has already fired for `last`; cleared when a new
+    /// publication arrives.
+    expired_fired: bool,
+    /// Value of `GooseSubscriber::clock` when this publication was last heard.
+    last_seen: u64,
 }
 
 impl std::fmt::Debug for GooseSubscriber {
@@ -297,38 +341,46 @@ impl GooseSubscriber {
 
     /// Applies a decoded publication and invokes the listener.
     ///
+    /// The publication is compared with the previous one of the same gocbRef.
     /// A higher stNum, or the first publication, raises `NewState`; the same
     /// stNum raises `Retransmission`. An stNum that moves backwards, or an
     /// sqNum that does not advance within a state, clears `state_valid` while
     /// the listener is still called. A change of confRev is passed as
     /// `Err(ConfRevMismatch)` in `parse_result`.
     pub(crate) fn update_and_dispatch(&mut self, new_state: GooseSubscriberState) {
-        let prev_st_num = self.last_state.as_ref().map(|s| s.st_num).unwrap_or(0);
-        let prev_sq_num = self.last_state.as_ref().map(|s| s.sq_num).unwrap_or(0);
-        let prev_conf_rev = self.last_state.as_ref().map(|s| s.conf_rev).unwrap_or(0);
+        let slot = self
+            .streams
+            .iter()
+            .position(|t| t.last.gocb_ref == new_state.gocb_ref);
+        let prev = slot
+            .and_then(|i| self.streams.get(i))
+            .map(|t| t.last.clone());
+        let prev_st_num = prev.as_ref().map(|s| s.st_num).unwrap_or(0);
+        let prev_sq_num = prev.as_ref().map(|s| s.sq_num).unwrap_or(0);
+        let prev_conf_rev = prev.as_ref().map(|s| s.conf_rev).unwrap_or(0);
 
         let new_st_num = new_state.st_num;
         let new_sq_num = new_state.sq_num;
         let new_conf_rev = new_state.conf_rev;
 
-        let st_num_rollback = self.last_state.is_some() && new_st_num < prev_st_num;
+        let st_num_rollback = prev.is_some() && new_st_num < prev_st_num;
         if st_num_rollback {
             tracing::warn!(
                 "goose subscriber gocbref={:?}: stnum went backwards from {} to {}",
-                self.gocb_ref,
+                new_state.gocb_ref,
                 prev_st_num,
                 new_st_num
             );
         }
 
         let sq_num_rollback = !st_num_rollback
-            && self.last_state.is_some()
+            && prev.is_some()
             && new_st_num == prev_st_num
             && new_sq_num <= prev_sq_num;
         if sq_num_rollback {
             tracing::warn!(
                 "goose subscriber gocbref={:?}: stnum={} sqnum {} did not advance past {}",
-                self.gocb_ref,
+                new_state.gocb_ref,
                 new_st_num,
                 new_sq_num,
                 prev_sq_num
@@ -336,11 +388,11 @@ impl GooseSubscriber {
         }
 
         let conf_rev_mismatch =
-            self.last_state.is_some() && prev_conf_rev != 0 && new_conf_rev != prev_conf_rev;
+            prev.is_some() && prev_conf_rev != 0 && new_conf_rev != prev_conf_rev;
         let parse_result: Result<(), GooseError> = if conf_rev_mismatch {
             tracing::warn!(
                 "goose subscriber gocbref={:?}: confrev changed from {} to {}",
-                self.gocb_ref,
+                new_state.gocb_ref,
                 prev_conf_rev,
                 new_conf_rev
             );
@@ -359,11 +411,6 @@ impl GooseSubscriber {
             ..new_state
         });
 
-        // A fresh publication re-arms the expiry event.
-        if !sq_num_rollback {
-            self.expired_fired = false;
-        }
-
         let event = if st_num_rollback || new_st_num > prev_st_num || prev_st_num == 0 {
             GooseEvent::NewState {
                 prev_st_num,
@@ -377,6 +424,28 @@ impl GooseSubscriber {
             }
         };
 
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+        match slot.and_then(|i| self.streams.get_mut(i)) {
+            Some(track) => {
+                track.last_seen = clock;
+                // A fresh publication re-arms the expiry event.
+                if !sq_num_rollback {
+                    track.expired_fired = false;
+                }
+                track.last = final_state.clone();
+            }
+            None => {
+                if self.streams.len() >= self.max_streams {
+                    self.evict_least_recent();
+                }
+                self.streams.push(StreamTrack {
+                    last: final_state.clone(),
+                    expired_fired: false,
+                    last_seen: clock,
+                });
+            }
+        }
         self.last_state = Some(final_state);
 
         if let Some(cb) = &self.listener {
@@ -384,25 +453,46 @@ impl GooseSubscriber {
         }
     }
 
-    /// Raises `Expired` when timeAllowedToLive has elapsed at `now` since the
-    /// last publication.
+    /// Forgets the tracked publication whose last frame arrived earliest.
+    fn evict_least_recent(&mut self) {
+        let oldest = self
+            .streams
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| t.last_seen)
+            .map(|(i, _)| i);
+        if let Some(i) = oldest {
+            let gone = self.streams.swap_remove(i);
+            if !self.eviction_reported {
+                self.eviction_reported = true;
+                tracing::warn!(
+                    "goose observer tracks {} publications, forgetting gocbref={:?}; later evictions are not logged",
+                    self.max_streams,
+                    gone.last.gocb_ref
+                );
+            }
+        }
+    }
+
+    /// Raises `Expired` for each tracked publication whose timeAllowedToLive
+    /// has elapsed at `now` since its last frame.
     ///
     /// The event fires at most once per state; a new publication re-arms it.
     /// An out-of-sequence last publication expires like any other, since the
     /// timeAllowedToLive supervision of IEC 61850-8-1 depends only on when the
     /// last message arrived.
     pub(crate) fn check_expired_at(&mut self, now: Instant) {
-        if self.expired_fired {
-            return;
-        }
-        let Some(state) = &self.last_state else {
-            return;
-        };
-        if elapsed_ms(state, now) > state.time_allowed_to_live_ms as u64 {
-            self.expired_fired = true;
-            let last = state.clone();
-            if let Some(cb) = &self.listener {
-                cb(GooseEvent::Expired { last_state: last });
+        for track in &mut self.streams {
+            if track.expired_fired {
+                continue;
+            }
+            if elapsed_ms(&track.last, now) > track.last.time_allowed_to_live_ms as u64 {
+                track.expired_fired = true;
+                if let Some(cb) = &self.listener {
+                    cb(GooseEvent::Expired {
+                        last_state: track.last.clone(),
+                    });
+                }
             }
         }
     }
