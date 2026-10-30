@@ -2135,7 +2135,7 @@ fn handle_write_with_routing(
                     return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
                 }
                 if let Some(field) = target.field.clone() {
-                    use crate::reporting::service::handle_set_brcb_field;
+                    use crate::reporting::service::handle_set_brcb_field_for_connection;
                     let rcb_value = match mms_data_to_rcb_write_value(data) {
                         Some(v) => v,
                         None => {
@@ -2148,9 +2148,13 @@ fn handle_write_with_routing(
                             return WriteOutcome::Failure(DataAccessError::TypeInconsistent);
                         }
                     };
-                    if let Some(res) =
-                        handle_set_brcb_field(reporting_engine, &target.mms_path, field, rcb_value)
-                    {
+                    if let Some(res) = handle_set_brcb_field_for_connection(
+                        reporting_engine,
+                        &target.mms_path,
+                        field,
+                        rcb_value,
+                        conn_id,
+                    ) {
                         return match res {
                             Ok(()) => WriteOutcome::Success,
                             Err(e) => WriteOutcome::Failure(e),

@@ -8,8 +8,23 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+- **`iec61850-server`** — `reporting::handle_set_brcb_field_for_connection`
+  applies a SetBRCBValues field write received on a given connection, and the
+  server routes every BRCB write it receives through it.
+  `handle_set_brcb_field` keeps its signature and binds no connection.
+
 ### Fixed
 
+- **`iec61850-server`** — A BRCB a client enables over MMS sends its reports
+  to the association that wrote `RptEna`; it used to send none, because the
+  write did not record the connection. A client that enables a BRCB without
+  writing `EntryID` first receives the buffer from its oldest entry. While the
+  BRCB is enabled, `RptEna` from another association is refused with
+  `object-access-denied`. When the association ends the BRCB is disabled and
+  keeps buffering, its `ResvTms` reservation kept, so a client that
+  enables it again receives the entries buffered after the last one sent.
 - **`iec61850-client`** — `ClientReport::reasons` now describes only the
   latest report: a data set member the report omits has empty reasons, where
   it used to keep the reason of the last report that carried it. A member

@@ -35,8 +35,9 @@
 //!   rejected result.
 //! - However the connection ends, including a transport error, the
 //!   association's URCB reservations, control selects and setting group edit
-//!   session are released as the connection task ends. A BRCB reservation is
-//!   kept until its ResvTms expires.
+//!   session are released as the connection task ends. A BRCB the association
+//!   enabled is disabled and keeps buffering; its reservation is kept until its
+//!   ResvTms expires.
 
 use crate::control::{ConnectionTerminationEvent, ControlAddCause, ControlLastApplError};
 use crate::error::Result;

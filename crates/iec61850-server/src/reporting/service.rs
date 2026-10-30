@@ -436,7 +436,23 @@ use super::buffer::EntryId;
 use crate::flags::{OptFlds, TriggerOptions};
 use iec61850_mms::binary_time6_from_epoch_ms;
 
-/// Applies one SetBRCBValues field write.
+/// Applies one SetBRCBValues field write without binding the BRCB to a connection.
+///
+/// Applies the same rules as `handle_set_brcb_field_for_connection`, except that
+/// no connection is recorded and none is checked: a BRCB enabled through this
+/// function sends no report until a connection is bound to it, and `RptEna` is
+/// accepted whichever connection holds the BRCB. A write that arrives on an
+/// association goes through `handle_set_brcb_field_for_connection`.
+pub fn handle_set_brcb_field(
+    engine: &Arc<Mutex<ReportingEngine>>,
+    mms_path: &str,
+    field: RcbField,
+    value: RcbWriteValue,
+) -> Option<Result<(), DataAccessError>> {
+    set_brcb_field(engine, mms_path, field, value, None)
+}
+
+/// Applies one SetBRCBValues field write received on connection `conn_id`.
 ///
 /// Implements the BRCB branch of the RCB write rules of IEC 61850-7-2, including
 /// the EntryID resynchronization path.
@@ -448,15 +464,31 @@ use iec61850_mms::binary_time6_from_epoch_ms;
 /// Field rules:
 /// - ConfRev, SqNum, TimeOfEntry, and Owner are never writable and give
 ///   ObjectAccessDenied
+/// - RptEna = true binds the BRCB to `conn_id`, which then receives its reports;
+///   enabling a BRCB whose transmit anchor is unset sends its buffer from the
+///   oldest entry
+/// - while the BRCB is enabled for another connection, RptEna gives
+///   ObjectAccessDenied
 /// - DatSet, TrgOps, IntgPd, BufTm, and RptID are refused with
 ///   TemporarilyUnavailable while RptEna is true
 /// - an accepted change to one of those fields purges the report buffer, through
 ///   `BufferedReportControl::set_config_field`
-pub fn handle_set_brcb_field(
+pub fn handle_set_brcb_field_for_connection(
     engine: &Arc<Mutex<ReportingEngine>>,
     mms_path: &str,
     field: RcbField,
     value: RcbWriteValue,
+    conn_id: ConnectionId,
+) -> Option<Result<(), DataAccessError>> {
+    set_brcb_field(engine, mms_path, field, value, Some(conn_id))
+}
+
+fn set_brcb_field(
+    engine: &Arc<Mutex<ReportingEngine>>,
+    mms_path: &str,
+    field: RcbField,
+    value: RcbWriteValue,
+    conn_id: Option<ConnectionId>,
 ) -> Option<Result<(), DataAccessError>> {
     // Never writable.
     match &field {
@@ -525,7 +557,7 @@ pub fn handle_set_brcb_field(
         RcbField::Unknown(ref n) if n == "PurgeBuf" => set_brcb_purge_buf(&brcb, value),
 
         // RptEna: enable or disable.
-        RcbField::RptEna => set_brcb_rpt_ena(&brcb, value),
+        RcbField::RptEna => set_brcb_rpt_ena(&brcb, value, conn_id),
 
         // GI: trigger a general interrogation.
         RcbField::Gi => set_brcb_gi(&brcb, value),
@@ -662,6 +694,7 @@ fn set_brcb_purge_buf(
 fn set_brcb_rpt_ena(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
+    conn_id: Option<ConnectionId>,
 ) -> Option<Result<(), DataAccessError>> {
     let v = match value {
         RcbWriteValue::Bool(b) => b,
@@ -671,6 +704,16 @@ fn set_brcb_rpt_ena(
         Ok(s) => s,
         Err(_) => return Some(Err(DataAccessError::HardwareFault)),
     };
+    if let (true, Some(writer), Some(holder)) = (state.rpt_ena, conn_id, state.client_conn_id) {
+        if writer != holder {
+            tracing::warn!(
+                mms_path = %brcb.mms_path,
+                conn_id = writer,
+                "SetBRCBValues RptEna: the control block is enabled for another client"
+            );
+            return Some(Err(DataAccessError::ObjectAccessDenied));
+        }
+    }
     if v {
         if state.dat_set.is_empty() {
             tracing::warn!(
@@ -679,10 +722,18 @@ fn set_brcb_rpt_ena(
             );
             return Some(Err(DataAccessError::TemporarilyUnavailable));
         }
+        if conn_id.is_some() {
+            state.client_conn_id = conn_id;
+        }
         if state.rpt_ena {
             return Some(Ok(()));
         }
         state.rpt_ena = true;
+        // A client that enables reporting without writing EntryID first receives
+        // the buffer from its oldest entry.
+        if state.transmit_anchor == super::brcb::TransmitAnchor::None {
+            state.transmit_anchor = super::brcb::TransmitAnchor::FromHead;
+        }
         // SqNum is not reset on enable: a BRCB sequence number is 16 bits and wraps
         // naturally, unlike the URCB counter.
     } else {
@@ -1549,5 +1600,116 @@ mod tests {
             super::super::brcb::ResvTmsState::WithTimeout(_)
         ));
         assert!(s.reservation_timeout.is_some());
+    }
+
+    fn brcb_state(
+        engine: &Arc<Mutex<ReportingEngine>>,
+        path: &str,
+    ) -> (
+        Option<ConnectionId>,
+        bool,
+        super::super::brcb::TransmitAnchor,
+    ) {
+        let brcb = engine.lock().unwrap().get_brcb(path).unwrap();
+        let s = brcb.state.lock().unwrap();
+        (s.client_conn_id, s.rpt_ena, s.transmit_anchor.clone())
+    }
+
+    #[test]
+    fn brcb_rpt_ena_for_connection_binds_the_writer() {
+        use super::super::brcb::TransmitAnchor;
+        let (engine, path) = make_engine_with_brcb("18", TriggerOptions::DATA_CHANGED);
+        let res = handle_set_brcb_field_for_connection(
+            &engine,
+            &path,
+            RcbField::RptEna,
+            RcbWriteValue::Bool(true),
+            3,
+        );
+        assert_eq!(res, Some(Ok(())));
+        assert_eq!(
+            brcb_state(&engine, &path),
+            (Some(3), true, TransmitAnchor::FromHead)
+        );
+    }
+
+    #[test]
+    fn brcb_rpt_ena_without_connection_binds_none() {
+        use super::super::brcb::TransmitAnchor;
+        let (engine, path) = make_engine_with_brcb("19", TriggerOptions::DATA_CHANGED);
+        let res =
+            handle_set_brcb_field(&engine, &path, RcbField::RptEna, RcbWriteValue::Bool(true));
+        assert_eq!(res, Some(Ok(())));
+        assert_eq!(
+            brcb_state(&engine, &path),
+            (None, true, TransmitAnchor::FromHead)
+        );
+        // A connection that writes RptEna to the unbound, enabled block takes it.
+        let res = handle_set_brcb_field_for_connection(
+            &engine,
+            &path,
+            RcbField::RptEna,
+            RcbWriteValue::Bool(true),
+            4,
+        );
+        assert_eq!(res, Some(Ok(())));
+        assert_eq!(brcb_state(&engine, &path).0, Some(4));
+    }
+
+    #[test]
+    fn brcb_rpt_ena_keeps_a_resynchronized_anchor() {
+        use super::super::brcb::TransmitAnchor;
+        let (engine, path) = make_engine_with_brcb("20", TriggerOptions::DATA_CHANGED);
+        let res = handle_set_brcb_field_for_connection(
+            &engine,
+            &path,
+            RcbField::EntryId,
+            RcbWriteValue::OctetString(vec![0; 8]),
+            3,
+        );
+        assert_eq!(res, Some(Ok(())));
+        {
+            let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+            brcb.state.lock().unwrap().transmit_anchor =
+                TransmitAnchor::AfterEntryId(super::super::buffer::EntryId::from_ms(7));
+        }
+        let res = handle_set_brcb_field_for_connection(
+            &engine,
+            &path,
+            RcbField::RptEna,
+            RcbWriteValue::Bool(true),
+            3,
+        );
+        assert_eq!(res, Some(Ok(())));
+        assert_eq!(
+            brcb_state(&engine, &path).2,
+            TransmitAnchor::AfterEntryId(super::super::buffer::EntryId::from_ms(7))
+        );
+    }
+
+    #[test]
+    fn brcb_rpt_ena_from_another_connection_denied() {
+        let (engine, path) = make_engine_with_brcb("21", TriggerOptions::DATA_CHANGED);
+        let set = |value: bool, conn_id: ConnectionId| {
+            handle_set_brcb_field_for_connection(
+                &engine,
+                &path,
+                RcbField::RptEna,
+                RcbWriteValue::Bool(value),
+                conn_id,
+            )
+        };
+        assert_eq!(set(true, 3), Some(Ok(())));
+        assert_eq!(set(true, 4), Some(Err(DataAccessError::ObjectAccessDenied)));
+        assert_eq!(
+            set(false, 4),
+            Some(Err(DataAccessError::ObjectAccessDenied))
+        );
+        assert_eq!(brcb_state(&engine, &path).0, Some(3));
+        assert!(brcb_state(&engine, &path).1);
+
+        assert_eq!(set(false, 3), Some(Ok(())));
+        assert_eq!(set(true, 4), Some(Ok(())));
+        assert_eq!(brcb_state(&engine, &path).0, Some(4));
     }
 }

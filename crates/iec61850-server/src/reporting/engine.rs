@@ -1008,10 +1008,13 @@ impl ReportingEngine {
 
     // ─── Connection loss ──────────────────────────────────────────────────────
 
-    /// Releases every RCB held by a connection that has gone away: the control block
-    /// is disabled and its reservation cleared.
+    /// Releases every RCB held by a connection that has gone away.
     ///
-    /// Implements the RCB release on connection loss of IEC 61850-7-2.
+    /// Implements the RCB release on connection loss of IEC 61850-7-2. A URCB is
+    /// disabled and its reservation cleared. A BRCB is disabled and unbound from
+    /// the connection but keeps its buffer, its transmit anchor, and its ResvTms
+    /// reservation, so a client that enables it again resumes after the last
+    /// entry sent.
     pub fn on_connection_dropped(&self, conn_id: ConnectionId) {
         for rc_arc in self.rcbs.values() {
             let Ok(rc_guard) = rc_arc.lock() else {
@@ -1035,6 +1038,22 @@ impl ReportingEngine {
             state.report_due = None;
             // A lost connection always clears Resv.
             state.resv = false;
+            state.gi = false;
+        }
+        for brcb in self.brcbs.values() {
+            let Ok(mut state) = brcb.state.lock() else {
+                continue;
+            };
+            if state.client_conn_id != Some(conn_id) {
+                continue;
+            }
+            tracing::warn!(
+                conn_id,
+                mms_path = %brcb.mms_path,
+                "connection lost, disabling brcb and keeping its buffer"
+            );
+            state.rpt_ena = false;
+            state.client_conn_id = None;
             state.gi = false;
         }
     }
@@ -2057,6 +2076,50 @@ mod tests {
             eng.get_rcb(path).is_none(),
             "the urcb table must not contain a brcb"
         );
+    }
+
+    #[test]
+    fn on_connection_dropped_disables_brcb_and_keeps_its_buffer() {
+        use crate::reporting::brcb::ResvTmsState;
+        use std::num::NonZeroU16;
+        let mut eng = ReportingEngine::new_null();
+        eng.register_brcb(make_brcb("brcb01")).unwrap();
+        eng.register_brcb(make_brcb("brcb02")).unwrap();
+        let dropped = eng.get_brcb("IED1LD0/GGIO1$BR$brcb01").unwrap();
+        let kept = eng.get_brcb("IED1LD0/GGIO1$BR$brcb02").unwrap();
+        let (entry_id, _) = dropped
+            .enqueue_entry(1_000, false, false, Bytes::from_static(b"a"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for (brcb, conn_id) in [(&dropped, 5), (&kept, 6)] {
+            let mut s = brcb.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.gi = true;
+            s.client_conn_id = Some(conn_id);
+            s.resv_tms = ResvTmsState::WithTimeout(NonZeroU16::new(30).unwrap());
+            s.reservation_timeout = Some(deadline);
+            s.transmit_anchor = TransmitAnchor::AfterEntryId(entry_id);
+        }
+
+        eng.on_connection_dropped(5);
+
+        {
+            let s = dropped.state.lock().unwrap();
+            assert!(!s.rpt_ena);
+            assert!(!s.gi);
+            assert_eq!(s.client_conn_id, None);
+            assert_eq!(
+                s.resv_tms,
+                ResvTmsState::WithTimeout(NonZeroU16::new(30).unwrap())
+            );
+            assert_eq!(s.reservation_timeout, Some(deadline));
+            assert_eq!(s.transmit_anchor, TransmitAnchor::AfterEntryId(entry_id));
+        }
+        assert_eq!(dropped.lock_buffer().unwrap().len(), 1);
+        let s = kept.state.lock().unwrap();
+        assert!(s.rpt_ena);
+        assert!(s.gi);
+        assert_eq!(s.client_conn_id, Some(6));
     }
 
     #[test]
