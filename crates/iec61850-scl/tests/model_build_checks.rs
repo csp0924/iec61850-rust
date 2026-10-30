@@ -669,3 +669,25 @@ fn enum_within_integer8_keeps_its_type() {
         );
     }
 }
+
+/// A `<GSEControl>` with an empty `appID` gets the default GoID, its GoCBRef
+/// `<domain>/LLN0$GO$<name>`, where the domain is the `ldName` when the
+/// logical device sets one.
+#[test]
+fn gse_control_empty_app_id_defaults_to_the_gocb_ref() {
+    let ln0 = r#"
+            <DataSet name="DSGoose">
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Ind1" daName="stVal" fc="ST"/>
+            </DataSet>
+            <GSEControl name="gcb1" appID="" datSet="DSGoose" confRev="1"/>"#;
+    let xml = wrap(GGIO_SPS, ln0, GGIO1);
+    let m = build(&xml);
+    let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
+    assert_eq!(ln.gocbs[0].go_id, "IED1LD0/LLN0$GO$gcb1");
+    let m = build(&xml.replace(
+        r#"<LDevice inst="LD0">"#,
+        r#"<LDevice inst="LD0" ldName="Bay1">"#,
+    ));
+    let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
+    assert_eq!(ln.gocbs[0].go_id, "Bay1/LLN0$GO$gcb1");
+}

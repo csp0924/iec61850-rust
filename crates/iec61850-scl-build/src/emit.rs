@@ -28,8 +28,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    attribute_type, fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup,
-    skip_indexed_instance, template_initial_value, warn_count_not_modeled, MmsValue,
+    attribute_type, fcda_do_path, gse_control_go_id, ld_domain_name, parse_fc,
+    parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance, template_initial_value,
+    warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -147,7 +148,7 @@ fn emit_ied_fn(
 
     let ld_exprs = lds
         .iter()
-        .map(|ld| emit_ld_expr(ld, dtt, cfg))
+        .map(|ld| emit_ld_expr(ld, dtt, &ied.name, cfg))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
@@ -176,8 +177,10 @@ fn emit_ied_fn(
 fn emit_ld_expr(
     ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
+    ied_name: &str,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
+    let domain = ld_domain_name(ld, ied_name);
     let inst_lit = ld.inst.as_str();
     let with_ld_name = ld.ld_name.as_deref().map(|n| {
         quote! { __ld = __ld.with_ld_name(#n); }
@@ -211,7 +214,7 @@ fn emit_ld_expr(
 
     let ln_exprs = lns
         .iter()
-        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, cfg))
+        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, cfg))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
@@ -236,6 +239,7 @@ fn emit_ln_expr(
     ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
+    domain: &str,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let prefix_lit = ln.prefix.as_deref().unwrap_or("");
@@ -275,7 +279,7 @@ fn emit_ln_expr(
         .collect::<Vec<_>>();
     let gocb_exprs = sorted_by_name(ln.gse_controls.iter(), cfg, |g| g.name.as_str())
         .into_iter()
-        .map(emit_gocb_expr)
+        .map(|g| emit_gocb_expr(g, domain))
         .collect::<Vec<_>>();
     let svcb_exprs = sorted_by_name(ln.smv_controls.iter(), cfg, |s| s.name.as_str())
         .into_iter()
@@ -615,12 +619,13 @@ fn emit_rcb_expr(r: &RawReportControlBlock) -> TokenStream {
     }
 }
 
-fn emit_gocb_expr(g: &RawGseControl) -> TokenStream {
+fn emit_gocb_expr(g: &RawGseControl, domain: &str) -> TokenStream {
     let name = g.name.as_str();
     let dataset_ref = g.data_set.as_str();
     let conf_rev = g.conf_rev;
-    // The `appID` of a `<GSEControl>` is its GoID, as on the runtime path.
-    let go_id = g.appl_id.as_str();
+    // The GoID follows the runtime path: the `appID`, or the GoCBRef when it
+    // is empty.
+    let go_id = gse_control_go_id(g, domain);
     quote! {
         GooseControlBlock {
             name: ::std::string::String::from(#name),
@@ -1371,8 +1376,8 @@ mod tests {
         assert!(emitted.contains(&sbo), "sboTimeout is not emitted as 30000");
     }
 
-    /// The generated GoCB carries the `appID` as its GoID, as the runtime
-    /// model does.
+    /// The generated GoCB carries the `appID` as its GoID, or the GoCBRef when
+    /// the `appID` is empty, as the runtime model does.
     #[test]
     fn emitted_go_id_is_the_app_id() {
         let xml = r#"<SCL>
@@ -1380,6 +1385,7 @@ mod tests {
     <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
       <DataSet name="DS1"><FCDA ldInst="LD0" lnClass="LLN0" doName="Mod" daName="stVal" fc="ST"/></DataSet>
       <GSEControl name="gcbEvents" appID="events" datSet="DS1" confRev="1"/>
+      <GSEControl name="gcbBare" appID="" datSet="DS1" confRev="1"/>
     </LN0>
   </LDevice></Server></AccessPoint></IED>
   <DataTypeTemplates>
@@ -1389,11 +1395,17 @@ mod tests {
 </SCL>"#;
         let resolved = parse_scl(xml).unwrap().resolve().unwrap();
         let runtime = resolved.build_model("IED1").unwrap();
-        let go_id = runtime.lds[0].lns[0].gocbs[0].go_id.clone();
-        assert_eq!(go_id, "events");
+        let go_ids: Vec<String> = runtime.lds[0].lns[0]
+            .gocbs
+            .iter()
+            .map(|g| g.go_id.clone())
+            .collect();
+        assert_eq!(go_ids, vec!["events", "IED1LD0/LLN0$GO$gcbBare"]);
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
-        let expected = quote! { go_id: ::std::string::String::from(#go_id) }.to_string();
-        assert!(emitted.contains(&expected), "{emitted}");
+        for go_id in go_ids {
+            let expected = quote! { go_id: ::std::string::String::from(#go_id) }.to_string();
+            assert!(emitted.contains(&expected), "{emitted}");
+        }
     }
 
     /// The generated data set entry carries the same path segments and array

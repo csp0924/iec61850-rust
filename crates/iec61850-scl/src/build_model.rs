@@ -77,7 +77,7 @@ pub(crate) fn build_ied_model(raw: &RawScl, ied_name: &str) -> Result<IedModel, 
         };
         for raw_ld in &server.logical_devices {
             had_any_ld = true;
-            let ld = build_ld(raw_ld, dtt)?;
+            let ld = build_ld(raw_ld, dtt, ied_name)?;
             model_b = model_b.add_ld(ld).map_err(|e| {
                 SclParseError::at(
                     raw_ld.span,
@@ -117,14 +117,16 @@ pub(crate) fn build_ied_model(raw: &RawScl, ied_name: &str) -> Result<IedModel, 
 fn build_ld(
     raw_ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
+    ied_name: &str,
 ) -> Result<iec61850_model::LogicalDevice, SclParseError> {
     let mut ld_b = LogicalDeviceBuilder::new(raw_ld.inst.clone());
     if let Some(name) = &raw_ld.ld_name {
         ld_b = ld_b.with_ld_name(name.clone());
     }
+    let domain = ld_domain_name(raw_ld, ied_name);
 
     for raw_ln in &raw_ld.logical_nodes {
-        let ln = build_ln(raw_ln, dtt, &raw_ld.inst)?;
+        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain)?;
         ld_b = ld_b.add_ln(ln);
     }
 
@@ -143,6 +145,7 @@ fn build_ln(
     raw_ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
+    domain: &str,
 ) -> Result<iec61850_model::LogicalNode, SclParseError> {
     // Stage 2 has already checked that ln_type_ref resolves, so `expect` here
     // states an invariant rather than a hope.
@@ -175,7 +178,7 @@ fn build_ln(
 
     // GOOSE control blocks
     for raw_gcb in &raw_ln.gse_controls {
-        ln_b = ln_b.add_gocb(build_gocb(raw_gcb));
+        ln_b = ln_b.add_gocb(build_gocb(raw_gcb, domain));
     }
 
     // Sampled value control blocks
@@ -664,16 +667,43 @@ fn build_rcb(raw_rcb: &RawReportControlBlock) -> ReportControlBlock {
     }
 }
 
-/// Converts a `<GSEControl>` into a [`GooseControlBlock`].
-///
-/// The `appID` attribute is the GoID of the control block (IEC 61850-6), the
-/// identifier a subscriber filters on.
-fn build_gocb(raw_gcb: &RawGseControl) -> GooseControlBlock {
+/// Converts a `<GSEControl>` into a [`GooseControlBlock`], whose GoID comes
+/// from [`gse_control_go_id`].
+fn build_gocb(raw_gcb: &RawGseControl, domain: &str) -> GooseControlBlock {
     GooseControlBlock {
         name: raw_gcb.name.clone(),
         dataset_ref: raw_gcb.data_set.clone(),
         conf_rev: raw_gcb.conf_rev,
-        go_id: raw_gcb.appl_id.clone(),
+        go_id: gse_control_go_id(raw_gcb, domain),
+    }
+}
+
+/// Returns the GoID of a `<GSEControl>` in the logical device whose MMS
+/// domain name is `domain`.
+///
+/// The `appID` attribute is the GoID (IEC 61850-6), the identifier a
+/// subscriber filters on. An empty `appID` leaves the GoID at its IEC 61850-8-1
+/// default, the GoCBRef of the control block: `<domain>/LLN0$GO$<name>`.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn gse_control_go_id(raw_gcb: &RawGseControl, domain: &str) -> String {
+    if raw_gcb.appl_id.is_empty() {
+        format!("{domain}/LLN0$GO${}", raw_gcb.name)
+    } else {
+        raw_gcb.appl_id.clone()
+    }
+}
+
+/// Returns the MMS domain name of a logical device: its `ldName` when set, and
+/// otherwise the IED name followed by the `inst`.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn ld_domain_name(raw_ld: &RawLogicalDevice, ied_name: &str) -> String {
+    match &raw_ld.ld_name {
+        Some(name) => name.clone(),
+        None => format!("{ied_name}{}", raw_ld.inst),
     }
 }
 
