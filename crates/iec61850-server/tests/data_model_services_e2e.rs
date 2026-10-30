@@ -367,6 +367,30 @@ impl ReadHandler for Deny {
     }
 }
 
+/// GetDataSetValues of a data set that does not exist fails the service, as
+/// GetDataSetDirectory does, rather than answering one failed member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_set_values_of_an_unknown_data_set_fail_the_service() {
+    let m = model(false);
+    let server = server_with(m.clone(), IedServerConfig::default());
+    server.register_dataset(DOM, status_data_set(&m));
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let unknown = t!(c.read_named_variable_list_values(DOM, "LLN0$noSuch"));
+    assert!(
+        matches!(unknown, Err(ClientError::ServiceError { .. })),
+        "{unknown:?}"
+    );
+    assert_eq!(
+        t!(c.read_named_variable_list_values(DOM, "LLN0$dsStatus"))
+            .unwrap()
+            .len(),
+        2
+    );
+    handle.stop().await;
+}
+
 // ── Writes below a constructed attribute ────────────────────────────────
 
 // ── GetNameList paging ──────────────────────────────────────────────────

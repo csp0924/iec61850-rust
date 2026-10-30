@@ -344,20 +344,15 @@ async fn dataset_not_registered_returns_object_nonexistent() {
 
     let conn = fresh_client(port).await;
 
-    // An unknown data set is reported per entry: the read itself succeeds on
-    // the wire and every access result is a failure, which the client passes on.
+    // An unknown data set fails the whole service, which the client reports
+    // as an error rather than as access results.
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         conn.get_data_set_values("IED1LD0/GGIO1.ds_unknown"),
     )
     .await
-    .expect("timeout")
-    .expect("get_data_set_values");
-    assert_eq!(result.len(), 1);
-    assert!(matches!(
-        result[0],
-        AccessResult::Failure(iec61850_mms::DataAccessError::ObjectNonExistent)
-    ));
+    .expect("timeout");
+    assert!(result.is_err(), "got: {result:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

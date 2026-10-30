@@ -151,19 +151,14 @@ async fn create_then_read_then_delete_round_trip() {
     assert!(deleted, "the server should report the data set as deleted");
     assert_eq!(server.dynamic_dataset_count(), 0);
 
-    // Reading it again reports ObjectNonExistent per entry.
+    // Reading it again fails the service: the data set no longer exists.
     let results2 = tokio::time::timeout(
         Duration::from_secs(5),
         conn.get_data_set_values("IED1LD0/GGIO1.ds_dyn1"),
     )
     .await
-    .expect("read2 timeout")
-    .expect("read2 returns Vec");
-    assert_eq!(results2.len(), 1);
-    assert!(matches!(
-        &results2[0],
-        AccessResult::Failure(iec61850_mms::DataAccessError::ObjectNonExistent)
-    ));
+    .expect("read2 timeout");
+    assert!(results2.is_err(), "got: {results2:?}");
 
     let _ = conn.disconnect().await;
     let _ = handle.stop().await;

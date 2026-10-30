@@ -910,6 +910,9 @@ fn dispatch_read(
                     None
                 }
             };
+            // A variable list name that does not resolve fails the whole
+            // service rather than one access result: the list it names has no
+            // members to answer for.
             let Some(dataset) = dataset_arc else {
                 tracing::warn!(
                     invoke_id,
@@ -917,15 +920,10 @@ fn dispatch_read(
                     list = key.1,
                     "read: no such data set, answering object-non-existent"
                 );
-                let resp = ReadResponse {
-                    variable_access_spec: None,
-                    list_of_access_result: vec![AccessResult::Failure(
-                        DataAccessError::ObjectNonExistent,
-                    )],
-                };
-                let mut buf = BytesMut::new();
-                encode_confirmed_read_response(invoke_id, &resp, &mut buf);
-                return ConfirmedResponse::Response(buf.freeze());
+                return make_confirmed_error(
+                    invoke_id,
+                    ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+                );
             };
 
             // Each entry snapshots its value under the shared lock and is then
