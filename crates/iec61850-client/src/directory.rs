@@ -85,15 +85,21 @@ pub enum AcsiClass {
 
 // Name list retrieval, following the GetNameList continuation.
 
+/// Most names one GetNameList walk collects across its pages.
+const MAX_NAME_LIST_NAMES: usize = 1_000_000;
+
 /// Calls GetNameList repeatedly until the server reports no more names.
 ///
 /// `domain` selects the scope: `Some(name)` is domain-specific, `None` is
-/// VMD-specific.
+/// VMD-specific. Each continuation must move past the previous one, and the
+/// walk stops at `MAX_NAME_LIST_NAMES` names, so a server that keeps reporting
+/// more cannot hold the client in the loop.
 ///
 /// # Errors
 ///
-/// `NotConnected` if the association is not established, or the error the MMS
-/// layer reports.
+/// `NotConnected` if the association is not established, `Mms` if a page that
+/// reports more names ends on the name the previous page ended on, or the walk
+/// exceeds `MAX_NAME_LIST_NAMES` names, and the error the MMS layer reports.
 async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     conn: &IedConnection<T, Tm>,
     object_class: ObjectClass,
@@ -110,9 +116,31 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
             .get_name_list(object_class, domain, continue_after.as_deref())
             .await?;
         drop(client);
+        if all.len().saturating_add(page.len()) > MAX_NAME_LIST_NAMES {
+            tracing::warn!(
+                ?object_class,
+                domain,
+                limit = MAX_NAME_LIST_NAMES,
+                "getnamelist walk exceeds the name limit, abandoning it"
+            );
+            return Err(ClientError::Mms(format!(
+                "getnamelist returned more than {MAX_NAME_LIST_NAMES} names"
+            )));
+        }
         if let Some(last) = page.last().cloned() {
             all.extend(page);
             if more {
+                if continue_after.as_deref() == Some(last.as_str()) {
+                    tracing::warn!(
+                        ?object_class,
+                        domain,
+                        continue_after = last.as_str(),
+                        "getnamelist page does not advance past its continuation, abandoning the walk"
+                    );
+                    return Err(ClientError::Mms(format!(
+                        "getnamelist does not advance past '{last}'"
+                    )));
+                }
                 continue_after = Some(last);
                 continue;
             }
