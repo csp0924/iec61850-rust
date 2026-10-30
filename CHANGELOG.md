@@ -15,6 +15,12 @@ Every crate in the workspace shares one version number.
   it used to keep the reason of the last report that carried it. A member
   absent from a report therefore no longer looks as if it had triggered it.
   `data_set_values` still keeps the previous value of an omitted member.
+- **`iec61850-server`** — A bit string that arrives in a remote Write or a
+  SetDataSetValues is stored, and handed to a write handler, with the unused
+  bits of its last byte cleared, and every bit string a Read returns, whether
+  the cached value of the model or the value of a read handler, is sent with
+  them cleared, as `IedServer::update_bit_string` already stores them.
+  Nonzero unused bits used to be stored, handed on and sent as received.
 
 ## [0.3.1] - 2026-10-31
 

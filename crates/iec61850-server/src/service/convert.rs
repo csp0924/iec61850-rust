@@ -7,6 +7,8 @@
 //! `MmsTypeSpec` converts to `TypeSpecification` in one direction only, for
 //! GetVariableAccessAttributes. A generic bit string carries no declared size,
 //! so its type specification encodes `bitString = 0` per IEC 61850-8-1 §9.7.
+//! A bit string leaves either conversion with the unused bits of its last byte
+//! cleared.
 
 // These names are in the std prelude, so the import is only needed in a no_std
 // build. Which subset is used depends on the enabled features, hence the blanket
@@ -117,6 +119,16 @@ fn string_size_to_signed(size: StringSize) -> i32 {
 // MmsValue to MmsData, for the Read path
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns the bytes of a bit string with the `padding` unused low-order bits
+/// of the last byte cleared; a padding above 7 leaves the bytes unchanged.
+fn bit_string_bytes(padding: u8, data: &[u8]) -> Vec<u8> {
+    let mut bytes = data.to_vec();
+    if let (Some(last), Some(mask)) = (bytes.last_mut(), u8::MAX.checked_shl(u32::from(padding))) {
+        *last &= mask;
+    }
+    bytes
+}
+
 /// Converts a model value into the wire value carried by an MMS PDU.
 ///
 /// Arrays and structures are converted recursively.
@@ -129,7 +141,7 @@ pub fn mms_value_to_mms_data(v: &MmsValue) -> MmsData {
         MmsValue::Float64(f) => MmsData::Float64(*f),
         MmsValue::BitString { padding, data } => MmsData::BitString {
             padding: *padding,
-            data: data.clone(),
+            data: bit_string_bytes(*padding, data),
         },
         MmsValue::OctetString(bytes) => MmsData::OctetString(bytes.clone()),
         MmsValue::VisibleString(s) => MmsData::VisibleString(s.clone()),
@@ -159,7 +171,7 @@ pub fn mms_data_to_mms_value(d: &MmsData) -> MmsValue {
         MmsData::Float64(f) => MmsValue::Float64(*f),
         MmsData::BitString { padding, data } => MmsValue::BitString {
             padding: *padding,
-            data: data.clone(),
+            data: bit_string_bytes(*padding, data),
         },
         MmsData::OctetString(bytes) => MmsValue::OctetString(bytes.clone()),
         MmsData::VisibleString(s) => MmsValue::VisibleString(s.clone()),
@@ -173,7 +185,7 @@ pub fn mms_data_to_mms_value(d: &MmsData) -> MmsValue {
         // A BooleanArray on the wire maps onto a model bit string.
         MmsData::BooleanArray { padding, data } => MmsValue::BitString {
             padding: *padding,
-            data: data.clone(),
+            data: bit_string_bytes(*padding, data),
         },
         MmsData::GeneralizedTime(s) => MmsValue::VisibleString(s.clone()),
     }
@@ -368,6 +380,54 @@ mod tests {
         }
         let v2 = mms_data_to_mms_value(&d);
         assert!(matches!(v2, MmsValue::Structure(_)));
+    }
+
+    #[test]
+    fn bit_string_unused_bits_cleared_both_ways() {
+        let wire = MmsData::BitString {
+            padding: 3,
+            data: vec![0xff, 0xff],
+        };
+        let model = MmsValue::BitString {
+            padding: 3,
+            data: vec![0xff, 0xf8],
+        };
+        assert_eq!(mms_data_to_mms_value(&wire), model);
+        let boolean_array = MmsData::BooleanArray {
+            padding: 6,
+            data: vec![0x7f],
+        };
+        assert_eq!(
+            mms_data_to_mms_value(&boolean_array),
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0x40],
+            }
+        );
+        assert_eq!(
+            mms_value_to_mms_data(&MmsValue::BitString {
+                padding: 6,
+                data: vec![0x7f],
+            }),
+            MmsData::BitString {
+                padding: 6,
+                data: vec![0x40],
+            }
+        );
+    }
+
+    #[test]
+    fn bit_string_without_unused_bits_kept() {
+        for (padding, data) in [(0u8, vec![0xffu8, 0xff]), (0, vec![]), (8, vec![0xff])] {
+            let model = MmsValue::BitString {
+                padding,
+                data: data.clone(),
+            };
+            assert_eq!(
+                mms_value_to_mms_data(&model),
+                MmsData::BitString { padding, data }
+            );
+        }
     }
 
     // same_data_variant checks

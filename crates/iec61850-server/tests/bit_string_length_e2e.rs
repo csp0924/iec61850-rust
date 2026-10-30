@@ -5,7 +5,9 @@
 //! that declares no size. One that does not
 //! fit answers `type-inconsistent` and leaves the model unchanged. A read
 //! handler value that does not fit is not sent, and the read answers
-//! `object-value-invalid`.
+//! `object-value-invalid`. The unused bits of the last byte are stored and
+//! sent as zero, whatever a Write, a SetDataSetValues or a read handler
+//! supplies.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_mms::{DataAccessError, WriteOutcome};
 use iec61850_model::{
     DataAttributeType, DataObjectBuilder, IedModel, IedModelBuilder, LogicalDeviceBuilder,
-    LogicalNodeBuilder, MmsValue, TrgOps, FC,
+    LogicalNodeBuilder, MmsValue, NodeRef, ObjectRef, TrgOps, FC,
 };
 use iec61850_server::{
     IedServer, IedServerConfig, ReadContext, ReadHandler, ReadOutcome, WriteAccessPolicies,
@@ -102,6 +104,16 @@ fn bit_string(padding: u8, data: &[u8]) -> MmsValue {
     MmsValue::BitString {
         padding,
         data: data.to_vec(),
+    }
+}
+
+/// Returns the value the model holds for a data attribute.
+fn stored(server: &IedServer, path: &str) -> MmsValue {
+    let model = server.model();
+    let r = ObjectRef::parse_iec(path).expect("parse_iec");
+    match model.node_by_object_ref(&r).expect("node lookup") {
+        NodeRef::Da(da) => da.value.read().unwrap().clone(),
+        _ => panic!("expected a data attribute at {path}"),
     }
 }
 
@@ -351,6 +363,99 @@ async fn read_handler_bit_string_of_declared_length_sent() {
 
         let read = conn.read_object(POS, FC::Cf).await.expect("read_object");
         assert_eq!(read, bit_string(6, &[0xc0]));
+
+        let _ = conn.disconnect().await;
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A Write stores the unused bits of the last byte as zero and reads them back
+/// as zero; the bits in use are kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_stores_unused_bits_as_zero() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = build_server();
+        let handle = server.start().await.expect("start");
+        let conn = make_client(handle.bound_addr.port()).await;
+
+        conn.write_object(POS, FC::Cf, bit_string(6, &[0xff]))
+            .await
+            .expect("write pos");
+        assert_eq!(stored(&server, POS), bit_string(6, &[0xc0]));
+        let read = conn.read_object(POS, FC::Cf).await.expect("read pos");
+        assert_eq!(read, bit_string(6, &[0xc0]));
+
+        conn.write_object(QUAL, FC::Cf, bit_string(3, &[0x5a, 0xff]))
+            .await
+            .expect("write qual");
+        assert_eq!(stored(&server, QUAL), bit_string(3, &[0x5a, 0xf8]));
+
+        let _ = conn.disconnect().await;
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// SetDataSetValues stores the unused bits of each member as zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_data_set_values_stores_unused_bits_as_zero() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = build_server();
+        let handle = server.start().await.expect("start");
+        let conn = make_client(handle.bound_addr.port()).await;
+
+        conn.create_data_set(
+            "IED1LD0/GGIO1.dsBits",
+            &[
+                DataSetMember::new(POS, FC::Cf),
+                DataSetMember::new(QUAL, FC::Cf),
+            ],
+        )
+        .await
+        .expect("create_data_set");
+        let outcomes = conn
+            .set_data_set_values(
+                "IED1LD0/GGIO1.dsBits",
+                vec![bit_string(6, &[0xbf]), bit_string(3, &[0x40, 0x07])],
+            )
+            .await
+            .expect("set_data_set_values");
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [WriteOutcome::Success, WriteOutcome::Success]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(stored(&server, POS), bit_string(6, &[0x80]));
+        assert_eq!(stored(&server, QUAL), bit_string(3, &[0x40, 0x00]));
+
+        let _ = conn.disconnect().await;
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A read handler value is sent with the unused bits of its last byte as zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_handler_unused_bits_sent_as_zero() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let server = build_server();
+        server
+            .install_read_handler(
+                "GGIO1$CF$Cfg$pos",
+                Arc::new(FixedRead(bit_string(6, &[0x7f]))),
+            )
+            .expect("install_read_handler");
+        let handle = server.start().await.expect("start");
+        let conn = make_client(handle.bound_addr.port()).await;
+
+        let read = conn.read_object(POS, FC::Cf).await.expect("read_object");
+        assert_eq!(read, bit_string(6, &[0x40]));
 
         let _ = conn.disconnect().await;
         handle.stop().await;
