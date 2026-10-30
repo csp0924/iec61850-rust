@@ -4,10 +4,10 @@
 //! `build_server` validate them and produce a [`TlsClientConfig`] or a
 //! [`TlsServerConfig`].
 //!
-//! Defaults: chain validation on, validity-time validation on,
-//! allow-only-known peers off, client authentication requested but not
-//! required when trust anchors are set, session resumption on, and TLS 1.2
-//! as the minimum version, which IEC 62351-3 mandates.
+//! Defaults: validity-time validation on, allow-only-known peers off, client
+//! authentication requested but not required when trust anchors are set,
+//! session resumption on, and TLS 1.2 as the minimum version, which
+//! IEC 62351-3 mandates. Chain validation always runs.
 //!
 //! Client authentication on the server is mandatory when
 //! [`TlsConfigBuilder::require_client_auth`] or
@@ -116,7 +116,8 @@ pub struct TlsConfigBuilder {
     require_client_auth: bool,
 
     // Verification settings
-    /// Runs chain validation against the trust anchors. Defaults to true.
+    /// Requested chain validation setting. Not applied: chain validation
+    /// always runs.
     chain_validation: bool,
     /// Checks certificate validity time. Defaults to true; false accepts an
     /// expired or not yet valid certificate whose chain is otherwise valid.
@@ -148,8 +149,8 @@ pub struct TlsConfigBuilder {
     session_clock: SessionClock,
 
     // Renegotiation
-    /// Renegotiation interval in milliseconds; 0 disables it. Not applicable
-    /// to TLS 1.3.
+    /// Requested renegotiation interval in milliseconds. Not applied: no
+    /// renegotiation is ever initiated.
     renegotiation_interval_ms: u64,
 
     // -- Event handler -------------------------------------------------------
@@ -292,8 +293,9 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Enables or disables chain validation against the trust anchors.
-    /// Defaults to true.
+    /// Records a chain validation setting. Not applied: chain validation
+    /// against the trust anchors always runs, and `false` only logs a warning
+    /// when the configuration is built.
     pub fn chain_validation(mut self, v: bool) -> Self {
         self.chain_validation = v;
         self
@@ -380,12 +382,11 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Sets the renegotiation interval in milliseconds; 0 disables it. TLS 1.2
-    /// only.
+    /// Records a renegotiation interval in milliseconds. Not applied.
     ///
-    /// A session that runs indefinitely without rekeying
-    /// is bounded by this interval. rustls does not support server-initiated
-    /// renegotiation, so the value is recorded but no HelloRequest is sent.
+    /// rustls supports no TLS 1.2 renegotiation, so no HelloRequest is ever
+    /// sent; a non-zero value only logs a warning when the configuration is
+    /// built.
     pub fn renegotiation_interval(mut self, ms: u64) -> Self {
         self.renegotiation_interval_ms = ms;
         self
@@ -414,6 +415,7 @@ impl TlsConfigBuilder {
                 self.min_version, self.max_version
             )));
         }
+        self.warn_unapplied_settings();
 
         let versions = build_version_list(self.min_version, self.max_version);
         // cipher_suites is a public field of CryptoProvider and is overwritten
@@ -506,6 +508,7 @@ impl TlsConfigBuilder {
                 self.min_version, self.max_version
             )));
         }
+        self.warn_unapplied_settings();
         // A server must present a certificate and a key.
         let key = self
             .private_key
@@ -586,6 +589,19 @@ impl TlsConfigBuilder {
         Ok(TlsServerConfig {
             inner: Arc::new(cfg),
         })
+    }
+
+    /// Logs the settings the builder records but does not apply.
+    fn warn_unapplied_settings(&self) {
+        if !self.chain_validation {
+            tracing::warn!("chain_validation(false) is not applied; chain validation still runs");
+        }
+        if self.renegotiation_interval_ms != 0 {
+            tracing::warn!(
+                "renegotiation_interval ({} ms) is not applied; no renegotiation is initiated",
+                self.renegotiation_interval_ms
+            );
+        }
     }
 }
 

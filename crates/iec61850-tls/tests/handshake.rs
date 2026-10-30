@@ -838,3 +838,26 @@ async fn no_sni_verify_still_rejects_an_expired_certificate() {
         "server={srv:?} client={cli:?}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Settings that are not applied
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chain_validation_off_still_validates_the_chain() {
+    let trusted_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let rogue_leaf = rogue_ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&rogue_leaf).build_server().unwrap();
+    let client = client_trusting(&trusted_ca)
+        .chain_validation(false)
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
