@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::{Error as PemError, PemObject};
 use rustls_pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
@@ -27,6 +27,7 @@ use rustls_pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyD
 use crate::ciphers::IEC62351_3_ALL_CIPHERS;
 use crate::error::TlsError;
 use crate::event::{DefaultTracingHandler, TlsEventHandler};
+use crate::session::{system_clock, ExpiringSessionStore, SessionClock, SESSION_CACHE_CAPACITY};
 use crate::verifier::{
     AllowOnlyKnownCertsClientVerifier, AllowOnlyKnownCertsServerVerifier,
     IgnoreValidityTimeClientVerifier, IgnoreValidityTimeServerVerifier,
@@ -137,11 +138,14 @@ pub struct TlsConfigBuilder {
     crls: Vec<CertificateRevocationListDer<'static>>,
 
     // -- Session resumption --------------------------------------------------
-    /// Enables session resumption: tickets on the server, a cache on the
-    /// client. Defaults to true.
+    /// Enables session resumption: a session cache on both sides. Defaults to
+    /// true.
     session_resumption: bool,
-    /// Session resumption lifetime; `None` keeps the rustls default.
+    /// How long the server keeps a session resumable; `None` keeps the rustls
+    /// cache, which bounds the entry count only.
     session_resumption_lifetime: Option<Duration>,
+    /// Time source of the server session store.
+    session_clock: SessionClock,
 
     // Renegotiation
     /// Renegotiation interval in milliseconds; 0 disables it. Not applicable
@@ -177,6 +181,7 @@ impl TlsConfigBuilder {
             crls: Vec::new(),
             session_resumption: true,
             session_resumption_lifetime: None,
+            session_clock: system_clock(),
             renegotiation_interval_ms: 0,
             event_handler: Arc::new(DefaultTracingHandler),
         }
@@ -344,14 +349,31 @@ impl TlsConfigBuilder {
     }
 
     /// Enables or disables session resumption. Defaults to true.
+    ///
+    /// When disabled, the server keeps no session state and issues no TLS 1.3
+    /// ticket, so neither TLS 1.2 nor TLS 1.3 sessions resume, and the client
+    /// offers no session to resume. This takes precedence over
+    /// [`Self::session_resumption_lifetime`].
     pub fn session_resumption(mut self, v: bool) -> Self {
         self.session_resumption = v;
         self
     }
 
-    /// Sets the session resumption lifetime.
+    /// Sets how long the server keeps a session resumable after storing it.
+    ///
+    /// Applies to TLS 1.2 session IDs and TLS 1.3 tickets alike; resuming an
+    /// older session falls back to a full handshake. A zero lifetime disables
+    /// resumption on the server. Without this setting the server keeps up to
+    /// 256 sessions with no time limit. Has no effect on `build_client`.
     pub fn session_resumption_lifetime(mut self, d: Duration) -> Self {
         self.session_resumption_lifetime = Some(d);
+        self
+    }
+
+    /// Replaces the time source of the server session store.
+    #[cfg(test)]
+    pub(crate) fn with_session_clock(mut self, clock: SessionClock) -> Self {
+        self.session_clock = clock;
         self
     }
 
@@ -545,11 +567,18 @@ impl TlsConfigBuilder {
             .with_single_cert(self.cert_chain, key)
             .map_err(|e| TlsError::CertLoad(format!("server cert: {e}")))?;
 
-        if !self.session_resumption {
+        // TLS 1.2 session IDs and TLS 1.3 stateful tickets both live in
+        // session_storage; the default ticketer issues no stateless ticket.
+        let lifetime = self.session_resumption_lifetime;
+        if !self.session_resumption || lifetime.is_some_and(|d| d.is_zero()) {
+            cfg.session_storage = Arc::new(NoServerSessionStorage {});
             cfg.send_tls13_tickets = 0;
-        }
-        if let Some(lifetime) = self.session_resumption_lifetime {
-            cfg.send_tls13_tickets = (lifetime.as_secs() / 3600).max(1) as usize;
+        } else if let Some(lifetime) = lifetime {
+            cfg.session_storage = Arc::new(ExpiringSessionStore::new(
+                lifetime,
+                SESSION_CACHE_CAPACITY,
+                self.session_clock,
+            ));
         }
 
         Ok(TlsServerConfig {

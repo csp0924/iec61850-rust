@@ -186,6 +186,7 @@ struct ServerSide {
 
 #[derive(Debug)]
 struct ClientSide {
+    resumed: bool,
     version: Option<rustls::ProtocolVersion>,
 }
 
@@ -218,6 +219,7 @@ async fn handshake_as(
     let client = match connector.connect(name, tcp).await {
         Ok(mut stream) => {
             let conn = stream.get_ref().1;
+            let resumed = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
             let version = conn.protocol_version();
             async {
                 stream.write_all(&[7]).await?;
@@ -226,7 +228,7 @@ async fn handshake_as(
                 Ok::<_, std::io::Error>(())
             }
             .await
-            .map(|_| ClientSide { version })
+            .map(|_| ClientSide { resumed, version })
             .map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
@@ -649,4 +651,99 @@ fn mandatory_client_auth_without_trust_anchors_fails_to_build() {
         .build_server();
     assert!(matches!(required, Err(TlsError::Validation(_))));
     assert!(matches!(known_only, Err(TlsError::Validation(_))));
+}
+
+// -----------------------------------------------------------------------------
+// Session resumption
+// -----------------------------------------------------------------------------
+
+/// Runs two handshakes with one connector against an RSA server, so TLS 1.2
+/// is available whatever the suites, and reports whether the second one
+/// resumed.
+async fn second_handshake_resumed(
+    server: impl Fn(&Leaf) -> TlsConfigBuilder,
+    max: TlsVersion,
+) -> bool {
+    let ca = Ca::new();
+    let leaf = rsa_leaf(&ca, SERVER_NAME);
+    let acceptor = TlsAcceptor::new(server(&leaf).build_server().unwrap());
+    let client = client_trusting(&ca).max_version(max);
+    let connector = TlsConnector::new(client.build_client().unwrap());
+    let (s1, c1) = handshake(acceptor.clone(), &connector).await;
+    assert!(
+        s1.is_ok() && c1.is_ok(),
+        "first: server={s1:?} client={c1:?}"
+    );
+    let (s2, c2) = handshake(acceptor, &connector).await;
+    assert!(s2.is_ok(), "second: server={s2:?}");
+    c2.expect("second client side").resumed
+}
+
+const BOTH_VERSIONS: [TlsVersion; 2] = [TlsVersion::Tls12, TlsVersion::Tls13];
+
+#[tokio::test]
+async fn enabled_resumption_resumes_tls12_and_tls13_sessions() {
+    for max in BOTH_VERSIONS {
+        let resumed = second_handshake_resumed(server_with, max).await;
+        assert!(resumed, "{max:?} session did not resume");
+    }
+}
+
+#[tokio::test]
+async fn disabled_resumption_disables_tls12_and_tls13_resumption() {
+    for max in BOTH_VERSIONS {
+        let resumed =
+            second_handshake_resumed(|leaf| server_with(leaf).session_resumption(false), max).await;
+        assert!(!resumed, "{max:?} session resumed");
+    }
+}
+
+#[tokio::test]
+async fn resumption_lifetime_keeps_disabled_resumption_off() {
+    let server = |leaf: &Leaf| {
+        server_with(leaf)
+            .session_resumption(false)
+            .session_resumption_lifetime(Duration::from_secs(7200))
+    };
+    for max in BOTH_VERSIONS {
+        let resumed = second_handshake_resumed(server, max).await;
+        assert!(!resumed, "{max:?} session resumed");
+    }
+}
+
+#[tokio::test]
+async fn resumption_lifetime_keeps_sessions_resumable_within_it() {
+    let server =
+        |leaf: &Leaf| server_with(leaf).session_resumption_lifetime(Duration::from_secs(3600));
+    for max in BOTH_VERSIONS {
+        let resumed = second_handshake_resumed(server, max).await;
+        assert!(resumed, "{max:?} session did not resume");
+    }
+}
+
+#[tokio::test]
+async fn zero_resumption_lifetime_disables_resumption() {
+    let server = |leaf: &Leaf| server_with(leaf).session_resumption_lifetime(Duration::ZERO);
+    for max in BOTH_VERSIONS {
+        let resumed = second_handshake_resumed(server, max).await;
+        assert!(!resumed, "{max:?} session resumed");
+    }
+}
+
+#[test]
+fn resumption_lifetime_leaves_the_ticket_count_unchanged() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let default_count = server_with(&leaf)
+        .build_server()
+        .unwrap()
+        .inner()
+        .send_tls13_tickets;
+    let with_lifetime = server_with(&leaf)
+        .session_resumption_lifetime(Duration::from_secs(36_000))
+        .build_server()
+        .unwrap()
+        .inner()
+        .send_tls13_tickets;
+    assert_eq!(with_lifetime, default_count);
 }

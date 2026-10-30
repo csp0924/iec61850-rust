@@ -27,6 +27,7 @@ pub mod config;
 pub mod connector;
 pub mod error;
 pub mod event;
+mod session;
 pub mod verifier;
 
 #[cfg(test)]
