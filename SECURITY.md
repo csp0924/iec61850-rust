@@ -121,7 +121,7 @@ is true.
 ## Known dependency advisories
 
 `cargo deny check advisories` runs in CI and is the authoritative list. No
-advisory stands open at `0.3.1`: the `deny.toml` ignore list is empty.
+advisory stands open at `0.3.2`: the `deny.toml` ignore list is empty.
 
 An advisory is never suppressed silently. Every entry added to the `deny.toml`
 ignore list carries the reason it is there.
