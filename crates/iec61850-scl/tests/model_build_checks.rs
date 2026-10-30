@@ -229,3 +229,78 @@ fn gse_control_app_id_is_the_go_id() {
         vec![("gcb1", "IED1_GOOSE_PROT"), ("gcbEvents", "events")]
     );
 }
+
+/// One GGIO whose `Lim` data object has one attribute of each integer bType,
+/// with the given DOI body.
+fn integer_scl(doi: &str) -> String {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Lim" type="INT_T"/></LNodeType>
+    <DOType id="INT_T" cdc="ING">
+      <DA name="i8" fc="SP" bType="INT8"/>
+      <DA name="i16" fc="SP" bType="INT16"/>
+      <DA name="i32" fc="SP" bType="INT32"/>
+      <DA name="u8" fc="CF" bType="INT8U"/>
+      <DA name="u16" fc="CF" bType="INT16U"/>
+      <DA name="u24" fc="CF" bType="INT24U"/>
+      <DA name="u32" fc="CF" bType="INT32U"/>
+    </DOType>"#;
+    let ln =
+        format!(r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="Lim">{doi}</DOI></LN>"#);
+    wrap(t, "", &ln)
+}
+
+/// A `<DAI>` value outside the range of its integer bType is rejected rather
+/// than stored, so an INT8 never holds 300.
+#[test]
+fn dai_integer_out_of_range_is_rejected() {
+    for (name, value) in [
+        ("i8", "300"),
+        ("i8", "-129"),
+        ("i16", "32768"),
+        ("i32", "2147483648"),
+        ("u8", "256"),
+        ("u16", "65536"),
+        ("u24", "16777216"),
+        ("u32", "4294967296"),
+    ] {
+        let doi = format!(r#"<DAI name="{name}"><Val>{value}</Val></DAI>"#);
+        let r = try_build(&integer_scl(&doi));
+        assert!(r.is_err(), "{name} = {value} must be rejected");
+    }
+}
+
+/// Control: the bounds of each integer bType are accepted.
+#[test]
+fn dai_integer_at_the_bounds_is_accepted() {
+    let doi = r#"
+        <DAI name="i8"><Val>-128</Val></DAI>
+        <DAI name="i16"><Val>32767</Val></DAI>
+        <DAI name="i32"><Val>-2147483648</Val></DAI>
+        <DAI name="u8"><Val>255</Val></DAI>
+        <DAI name="u16"><Val>65535</Val></DAI>
+        <DAI name="u24"><Val>16777215</Val></DAI>
+        <DAI name="u32"><Val>4294967295</Val></DAI>"#;
+    let m = build(&integer_scl(doi));
+    let v = |n: &str| da(&m, "GGIO1", "Lim", n).snapshot();
+    assert_eq!(v("i8"), MmsValue::Integer(-128));
+    assert_eq!(v("i16"), MmsValue::Integer(32767));
+    assert_eq!(v("i32"), MmsValue::Integer(-2147483648));
+    assert_eq!(v("u8"), MmsValue::Unsigned(255));
+    assert_eq!(v("u16"), MmsValue::Unsigned(65535));
+    assert_eq!(v("u24"), MmsValue::Unsigned(16777215));
+    assert_eq!(v("u32"), MmsValue::Unsigned(4294967295));
+}
+
+/// The range check applies to a DataTypeTemplates `<Val>` as well.
+#[test]
+fn template_integer_out_of_range_is_rejected() {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="X" type="X_T"/></LNodeType>
+    <DOType id="X_T" cdc="ING"><DA name="v" fc="SP" bType="INT8"><Val>128</Val></DA></DOType>"#;
+    assert!(try_build(&wrap(
+        t,
+        "",
+        r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#
+    ))
+    .is_err());
+}

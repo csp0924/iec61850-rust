@@ -985,7 +985,9 @@ pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
 /// The parse is deliberately strict, so a malformed file fails instead of
 /// silently taking a wrong value: a BOOLEAN accepts the xs:boolean literals
 /// `true`, `false`, `1` and `0`, and `TRUE` and `FALSE` as well;
-/// an integer rejects leading and trailing whitespace; a float rejects a comma
+/// an integer rejects leading and trailing whitespace and a value outside the
+/// range of its bType, with INT64 and INT128 both held to the `i64` range of
+/// [`MmsValue::Integer`]; a float rejects a comma
 /// as the decimal separator; a visible string is length-checked against its
 /// declared limit; and an enumeration is looked up by name in its EnumType
 /// before falling back to an integer ordinal.
@@ -1041,9 +1043,22 @@ pub fn parse_val_for_b_type(
                     Some("leading and trailing whitespace are not allowed".to_string()),
                 ));
             }
-            raw.parse::<i64>()
-                .map(MmsValue::Integer)
-                .map_err(|e| invalid(b_type, Some(e.to_string())))
+            let v = raw
+                .parse::<i64>()
+                .map_err(|e| invalid(b_type, Some(e.to_string())))?;
+            let (min, max) = match b_type {
+                "INT8" => (i64::from(i8::MIN), i64::from(i8::MAX)),
+                "INT16" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                "INT32" => (i64::from(i32::MIN), i64::from(i32::MAX)),
+                _ => (i64::MIN, i64::MAX),
+            };
+            if !(min..=max).contains(&v) {
+                return Err(invalid(
+                    b_type,
+                    Some(format!("{v} is outside the range {min}..={max}")),
+                ));
+            }
+            Ok(MmsValue::Integer(v))
         }
         "INT8U" | "INT16U" | "INT24U" | "INT32U" => {
             if raw.trim() != raw {
@@ -1052,9 +1067,22 @@ pub fn parse_val_for_b_type(
                     Some("leading and trailing whitespace are not allowed".to_string()),
                 ));
             }
-            raw.parse::<u64>()
-                .map(MmsValue::Unsigned)
-                .map_err(|e| invalid(b_type, Some(e.to_string())))
+            let v = raw
+                .parse::<u64>()
+                .map_err(|e| invalid(b_type, Some(e.to_string())))?;
+            let max = match b_type {
+                "INT8U" => u64::from(u8::MAX),
+                "INT16U" => u64::from(u16::MAX),
+                "INT24U" => (1 << 24) - 1,
+                _ => u64::from(u32::MAX),
+            };
+            if v > max {
+                return Err(invalid(
+                    b_type,
+                    Some(format!("{v} is outside the range 0..={max}")),
+                ));
+            }
+            Ok(MmsValue::Unsigned(v))
         }
         "FLOAT32" => {
             if raw.contains(',') {
