@@ -55,7 +55,7 @@ pub use iso::cotp::{
     encode_cc, encode_cr, encode_dc, encode_dr, encode_dt, encode_options, parse_cc,
     parse_cotp_pdu, parse_cr, parse_dc, parse_dr, parse_dt, parse_options, CotpConnection,
     CotpOptions, CotpOptionsSummary, CotpPdu, CotpState, TSelector, TpduSize,
-    COTP_DATA_HEADER_SIZE, COTP_MAX_BUFFER_SIZE,
+    COTP_DATA_HEADER_SIZE, COTP_MAX_BUFFER_SIZE, DEFAULT_MAX_TSDU_SIZE,
 };
 pub use iso::tpkt::{TpktHeader, TPKT_HEADER_LEN};
 

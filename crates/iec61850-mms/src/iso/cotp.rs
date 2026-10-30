@@ -18,6 +18,7 @@
 use super::tpkt::{TpktHeader, TPKT_HEADER_LEN};
 use crate::compat::prelude::*;
 use crate::error::CotpError;
+use crate::mms::DEFAULT_MAX_PDU_SIZE;
 use bytes::{Bytes, BytesMut};
 // The transport is the hal AsyncTransport trait rather than a concrete tokio
 // type; tokio TCP, duplex and TLS streams satisfy it through a blanket impl.
@@ -37,6 +38,14 @@ pub const COTP_MAX_TPDU_SIZE_ENCODED: u8 = 0x0D;
 
 /// Smallest legal encoded TPDU size, 0x07 for 128 bytes.
 pub const COTP_MIN_TPDU_SIZE_ENCODED: u8 = 0x07;
+
+/// Default upper bound on a reassembled TSDU payload, in bytes.
+///
+/// The largest MMS PDU either side of an association accepts,
+/// [`DEFAULT_MAX_PDU_SIZE`], plus 8192 bytes for the Session, Presentation and
+/// ACSE envelope around it, which leaves room for an AARQ carrying
+/// authentication values.
+pub const DEFAULT_MAX_TSDU_SIZE: usize = DEFAULT_MAX_PDU_SIZE as usize + 8192;
 
 /// COTP CR TPDU type code.
 const TPDU_CR: u8 = 0xE0;
@@ -224,7 +233,7 @@ pub struct CotpConnection<T> {
     read_state: ReadState,
     /// Upper bound on a reassembled TSDU payload; `None` means unbounded.
     ///
-    /// See [`CotpConnection::set_max_tsdu_size`].
+    /// Starts at [`DEFAULT_MAX_TSDU_SIZE`]; see [`CotpConnection::set_max_tsdu_size`].
     max_tsdu_size: Option<usize>,
 }
 
@@ -240,7 +249,7 @@ impl<T: AsyncTransport> CotpConnection<T> {
             read_buf: BytesMut::with_capacity(COTP_MAX_BUFFER_SIZE),
             payload_buf: BytesMut::new(),
             read_state: ReadState::Idle,
-            max_tsdu_size: None,
+            max_tsdu_size: Some(DEFAULT_MAX_TSDU_SIZE),
         }
     }
 
@@ -249,11 +258,13 @@ impl<T: AsyncTransport> CotpConnection<T> {
     /// A class 0 TSDU is any number of DT TPDUs ending with EOT=1 and its total
     /// length is never announced in advance, so without a bound the reassembly
     /// buffer of [`recv_data`](Self::recv_data) is sized entirely by the peer. Once
-    /// `limit` is exceeded [`CotpError::TsduTooLarge`] is returned and the caller is
-    /// expected to close the connection.
+    /// `limit` is exceeded [`CotpError::TsduTooLarge`] is returned and the
+    /// connection moves to [`CotpState::Closed`].
     ///
-    /// `None`, the default, leaves the size unbounded. A deployment with a fixed
-    /// memory budget, such as an embedded responder, should set a limit.
+    /// The default is [`DEFAULT_MAX_TSDU_SIZE`]. A deployment with a smaller memory
+    /// budget, such as an embedded responder, or an association that negotiated a
+    /// smaller maximum PDU size, can lower it. `None` removes the bound and leaves
+    /// the reassembly buffer sized by the peer.
     pub fn set_max_tsdu_size(&mut self, limit: Option<usize>) {
         self.max_tsdu_size = limit;
     }
@@ -385,12 +396,13 @@ impl<T: AsyncTransport> CotpConnection<T> {
     /// After an error the caller should normally close the connection. Calling
     /// `recv_data` again concatenates the leftover payload with the next TSDU and
     /// corrupts decoding. [`CotpError::TsduTooLarge`] is the exception: it clears
-    /// the reassembly buffer before returning.
+    /// the reassembly buffer and moves the connection to [`CotpState::Closed`], so
+    /// the rest of the oversized TSDU is never read as the start of another.
     ///
-    /// Memory bound: the TSDU length is never announced in advance and is unbounded
-    /// by default, which leaves the reassembly buffer sized by the peer. After
-    /// [`set_max_tsdu_size`](Self::set_max_tsdu_size) an oversized TSDU returns
-    /// [`CotpError::TsduTooLarge`].
+    /// Memory bound: the TSDU length is never announced in advance, so the
+    /// reassembly buffer is capped by the limit set through
+    /// [`set_max_tsdu_size`](Self::set_max_tsdu_size), [`DEFAULT_MAX_TSDU_SIZE`]
+    /// unless changed. An oversized TSDU returns [`CotpError::TsduTooLarge`].
     pub async fn recv_data(&mut self) -> Result<Bytes, CotpError> {
         if self.state != CotpState::Connected {
             return Err(CotpError::InvalidState {
@@ -408,9 +420,10 @@ impl<T: AsyncTransport> CotpConnection<T> {
                     let accumulated = self.payload_buf.len();
                     warn!(
                         accumulated,
-                        limit, "reassembled tsdu exceeds the configured limit, aborting"
+                        limit, "reassembled tsdu exceeds the configured limit, closing"
                     );
                     self.payload_buf.clear();
+                    self.state = CotpState::Closed;
                     return Err(CotpError::TsduTooLarge { accumulated, limit });
                 }
             }
@@ -1546,8 +1559,7 @@ mod tests {
         );
     }
 
-    /// A TSDU exactly at the limit is accepted; leaving the limit unset keeps the
-    /// unbounded behavior.
+    /// A TSDU exactly at the limit is accepted.
     #[tokio::test]
     async fn recv_data_accepts_tsdu_at_limit() {
         let (mut client_stream, mut server_stream) = duplex(65536);
@@ -1568,6 +1580,87 @@ mod tests {
 
         let payload = conn.recv_data().await.unwrap();
         assert_eq!(payload.as_ref(), b"PART1PART2");
+    }
+
+    /// Writes `total` bytes as DT TPDUs of at most 4096 bytes, EOT set only on the
+    /// last one when `eot` is true.
+    async fn write_tsdu(stream: &mut tokio::io::DuplexStream, total: usize, eot: bool) {
+        let chunk = [0x55u8; 4096];
+        let mut left = total;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            left -= n;
+            write_dt_fragments(stream, &[(&chunk[..n], eot && left == 0)]).await;
+        }
+    }
+
+    /// Without a configured limit a peer that sends EOT=0 DT TPDUs indefinitely is
+    /// stopped at `DEFAULT_MAX_TSDU_SIZE`, and the connection is closed so the rest
+    /// of that TSDU is never taken for the next one.
+    #[tokio::test]
+    async fn recv_data_default_limit_bounds_reassembly() {
+        let (mut client_stream, mut server_stream) = duplex(65536);
+        let total = DEFAULT_MAX_TSDU_SIZE + 4096;
+        let writer = tokio::spawn(async move {
+            write_tsdu(&mut server_stream, total, false).await;
+        });
+
+        let mut conn = CotpConnection::new(&mut client_stream, CotpOptions::default());
+        conn.state = CotpState::Connected;
+
+        let err = conn.recv_data().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CotpError::TsduTooLarge {
+                    limit: DEFAULT_MAX_TSDU_SIZE,
+                    ..
+                }
+            ),
+            "expected TsduTooLarge at the default limit, got {err:?}"
+        );
+        assert_eq!(conn.state, CotpState::Closed);
+        assert!(matches!(
+            conn.recv_data().await,
+            Err(CotpError::InvalidState { .. })
+        ));
+        drop(conn);
+        drop(client_stream);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn recv_data_accepts_tsdu_at_default_limit() {
+        let (mut client_stream, mut server_stream) = duplex(65536);
+        let writer = tokio::spawn(async move {
+            write_tsdu(&mut server_stream, DEFAULT_MAX_TSDU_SIZE, true).await;
+        });
+
+        let mut conn = CotpConnection::new(&mut client_stream, CotpOptions::default());
+        conn.state = CotpState::Connected;
+
+        let payload = conn.recv_data().await.unwrap();
+        assert_eq!(payload.len(), DEFAULT_MAX_TSDU_SIZE);
+        writer.await.unwrap();
+    }
+
+    /// `set_max_tsdu_size(None)` lifts the bound for a caller that bounds memory
+    /// another way.
+    #[tokio::test]
+    async fn recv_data_unbounded_when_limit_cleared() {
+        let (mut client_stream, mut server_stream) = duplex(65536);
+        let total = DEFAULT_MAX_TSDU_SIZE + 4096;
+        let writer = tokio::spawn(async move {
+            write_tsdu(&mut server_stream, total, true).await;
+        });
+
+        let mut conn = CotpConnection::new(&mut client_stream, CotpOptions::default());
+        conn.state = CotpState::Connected;
+        conn.set_max_tsdu_size(None);
+
+        let payload = conn.recv_data().await.unwrap();
+        assert_eq!(payload.len(), total);
+        writer.await.unwrap();
     }
 
     // parse_cotp_pdu dispatch

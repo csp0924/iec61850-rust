@@ -8,12 +8,25 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Changed
+
+- **`iec61850-mms`** — `CotpConnection` bounds a reassembled TSDU at
+  `DEFAULT_MAX_TSDU_SIZE`, 73192 bytes, where it was unbounded unless
+  `set_max_tsdu_size` was called, so a peer sending DT TPDUs without EOT no
+  longer grows the reassembly buffer until memory runs out. A TSDU past the
+  limit returns `TsduTooLarge` and moves the connection to `Closed`, so the rest
+  of it is never read as the next TSDU. `set_max_tsdu_size(None)` removes the
+  bound.
+
 ### Added
 
 - **`iec61850-mms`** — `AlternateAccess::decode_with_negotiated_cap`, and
   `ReadRequest::decode_with_negotiated_cap` with its
   `decode_confirmed_read_request_with_negotiated_cap` wrapper, decoding under
   the negotiated `dataStructureNestingLevel` as a Write request already can.
+- **`iec61850-mms`** — `DEFAULT_MAX_TSDU_SIZE`, the default bound on a
+  reassembled COTP TSDU: `DEFAULT_MAX_PDU_SIZE` plus 8192 bytes for the Session,
+  Presentation and ACSE envelope.
 
 ### Fixed
 
