@@ -4,11 +4,21 @@
 //! `stVal` change is reported first, then a `q` change alone. The second
 //! report carries only `q`, so the subscription state keeps the previous
 //! `stVal` value but gives `stVal` no reason for inclusion.
+//!
+//! A scripted server sends a report whose ReasonCode is seven bits long, with
+//! bit 6 set, which a report does not define.
 
+mod support;
+
+use bytes::{Bytes, BytesMut};
 use iec61850_client::rcb::{RcbHandle, RcbWriteMask};
 use iec61850_client::report::{ClientReport, ReasonForInclusion, ReportCallback};
 use iec61850_client::IedConnection;
 use iec61850_mms::mms::client::MmsClientBuilder;
+use iec61850_mms::{
+    decode_confirmed_read_request, encode_confirmed_read_response, AccessResult, MmsData,
+    ReadResponse,
+};
 use iec61850_model::{
     cdc, DataAttribute, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
     MmsValue, NodeRef, ObjectRef,
@@ -19,6 +29,7 @@ use iec61850_server::{
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use support::{tlv, Plan};
 
 const RCB_PATH: &str = "IED1LD0/LLN0$RP$urcbPos";
 
@@ -158,4 +169,94 @@ async fn member_omitted_from_a_report_has_no_reason() {
     assert_eq!(second.reasons[0], ReasonForInclusion::empty());
 
     conn.disconnect().await.expect("disconnect");
+}
+
+/// An unbuffered report `RPT` of one member, with OptFlds asking for the
+/// reason and a seven-bit ReasonCode carrying quality-change and bit 6.
+fn seven_bit_reason_report(rpt_id: &str) -> Bytes {
+    let values = [
+        MmsData::VisibleString(rpt_id.to_string()),
+        // OptFlds, ten bits: reason-for-inclusion is wire bit 3.
+        MmsData::BitString {
+            padding: 6,
+            data: vec![0x10, 0x00],
+        },
+        // Inclusion, one member.
+        MmsData::BitString {
+            padding: 7,
+            data: vec![0x80],
+        },
+        MmsData::Boolean(true),
+        // ReasonCode, seven bits: quality-change is wire bit 2.
+        MmsData::BitString {
+            padding: 1,
+            data: vec![0x22],
+        },
+    ];
+    let mut results = BytesMut::new();
+    for v in &values {
+        v.encode(&mut results);
+    }
+    let mut name = BytesMut::new();
+    tlv(0x80, b"RPT", &mut name);
+    let mut body = BytesMut::new();
+    tlv(0xa1, &name, &mut body);
+    tlv(0xa0, &results, &mut body);
+    let mut combined = BytesMut::new();
+    tlv(0xa0, &body, &mut combined);
+    let mut pdu = BytesMut::new();
+    tlv(0xa3, &combined, &mut pdu);
+    pdu.freeze()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seven_bit_reason_code_is_accepted_and_bit_six_ignored() {
+    const RPT_ID: &str = "rptLong";
+    // Any Read is answered with a boolean, followed by the report.
+    let port = support::start(Arc::new(|mms: &[u8], _seq: u32| {
+        let (invoke_id, _) = decode_confirmed_read_request(mms).ok()?;
+        let mut buf = BytesMut::new();
+        encode_confirmed_read_response(
+            invoke_id,
+            &ReadResponse {
+                variable_access_spec: None,
+                list_of_access_result: vec![AccessResult::Success(MmsData::Boolean(true))],
+            },
+            &mut buf,
+        );
+        Some(Plan {
+            reply: Some(buf.freeze()),
+            after: vec![seven_bit_reason_report(RPT_ID)],
+            ..Plan::default()
+        })
+    }))
+    .await;
+
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    let seen: Arc<Mutex<Vec<Arc<ClientReport>>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let cb: ReportCallback = Arc::new(move |snap: Arc<ClientReport>| {
+        sink.lock().unwrap().push(snap);
+    });
+    conn.install_report_handler(
+        Some(RPT_ID.to_string()),
+        "IED1LD0/LLN0$RP$urcbLong",
+        None,
+        cb,
+    )
+    .await
+    .expect("install handler");
+    conn.read_object("IED1LD0/LLN0.Beh.stVal", iec61850_model::FC::St)
+        .await
+        .expect("read");
+
+    let report = wait_for_reports(&conn, &seen, 1).await;
+    assert_eq!(report.data_set_values[0], Some(MmsValue::Boolean(true)));
+    assert_eq!(report.reasons[0], ReasonForInclusion::QUALITY_CHANGE);
 }

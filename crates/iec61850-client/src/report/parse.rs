@@ -81,9 +81,11 @@ bitflags! {
     /// Why one data set member was included in a report, as defined in
     /// IEC 61850-7-2.
     ///
-    /// A BIT STRING(6) on the wire, with the same reserved bit 0 as OptFlds.
-    /// For member `i`, `reasons[i].contains(DATA_CHANGE)` answers whether that
-    /// member was included because its value changed.
+    /// A BIT STRING of at least six bits on the wire, with the same reserved
+    /// bit 0 as OptFlds. IEC 61850-8-1 defines bits 0 to 5 for a report; a
+    /// longer string is accepted and its further bits are ignored. For member
+    /// `i`, `reasons[i].contains(DATA_CHANGE)` answers whether that member was
+    /// included because its value changed.
     #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
     pub struct ReasonForInclusion: u8 {
         /// The value changed.
@@ -100,7 +102,8 @@ bitflags! {
 }
 
 impl ReasonForInclusion {
-    /// Decodes the reasons from the single data byte of a BIT STRING(6).
+    /// Decodes the reasons from the first data byte of the ReasonCode
+    /// BIT STRING; bits 6 and 7 are not defined for a report and are ignored.
     ///
     /// The caller has already split off the padding count.
     pub(crate) fn from_reason_byte(byte: u8) -> Self {
@@ -658,6 +661,25 @@ mod tests {
         // wire byte 0x40 → bit 1 → DATA_CHANGE
         let r = ReasonForInclusion::from_reason_byte(0x40);
         assert_eq!(r, ReasonForInclusion::DATA_CHANGE);
+    }
+
+    #[test]
+    fn reason_decode_ignores_the_bits_after_five() {
+        // wire byte 0x7f: bits 1 to 5 set, and bits 6 and 7, which a report
+        // does not define
+        let r = ReasonForInclusion::from_reason_byte(0x7f);
+        assert_eq!(
+            r,
+            ReasonForInclusion::DATA_CHANGE
+                | ReasonForInclusion::QUALITY_CHANGE
+                | ReasonForInclusion::DATA_UPDATE
+                | ReasonForInclusion::INTEGRITY
+                | ReasonForInclusion::GI
+        );
+        assert_eq!(
+            ReasonForInclusion::from_reason_byte(0x02),
+            ReasonForInclusion::empty()
+        );
     }
 
     #[test]
