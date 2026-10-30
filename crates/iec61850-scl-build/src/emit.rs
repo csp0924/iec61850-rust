@@ -29,7 +29,7 @@ use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
     fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance,
-    template_initial_value, MmsValue,
+    template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -391,6 +391,7 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
     let fc_tok = emit_fc_value(fc);
     let trg_tok = emit_trg_ops(da.trg_ops);
     let name_lit = da.name.as_str();
+    warn_count_not_modeled(da, "DA");
 
     if da.b_type == "Struct" {
         let type_id = da.type_ref.as_deref().ok_or_else(|| {

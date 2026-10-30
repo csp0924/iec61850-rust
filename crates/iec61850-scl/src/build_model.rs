@@ -315,6 +315,7 @@ fn build_da(
 ) -> Result<DataAttribute, SclParseError> {
     let fc = parse_fc(&raw_da.fc, raw_da.span, da_path)?;
     let trg_ops = trg_ops_to_model(raw_da.trg_ops);
+    warn_count_not_modeled(raw_da, da_path);
 
     if raw_da.b_type == "Struct" {
         let type_id = raw_da
@@ -359,6 +360,22 @@ fn build_da(
         trg_ops,
         initial,
     ))
+}
+
+/// Warns that the `count` of a `<DA>` is not carried into the model.
+///
+/// TODO: model a data attribute array and build `count` elements.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn warn_count_not_modeled(raw_da: &RawDaDef, da_path: &str) {
+    if let Some(count) = raw_da.count {
+        tracing::warn!(
+            path = da_path,
+            count,
+            "an array attribute is built as a single element; `count` is not modeled"
+        );
+    }
 }
 
 /// Expands a nested attribute. It has no functional constraint of its own and

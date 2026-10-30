@@ -523,7 +523,7 @@ pub struct RawDaDef {
     pub type_ref: Option<String>,
     /// The `dchg`, `qchg` and `dupd` attributes.
     pub trg_ops: TriggerOptionsBits,
-    /// The `dchg`, `qchg` and `dupd` attributes.
+    /// The `count` attribute, the number of elements of an array attribute.
     pub count: Option<u32>,
     /// The text of the `<Val>` child, if the declaration carries a default.
     pub default_value: Option<String>,

@@ -567,3 +567,58 @@ fn indexed_dai_and_sdi_are_skipped() {
         MmsValue::Unsigned(0)
     );
 }
+
+/// Counts the WARN events whose fields mention `count`.
+struct CountWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for CountWarnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Text(String);
+        impl tracing::field::Visit for Text {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={:?} ", f.name(), v));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            if text.0.contains("count") {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// An array declared with `count` on a `<DA>`, an `<SDO>` or a `<BDA>` is
+/// built as a single element, and each such declaration is warned about
+/// rather than dropped silently.
+#[test]
+fn count_is_warned_about() {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Hst" type="HST_T"/></LNodeType>
+    <DOType id="HST_T" cdc="HST">
+      <DA name="hstVal" fc="ST" bType="INT32" count="4"/>
+      <DA name="cfg" fc="CF" bType="Struct" type="CFG_T"/>
+      <SDO name="har" type="CMV_T" count="16"/>
+    </DOType>
+    <DOType id="CMV_T" cdc="CMV"><DA name="q" fc="MX" bType="Quality"/></DOType>
+    <DAType id="CFG_T"><BDA name="pts" bType="INT32" count="8"/></DAType>"#;
+    let xml = wrap(t, "", r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#);
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let m = tracing::subscriber::with_default(CountWarnings(seen.clone()), || build(&xml));
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        da(&m, "GGIO1", "Hst", "hstVal").snapshot(),
+        MmsValue::Integer(0)
+    );
+}

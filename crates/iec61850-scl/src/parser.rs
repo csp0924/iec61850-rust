@@ -1471,6 +1471,7 @@ fn build_sdo_def(
 ) -> Result<RawSdoDef, SclParseError> {
     let name = required(start.attributes(), "name", span, path)?;
     let do_type_ref = required(start.attributes(), "type", span, path)?;
+    warn_count_not_modeled(start, "SDO", &name, path);
     Ok(RawSdoDef {
         name,
         do_type_ref,
@@ -1527,6 +1528,22 @@ fn build_da_def(
     })
 }
 
+/// Warns that the `count` attribute of an `<SDO>` or a `<BDA>` is not carried
+/// into the raw tree, so the element is built as a single instance.
+///
+/// TODO: carry `count` and model arrays of sub-objects and nested attributes.
+fn warn_count_not_modeled(start: &BytesStart<'_>, element: &str, name: &str, path: &str) {
+    if let Some(count) = optional(start.attributes(), "count") {
+        tracing::warn!(
+            path,
+            count = %count,
+            "{} name=\"{}\" is an array, built as a single element; `count` is not modeled",
+            element,
+            name
+        );
+    }
+}
+
 /// Parses a `<DAType>`: `id` is required.
 ///
 /// # Errors
@@ -1560,6 +1577,7 @@ fn build_bda(
     let b_type = required(start.attributes(), "bType", span, path)?;
     let type_ref = optional(start.attributes(), "type");
     let val_kind = optional(start.attributes(), "valKind");
+    warn_count_not_modeled(start, "BDA", &name, path);
     Ok(RawBda {
         name,
         b_type,
