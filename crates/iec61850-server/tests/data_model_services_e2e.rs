@@ -383,6 +383,29 @@ async fn create_data_set_refuses_a_constructed_member() {
     handle.stop().await;
 }
 
+/// A persistent data set name is `<LN>$<name>` of a logical node that exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_data_set_checks_the_list_name() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+    let member = || {
+        vec![DefineNamedVariableEntry {
+            domain_id: DOM.into(),
+            item_id: "GGIO1$ST$Ind1$stVal".into(),
+        }]
+    };
+
+    for name in ["noLogicalNode", "LLN0$", "$ds", "LLN0$a$b", "NOSUCH1$ds"] {
+        let r = t!(c.define_named_variable_list(DOM, name, member()));
+        assert!(r.is_err(), "{name}: {r:?}");
+    }
+    let (lists, _) = t!(c.get_name_list(ObjectClass::NamedVariableList, Some(DOM), None)).unwrap();
+    assert!(lists.is_empty(), "{lists:?}");
+    t!(c.define_named_variable_list(DOM, "GGIO1$ds", member())).expect("a well-formed name");
+    handle.stop().await;
+}
+
 #[derive(Debug)]
 struct Deny;
 impl ReadHandler for Deny {

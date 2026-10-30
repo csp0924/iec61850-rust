@@ -10,6 +10,10 @@
 //! answered with `ObjectAccessUnsupported`, because the reporting engine also
 //! handles only domain-specific data sets.
 //!
+//! A domain-specific list name has the form `<LN>$<name>` that IEC 61850-8-1
+//! gives a persistent data set, and the logical node must exist in the domain;
+//! any other name is refused before a member is resolved.
+//!
 //! Such a data set is persistent: it outlives the association that created it.
 //! [`DynamicDatasetQuota`] bounds how many exist across the server and how many
 //! of them one association has created; a request beyond either limit is
@@ -103,6 +107,27 @@ impl Default for DynamicDatasetQuota {
     }
 }
 
+/// Checks a persistent data set name, `<LN>$<name>`, against the model.
+///
+/// A name that is not exactly two non-empty `$`-separated parts is refused
+/// with definition invalid-address; a domain or logical node that does not
+/// exist, with access object-non-existent.
+fn check_list_name(ied_model: &IedModel, domain: &str, list_name: &str) -> Result<(), ErrorClass> {
+    let Some((ln_name, ds_name)) = list_name.split_once('$') else {
+        return Err(ErrorClass::Definition(definition::INVALID_ADDRESS));
+    };
+    if ln_name.is_empty() || ds_name.is_empty() || ds_name.contains('$') {
+        return Err(ErrorClass::Definition(definition::INVALID_ADDRESS));
+    }
+    let ln_exists = ied_model
+        .ld_by_domain(domain)
+        .is_some_and(|ld| ld.ln_by_name(ln_name).is_some());
+    if !ln_exists {
+        return Err(ErrorClass::Access(access::OBJECT_NON_EXISTENT));
+    }
+    Ok(())
+}
+
 /// Handles a DefineNamedVariableList request (confirmed service tag 0xab).
 pub(crate) fn handle_define_named_variable_list(
     invoke_id: u32,
@@ -142,6 +167,16 @@ pub(crate) fn handle_define_named_variable_list(
             );
         }
     };
+
+    if let Err(class) = check_list_name(ied_model, &domain, &list_name) {
+        tracing::warn!(
+            invoke_id,
+            domain,
+            list_name,
+            "define-named-variable-list name is not `<LN>$<name>` of an existing logical node, refusing it"
+        );
+        return crate::service::make_confirmed_error_pub(invoke_id, class);
+    }
 
     // The PDU decoder guarantees every entry is domain-specific; a member whose
     // path does not resolve against the model is reported by `add_dynamic`.
