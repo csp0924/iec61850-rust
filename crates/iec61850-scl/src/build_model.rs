@@ -17,7 +17,8 @@
 //! Type mapping: [`b_type_to_dat`] turns a `bType` string into a
 //! [`DataAttributeType`], mapping `ObjRef` to a 129-byte visible string and
 //! `EntryID` to an 8-byte octet string, and rejecting anything else with
-//! [`ErrorKind::EnumValueUnknown`] rather than ignoring it. A functional
+//! [`ErrorKind::EnumValueUnknown`] rather than ignoring it; [`attribute_type`]
+//! widens an Enum whose ordinals exceed integer(8). A functional
 //! constraint goes through [`FC::parse`], and an unknown token is likewise an
 //! `EnumValueUnknown`.
 
@@ -343,7 +344,13 @@ fn build_da(
         return Ok(da);
     }
 
-    let dat = b_type_to_dat(&raw_da.b_type, raw_da.span, da_path)?;
+    let dat = attribute_type(
+        &raw_da.b_type,
+        raw_da.type_ref.as_deref(),
+        dtt,
+        raw_da.span,
+        da_path,
+    )?;
     let initial = template_initial_value(
         dat,
         &raw_da.b_type,
@@ -420,7 +427,13 @@ fn build_bda(
         ));
     }
 
-    let dat = b_type_to_dat(&raw_bda.b_type, raw_bda.span, bda_path)?;
+    let dat = attribute_type(
+        &raw_bda.b_type,
+        raw_bda.type_ref.as_deref(),
+        dtt,
+        raw_bda.span,
+        bda_path,
+    )?;
     let initial = template_initial_value(
         dat,
         &raw_bda.b_type,
@@ -1446,6 +1459,52 @@ pub fn parse_fc(token: &str, span: SourceSpan, path: &str) -> Result<FC, SclPars
             },
         )
         .with_attribute("fc")
+    })
+}
+
+/// Determines the [`DataAttributeType`] of a leaf `<DA>` or `<BDA>`.
+///
+/// An Enum is declared with the smallest integer that holds every ordinal of
+/// its EnumType (IEC 61850-8-1): [`DataAttributeType::Enumerated`], carried as
+/// integer(8), while the ordinals fit in −128..=127, and otherwise
+/// [`DataAttributeType::Int16`] or [`DataAttributeType::Int32`]. Any other
+/// bType goes through [`b_type_to_dat`].
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+///
+/// # Errors
+///
+/// Whatever [`b_type_to_dat`] reports, and [`ErrorKind::SemanticConflict`]
+/// when an Enum names no EnumType, which stage 2 has already ruled out.
+#[doc(hidden)]
+pub fn attribute_type(
+    b_type: &str,
+    type_ref: Option<&str>,
+    dtt: &DataTypeTemplates,
+    span: SourceSpan,
+    path: &str,
+) -> Result<DataAttributeType, SclParseError> {
+    if b_type != "Enum" {
+        return b_type_to_dat(b_type, span, path);
+    }
+    let et = type_ref
+        .and_then(|id| dtt.enum_types.get(id))
+        .ok_or_else(|| {
+            SclParseError::at(
+                span,
+                path.to_string(),
+                ErrorKind::SemanticConflict {
+                    detail: "an Enum attribute names no EnumType".to_string(),
+                },
+            )
+        })?;
+    let fits = |min: i32, max: i32| et.values.iter().all(|v| (min..=max).contains(&v.ord));
+    Ok(if fits(i8::MIN.into(), i8::MAX.into()) {
+        DataAttributeType::Enumerated
+    } else if fits(i16::MIN.into(), i16::MAX.into()) {
+        DataAttributeType::Int16
+    } else {
+        DataAttributeType::Int32
     })
 }
 

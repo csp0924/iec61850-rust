@@ -28,8 +28,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance,
-    template_initial_value, warn_count_not_modeled, MmsValue,
+    attribute_type, fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup,
+    skip_indexed_instance, template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -422,10 +422,10 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
         });
     }
 
-    // Leaf DA: the type comes from `b_type_to_dat` and the initial value, the
+    // Leaf DA: the type comes from `attribute_type` and the initial value, the
     // `<Val>` of the declaration or the zero value, from
     // `template_initial_value`.
-    let dat = iec61850_scl::__build_internals::b_type_to_dat(&da.b_type, da.span, "DA")
+    let dat = attribute_type(&da.b_type, da.type_ref.as_deref(), dtt, da.span, "DA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
     let initial = template_initial_value(
@@ -489,7 +489,7 @@ fn emit_bda_expr(
         });
     }
 
-    let dat = iec61850_scl::__build_internals::b_type_to_dat(&bda.b_type, bda.span, "BDA")
+    let dat = attribute_type(&bda.b_type, bda.type_ref.as_deref(), dtt, bda.span, "BDA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
     let initial = template_initial_value(
@@ -1328,12 +1328,14 @@ mod tests {
       <DA name="octet64" fc="ST" bType="Octet64"/>
       <DA name="t" fc="ST" bType="Timestamp"/>
       <DA name="int8" fc="ST" bType="INT8"/>
+      <DA name="wideEnum" fc="ST" bType="Enum" type="Wide"/>
       <DA name="cfg" fc="CF" bType="Struct" type="CFG_T"/>
     </DOType>
     <DAType id="CFG_T">
       <BDA name="pos" bType="Dbpos"/>
       <BDA name="opts" bType="OptFlds"/>
     </DAType>
+    <EnumType id="Wide"><EnumVal ord="1">a</EnumVal><EnumVal ord="300">b</EnumVal></EnumType>
   </DataTypeTemplates>
 </SCL>"#;
         assert_leaf_values_match_runtime(xml);

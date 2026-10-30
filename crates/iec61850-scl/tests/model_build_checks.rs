@@ -2,6 +2,7 @@
 //! stated as the outcome IEC 61850-6 requires for an inline SCL file.
 
 use iec61850_model::tree::{DataAttribute, DoChild, IedModel};
+use iec61850_model::types::DataAttributeType;
 use iec61850_model::MmsValue;
 
 fn try_build(xml: &str) -> Result<IedModel, String> {
@@ -621,4 +622,50 @@ fn count_is_warned_about() {
         da(&m, "GGIO1", "Hst", "hstVal").snapshot(),
         MmsValue::Integer(0)
     );
+}
+
+/// An EnumType with the given ordinals, referenced by `GGIO1.E.stVal`, with
+/// the DAI value `val`.
+fn enum_scl(ords: &[i32], val: &str) -> String {
+    let vals: String = ords
+        .iter()
+        .map(|o| format!(r#"<EnumVal ord="{o}">v{o}</EnumVal>"#))
+        .collect();
+    let t = format!(
+        r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="E" type="ENS_T"/></LNodeType>
+    <DOType id="ENS_T" cdc="ENS"><DA name="stVal" fc="ST" bType="Enum" type="Big"/></DOType>
+    <EnumType id="Big">{vals}</EnumType>"#
+    );
+    let ln = format!(
+        r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="E"><DAI name="stVal"><Val>{val}</Val></DAI></DOI></LN>"#
+    );
+    wrap(&t, "", &ln)
+}
+
+/// An Enum whose ordinals exceed integer(8) is declared with the smallest
+/// integer that holds them all, so the value it carries fits its type.
+#[test]
+fn enum_with_wide_ordinals_widens_its_type() {
+    for (ords, val, ty, v) in [
+        (&[1, 300][..], "v300", DataAttributeType::Int16, 300),
+        (&[-129, 0][..], "v-129", DataAttributeType::Int16, -129),
+        (&[0, 70000][..], "v70000", DataAttributeType::Int32, 70000),
+    ] {
+        let m = build(&enum_scl(ords, val));
+        let d = da(&m, "GGIO1", "E", "stVal");
+        assert_eq!((d.ty, d.snapshot()), (ty, MmsValue::Integer(v)), "{ords:?}");
+    }
+}
+
+/// Control: ordinals within −128..=127 keep the integer(8) Enumerated type.
+#[test]
+fn enum_within_integer8_keeps_its_type() {
+    for val in ["v127", "v-128"] {
+        let m = build(&enum_scl(&[-128, 127], val));
+        assert_eq!(
+            da(&m, "GGIO1", "E", "stVal").ty,
+            DataAttributeType::Enumerated
+        );
+    }
 }

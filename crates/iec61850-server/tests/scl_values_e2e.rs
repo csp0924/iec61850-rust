@@ -19,7 +19,10 @@ const SCL: &str = r#"<SCL>
       <Server>
         <LDevice inst="LD0">
           <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
-          <LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>
+          <LN lnClass="GGIO" inst="1" lnType="GGIO_T">
+            <DOI name="E"><DAI name="stVal"><Val>top</Val></DAI></DOI>
+            <DOI name="W"><DAI name="stVal"><Val>wide</Val></DAI></DOI>
+          </LN>
           <LN lnClass="CSWI" inst="1" lnType="CSWI_T"/>
           <LN lnClass="CSWI" inst="2" lnType="CSWI_T">
             <DOI name="Pos"><DAI name="ctlModel"><Val>direct-with-normal-security</Val></DAI></DOI>
@@ -34,6 +37,8 @@ const SCL: &str = r#"<SCL>
     </LNodeType>
     <LNodeType id="GGIO_T" lnClass="GGIO">
       <DO name="Rec" type="REC_T"/>
+      <DO name="E" type="ENS_T"/>
+      <DO name="W" type="ENS_W"/>
     </LNodeType>
     <LNodeType id="CSWI_T" lnClass="CSWI">
       <DO name="Pos" type="DPC_T"/>
@@ -44,6 +49,12 @@ const SCL: &str = r#"<SCL>
     <DOType id="REC_T" cdc="SPS">
       <DA name="entryId" fc="ST" bType="EntryID"/>
       <DA name="octet64" fc="ST" bType="Octet64"/>
+    </DOType>
+    <DOType id="ENS_T" cdc="ENS">
+      <DA name="stVal" fc="ST" bType="Enum" type="Narrow"/>
+    </DOType>
+    <DOType id="ENS_W" cdc="ENS">
+      <DA name="stVal" fc="ST" bType="Enum" type="Wide"/>
     </DOType>
     <DOType id="DPC_T" cdc="DPC">
       <DA name="stVal" fc="ST" bType="Dbpos" dchg="true"/>
@@ -56,6 +67,14 @@ const SCL: &str = r#"<SCL>
       <EnumVal ord="2">sbo-with-normal-security</EnumVal>
       <EnumVal ord="3">direct-with-enhanced-security</EnumVal>
       <EnumVal ord="4">sbo-with-enhanced-security</EnumVal>
+    </EnumType>
+    <EnumType id="Narrow">
+      <EnumVal ord="-128">bottom</EnumVal>
+      <EnumVal ord="127">top</EnumVal>
+    </EnumType>
+    <EnumType id="Wide">
+      <EnumVal ord="1">narrow</EnumVal>
+      <EnumVal ord="300">wide</EnumVal>
     </EnumType>
   </DataTypeTemplates>
 </SCL>"#;
@@ -133,4 +152,28 @@ async fn template_defaults_are_served() {
     assert_eq!(ctl_model, MmsValue::Integer(2));
     assert_eq!(sbo_timeout, MmsValue::Unsigned(30000));
     assert_eq!(overridden, MmsValue::Integer(1));
+}
+
+/// An Enum whose ordinals exceed integer(8) is declared as integer(16), and
+/// the value a client reads fits that declaration; one within integer(8) is
+/// declared as integer(8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enum_value_fits_its_declared_type() {
+    let (handle, conn) = serve(SCL).await;
+    let wide_ts = spec(&conn, "IED1LD0/GGIO1.W.stVal", FC::St).await;
+    let wide = read(&conn, "IED1LD0/GGIO1.W.stVal", FC::St).await;
+    let narrow_ts = spec(&conn, "IED1LD0/GGIO1.E.stVal", FC::St).await;
+    let narrow = read(&conn, "IED1LD0/GGIO1.E.stVal", FC::St).await;
+    conn.disconnect().await.ok();
+    handle.stop().await;
+    assert!(
+        matches!(wide_ts, TypeSpecification::Integer { width_bits: 16 }),
+        "W.stVal is declared as {wide_ts:?}"
+    );
+    assert_eq!(wide, MmsValue::Integer(300));
+    assert!(
+        matches!(narrow_ts, TypeSpecification::Integer { width_bits: 8 }),
+        "E.stVal is declared as {narrow_ts:?}"
+    );
+    assert_eq!(narrow, MmsValue::Integer(127));
 }
