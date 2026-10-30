@@ -438,15 +438,22 @@ async fn log_control_block_member_types() {
     handle.stop().await;
 }
 
-/// A read of a report control block, of its group, and of the whole logical
-/// node returns the layout the type description gives the same name.
+/// A read of a report or log control block, of its group, and of the whole
+/// logical node returns the layout the type description gives the same name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn report_control_block_reads_follow_their_type_description() {
+async fn control_block_reads_follow_their_type_description() {
     let server = server_with_control_blocks();
     let handle = server.start().await.unwrap();
     let mut c = mms(&handle).await;
 
-    for item in ["LLN0$RP$urcbA", "LLN0$BR$brcbA", "LLN0$RP", "LLN0$BR"] {
+    for item in [
+        "LLN0$RP$urcbA",
+        "LLN0$BR$brcbA",
+        "LLN0$LG$evlog",
+        "LLN0$RP",
+        "LLN0$BR",
+        "LLN0$LG",
+    ] {
         let spec = t!(c.get_variable_access_attributes(DOM, item)).unwrap();
         let value = t!(c.read(DOM, item)).unwrap_or_else(|e| panic!("{item}: {e:?}"));
         assert!(
@@ -462,9 +469,7 @@ async fn report_control_block_reads_follow_their_type_description() {
     };
     assert_eq!(components.len(), groups.len());
     for (c, g) in components.iter().zip(groups) {
-        if c.name != "LG" {
-            assert!(fits(&c.type_spec, g), "LLN0${}: {g:?}", c.name);
-        }
+        assert!(fits(&c.type_spec, g), "LLN0${}: {g:?}", c.name);
     }
     handle.stop().await;
 }
