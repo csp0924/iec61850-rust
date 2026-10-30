@@ -1143,12 +1143,16 @@ where
                 oper_len = oper_value.len(),
                 "sending a negative command termination"
             );
-            let (origin, ctl_num) = oper_origin_and_ctl_num(oper_value);
+            let echoed = echoed_oper(oper_value);
             let last_err = LastApplErrorRef {
                 ctl_obj: format!("{}/{}", domain_id, item_id),
-                error: crate::control::dispatch::last_appl_error_code(*add_cause) as i32,
-                origin,
-                ctl_num,
+                error: crate::control::dispatch::termination_error_code(
+                    *add_cause,
+                    echoed.test,
+                    echoed.time_activated,
+                ) as i32,
+                origin: echoed.origin,
+                ctl_num: echoed.ctl_num,
                 add_cause: cause_to_i32(*add_cause),
             };
             encode_command_termination_negative(&last_err, &domain_id, &item_id, oper_value.clone())
@@ -1186,10 +1190,19 @@ fn deferrable_write(response: &[u8], deferred: &[u64]) -> Option<u32> {
     }
 }
 
-/// Returns the `origin` and `ctlNum` of the encoded Oper structure a command
-/// termination echoes, which the LastApplError of a negative termination
-/// repeats; a structure that does not decode yields the defaults.
-fn oper_origin_and_ctl_num(oper_value: &[u8]) -> (OriginRef, u8) {
+/// The members of an echoed Oper structure the LastApplError of a negative
+/// command termination depends on.
+#[derive(Default)]
+struct EchoedOper {
+    origin: OriginRef,
+    ctl_num: u8,
+    test: bool,
+    time_activated: bool,
+}
+
+/// Decodes the Oper structure a command termination echoes; a structure that
+/// does not decode yields the defaults.
+fn echoed_oper(oper_value: &[u8]) -> EchoedOper {
     use crate::control::OperParams;
     use crate::service::convert::mms_data_to_mms_value;
     use iec61850_mms::mms::pdu::common::MmsData;
@@ -1198,16 +1211,18 @@ fn oper_origin_and_ctl_num(oper_value: &[u8]) -> (OriginRef, u8) {
         .ok()
         .and_then(|(data, _)| OperParams::from_mms_value(&mms_data_to_mms_value(&data)));
     match params {
-        Some(p) => (
-            OriginRef {
+        Some(p) => EchoedOper {
+            origin: OriginRef {
                 or_cat: p.origin.or_cat,
                 or_ident: p.origin.or_ident,
             },
-            p.ctl_num,
-        ),
+            ctl_num: p.ctl_num,
+            test: p.test,
+            time_activated: p.oper_tm_ms != 0,
+        },
         None => {
             tracing::warn!("command termination: the echoed Oper structure did not decode");
-            (OriginRef::default(), 0)
+            EchoedOper::default()
         }
     }
 }

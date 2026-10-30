@@ -480,6 +480,28 @@ pub(crate) fn last_appl_error_code(cause: ControlAddCause) -> ControlLastApplErr
     }
 }
 
+/// Returns the `Error` member of the LastApplError of a negative
+/// CommandTermination, which ends a command that failed after its Operate was
+/// answered positively.
+///
+/// A failed test command, one whose `Test` is set, carries `Timeout Test Not
+/// OK` when it was time activated and `Operator Test Not OK` otherwise, per
+/// IEC 61850-8-1. Any other command follows `last_appl_error_code`.
+// Only the connection loop of the integrated server sends a CommandTermination.
+#[cfg_attr(not(feature = "full-server"), allow(dead_code))]
+pub(crate) fn termination_error_code(
+    cause: ControlAddCause,
+    test: bool,
+    time_activated: bool,
+) -> ControlLastApplError {
+    match (cause, test, time_activated) {
+        (ControlAddCause::Unknown, _, _) => ControlLastApplError::Unknown,
+        (_, true, true) => ControlLastApplError::TimeoutTest,
+        (_, true, false) => ControlLastApplError::OperationFailed,
+        _ => ControlLastApplError::NoError,
+    }
+}
+
 /// Maps a control add cause onto the data access error of a negative write
 /// response, per the SelectWithValue, Operate, and Cancel mapping of
 /// IEC 61850-8-1; the add cause itself travels in `LastApplError`.
@@ -492,5 +514,49 @@ pub(crate) fn add_cause_to_data_access_error(cause: ControlAddCause) -> DataAcce
         | ControlAddCause::LockedByOtherClient
         | ControlAddCause::CommandAlreadyInExecution => DataAccessError::TemporarilyUnavailable,
         _ => DataAccessError::ObjectAccessDenied,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusals_carry_no_error_and_internal_failures_unknown() {
+        assert_eq!(
+            last_appl_error_code(ControlAddCause::ObjectNotSelected),
+            ControlLastApplError::NoError
+        );
+        assert_eq!(
+            last_appl_error_code(ControlAddCause::Unknown),
+            ControlLastApplError::Unknown
+        );
+    }
+
+    #[test]
+    fn failed_test_commands_carry_the_test_error_codes() {
+        let cause = ControlAddCause::BlockedByProcess;
+        assert_eq!(
+            termination_error_code(cause, false, false),
+            ControlLastApplError::NoError
+        );
+        assert_eq!(
+            termination_error_code(cause, false, true),
+            ControlLastApplError::NoError
+        );
+        assert_eq!(
+            termination_error_code(cause, true, false) as i32,
+            3,
+            "Operator Test Not OK"
+        );
+        assert_eq!(
+            termination_error_code(cause, true, true) as i32,
+            2,
+            "Timeout Test Not OK"
+        );
+        assert_eq!(
+            termination_error_code(ControlAddCause::Unknown, true, false),
+            ControlLastApplError::Unknown
+        );
     }
 }

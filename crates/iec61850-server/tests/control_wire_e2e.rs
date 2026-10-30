@@ -43,10 +43,14 @@ fn build_model() -> Arc<IedModel> {
         ("SPCSO2", ControlModel::SboNormal),
         ("SPCSO3", ControlModel::DirectEnhanced),
         ("SPCSO4", ControlModel::SboEnhanced),
+        ("SPCSO5", ControlModel::DirectEnhanced),
     ] {
-        let opts = ControlOptions::NONE
+        let mut opts = ControlOptions::NONE
             .with_model(model)
             .union(ControlOptions::HAS_CANCEL);
+        if name == "SPCSO5" {
+            opts = opts.union(ControlOptions::IS_TIME_ACTIVATED);
+        }
         ggio = ggio.add_do(cdc::spc(name, CdcOptions::NONE, opts));
     }
     let ld = LogicalDeviceBuilder::new("GenericIO")
@@ -888,5 +892,55 @@ async fn refused_enhanced_operate_in_a_multi_variable_write_is_terminated() {
         panic!("LastApplError is not a structure")
     };
     assert_last_appl_error(lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"), 21, 11);
+    h.stop().await;
+}
+
+// ── Error of a failed test command ─────────────────────────────────────────
+
+/// An Oper with `Test` set, carrying `operTm` when `oper_tm` is given.
+fn test_oper(ctl_num: u64, oper_tm: Option<[u8; 8]>) -> MmsData {
+    let MmsData::Structure(mut members) = oper(on(), ctl_num) else {
+        unreachable!()
+    };
+    members[4] = MmsData::Boolean(true);
+    if let Some(t) = oper_tm {
+        members.insert(1, MmsData::UtcTime(t));
+    }
+    MmsData::Structure(members)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_test_commands_terminate_with_the_test_error_codes() {
+    let s = server();
+    for name in ["SPCSO3", "SPCSO5"] {
+        register(
+            &s,
+            object(name, ControlModel::DirectEnhanced),
+            Arc::new(AlwaysFailOperateHandler {
+                cause: ControlAddCause::BlockedByProcess,
+            }),
+        );
+    }
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    for (item, value, error) in [
+        ("GGIO1$CO$SPCSO3$Oper", test_oper(31, None), 3),
+        (
+            "GGIO1$CO$SPCSO5$Oper",
+            test_oper(32, Some([0, 0, 0, 60, 0, 0, 0, 0])),
+            2,
+        ),
+        ("GGIO1$CO$SPCSO3$Oper", oper(on(), 33), 0),
+    ] {
+        a.write(DOMAIN, item, value).await.expect("accepted");
+        let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+        assert_eq!(names.len(), 2, "a negative termination");
+        let MmsData::Structure(lae) = &values[0] else {
+            panic!("LastApplError is not a structure")
+        };
+        assert_eq!(lae[1], MmsData::Integer(error), "Error of {item}");
+        assert_eq!(lae[4], MmsData::Integer(9), "AddCause");
+    }
     h.stop().await;
 }
