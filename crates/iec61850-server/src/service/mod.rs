@@ -3042,17 +3042,62 @@ fn ber_encode_u32(val: u32) -> Vec<u8> {
 // Journal services
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Resolves the journal a ReadJournal request names to the log control block
+/// whose log it reads.
+///
+/// A registry key equal to `(domain, item)` wins, so a control block registered
+/// under its own path, or under a log instance name, answers to that name.
+/// Otherwise the journal is the log a control block's LogRef names: a LogRef
+/// `<domain>/<item>` maps to the MMS journal `item` of domain `domain`. When
+/// several control blocks name the same log, the first by registry key that
+/// has a storage backend bound is chosen, or the first by key when none has.
+#[cfg(feature = "logging")]
+fn resolve_journal(
+    registry: &std::collections::HashMap<(String, String), Arc<LogControl>>,
+    domain: &str,
+    item: &str,
+) -> Option<Arc<LogControl>> {
+    if let Some(lc) = registry.get(&(domain.to_string(), item.to_string())) {
+        return Some(Arc::clone(lc));
+    }
+    let wanted = format!("{domain}/{item}");
+    let mut named: Vec<(&(String, String), &Arc<LogControl>)> = registry
+        .iter()
+        .filter(|((d, it), lc)| {
+            is_lcb_path(it) && log_ref_of(lc, d, it).as_deref() == Some(wanted.as_str())
+        })
+        .collect();
+    named.sort_by(|a, b| a.0.cmp(b.0));
+    named
+        .iter()
+        .find(|(_, lc)| lc.storage.is_some())
+        .or_else(|| named.first())
+        .map(|(_, lc)| Arc::clone(lc))
+}
+
+/// The LogRef of the control block registered under `(domain, item)`, or
+/// `None` when its state is unavailable.
+#[cfg(feature = "logging")]
+fn log_ref_of(lc: &LogControl, domain: &str, item: &str) -> Option<String> {
+    let ln = item.split('$').next().unwrap_or_default();
+    lc.state
+        .lock()
+        .ok()
+        .map(|state| effective_log_ref(&state, domain, ln))
+}
+
 /// Dispatches a ReadJournal request (`0xbf 0x41`).
 ///
-/// The request names a log control block by domain and item; the range selects
-/// either a time window or a cursor position, and the matching entries are
-/// encoded into a ReadJournalResponse.
+/// The request names a journal by domain and item, which [`resolve_journal`]
+/// maps to a log control block; the range selects either a time window or a
+/// cursor position, and the matching entries are encoded into a
+/// ReadJournalResponse.
 ///
 /// # Errors
 ///
 /// A request that fails to decode, and a storage backend that fails, both
-/// answer with a ConfirmedError of class access; a log control block that is
-/// not registered answers object-non-existent.
+/// answer with a ConfirmedError of class access; a journal that resolves to
+/// no log control block answers object-non-existent.
 ///
 /// Entries are added while they fit the PDU budget. Once one does not, the
 /// response stops there and sets `moreFollows`, and the client continues from
@@ -3080,9 +3125,8 @@ fn dispatch_read_journal(
         }
     };
 
-    let key = (req.domain_id.clone(), req.item_id.clone());
     let lc = match log_controls.read() {
-        Ok(g) => g.get(&key).cloned(),
+        Ok(g) => resolve_journal(&g, &req.domain_id, &req.item_id),
         Err(_) => {
             tracing::warn!(
                 invoke_id,
@@ -3096,7 +3140,7 @@ fn dispatch_read_journal(
             invoke_id,
             domain = req.domain_id,
             item = req.item_id,
-            "read-journal: no such log control block, answering object-non-existent"
+            "read-journal: no such journal, answering object-non-existent"
         );
         return make_confirmed_error(invoke_id, ErrorClass::Access(access::OBJECT_NON_EXISTENT));
     };

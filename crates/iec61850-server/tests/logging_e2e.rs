@@ -337,6 +337,53 @@ async fn whole_lcb_read_carries_the_nine_components() {
     h.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_journal_a_logref_names_is_readable() {
+    let m = model();
+    let srv = server(m.clone());
+    register_data_set(&srv, &m);
+    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+    register_lcb(
+        &srv,
+        lcb(TriggerOptions::DATA_CHANGED),
+        storage.clone(),
+        true,
+    );
+    // No LogRef configured: the default `<LD>/<LN>$GeneralLog` applies.
+    let general = LogControl::new(
+        format!("{DOM}/GGIO1$LG$gen"),
+        LogControlBlock::new("gen").with_dataset(DATA_SET),
+    )
+    .with_storage(Arc::new(InMemoryLogStorage::new()));
+    srv.register_log_control(DOM, "GGIO1$LG$gen", Arc::new(general));
+    let h = srv.start().await.unwrap();
+    srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
+
+    let mut c = client(h.bound_addr.port()).await;
+    let log_ref = c.read(DOM, &format!("{LCB_ITEM}$LogRef")).await.unwrap();
+    assert_eq!(
+        log_ref,
+        MmsData::VisibleString(format!("{DOM}/{EVENT_LOG}"))
+    );
+
+    let by_log_ref = read_all(&mut c, EVENT_LOG).await;
+    assert_eq!(by_log_ref.entries.len(), 1);
+    assert_eq!(by_log_ref.entries[0].variables[0].data_ref, ST_VAL_REF);
+    // The control block path still names the same journal.
+    assert_eq!(read_all(&mut c, LCB_ITEM).await, by_log_ref);
+    assert!(read_all(&mut c, "GGIO1$GeneralLog")
+        .await
+        .entries
+        .is_empty());
+
+    let missing = c
+        .read_journal(&ReadJournalRequest::time_range(DOM, "LLN0$NoLog", 0, 1))
+        .await;
+    assert!(missing.is_err(), "a journal no LogRef names is absent");
+    c.disconnect().await.ok();
+    h.stop().await;
+}
+
 /// Serves a journal of fresh entries on 0.0.0.0:18103 for thirty seconds, for
 /// a third-party client to read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
