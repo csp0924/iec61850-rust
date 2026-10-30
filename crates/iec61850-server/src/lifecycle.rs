@@ -36,8 +36,8 @@
 //! - However the connection ends, including a transport error, the
 //!   association's URCB reservations, control selects and setting group edit
 //!   session are released as the connection task ends. A BRCB the association
-//!   enabled is disabled and keeps buffering; its reservation is kept until its
-//!   ResvTms expires.
+//!   enabled is disabled and keeps buffering; a BRCB it reserved stays reserved
+//!   for the same client address until its ResvTms expires.
 
 use crate::control::{ConnectionTerminationEvent, ControlAddCause, ControlLastApplError};
 use crate::error::Result;
@@ -360,8 +360,9 @@ impl Drop for AssociationTeardown {
         self.server.ct_sink().deregister(conn_id);
         self.server.report_sink().deregister(conn_id);
         self.server.control_objects().release_connection(conn_id);
-        if let Ok(engine) = self.server.reporting_engine().lock() {
+        if let Ok(mut engine) = self.server.reporting_engine().lock() {
             engine.on_connection_dropped(conn_id);
+            engine.deregister_peer(conn_id);
         } else {
             tracing::warn!(
                 conn_id,
@@ -571,6 +572,9 @@ where
     // ── Register the association with the server ────────────────────────
     let client_conn = ClientConnection::new(conn_id, peer, mms_conn);
     server.add_connection(client_conn.clone());
+    if let Ok(mut engine) = server.reporting_engine().lock() {
+        engine.register_peer(conn_id, peer.ip());
+    }
 
     // ── Command terminations ────────────────────────────────────────────
     //

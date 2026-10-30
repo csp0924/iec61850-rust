@@ -21,7 +21,7 @@ Every crate in the workspace shares one version number.
   to the association that wrote `RptEna`; it used to send none, because the
   write did not record the connection. A client that enables a BRCB without
   writing `EntryID` first receives the buffer from its oldest entry. While the
-  BRCB is enabled, `RptEna` from another association is refused with
+  BRCB is enabled, a write from another association is refused with
   `object-access-denied`. When the association ends the BRCB is disabled and
   keeps buffering, its `ResvTms` reservation kept, so a client that
   enables it again receives the entries buffered after the last one sent.
@@ -32,6 +32,25 @@ Every crate in the workspace shares one version number.
   period used to be started only after an integrity report had been sent, so
   none was ever sent. An `IntgPd` of 0 or `TrgOps` without integrity still send
   no integrity report.
+- **`iec61850-server`** — A BRCB reserved with a positive `ResvTms` is held
+  for the client that reserved it, identified by the peer address the server
+  records for its association, which `Owner` reads back; clients that share an
+  address, behind one NAT or on one host, are the same owner, and
+  `handle_set_brcb_field_for_connection` called for a connection the server
+  has not recorded sees no address, so it cannot write a BRCB with a
+  pre-configured owner and leaves a reservation it makes without an owner.
+  While the owner's association is open, a write from any other
+  association is refused with `object-access-denied`; once it ends, the
+  reservation lasts `ResvTms` seconds from that moment, and only a new
+  association from the owner's address may write the BRCB and take it back. A
+  BRCB with a pre-configured owner accepts writes only from that address.
+  Other clients used to be able to write a reserved BRCB, and the reservation
+  timer used to start when `ResvTms` was written. A `ResvTms` written as an
+  INT16, as `IedConnection::set_rcb_values` sends it, is accepted where it was
+  refused with `type-inconsistent`; a `ResvTms` outside 0 to 32767, and an
+  unsigned value wider than 32 bits written to any report control block
+  field, are refused with `object-value-invalid`, where the unsigned value
+  used to be truncated to its low 32 bits.
 - **`iec61850-client`** — `ClientReport::reasons` now describes only the
   latest report: a data set member the report omits has empty reasons, where
   it used to keep the reason of the last report that carried it. A member

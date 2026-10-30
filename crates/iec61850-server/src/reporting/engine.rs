@@ -9,7 +9,7 @@
 //! must be called periodically by the caller; a 1 ms interval keeps
 //! `BufTm = 0` reports effectively immediate.
 
-use super::brcb::{BufferedReportControl, TransmitAnchor};
+use super::brcb::{BufferedReportControl, ResvTmsState, TransmitAnchor};
 use super::buffer::EnqueuedSnapshot;
 use super::dataset::{DataAttributeRef, Dataset};
 use super::pdu::{
@@ -24,6 +24,7 @@ use crate::flags::{InclusionFlag, TriggerOptions};
 use bytes::Bytes;
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -123,6 +124,9 @@ pub struct ReportingEngine {
     /// Engine-level metrics. `dropped_buffer_full` is incremented by the buffer
     /// backends themselves when an entry has to be discarded.
     metrics: Arc<ReportingEngineMetrics>,
+    /// Peer address of every open association, which identifies the owner of a
+    /// BRCB reservation across connections.
+    peers: HashMap<ConnectionId, IpAddr>,
 }
 
 /// Buffer-time accumulation state for one BRCB.
@@ -206,6 +210,7 @@ impl ReportingEngine {
             sink,
             channel_sink: None,
             metrics: ReportingEngineMetrics::new(),
+            peers: HashMap::new(),
         }
     }
 
@@ -228,6 +233,7 @@ impl ReportingEngine {
             sink: trait_sink,
             channel_sink: Some(sink),
             metrics: ReportingEngineMetrics::new(),
+            peers: HashMap::new(),
         }
     }
 
@@ -395,7 +401,11 @@ impl ReportingEngine {
     /// Returns how many reservations fired. Driven from the `tick` path, where once
     /// per second is enough resolution.
     pub fn tick_brcb_reservations(&self) -> usize {
-        let now = Instant::now();
+        self.tick_brcb_reservations_at(Instant::now())
+    }
+
+    /// Runs `tick_brcb_reservations` against the clock reading `now`.
+    pub(crate) fn tick_brcb_reservations_at(&self, now: Instant) -> usize {
         let mut fired = 0;
         for brcb in self.brcbs.values() {
             let Ok(mut state) = brcb.state.lock() else {
@@ -1008,15 +1018,33 @@ impl ReportingEngine {
         }
     }
 
+    // ─── Association peers ────────────────────────────────────────────────────
+
+    /// Records the peer address of association `conn_id`.
+    pub(crate) fn register_peer(&mut self, conn_id: ConnectionId, peer: IpAddr) {
+        self.peers.insert(conn_id, peer);
+    }
+
+    /// Forgets the peer address of association `conn_id`.
+    pub(crate) fn deregister_peer(&mut self, conn_id: ConnectionId) {
+        self.peers.remove(&conn_id);
+    }
+
+    /// Returns the peer address of association `conn_id`, when it is known.
+    pub(crate) fn peer(&self, conn_id: ConnectionId) -> Option<IpAddr> {
+        self.peers.get(&conn_id).copied()
+    }
+
     // ─── Connection loss ──────────────────────────────────────────────────────
 
     /// Releases every RCB held by a connection that has gone away.
     ///
     /// Implements the RCB release on connection loss of IEC 61850-7-2. A URCB is
     /// disabled and its reservation cleared. A BRCB is disabled and unbound from
-    /// the connection but keeps its buffer, its transmit anchor, and its ResvTms
-    /// reservation, so a client that enables it again resumes after the last
-    /// entry sent.
+    /// the connection but keeps its buffer and its transmit anchor, so a client
+    /// that enables it again resumes after the last entry sent. A BRCB reserved
+    /// with a positive ResvTms stays reserved for its owner for ResvTms seconds
+    /// from now; an unreserved one forgets its owner.
     pub fn on_connection_dropped(&self, conn_id: ConnectionId) {
         for rc_arc in self.rcbs.values() {
             let Ok(rc_guard) = rc_arc.lock() else {
@@ -1057,6 +1085,14 @@ impl ReportingEngine {
             state.rpt_ena = false;
             state.client_conn_id = None;
             state.gi = false;
+            match state.resv_tms {
+                ResvTmsState::WithTimeout(secs) => {
+                    state.reservation_timeout =
+                        Some(Instant::now() + Duration::from_secs(u64::from(secs.get())));
+                }
+                ResvTmsState::NotReserved => state.owner = None,
+                ResvTmsState::Preconfigured => {}
+            }
         }
     }
 
@@ -2081,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn on_connection_dropped_disables_brcb_and_keeps_its_buffer() {
+    fn on_connection_dropped_disables_brcb_and_holds_its_reservation() {
         use crate::reporting::brcb::ResvTmsState;
         use std::num::NonZeroU16;
         let mut eng = ReportingEngine::new_null();
@@ -2092,18 +2128,20 @@ mod tests {
         let (entry_id, _) = dropped
             .enqueue_entry(1_000, false, false, Bytes::from_static(b"a"))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
         for (brcb, conn_id) in [(&dropped, 5), (&kept, 6)] {
             let mut s = brcb.state.lock().unwrap();
             s.rpt_ena = true;
             s.gi = true;
             s.client_conn_id = Some(conn_id);
             s.resv_tms = ResvTmsState::WithTimeout(NonZeroU16::new(30).unwrap());
-            s.reservation_timeout = Some(deadline);
+            s.reservation_timeout = None;
             s.transmit_anchor = TransmitAnchor::AfterEntryId(entry_id);
         }
 
+        let before = Instant::now();
         eng.on_connection_dropped(5);
+        let after = Instant::now();
+        let resv = Duration::from_secs(30);
 
         {
             let s = dropped.state.lock().unwrap();
@@ -2114,7 +2152,8 @@ mod tests {
                 s.resv_tms,
                 ResvTmsState::WithTimeout(NonZeroU16::new(30).unwrap())
             );
-            assert_eq!(s.reservation_timeout, Some(deadline));
+            let restarted = s.reservation_timeout.unwrap();
+            assert!(before + resv <= restarted && restarted <= after + resv);
             assert_eq!(s.transmit_anchor, TransmitAnchor::AfterEntryId(entry_id));
         }
         assert_eq!(dropped.lock_buffer().unwrap().len(), 1);
@@ -2122,6 +2161,24 @@ mod tests {
         assert!(s.rpt_ena);
         assert!(s.gi);
         assert_eq!(s.client_conn_id, Some(6));
+        assert_eq!(s.reservation_timeout, None);
+    }
+
+    #[test]
+    fn on_connection_dropped_forgets_the_owner_of_an_unreserved_brcb() {
+        let mut eng = ReportingEngine::new_null();
+        eng.register_brcb(make_brcb("brcb01")).unwrap();
+        let brcb = eng.get_brcb("IED1LD0/GGIO1$BR$brcb01").unwrap();
+        {
+            let mut s = brcb.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.owner = Some("10.0.0.1".parse().unwrap());
+        }
+        eng.on_connection_dropped(5);
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.owner, None);
+        assert_eq!(s.reservation_timeout, None);
     }
 
     #[test]

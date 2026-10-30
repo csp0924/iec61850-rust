@@ -1799,29 +1799,34 @@ fn lcb_field_value(
 ///
 /// A bit string is passed on with its padding byte restored at the front of the
 /// buffer, which is the layout the option-flag and trigger-option decoders
-/// expect. `None` means the value has no control block representation.
+/// expect.
+///
+/// # Errors
+///
+/// Returns `TypeInconsistent` for a value type no control block field takes,
+/// and `ObjectValueInvalid` for an unsigned value wider than 32 bits.
 #[cfg(feature = "reporting")]
 fn mms_data_to_rcb_write_value(
     data: &iec61850_mms::mms::pdu::common::MmsData,
-) -> Option<crate::reporting::service::RcbWriteValue> {
+) -> Result<crate::reporting::service::RcbWriteValue, DataAccessError> {
     use crate::reporting::service::RcbWriteValue;
     use iec61850_mms::mms::pdu::common::MmsData;
     match data {
-        MmsData::Boolean(b) => Some(RcbWriteValue::Bool(*b)),
-        MmsData::Unsigned(u) => {
-            // No unsigned control block field is wider than 32 bits.
-            Some(RcbWriteValue::Unsigned(*u as u32))
-        }
-        MmsData::VisibleString(s) => Some(RcbWriteValue::VisibleString(s.clone())),
+        MmsData::Boolean(b) => Ok(RcbWriteValue::Bool(*b)),
+        // No unsigned control block field is wider than 32 bits.
+        MmsData::Unsigned(u) => u32::try_from(*u)
+            .map(RcbWriteValue::Unsigned)
+            .map_err(|_| DataAccessError::ObjectValueInvalid),
+        MmsData::VisibleString(s) => Ok(RcbWriteValue::VisibleString(s.clone())),
         MmsData::BitString { padding, data } => {
             // The decoders expect [padding_byte, data_bytes...].
             let mut bytes = Vec::with_capacity(1 + data.len());
             bytes.push(*padding);
             bytes.extend_from_slice(data);
-            Some(RcbWriteValue::BitString(bytes))
+            Ok(RcbWriteValue::BitString(bytes))
         }
-        MmsData::OctetString(b) => Some(RcbWriteValue::OctetString(b.clone())),
-        _ => None,
+        MmsData::OctetString(b) => Ok(RcbWriteValue::OctetString(b.clone())),
+        _ => Err(DataAccessError::TypeInconsistent),
     }
 }
 
@@ -2136,16 +2141,29 @@ fn handle_write_with_routing(
                 }
                 if let Some(field) = target.field.clone() {
                     use crate::reporting::service::handle_set_brcb_field_for_connection;
-                    let rcb_value = match mms_data_to_rcb_write_value(data) {
-                        Some(v) => v,
-                        None => {
+                    let rcb_value = match (field.as_str(), data) {
+                        // ResvTms is an INT16; the field handler takes its
+                        // non-negative range as an Unsigned.
+                        ("ResvTms", iec61850_mms::mms::pdu::common::MmsData::Integer(i)) => {
+                            i16::try_from(*i)
+                                .ok()
+                                .and_then(|v| u32::try_from(v).ok())
+                                .map(crate::reporting::service::RcbWriteValue::Unsigned)
+                                .ok_or(DataAccessError::ObjectValueInvalid)
+                        }
+                        _ => mms_data_to_rcb_write_value(data),
+                    };
+                    let rcb_value = match rcb_value {
+                        Ok(v) => v,
+                        Err(e) => {
                             tracing::warn!(
                                 domain = target.domain,
                                 mms_path = target.mms_path,
                                 field = field.as_str(),
-                                "write: the value type has no buffered report control block representation, answering type-inconsistent"
+                                error = ?e,
+                                "write: the value has no buffered report control block representation"
                             );
-                            return WriteOutcome::Failure(DataAccessError::TypeInconsistent);
+                            return WriteOutcome::Failure(e);
                         }
                     };
                     if let Some(res) = handle_set_brcb_field_for_connection(
@@ -2187,15 +2205,16 @@ fn handle_write_with_routing(
             };
 
             let rcb_value = match mms_data_to_rcb_write_value(data) {
-                Some(v) => v,
-                None => {
+                Ok(v) => v,
+                Err(e) => {
                     tracing::warn!(
                         domain = target.domain,
                         mms_path = target.mms_path,
                         field = field.as_str(),
-                        "write: the value type has no report control block representation, answering type-inconsistent"
+                        error = ?e,
+                        "write: the value has no report control block representation"
                     );
-                    return WriteOutcome::Failure(DataAccessError::TypeInconsistent);
+                    return WriteOutcome::Failure(e);
                 }
             };
 

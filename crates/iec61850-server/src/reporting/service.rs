@@ -472,12 +472,21 @@ pub fn handle_set_brcb_field(
 /// - RptEna = true binds the BRCB to `conn_id`, which then receives its reports;
 ///   enabling a BRCB whose transmit anchor is unset sends its buffer from the
 ///   oldest entry
-/// - while the BRCB is enabled for another connection, RptEna gives
+/// - while the BRCB is enabled or reserved by another connection, or held for
+///   the owner of a reservation whose association has ended, every write gives
 ///   ObjectAccessDenied
+/// - a positive ResvTms reserves the BRCB for `conn_id` and its peer address;
+///   the reservation outlives the association by ResvTms seconds
 /// - DatSet, TrgOps, IntgPd, BufTm, and RptID are refused with
 ///   TemporarilyUnavailable while RptEna is true
 /// - an accepted change to one of those fields purges the report buffer, through
 ///   `BufferedReportControl::set_config_field`
+///
+/// The owner of a reservation is the peer address the server records for the
+/// association `conn_id`, so clients that share an address, behind one NAT or
+/// on one host, are the same owner. A connection with no recorded address may
+/// not write a BRCB with a pre-configured owner, and a reservation it makes has
+/// no owner: any client may take it over once its association has ended.
 pub fn handle_set_brcb_field_for_connection(
     engine: &Arc<Mutex<ReportingEngine>>,
     mms_path: &str,
@@ -511,16 +520,21 @@ fn set_brcb_field(
     }
 
     // Take the control block handle and release the engine lock before locking it.
-    let brcb = {
+    let (brcb, writer_ip) = {
         let eng = engine
             .lock()
             .map_err(|_| DataAccessError::HardwareFault)
             .ok()?;
         match eng.get_brcb(mms_path) {
-            Some(b) => b,
+            Some(b) => (b, conn_id.and_then(|c| eng.peer(c))),
             None => return Some(Err(DataAccessError::ObjectNonExistent)),
         }
     };
+    if let Some(writer) = conn_id {
+        if let Err(e) = claim_brcb(&brcb, writer, writer_ip) {
+            return Some(Err(e));
+        }
+    }
 
     match field {
         // EntryID.
@@ -563,7 +577,7 @@ fn set_brcb_field(
 
         // RptEna: enable or disable; the integrity period runs from the moment
         // reporting is enabled.
-        RcbField::RptEna => match set_brcb_rpt_ena(&brcb, value, conn_id) {
+        RcbField::RptEna => match set_brcb_rpt_ena(&brcb, value, conn_id, writer_ip) {
             Ok(true) => {
                 match engine.lock() {
                     Ok(eng) => eng.refresh_brcb_integrity_period(mms_path),
@@ -588,7 +602,9 @@ fn set_brcb_field(
         RcbField::IntgPd => set_brcb_unsigned32(&brcb, value, "IntgPd"),
 
         // ResvTms, an INT16 introduced in Edition 2.
-        RcbField::Unknown(ref n) if n == "ResvTms" => set_brcb_resv_tms(&brcb, value),
+        RcbField::Unknown(ref n) if n == "ResvTms" => {
+            set_brcb_resv_tms(&brcb, value, conn_id, writer_ip)
+        }
 
         // Owner is never writable, per IEC 61850-7-2.
         RcbField::Owner => Some(Err(DataAccessError::ObjectAccessDenied)),
@@ -691,6 +707,72 @@ pub fn handle_get_brcb_field(
 // BRCB field write helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Decides whether connection `writer`, whose peer address is `writer_ip`, may
+/// write a field of the BRCB.
+///
+/// Per the BRCB reservation of IEC 61850-7-2: a BRCB that another association
+/// has enabled or reserved is refused with ObjectAccessDenied. A reservation
+/// whose association has ended (positive ResvTms, still running) or a
+/// pre-configured one is refused to every client whose address is not the
+/// owner's; the owner's new association takes the BRCB over and the
+/// reservation timer stops.
+fn claim_brcb(
+    brcb: &super::brcb::BufferedReportControl,
+    writer: ConnectionId,
+    writer_ip: Option<std::net::IpAddr>,
+) -> Result<(), DataAccessError> {
+    let mut state = brcb
+        .lock_state()
+        .map_err(|_| DataAccessError::HardwareFault)?;
+    claim_brcb_locked(brcb, &mut state, writer, writer_ip)
+}
+
+/// Applies the `claim_brcb` decision to state the caller already holds locked.
+///
+/// A setter that changes which connection holds the BRCB repeats the decision
+/// inside its own critical section, so a claim decided before another
+/// connection's write cannot overwrite that write.
+fn claim_brcb_locked(
+    brcb: &super::brcb::BufferedReportControl,
+    state: &mut super::brcb::BrcbState,
+    writer: ConnectionId,
+    writer_ip: Option<std::net::IpAddr>,
+) -> Result<(), DataAccessError> {
+    use super::brcb::ResvTmsState;
+    let reserved = state.resv_tms != ResvTmsState::NotReserved;
+    match state.client_conn_id {
+        Some(holder) if holder == writer => return Ok(()),
+        Some(_) if state.rpt_ena || reserved => {
+            tracing::warn!(
+                mms_path = %brcb.mms_path,
+                conn_id = writer,
+                "SetBRCBValues: the control block is held by another client"
+            );
+            return Err(DataAccessError::ObjectAccessDenied);
+        }
+        _ => {}
+    }
+    if !reserved {
+        return Ok(());
+    }
+    let owner = match state.resv_tms {
+        ResvTmsState::Preconfigured => brcb.brcb.client_reservation.or(state.owner),
+        _ => state.owner,
+    };
+    if owner.is_some() && owner != writer_ip {
+        tracing::warn!(
+            mms_path = %brcb.mms_path,
+            conn_id = writer,
+            "SetBRCBValues: the control block is reserved for another client"
+        );
+        return Err(DataAccessError::ObjectAccessDenied);
+    }
+    state.client_conn_id = Some(writer);
+    state.owner = owner.or(writer_ip);
+    state.reservation_timeout = None;
+    Ok(())
+}
+
 fn set_brcb_purge_buf(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
@@ -712,6 +794,7 @@ fn set_brcb_rpt_ena(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
     conn_id: Option<ConnectionId>,
+    writer_ip: Option<std::net::IpAddr>,
 ) -> Result<bool, DataAccessError> {
     let v = match value {
         RcbWriteValue::Bool(b) => b,
@@ -721,15 +804,8 @@ fn set_brcb_rpt_ena(
         Ok(s) => s,
         Err(_) => return Err(DataAccessError::HardwareFault),
     };
-    if let (true, Some(writer), Some(holder)) = (state.rpt_ena, conn_id, state.client_conn_id) {
-        if writer != holder {
-            tracing::warn!(
-                mms_path = %brcb.mms_path,
-                conn_id = writer,
-                "SetBRCBValues RptEna: the control block is enabled for another client"
-            );
-            return Err(DataAccessError::ObjectAccessDenied);
-        }
+    if let Some(writer) = conn_id {
+        claim_brcb_locked(brcb, &mut state, writer, writer_ip)?;
     }
     if v {
         if state.dat_set.is_empty() {
@@ -892,9 +968,17 @@ fn set_brcb_opt_flds(
     Some(Ok(()))
 }
 
+/// Applies a ResvTms write.
+///
+/// A positive value received on connection `conn_id` reserves the BRCB for that
+/// association, owned by `writer_ip`; the reservation timer starts only when the
+/// association ends. Without a connection the timer starts at the write. Zero
+/// releases the reservation; an enabled BRCB keeps its connection.
 fn set_brcb_resv_tms(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
+    conn_id: Option<ConnectionId>,
+    writer_ip: Option<std::net::IpAddr>,
 ) -> Option<Result<(), DataAccessError>> {
     // ResvTms is an INT16 on the wire. `RcbWriteValue` has no signed variant, so a
     // client encodes the positive range as an Unsigned.
@@ -911,14 +995,31 @@ fn set_brcb_resv_tms(
         Ok(s) => s,
         Err(_) => return Some(Err(DataAccessError::HardwareFault)),
     };
+    if let Some(writer) = conn_id {
+        if let Err(e) = claim_brcb_locked(brcb, &mut state, writer, writer_ip) {
+            return Some(Err(e));
+        }
+    }
     let new_state = super::brcb::ResvTmsState::from_wire(v_i16);
     state.resv_tms = new_state;
-    if let super::brcb::ResvTmsState::WithTimeout(secs) = new_state {
-        state.reservation_timeout =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs.get() as u64));
-    } else if matches!(new_state, super::brcb::ResvTmsState::NotReserved) {
-        state.reservation_timeout = None;
-        state.client_conn_id = None;
+    match (new_state, conn_id) {
+        (super::brcb::ResvTmsState::WithTimeout(_), Some(writer)) => {
+            state.client_conn_id = Some(writer);
+            state.owner = writer_ip;
+            state.reservation_timeout = None;
+        }
+        (super::brcb::ResvTmsState::WithTimeout(secs), None) => {
+            state.reservation_timeout =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(secs.get() as u64));
+        }
+        (super::brcb::ResvTmsState::NotReserved, _) => {
+            state.reservation_timeout = None;
+            if !state.rpt_ena {
+                state.client_conn_id = None;
+                state.owner = None;
+            }
+        }
+        (super::brcb::ResvTmsState::Preconfigured, _) => {}
     }
     Some(Ok(()))
 }
@@ -1723,6 +1824,19 @@ mod tests {
             set(false, 4),
             Some(Err(DataAccessError::ObjectAccessDenied))
         );
+        for (field, value) in [
+            (
+                RcbField::Unknown("ResvTms".to_string()),
+                RcbWriteValue::Unsigned(30),
+            ),
+            (RcbField::Gi, RcbWriteValue::Bool(true)),
+            (RcbField::EntryId, RcbWriteValue::OctetString(vec![0; 8])),
+        ] {
+            assert_eq!(
+                handle_set_brcb_field_for_connection(&engine, &path, field, value, 4),
+                Some(Err(DataAccessError::ObjectAccessDenied))
+            );
+        }
         assert_eq!(brcb_state(&engine, &path).0, Some(3));
         assert!(brcb_state(&engine, &path).1);
 
@@ -1922,5 +2036,269 @@ mod tests {
         f.reserve_urcb();
         let (_, after) = f.enable();
         assert_eq!(f.tick(after + Duration::from_millis(1_000)), (0, 0));
+    }
+
+    // ── BRCB reservation across associations ─────────────────────────────────
+
+    const OWNER: ConnectionId = 11;
+    const OTHER: ConnectionId = 12;
+    const OWNER_AGAIN: ConnectionId = 13;
+    const RESV_TMS_S: u32 = 30;
+
+    /// A BRCB with three associations: `OWNER` and `OWNER_AGAIN` from one address,
+    /// `OTHER` from another.
+    fn reservation_fixture(
+        brcb: super::super::brcb::Brcb,
+    ) -> (Arc<Mutex<ReportingEngine>>, String) {
+        use super::super::brcb::BufferedReportControl;
+        let path = "IED1LD0/MMXU1$BR$brcbResv".to_string();
+        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        engine
+            .register_brcb(BufferedReportControl::new(&path, brcb))
+            .unwrap();
+        let owner_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        engine.register_peer(OWNER, owner_ip);
+        engine.register_peer(OWNER_AGAIN, owner_ip);
+        engine.register_peer(OTHER, "10.0.0.2".parse().unwrap());
+        (Arc::new(Mutex::new(engine)), path)
+    }
+
+    fn plain_brcb() -> super::super::brcb::Brcb {
+        super::super::brcb::Brcb::new("brcbResv", "MMXU1$ds1")
+    }
+
+    fn write_brcb(
+        engine: &Arc<Mutex<ReportingEngine>>,
+        path: &str,
+        conn_id: ConnectionId,
+        field: &str,
+        value: RcbWriteValue,
+    ) -> Option<Result<(), DataAccessError>> {
+        handle_set_brcb_field_for_connection(
+            engine,
+            path,
+            RcbField::from_name(field),
+            value,
+            conn_id,
+        )
+    }
+
+    fn reserve(engine: &Arc<Mutex<ReportingEngine>>, path: &str, conn_id: ConnectionId) {
+        let res = write_brcb(
+            engine,
+            path,
+            conn_id,
+            "ResvTms",
+            RcbWriteValue::Unsigned(RESV_TMS_S),
+        );
+        assert_eq!(res, Some(Ok(())));
+    }
+
+    const DENIED: Option<Result<(), DataAccessError>> =
+        Some(Err(DataAccessError::ObjectAccessDenied));
+
+    #[test]
+    fn brcb_reserved_by_resv_tms_refuses_other_clients() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        reserve(&engine, &path, OWNER);
+
+        let intg_pd = || RcbWriteValue::Unsigned(500);
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "IntgPd", intg_pd()),
+            DENIED
+        );
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "RptEna", RcbWriteValue::Bool(true)),
+            DENIED
+        );
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "ResvTms", RcbWriteValue::Unsigned(0)),
+            DENIED
+        );
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "IntgPd", intg_pd()),
+            Some(Ok(()))
+        );
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.client_conn_id, Some(OWNER));
+        assert_eq!(s.owner, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(
+            s.reservation_timeout, None,
+            "the timer waits for the association to end"
+        );
+    }
+
+    #[test]
+    fn brcb_reservation_is_held_for_its_owner_after_close() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        reserve(&engine, &path, OWNER);
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+        let before = Instant::now();
+        engine.lock().unwrap().on_connection_dropped(OWNER);
+        let after = Instant::now();
+        let resv = Duration::from_secs(u64::from(RESV_TMS_S));
+
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        let deadline = brcb.state.lock().unwrap().reservation_timeout.unwrap();
+        assert!(before + resv <= deadline && deadline <= after + resv);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .tick_brcb_reservations_at(before + resv - Duration::from_millis(1)),
+            0
+        );
+
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "RptEna", RcbWriteValue::Bool(true)),
+            DENIED
+        );
+        assert_eq!(
+            write_brcb(
+                &engine,
+                &path,
+                OWNER_AGAIN,
+                "RptEna",
+                RcbWriteValue::Bool(true)
+            ),
+            Some(Ok(()))
+        );
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.client_conn_id, Some(OWNER_AGAIN));
+        assert!(s.rpt_ena);
+        assert_eq!(s.reservation_timeout, None);
+    }
+
+    #[test]
+    fn brcb_reservation_is_released_when_resv_tms_expires_after_close() {
+        use super::super::brcb::ResvTmsState;
+        let (engine, path) = reservation_fixture(plain_brcb());
+        reserve(&engine, &path, OWNER);
+        engine.lock().unwrap().on_connection_dropped(OWNER);
+        let after = Instant::now();
+        let resv = Duration::from_secs(u64::from(RESV_TMS_S));
+
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .tick_brcb_reservations_at(after + resv),
+            1
+        );
+        {
+            let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+            let s = brcb.state.lock().unwrap();
+            assert_eq!(s.resv_tms, ResvTmsState::NotReserved);
+            assert_eq!(s.owner, None);
+        }
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "RptEna", RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+    }
+
+    #[test]
+    fn unreserved_brcb_accepts_any_client() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        for conn_id in [OWNER, OTHER] {
+            assert_eq!(
+                write_brcb(
+                    &engine,
+                    &path,
+                    conn_id,
+                    "IntgPd",
+                    RcbWriteValue::Unsigned(500)
+                ),
+                Some(Ok(()))
+            );
+        }
+        engine.lock().unwrap().on_connection_dropped(OWNER);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        assert_eq!(brcb.state.lock().unwrap().reservation_timeout, None);
+    }
+
+    #[test]
+    fn resv_tms_zero_keeps_an_enabled_brcb_bound() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        reserve(&engine, &path, OWNER);
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "ResvTms", RcbWriteValue::Unsigned(0)),
+            Some(Ok(()))
+        );
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        assert_eq!(brcb.state.lock().unwrap().client_conn_id, Some(OWNER));
+    }
+
+    #[test]
+    fn preconfigured_brcb_refuses_other_addresses() {
+        let brcb = plain_brcb().with_preconfigured_owner("10.0.0.1".parse().unwrap());
+        let (engine, path) = reservation_fixture(brcb);
+        let intg_pd = || RcbWriteValue::Unsigned(500);
+        assert_eq!(
+            write_brcb(&engine, &path, OTHER, "IntgPd", intg_pd()),
+            DENIED
+        );
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "IntgPd", intg_pd()),
+            Some(Ok(()))
+        );
+    }
+
+    fn other_ip() -> Option<std::net::IpAddr> {
+        Some("10.0.0.2".parse().unwrap())
+    }
+
+    #[test]
+    fn resv_tms_rechecks_a_claim_overtaken_by_another_reservation() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        // OTHER passes the claim while the BRCB is free; OWNER then reserves it
+        // before OTHER's ResvTms write takes the state lock.
+        assert_eq!(claim_brcb(&brcb, OTHER, other_ip()), Ok(()));
+        reserve(&engine, &path, OWNER);
+        assert_eq!(
+            set_brcb_resv_tms(&brcb, RcbWriteValue::Unsigned(30), Some(OTHER), other_ip()),
+            DENIED
+        );
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.client_conn_id, Some(OWNER));
+        assert_eq!(s.owner, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rpt_ena_rechecks_a_claim_overtaken_by_another_reservation() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        assert_eq!(claim_brcb(&brcb, OTHER, other_ip()), Ok(()));
+        reserve(&engine, &path, OWNER);
+        assert_eq!(
+            set_brcb_rpt_ena(&brcb, RcbWriteValue::Bool(true), Some(OTHER), other_ip()),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.client_conn_id, Some(OWNER));
+        assert!(!s.rpt_ena);
+    }
+
+    #[test]
+    fn resv_tms_zero_on_a_disabled_brcb_forgets_its_owner() {
+        let (engine, path) = reservation_fixture(plain_brcb());
+        reserve(&engine, &path, OWNER);
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "ResvTms", RcbWriteValue::Unsigned(0)),
+            Some(Ok(()))
+        );
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        let s = brcb.state.lock().unwrap();
+        assert_eq!(s.client_conn_id, None);
+        assert_eq!(s.owner, None);
     }
 }

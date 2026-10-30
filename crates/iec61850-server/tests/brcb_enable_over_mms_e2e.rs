@@ -343,3 +343,84 @@ async fn brcb_resumes_after_the_client_reconnects() {
         assert_eq!(resumed.buf_ovfl, Some(false), "resync {resync}");
     }
 }
+
+/// A client that reserves a BRCB through `ResvTms` is its owner, by address:
+/// `Owner` reads back the client address, and after the association ends a new
+/// association from the same address takes the BRCB back and receives the
+/// entries buffered in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_reserved_over_mms_is_taken_back_by_its_owner() {
+    let f = start(0).await;
+    let mut first = f.connect().await;
+    write_brcb(&mut first, "ResvTms", MmsData::Integer(30))
+        .await
+        .expect("write ResvTms");
+    assert_eq!(
+        first
+            .read(DOMAIN, "LLN0$BR$brcbPos$Owner")
+            .await
+            .expect("read Owner"),
+        MmsData::OctetString(vec![127, 0, 0, 1])
+    );
+    write_brcb(&mut first, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the brcb");
+    f.set_st_val(2);
+    let sent = next_report(&mut first).await;
+    assert_brcb_report(&sent, dbpos(2));
+
+    first.disconnect().await.expect("disconnect");
+    f.wait_for_no_connection().await;
+    f.set_st_val(1);
+
+    let mut second = f.connect().await;
+    write_brcb(&mut second, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("the owner enables the brcb again");
+    let resumed = next_report(&mut second).await;
+    assert_brcb_report(&resumed, dbpos(1));
+    assert!(resumed.entry_id > sent.entry_id);
+}
+
+fn assert_refused_with(result: Result<(), ClientError>, expected: DataAccessError) {
+    match result {
+        Err(ClientError::DataAccessError(e)) if e == expected => {}
+        other => panic!("expected {expected:?}, got {other:?}"),
+    }
+}
+
+/// `ResvTms` takes an INT16 from 0 to 32767 or an unsigned value in that range;
+/// any other value is refused with object-value-invalid and leaves the
+/// reservation as it was. No other field takes an INT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_resv_tms_takes_only_its_range() {
+    let f = start(0).await;
+    let mut mms = f.connect().await;
+    write_brcb(&mut mms, "ResvTms", MmsData::Integer(30))
+        .await
+        .expect("write ResvTms");
+
+    for value in [
+        MmsData::Integer(-1),
+        MmsData::Integer(40_000),
+        MmsData::Integer(5_000_000_000),
+        MmsData::Unsigned(40_000),
+        MmsData::Unsigned(1 << 32),
+    ] {
+        assert_refused_with(
+            write_brcb(&mut mms, "ResvTms", value).await,
+            DataAccessError::ObjectValueInvalid,
+        );
+    }
+    assert_eq!(
+        mms.read(DOMAIN, "LLN0$BR$brcbPos$ResvTms")
+            .await
+            .expect("read ResvTms"),
+        MmsData::Integer(30)
+    );
+
+    assert_refused_with(
+        write_brcb(&mut mms, "IntgPd", MmsData::Integer(100)).await,
+        DataAccessError::TypeInconsistent,
+    );
+}

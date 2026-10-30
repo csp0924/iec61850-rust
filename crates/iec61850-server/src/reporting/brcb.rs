@@ -465,8 +465,9 @@ impl BrcbState {
     /// Releases the reservation when its timer has elapsed.
     ///
     /// Called once per second from `ReportingEngine::tick()`. When
-    /// `reservation_timeout` has passed, the reservation is released: the client
-    /// connection is forgotten and ResvTms returns to `NotReserved`.
+    /// `reservation_timeout` has passed, the reservation is released: ResvTms
+    /// returns to `NotReserved`, and a disabled BRCB forgets its connection and
+    /// its owner.
     ///
     /// Returns `true` when this call actually released a reservation.
     pub fn tick_reservation(&mut self, now: Instant) -> bool {
@@ -488,6 +489,7 @@ impl BrcbState {
         // cleared here; the buffer and is_buffering are kept.
         if !self.rpt_ena {
             self.client_conn_id = None;
+            self.owner = None;
         }
         true
     }
