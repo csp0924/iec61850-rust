@@ -26,7 +26,9 @@ use iec61850_model::{
     LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, NodeRef, ObjectRef,
     SettingGroupControlBlock, TrgOps, FC,
 };
-use iec61850_server::handler::{ReadContext, ReadHandler, ReadOutcome};
+use iec61850_server::handler::{
+    AttributeAccessHandler, ReadContext, ReadHandler, ReadOutcome, WriteContext, WriteOutcome,
+};
 use iec61850_server::logging::{LogControl, LogControlBlock};
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{
@@ -745,6 +747,51 @@ async fn constructed_edit_setting_is_writable_in_an_edit_session() {
     t!(c.write(DOM, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(2))).expect("edit session");
     t!(c.write(DOM, item, MmsData::Float32(9.0))).expect("leaf in the edit session");
     assert_eq!(t!(c.read(DOM, item)).unwrap(), MmsData::Float32(9.0));
+    handle.stop().await;
+}
+
+#[derive(Debug)]
+struct RefuseWrites;
+impl AttributeAccessHandler for RefuseWrites {
+    fn on_write(&self, _ctx: &WriteContext<'_>, _value: &MmsValue) -> WriteOutcome {
+        WriteOutcome::Reject(DataAccessError::ObjectAccessDenied)
+    }
+}
+
+/// A write handler on a constructed setting refuses a write of a leaf below
+/// it as it refuses a write of the whole setting, under SP and under SE in an
+/// edit session; a setting without the handler stays writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaf_write_is_decided_by_the_handler_of_its_constructed_attribute() {
+    let server = server_with(model(false), IedServerConfig::default());
+    for path in ["PTOC1$SP$StrVal$setMag", "PTOC1$SE$OpDlTmms$setMag"] {
+        server
+            .install_write_access_handler(path, Arc::new(RefuseWrites))
+            .unwrap();
+    }
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+    t!(c.write(DOM, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(2))).expect("edit session");
+
+    for item in ["PTOC1$SP$StrVal$setMag$f", "PTOC1$SE$OpDlTmms$setMag$f"] {
+        let r = t!(c.write(DOM, item, MmsData::Float32(5.0)));
+        assert!(
+            matches!(
+                r,
+                Err(ClientError::DataAccessError(
+                    DataAccessError::ObjectAccessDenied
+                ))
+            ),
+            "{item}: {r:?}"
+        );
+        assert_eq!(
+            t!(c.read(DOM, item)).unwrap(),
+            MmsData::Float32(1.0),
+            "{item}"
+        );
+    }
+    t!(c.write(DOM, "GGIO1$MX$AnIn1$mag$f", MmsData::Float32(5.0)))
+        .expect_err("MX stays read-only");
     handle.stop().await;
 }
 

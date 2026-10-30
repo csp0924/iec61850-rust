@@ -24,7 +24,13 @@
 //! a structure with one member per sub-attribute, in model order, and writes
 //! every leaf beneath it: all leaves are checked, and every handler on the way
 //! has its say, before any cached value changes, so a refused write leaves the
-//! whole attribute as it was.
+//! cached value of the whole attribute as it was.
+//!
+//! A write below a data attribute is also a write of each attribute above it.
+//! The handler of every such ancestor, outermost first, decides the write with
+//! the ancestor's current value in which the target is replaced by the written
+//! value: a refusal refuses the write, and taking the value over leaves the
+//! cache alone, exactly as for a write of the ancestor itself.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -361,9 +367,13 @@ fn write_to_da(
     };
 
     // Sub-attributes carry the functional constraint of their attribute, so
-    // the rest of the path descends by name alone.
+    // the rest of the path descends by name alone. The attributes passed on the
+    // way, the data attribute first, are the ancestors of the target.
+    let steps = &object_path[next..];
+    let mut ancestors: Vec<&DataAttribute> = Vec::with_capacity(steps.len());
     let mut target = da;
-    for step in &object_path[next..] {
+    for step in steps {
+        ancestors.push(target);
         target = match target.child_by_name(step) {
             Some(child) => child,
             None => {
@@ -389,6 +399,23 @@ fn write_to_da(
             "write: the value does not match the data attribute"
         );
         return WriteOutcome::Failure(e);
+    }
+
+    // A handler on an ancestor of the target decides the write as it decides a
+    // write of the whole ancestor: it sees the ancestor's current value with
+    // the target replaced by the written one, outermost ancestor first.
+    let item_segments: Vec<&str> = item_id.split('$').collect();
+    let da_depth = item_segments.len() - steps.len();
+    for (depth, ancestor) in ancestors.iter().enumerate() {
+        let path = item_segments[..da_depth + depth].join("$");
+        let merged = merged_value(ancestor, &steps[depth..], mms_data_to_mms_value(data));
+        match consult_write_handler(handler_registry, &path, fc, conn_id, &merged) {
+            HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
+            // The handler takes the whole ancestor over, so no cached value of
+            // it changes.
+            HandlerWriteOutcome::AcceptNoUpdate => return WriteOutcome::Success,
+            HandlerWriteOutcome::Accept => {}
+        }
     }
 
     // The handlers run only after the policy and type checks have passed, and
@@ -437,6 +464,29 @@ fn write_to_da(
         "write: value updated"
     );
     WriteOutcome::Success
+}
+
+/// Returns the current value of `ancestor` with the node `steps` names below
+/// it replaced by `new_value`.
+fn merged_value(
+    ancestor: &DataAttribute,
+    steps: &[&str],
+    new_value: iec61850_model::MmsValue,
+) -> iec61850_model::MmsValue {
+    let Some((step, rest)) = steps.split_first() else {
+        return new_value;
+    };
+    let mut new_value = Some(new_value);
+    iec61850_model::MmsValue::Structure(
+        ancestor
+            .children
+            .iter()
+            .map(|child| match new_value.take_if(|_| child.name == *step) {
+                Some(v) => merged_value(child, rest, v),
+                None => child.snapshot(),
+            })
+            .collect(),
+    )
 }
 
 /// One node a write reaches: a leaf, whose cached value it replaces, or a
@@ -903,6 +953,103 @@ mod tests {
         assert_eq!(
             leaf_value(&model, "IED1LD0/GGIO1$SP$SetPt$setMag$f"),
             MmsValue::Float32(0.0)
+        );
+    }
+
+    /// Records the value it is asked about, then answers as configured.
+    #[derive(Debug)]
+    struct Witness {
+        answer: HandlerWriteOutcome,
+        seen: std::sync::Mutex<Vec<MmsValue>>,
+    }
+    impl crate::handler::AttributeAccessHandler for Witness {
+        fn on_write(&self, _ctx: &WriteContext<'_>, value: &MmsValue) -> HandlerWriteOutcome {
+            self.seen.lock().unwrap().push(value.clone());
+            self.answer.clone()
+        }
+    }
+
+    fn witness(answer: HandlerWriteOutcome) -> Arc<Witness> {
+        Arc::new(Witness {
+            answer,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A handler on a constructed attribute decides a write of a leaf below it
+    /// as it decides a write of the attribute itself: a refusal refuses the
+    /// leaf, and the leaf keeps its value.
+    #[test]
+    fn write_leaf_consults_the_handler_of_the_constructed_ancestor() {
+        let (model, mms_model) = build_test_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$SetPt$setMag", Arc::new(Refuse))
+            .unwrap();
+        for (item_id, data) in [
+            (
+                "GGIO1$SP$SetPt$setMag",
+                MmsData::Structure(vec![MmsData::Float32(5.0)]),
+            ),
+            ("GGIO1$SP$SetPt$setMag$f", MmsData::Float32(5.0)),
+        ] {
+            assert_eq!(
+                write_set_mag(&model, &mms_model, Some(&registry), item_id, data),
+                WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+                "{item_id}"
+            );
+        }
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$SetPt$setMag$f"),
+            MmsValue::Float32(0.0)
+        );
+    }
+
+    /// The ancestor's handler sees the ancestor as it would be after the
+    /// write; accepting lets the leaf be stored, taking the value over leaves
+    /// the cache alone.
+    #[test]
+    fn write_leaf_passes_the_merged_ancestor_value() {
+        let (model, mms_model) = build_test_model();
+        let accept = witness(HandlerWriteOutcome::Accept);
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$SetPt$setMag", accept.clone())
+            .unwrap();
+        let result = write_set_mag(
+            &model,
+            &mms_model,
+            Some(&registry),
+            "GGIO1$SP$SetPt$setMag$f",
+            MmsData::Float32(6.0),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *accept.seen.lock().unwrap(),
+            [MmsValue::Structure(vec![MmsValue::Float32(6.0)])]
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$SetPt$setMag$f"),
+            MmsValue::Float32(6.0)
+        );
+
+        let own = witness(HandlerWriteOutcome::AcceptNoUpdate);
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$SetPt$setMag", own.clone())
+            .unwrap();
+        let result = write_set_mag(
+            &model,
+            &mms_model,
+            Some(&registry),
+            "GGIO1$SP$SetPt$setMag$f",
+            MmsData::Float32(7.0),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(own.seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$SetPt$setMag$f"),
+            MmsValue::Float32(6.0)
         );
     }
 
