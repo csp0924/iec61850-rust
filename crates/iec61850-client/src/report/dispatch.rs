@@ -41,16 +41,19 @@ pub type ReportCallback = Arc<dyn Fn(Arc<ClientReport>) + Send + Sync + 'static>
 struct ReportEntry {
     state: ClientReport,
     callback: ReportCallback,
+    /// Member count every report must carry, from `DatasetDirectory::expected_size`.
+    expected_size: Option<usize>,
 }
 
 /// Optional description of the data set a report is expected to carry.
 ///
-/// Currently only the member count, used as a sanity check at install time.
+/// Currently only the member count, checked against every report.
 #[derive(Debug, Clone, Default)]
 pub struct DatasetDirectory {
-    /// Expected number of data set members. If `Some(n)` and the first report
-    /// carries a different inclusion length, the report is rejected. `None`
-    /// disables the check.
+    /// Expected number of data set members. If `Some(n)`, a report whose
+    /// inclusion bitstring has another length is rejected with
+    /// `StateError::DataSetSizeChanged { prev: n, .. }` and leaves the state and
+    /// the callback untouched. `None` disables the check.
     pub expected_size: Option<usize>,
 }
 
@@ -75,7 +78,8 @@ impl ReportRegistry {
     ///
     /// With `rpt_id` set to `None`, dispatch matches against the RCB reference
     /// with every '.' replaced by '$'. An existing entry for the same RCB
-    /// reference is replaced.
+    /// reference is replaced. `dataset_dir` sets the member count every report
+    /// must carry; see [`DatasetDirectory`].
     ///
     /// # Errors
     ///
@@ -85,7 +89,7 @@ impl ReportRegistry {
         &self,
         rcb_reference: String,
         rpt_id: Option<String>,
-        _dataset_dir: Option<DatasetDirectory>,
+        dataset_dir: Option<DatasetDirectory>,
         callback: ReportCallback,
     ) -> Result<(), ClientError> {
         if let Some(ref id) = rpt_id {
@@ -99,6 +103,7 @@ impl ReportRegistry {
         let entry = ReportEntry {
             state: ClientReport::new(rcb_reference.clone(), rpt_id),
             callback,
+            expected_size: dataset_dir.and_then(|d| d.expected_size),
         };
 
         let mut guard = self.inner.write().await;
@@ -133,15 +138,28 @@ impl ReportRegistry {
         let (callback, snapshot) = {
             let mut guard = self.inner.write().await;
             // Match on the effective RptId of each entry.
-            let matched_key = guard
-                .iter()
-                .find(|(_, e)| e.state.effective_rpt_id() == rpt_id)
-                .map(|(k, _)| k.clone());
-            let Some(key) = matched_key else {
+            let Some(entry) = guard
+                .values_mut()
+                .find(|e| e.state.effective_rpt_id() == rpt_id)
+            else {
                 tracing::debug!(rpt_id = %rpt_id, "no handler matches rpt_id — dropping report");
                 return Ok(());
             };
-            let entry = guard.get_mut(&key).expect("just-found key must exist");
+            if let Some(expected) = entry.expected_size {
+                let carried = parsed.inclusion_bits.len();
+                if carried != expected {
+                    tracing::warn!(
+                        rpt_id = %rpt_id,
+                        expected,
+                        carried,
+                        "report member count differs from the data set directory, rejecting it"
+                    );
+                    return Err(DispatchError::State(StateError::DataSetSizeChanged {
+                        prev: expected,
+                        new: carried,
+                    }));
+                }
+            }
             apply_report(&mut entry.state, parsed).map_err(DispatchError::State)?;
             let snapshot = Arc::new(entry.state.clone());
             (Arc::clone(&entry.callback), snapshot)
@@ -576,6 +594,64 @@ mod tests {
         let cb: ReportCallback = Arc::new(|_| {});
         let r = reg.install("RCB1".to_string(), Some(long), None, cb).await;
         assert!(matches!(r, Err(ClientError::InvalidRptId { len: 129 })));
+    }
+
+    /// Installs a counting handler for `RCB1` with the given expected size.
+    async fn counting_registry(expected_size: Option<usize>) -> (ReportRegistry, Arc<AtomicUsize>) {
+        let reg = ReportRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let cb: ReportCallback = Arc::new(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        reg.install(
+            "RCB1".to_string(),
+            Some("RCB1".to_string()),
+            Some(DatasetDirectory { expected_size }),
+            cb,
+        )
+        .await
+        .unwrap();
+        (reg, counter)
+    }
+
+    #[tokio::test]
+    async fn report_with_another_member_count_than_expected_is_rejected() {
+        let (reg, counter) = counting_registry(Some(2)).await;
+        let r = reg.handle_report(&minimal_report_value("RCB1", 7)).await;
+        assert!(
+            matches!(
+                r,
+                Err(DispatchError::State(StateError::DataSetSizeChanged {
+                    prev: 2,
+                    new: 1
+                }))
+            ),
+            "got {r:?}"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "the callback is not invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_with_the_expected_member_count_is_dispatched() {
+        let (reg, counter) = counting_registry(Some(1)).await;
+        reg.handle_report(&minimal_report_value("RCB1", 7))
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn absent_expected_size_accepts_any_member_count() {
+        let (reg, counter) = counting_registry(None).await;
+        reg.handle_report(&minimal_report_value("RCB1", 7))
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
