@@ -483,6 +483,37 @@ async fn transport_loss_while_polling_is_not_connected() {
     handle.stop().await;
 }
 
+// Host names
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_accepts_ipv6_literals_with_and_without_brackets() {
+    let handle = start_server("[::1]:0").await;
+    let port = handle.bound_addr.port();
+    for host in ["::1", "[::1]"] {
+        let mut client = mms_client(3_000);
+        client
+            .connect(host, port)
+            .await
+            .unwrap_or_else(|e| panic!("{host}: {e}"));
+        assert_eq!(client.state(), ConnectionState::Connected);
+        client.disconnect().await.expect("disconnect");
+    }
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_resolves_a_host_name() {
+    let handle = start_server("127.0.0.1:0").await;
+    let mut client = mms_client(3_000);
+    client
+        .connect("localhost", handle.bound_addr.port())
+        .await
+        .expect("connect localhost");
+    assert_eq!(client.state(), ConnectionState::Connected);
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
 // Outbound PDU size
 
 /// Encodes the Write request `client` would send under `invoke_id` and

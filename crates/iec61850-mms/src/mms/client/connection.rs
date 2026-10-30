@@ -338,6 +338,8 @@ impl<T, Tm> MmsConnection<T, Tm> {
 impl MmsConnection<TcpStream, TokioTimer> {
     /// Runs the full ISO and MMS association sequence over a new TCP connection.
     ///
+    /// `host` is an IP literal, with or without the brackets of an IPv6 literal,
+    /// or a host name, which is resolved and whose addresses are tried in turn.
     /// The sequence is TCP, COTP CR and CC, then Session CN with Presentation CP,
     /// ACSE AARQ and the MMS Initiate request, and the matching Session AC with
     /// Presentation CPA, ACSE AARE and the MMS Initiate response.
@@ -346,25 +348,21 @@ impl MmsConnection<TcpStream, TokioTimer> {
     ///
     /// - `ConnectTimeout` when no TCP connection is established within
     ///   `connect_timeout_ms`.
-    /// - `IsoError` when the address does not parse or the connection is refused.
+    /// - `IsoError` when the name does not resolve or every address refuses.
     /// - The errors of [`Self::connect_via`] for the association itself.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
-        let addr: std::net::SocketAddr = format!("{host}:{port}")
-            .parse()
-            .map_err(|e| ClientError::IsoError(format!("address parse: {e}")))?;
         let timeout_ms = self.connect_timeout_ms;
         let timer = self.timer;
         let tcp = with_timeout(
             &timer,
             Duration::from_millis(timeout_ms),
-            TcpStream::connect(addr),
+            connect_tcp(host, port),
         )
         .await
         .map_err(|_| {
-            warn!(%addr, timeout_ms, "tcp connect timed out");
+            warn!(host, port, timeout_ms, "tcp connect timed out");
             ClientError::ConnectTimeout { timeout_ms }
-        })?
-        .map_err(|e| ClientError::IsoError(format!("TCP connect: {e}")))?;
+        })??;
         // disable Nagle to keep the latency of small PDUs down
         let _ = tcp.set_nodelay(true);
 
@@ -509,6 +507,38 @@ impl MmsConnection<TcpStream, TokioTimer> {
         self.set_state(ConnectionState::Connected);
         Ok(())
     }
+}
+
+/// Resolves `host` and connects to the first of its addresses that accepts.
+///
+/// A bracketed IPv6 literal such as `[::1]` is accepted as well as the bare form.
+#[cfg(feature = "std")]
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ClientError> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+        warn!(host, port, error = %e, "address resolution failed");
+        ClientError::IsoError(format!("address resolution: {e}"))
+    })?;
+    let mut last_error: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => {
+                debug!(%addr, error = %e, "tcp connect attempt failed");
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(match last_error {
+        Some(e) => ClientError::IsoError(format!("TCP connect: {e}")),
+        None => {
+            warn!(host, port, "address resolution returned no address");
+            ClientError::IsoError(format!("address resolution: no address for {host}"))
+        }
+    })
 }
 
 // Transport-generic association handling
