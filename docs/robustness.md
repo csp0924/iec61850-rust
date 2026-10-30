@@ -71,6 +71,7 @@ buffer, never loop without bound, and never leave partial state behind.
 | A peer closing the association while one of its requests is still in flight | Invalidation and access are mutually exclusive: the MMS state is taken out from under the mutex, and background work is counted so a release waits for it to reach zero | `invalidate_marks_inactive`, `invalidated_connection_set_block_requests_returns_false` in `crates/iec61850-server/src/connection.rs` |
 | An update whose value type does not match the data attribute's current type | `TypeMismatch` at run time, rather than an assertion a release build would drop | `update_boolean_type_mismatch_returns_err_no_engine_trigger` in `crates/iec61850-server/tests/reporting_update_hook.rs` |
 | A SetDataSetValues whose data set includes a member the write access policy refuses, or whose value for a member has the wrong type | Each member is written through the single-write path and answered as a Write naming it alone would be; a refused member keeps its value | `set_data_set_values_applies_member_write_access`, `set_data_set_values_refuses_a_mistyped_member` in `crates/iec61850-server/src/service/mod.rs` |
+| An AARQ whose user information is a confirmed request rather than an Initiate-RequestPDU | Answered with an associate reject and the socket closed; the request is never dispatched | `request_in_place_of_initiate_is_not_executed` in `crates/iec61850-server/tests/association_lifecycle.rs` |
 
 ## `iec61850-client`
 

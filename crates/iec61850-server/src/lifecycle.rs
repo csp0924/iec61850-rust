@@ -56,6 +56,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::connection::ClientConnection;
 
+/// Tag of the MMS Initiate-RequestPDU, the only PDU an AARQ may carry.
+const MMS_INITIATE_REQUEST_TAG: u8 = 0xa8;
+
 /// Handle to a running server, returned by `IedServer::start`.
 #[derive(Debug)]
 pub struct ServerHandle {
@@ -363,6 +366,17 @@ where
 
     // The ACSE user information is the MMS Initiate PDU, tag 0xa8.
     let initiate_bytes: bytes::Bytes = bytes::Bytes::copy_from_slice(acse_user_data);
+    // Any other MMS PDU in the AARQ is refused before it reaches the dispatcher,
+    // so no confirmed service runs on an association that has not negotiated.
+    if initiate_bytes.first() != Some(&MMS_INITIATE_REQUEST_TAG) {
+        tracing::warn!(
+            conn_id,
+            first_byte = ?initiate_bytes.first(),
+            "the acse user information is not an initiate-request, sending an associate reject and closing the socket"
+        );
+        send_acse_only(&mut cotp, &mut session, &mut pres, encode_associate_failed).await?;
+        return Err(ConnError::InitiateRejected);
+    }
     let mut mms_conn = MmsServerConnection::new();
     let outcome = parse_message(&mms_conn, dispatcher.as_ref(), &initiate_bytes);
 

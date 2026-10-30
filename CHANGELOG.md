@@ -80,6 +80,11 @@ Every crate in the workspace shares one version number.
   checks refuse keeps its value and is answered with the same failure, and the
   other members of the request are written independently. The values used to
   be stored into the model without any of these checks.
+- **`iec61850-server`** — an AARQ whose user information is any MMS PDU other
+  than an Initiate-RequestPDU is answered with an associate reject and the
+  socket closed, before the PDU reaches the dispatcher. A confirmed request
+  carried there used to be executed even though the association was then
+  refused.
 
 ## [0.2.0] - 2026-09-06
 
