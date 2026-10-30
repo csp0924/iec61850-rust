@@ -66,6 +66,13 @@ Every crate in the workspace shares one version number.
   further ASDU returns `TooManyAsdus` before it is parsed. A frame repeating
   noASDU or the sequence of ASDU is dropped with the new
   `SvError::DuplicateField` instead of the later copy replacing the first.
+- **`iec61850-mms`** — the `AcseAuthenticator` of an `AcseConnection` is
+  handed the credentials the AARQ carries: `AcseAuth::Password` with the
+  charstring calling-authentication-value when mechanism-name is the password
+  OID, and `AcseAuth::None` otherwise. It was always handed `AcseAuth::None`, so
+  an authenticator could not check a password. A failed authentication is
+  logged with the mechanism name, never the credentials, and the `Debug`
+  output of `AcseAuth::Password` gives the password's length, not its content.
 
 ## [0.2.0] - 2026-09-06
 

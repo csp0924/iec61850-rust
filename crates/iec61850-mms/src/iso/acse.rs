@@ -70,7 +70,7 @@ pub enum AcseError {
 /// Listed in IEC 61850-8-1 Table A.1.
 const APP_CONTEXT_NAME_MMS: [u8; 5] = [0x28, 0xca, 0x22, 0x02, 0x03];
 
-/// Password mechanism OID 2.16.840.1.101.2.1.22.3, as BER content octets.
+/// Password mechanism OID 2.2.3.1, as BER content octets.
 const AUTH_MECH_PASSWORD_OID: [u8; 3] = [0x52, 0x03, 0x01];
 
 /// sender-ACSE-requirements BIT STRING value; bit 0 signals authentication.
@@ -128,7 +128,9 @@ pub enum AcseIndication {
 }
 
 /// ACSE authentication credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The `Debug` output of a password gives its length, never its content.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AcseAuth {
     /// No authentication; the mechanism fields are absent.
     None,
@@ -140,6 +142,19 @@ pub enum AcseAuth {
     /// only checked by the TLS handshake itself.
     // TODO: emit the certificate mechanism-name OID so a peer can tell the two apart.
     TlsCertificate(Vec<u8>),
+}
+
+impl core::fmt::Debug for AcseAuth {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AcseAuth::None => f.write_str("None"),
+            AcseAuth::Password(pw) => f
+                .debug_tuple("Password")
+                .field(&format_args!("<{} bytes redacted>", pw.len()))
+                .finish(),
+            AcseAuth::TlsCertificate(cert) => f.debug_tuple("TlsCertificate").field(cert).finish(),
+        }
+    }
 }
 
 /// Application reference taken from calling-AP-title and calling-AE-qualifier.
@@ -210,11 +225,11 @@ impl AcseConnection {
         match tag {
             0x60 => {
                 // AARQ
-                let user_data = self.parse_aarq(buf)?;
-                let (passed, auth_type) = self.check_authentication();
+                let (user_data, auth) = self.parse_aarq(buf)?;
+                let (passed, auth) = self.check_authentication(auth);
                 if !passed {
                     warn!(
-                        mechanism = ?auth_type,
+                        mechanism = mechanism_label(&auth),
                         "acse aarq authentication failed, rejecting association"
                     );
                     return Ok((AcseIndication::AssociateFailed, &[]));
@@ -254,16 +269,15 @@ impl AcseConnection {
 
     /// Checks the association against the authenticator.
     ///
-    /// Returns whether the association is accepted, together with the credentials used.
+    /// Returns whether the association is accepted, together with the credentials
+    /// `auth` taken from the AARQ.
     ///
     /// - Without an authenticator every association is accepted.
-    /// - With one it is called with `AcseAuth::None`, since an AARQ without
-    ///   authentication fields carries no credentials.
-    fn check_authentication(&self) -> (bool, AcseAuth) {
+    /// - With one it is called with `auth` and the calling application reference.
+    fn check_authentication(&self, auth: AcseAuth) -> (bool, AcseAuth) {
         match &self.authenticator {
-            None => (true, AcseAuth::None),
+            None => (true, auth),
             Some(auth_fn) => {
-                let auth = AcseAuth::None;
                 let passed = auth_fn.authenticate(&auth, &self.application_reference);
                 (passed, auth)
             }
@@ -272,8 +286,12 @@ impl AcseConnection {
 
     /// Parses an AARQ PDU, tag 0x60, and updates `application_reference`.
     ///
+    /// Returns the user-information payload and the credentials the AARQ carries:
+    /// `AcseAuth::Password` when mechanism-name is the password OID and
+    /// calling-authentication-value is a charstring, `AcseAuth::None` otherwise.
+    ///
     /// Every TLV is bounds checked before it is read.
-    fn parse_aarq<'buf>(&mut self, buf: &'buf [u8]) -> Result<&'buf [u8], AcseError> {
+    fn parse_aarq<'buf>(&mut self, buf: &'buf [u8]) -> Result<(&'buf [u8], AcseAuth), AcseError> {
         let mut pos = 1usize; // skip the outer tag 0x60
         let outer_len = ber_decode_length(buf, &mut pos, buf.len())?;
         let end = pos + outer_len;
@@ -285,6 +303,8 @@ impl AcseConnection {
         }
 
         let mut user_data: Option<&'buf [u8]> = None;
+        let mut mechanism: Option<&'buf [u8]> = None;
+        let mut auth_value: Option<&'buf [u8]> = None;
 
         while pos < end {
             // Bound the tag byte before reading it
@@ -333,11 +353,13 @@ impl AcseConnection {
                     pos += len;
                 }
                 0x8b => {
-                    // mechanism-name [11] IMPLICIT OID, skipped
+                    // mechanism-name [11] IMPLICIT OID
+                    mechanism = Some(safe_slice(buf, pos, len, end)?);
                     pos += len;
                 }
                 0xac => {
-                    // calling-authentication-value [12] EXPLICIT, skipped
+                    // calling-authentication-value [12] EXPLICIT
+                    auth_value = Some(safe_slice(buf, pos, len, end)?);
                     pos += len;
                 }
                 0xbe => {
@@ -353,13 +375,20 @@ impl AcseConnection {
             }
         }
 
-        match user_data {
-            Some(ud) => Ok(ud),
-            None => {
-                warn!("aarq is missing user-information (0xbe)");
-                Err(AcseError::NoUserData)
+        let Some(ud) = user_data else {
+            warn!("aarq is missing user-information (0xbe)");
+            return Err(AcseError::NoUserData);
+        };
+        let auth = match (mechanism, auth_value) {
+            (Some(oid), Some(value)) if oid == AUTH_MECH_PASSWORD_OID => {
+                match parse_charstring(value)? {
+                    Some(pw) => AcseAuth::Password(pw.to_vec()),
+                    None => AcseAuth::None,
+                }
             }
-        }
+            _ => AcseAuth::None,
+        };
+        Ok((ud, auth))
     }
 
     /// Parses an AARE PDU, tag 0x61, and returns the result code with the
@@ -693,6 +722,35 @@ fn build_user_information(payload: &[u8], next_reference: u32) -> Vec<u8> {
     out.extend_from_slice(payload);
 
     out
+}
+
+/// Returns the charstring alternative of an Authentication-value, the content of
+/// calling-authentication-value `[12]`, or `None` for any other alternative.
+///
+/// A charstring `[0]` IMPLICIT GraphicString that does not fill `value` exactly
+/// is ignored rather than read as a password.
+fn parse_charstring(value: &[u8]) -> Result<Option<&[u8]>, AcseError> {
+    let mut pos = 0usize;
+    let end = value.len();
+    if safe_get_byte(value, &mut pos, end)? != 0x80 {
+        return Ok(None);
+    }
+    let len = ber_decode_length(value, &mut pos, end)?;
+    let charstring = safe_slice(value, pos, len, end)?;
+    if pos + len != end {
+        warn!("calling-authentication-value carries bytes after its charstring, ignoring it");
+        return Ok(None);
+    }
+    Ok(Some(charstring))
+}
+
+/// Names the mechanism of `auth` for logging, without its credentials.
+fn mechanism_label(auth: &AcseAuth) -> &'static str {
+    match auth {
+        AcseAuth::None => "none",
+        AcseAuth::Password(_) => "password",
+        AcseAuth::TlsCertificate(_) => "certificate",
+    }
 }
 
 /// Builds the authentication fields for the no-auth and password mechanisms.
@@ -1467,5 +1525,118 @@ mod tests {
             pdu.windows(result_field.len()).any(|w| w == result_field),
             "encode_associate_failed must carry result 1"
         );
+    }
+
+    // AARQ credentials reach the authenticator
+
+    /// Accepts one password and records the credentials it is handed.
+    struct PasswordAuthenticator {
+        expected: Vec<u8>,
+        seen: std::sync::Arc<std::sync::Mutex<Option<AcseAuth>>>,
+    }
+
+    impl AcseAuthenticator for PasswordAuthenticator {
+        fn authenticate(&self, auth: &AcseAuth, _app_ref: &IsoApplicationReference) -> bool {
+            *self.seen.lock().unwrap() = Some(auth.clone());
+            matches!(auth, AcseAuth::Password(pw) if *pw == self.expected)
+        }
+    }
+
+    fn password_conn(
+        expected: &[u8],
+    ) -> (
+        AcseConnection,
+        std::sync::Arc<std::sync::Mutex<Option<AcseAuth>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let auth = PasswordAuthenticator {
+            expected: expected.to_vec(),
+            seen: seen.clone(),
+        };
+        (AcseConnection::new(Some(Box::new(auth))), seen)
+    }
+
+    /// The password an AARQ carries under the password mechanism-name is handed
+    /// to the authenticator, which decides the association on it.
+    #[test]
+    fn aarq_password_reaches_authenticator() {
+        let (mut conn, seen) = password_conn(b"secret");
+        let aarq = make_aarq_pw(&[0x01, 0x02], b"secret");
+        let (indication, user_data) = conn.parse_message(&aarq).unwrap();
+        assert_eq!(indication, AcseIndication::Associate);
+        assert_eq!(user_data, &[0x01, 0x02]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(AcseAuth::Password(b"secret".to_vec()))
+        );
+    }
+
+    #[test]
+    fn aarq_wrong_password_rejected() {
+        let (mut conn, seen) = password_conn(b"secret");
+        let aarq = make_aarq_pw(&[0x01, 0x02], b"guess");
+        let (indication, _) = conn.parse_message(&aarq).unwrap();
+        assert_eq!(indication, AcseIndication::AssociateFailed);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(AcseAuth::Password(b"guess".to_vec()))
+        );
+    }
+
+    #[test]
+    fn aarq_without_credentials_passes_none() {
+        let (mut conn, seen) = password_conn(b"secret");
+        let aarq = make_aarq(&[0x01, 0x02]);
+        let (indication, _) = conn.parse_message(&aarq).unwrap();
+        assert_eq!(indication, AcseIndication::AssociateFailed);
+        assert_eq!(*seen.lock().unwrap(), Some(AcseAuth::None));
+    }
+
+    /// A charstring followed by further bytes inside calling-authentication-value
+    /// is not presented as a password.
+    #[test]
+    fn aarq_charstring_with_trailing_bytes_passes_none() {
+        let (mut conn, seen) = password_conn(b"secret");
+        let mut aarq = make_aarq_pw(&[0x01, 0x02], b"secret");
+        // ac 08 80 06 "secret" -> ac 0a 80 06 "secret" 00 00, outer lengths adjusted
+        let pos = aarq
+            .windows(4)
+            .position(|w| w == [0xac, 0x08, 0x80, 0x06])
+            .unwrap();
+        aarq[pos + 1] = 0x0a;
+        aarq.splice(pos + 10..pos + 10, [0x00, 0x00]);
+        assert!(
+            aarq[1] < 0x80,
+            "the test aarq uses a short-form outer length"
+        );
+        aarq[1] += 2;
+        let (indication, _) = conn.parse_message(&aarq).unwrap();
+        assert_eq!(indication, AcseIndication::AssociateFailed);
+        assert_eq!(*seen.lock().unwrap(), Some(AcseAuth::None));
+    }
+
+    /// The `Debug` output of a password names its length and leaves out its bytes.
+    #[test]
+    fn acse_auth_debug_redacts_password() {
+        let text = format!("{:?}", AcseAuth::Password(b"hunter2".to_vec()));
+        assert_eq!(text, "Password(<7 bytes redacted>)");
+        assert!(!text.contains("hunter2") && !text.contains("104"));
+        assert_eq!(format!("{:?}", AcseAuth::None), "None");
+    }
+
+    /// An authentication value under a mechanism-name other than the password one
+    /// is not presented as a password.
+    #[test]
+    fn aarq_value_under_unknown_mechanism_passes_none() {
+        let (mut conn, seen) = password_conn(b"secret");
+        let mut aarq = make_aarq_pw(&[0x01, 0x02], b"secret");
+        let pos = aarq
+            .windows(AUTH_MECH_PASSWORD_OID.len())
+            .position(|w| w == AUTH_MECH_PASSWORD_OID)
+            .unwrap();
+        aarq[pos + 2] = 0x02;
+        let (indication, _) = conn.parse_message(&aarq).unwrap();
+        assert_eq!(indication, AcseIndication::AssociateFailed);
+        assert_eq!(*seen.lock().unwrap(), Some(AcseAuth::None));
     }
 }
