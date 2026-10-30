@@ -132,6 +132,11 @@ Every crate in the workspace shares one version number.
   association setup through the Initiate response within
   `IedServerConfig::association_setup_timeout_ms`, 10 000 ms by default, is
   closed.
+- **`iec61850-server`** — a Read or Write request is decoded under the
+  `dataStructureNestingLevel` negotiated for the association when that is
+  smaller than the local limit of 32, so data or an alternate access nested
+  deeper than the association allows is answered with a confirmed error
+  instead of being decoded.
 
 ## [0.2.0] - 2026-09-06
 

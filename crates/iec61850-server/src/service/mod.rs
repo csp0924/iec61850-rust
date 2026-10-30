@@ -470,6 +470,10 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
             }
         }
 
+        // Read and Write decode their data and alternate access no deeper than
+        // the nesting level the association negotiated.
+        let negotiated_nesting_level = conn.negotiated().map(|p| p.data_structure_nesting_level);
+
         // Every answer below leaves through the outbound size guard, so a
         // service added later is bounded by the negotiated maximum PDU size
         // without having to arrange it itself.
@@ -511,6 +515,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &self.log_controls,
                 conn_id,
                 conn.negotiated_max_pdu_size(),
+                negotiated_nesting_level,
             ),
             SERVICE_TAG_WRITE => dispatch_write(
                 invoke_id,
@@ -530,6 +535,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "goose-mapping")]
                 &self.gocb_registry,
                 conn_id,
+                negotiated_nesting_level,
             ),
             // DefineNamedVariableList, the mapping of CreateDataSet.
             #[cfg(feature = "reporting")]
@@ -858,8 +864,9 @@ fn dispatch_read(
     #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
     conn_id: u64,
     negotiated_max_pdu_size: Option<u32>,
+    negotiated_nesting_level: Option<u8>,
 ) -> ConfirmedResponse {
-    let req = match ReadRequest::decode(body) {
+    let req = match ReadRequest::decode_with_negotiated_cap(body, negotiated_nesting_level) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -1068,9 +1075,10 @@ fn dispatch_read(
     _handler_registry: &HandlerRegistry,
     _conn_id: u64,
     negotiated_max_pdu_size: Option<u32>,
+    negotiated_nesting_level: Option<u8>,
 ) -> ConfirmedResponse {
     use crate::service::read::{handle_single_read_with_budget, LookupResult};
-    let req = match ReadRequest::decode(body) {
+    let req = match ReadRequest::decode_with_negotiated_cap(body, negotiated_nesting_level) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(invoke_id, error = %e, "read request failed to decode, answering confirmed-error");
@@ -1275,8 +1283,9 @@ fn dispatch_write(
     #[cfg(feature = "setting-groups")] setting_groups: &crate::setting_groups::SettingGroupRegistry,
     #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
     conn_id: u64,
+    negotiated_nesting_level: Option<u8>,
 ) -> ConfirmedResponse {
-    let req = match WriteRequest::decode(body) {
+    let req = match WriteRequest::decode_with_negotiated_cap(body, negotiated_nesting_level) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -1486,8 +1495,9 @@ fn dispatch_write(
     policies: &WriteAccessPolicies,
     handler_registry: &HandlerRegistry,
     conn_id: u64,
+    negotiated_nesting_level: Option<u8>,
 ) -> ConfirmedResponse {
-    let req = match WriteRequest::decode(body) {
+    let req = match WriteRequest::decode_with_negotiated_cap(body, negotiated_nesting_level) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(invoke_id, error = %e, "write request failed to decode, answering confirmed-error");
@@ -3649,6 +3659,100 @@ mod tests {
             ConfirmedResponse::Response(_)
         ));
         assert_defined(define_dataset(&dispatcher, 3, "d3"));
+    }
+
+    // ── Negotiated nesting level ─────────────────────────────────────
+
+    /// A connection that has negotiated `level` as its
+    /// dataStructureNestingLevel.
+    fn conn_with_nesting(level: u8) -> MmsServerConnection {
+        use iec61850_mms::mms::server::connection::NegotiatedParams;
+
+        let mut conn = MmsServerConnection::new();
+        conn.set_negotiated(NegotiatedParams {
+            data_structure_nesting_level: level,
+            ..NegotiatedParams::default()
+        });
+        conn
+    }
+
+    fn is_decode_error(resp: &ConfirmedResponse) -> bool {
+        use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
+
+        match resp {
+            ConfirmedResponse::Error(bytes) => {
+                let (_, service_error) =
+                    decode_confirmed_error_pdu(bytes).expect("the confirmed error must decode");
+                service_error.error_class == ErrorClass::Access(access::OTHER)
+            }
+            _ => false,
+        }
+    }
+
+    /// A Read whose alternate access nests deeper than the negotiated
+    /// dataStructureNestingLevel is refused as undecodable, and the same
+    /// request is served on an association that negotiated a deeper level.
+    #[test]
+    fn read_alternate_access_is_bounded_by_the_negotiated_nesting_level() {
+        use iec61850_mms::mms::pdu::common::VariableAccessSpecification;
+        use iec61850_mms::mms::pdu::common::{AlternateAccess, ListOfVariableEntry, ObjectName};
+        use iec61850_mms::mms::pdu::read::{encode_confirmed_read_request, ReadRequest};
+
+        let dispatcher = build_dispatcher();
+        let req = ReadRequest {
+            specification_with_result: false,
+            variable_access_spec: VariableAccessSpecification::ListOfVariable(vec![
+                ListOfVariableEntry::with_alt_access(
+                    ObjectName::DomainSpecific {
+                        domain_id: "IED1LD0".into(),
+                        item_id: "MMXU1$MX$TotW".into(),
+                    },
+                    AlternateAccess::index_component(0, "a$b$c$d").unwrap(),
+                ),
+            ]),
+        };
+        let mut full = BytesMut::new();
+        encode_confirmed_read_request(31, &req, &mut full);
+        let request = || ConfirmedRequest {
+            invoke_id: 31,
+            service_body: extract_service_body_from_confirmed_request(&full),
+        };
+
+        assert!(is_decode_error(
+            &dispatcher.dispatch(&conn_with_nesting(2), request())
+        ));
+        assert!(matches!(
+            dispatcher.dispatch(&conn_with_nesting(10), request()),
+            ConfirmedResponse::Response(_)
+        ));
+    }
+
+    /// A Write whose data nests deeper than the negotiated
+    /// dataStructureNestingLevel is refused as undecodable, and the same
+    /// request is decoded on an association that negotiated a deeper level.
+    #[test]
+    fn write_data_is_bounded_by_the_negotiated_nesting_level() {
+        use iec61850_mms::mms::pdu::write::{encode_confirmed_write_request, WriteRequest};
+
+        let dispatcher = build_dispatcher();
+        let nested = MmsData::Structure(vec![MmsData::Structure(vec![MmsData::Structure(vec![
+            MmsData::Structure(vec![MmsData::Integer(1)]),
+        ])])]);
+        let req = WriteRequest::single_domain("IED1LD0", "GGIO1$CF$Mod$ctlModel", nested);
+        let mut full = BytesMut::new();
+        encode_confirmed_write_request(32, &req, &mut full);
+        let request = || ConfirmedRequest {
+            invoke_id: 32,
+            service_body: extract_service_body_from_confirmed_request(&full),
+        };
+
+        assert!(is_decode_error(
+            &dispatcher.dispatch(&conn_with_nesting(2), request())
+        ));
+        assert!(matches!(
+            dispatcher.dispatch(&conn_with_nesting(10), request()),
+            ConfirmedResponse::Response(_)
+        ));
     }
 
     // ── GetVarAccessAttrs → Response ─────────────────────────────────
