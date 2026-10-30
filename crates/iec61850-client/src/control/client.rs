@@ -33,6 +33,7 @@ use iec61850_mms::mms::pdu::common::MmsData;
 use iec61850_mms::mms::pdu::common::ObjectName;
 #[cfg(feature = "std")]
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
+use iec61850_mms::ClientError as MmsClientError;
 use iec61850_model::value::MmsValue;
 
 use crate::error::ClientError;
@@ -237,8 +238,10 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// # Errors
     ///
-    /// `NotConnected` if the association is closed, and `InvalidArgument` unless
-    /// the control model is sbo-enhanced.
+    /// `NotConnected` if the association is closed, `InvalidArgument` unless
+    /// the control model is sbo-enhanced, and any MMS-layer error other than
+    /// the server refusing the write, such as a timeout or a lost connection,
+    /// after which the fate of the command is unknown.
     pub async fn select_with_value(
         &self,
         ctl_val: MmsValue,
@@ -271,7 +274,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         };
         match result {
             Ok(()) => Ok(ControlOutcome::Success),
-            Err(e) => Ok(self.write_err_to_outcome(e.into())),
+            Err(e) => self.write_err_to_outcome(e),
         }
     }
 
@@ -290,8 +293,10 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// # Errors
     ///
     /// `NotConnected` if the association is closed, `Mms` if no command
-    /// termination arrives within the timeout, and `InvalidArgument` for an
-    /// enhanced model on a build without `std`.
+    /// termination arrives within the timeout or the MMS layer fails other than
+    /// by the server refusing the write, such as a timeout or a lost
+    /// connection, after which the fate of the command is unknown; and
+    /// `InvalidArgument` for an enhanced model on a build without `std`.
     pub async fn operate(&self, ctl_val: MmsValue) -> Result<ControlOutcome, ClientError> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err(ClientError::NotConnected);
@@ -327,7 +332,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
                 .await
             {
                 Ok(()) => Ok(ControlOutcome::Success),
-                Err(e) => Ok(self.write_err_to_outcome(e.into())),
+                Err(e) => self.write_err_to_outcome(e),
             };
         }
 
@@ -350,13 +355,14 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
                     ))),
                 },
                 Err(e) => {
+                    let refused = self.write_err_to_outcome(e)?;
                     // A CT- may still follow a rejected write.
                     match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT).await {
                         Ok(Some(ct)) => match ct.last_appl_error {
                             Some(err) => Ok(ControlOutcome::Failure(err.add_cause)),
                             None => Ok(ControlOutcome::Failure(ControlAddCause::Unknown)),
                         },
-                        _ => Ok(self.write_err_to_outcome(e.into())),
+                        _ => Ok(refused),
                     }
                 }
             }
@@ -379,7 +385,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// # Errors
     ///
-    /// `NotConnected` if the association is closed.
+    /// `NotConnected` if the association is closed, and any MMS-layer error
+    /// other than the server refusing the write, such as a timeout or a lost
+    /// connection.
     pub async fn cancel(&self, ctl_val: MmsValue) -> Result<ControlOutcome, ClientError> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err(ClientError::NotConnected);
@@ -401,7 +409,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         };
         match result {
             Ok(()) => Ok(ControlOutcome::Success),
-            Err(e) => Ok(self.write_err_to_outcome(e.into())),
+            Err(e) => self.write_err_to_outcome(e),
         }
     }
 
@@ -413,14 +421,20 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         prev.wrapping_add(1)
     }
 
-    /// Maps a rejected write to a failed outcome.
+    /// Maps a failed control write onto the result of the command.
     ///
-    /// The confirmed error carries no add cause, so `Unknown` is reported. Only
-    /// an MMS or service error becomes a failure; a transport-level error such
-    /// as `NotConnected` is propagated by the caller instead.
-    fn write_err_to_outcome(&self, e: ClientError) -> ControlOutcome {
-        tracing::warn!(error = %e, "control write rejected");
-        ControlOutcome::Failure(ControlAddCause::Unknown)
+    /// A data access error or a confirmed service error is the server refusing
+    /// the command, a `Failure`; the confirmed error carries no add cause, so
+    /// `Unknown` is reported. Any other error leaves the fate of the command
+    /// unknown and is returned unchanged.
+    fn write_err_to_outcome(&self, e: MmsClientError) -> Result<ControlOutcome, ClientError> {
+        match e {
+            MmsClientError::DataAccessError(_) | MmsClientError::ServiceError { .. } => {
+                tracing::warn!(error = %e, "control write rejected");
+                Ok(ControlOutcome::Failure(ControlAddCause::Unknown))
+            }
+            other => Err(other.into()),
+        }
     }
 
     /// Waits for one command termination.
