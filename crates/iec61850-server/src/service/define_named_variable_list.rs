@@ -9,7 +9,13 @@
 //! list names are served: a vmd-specific or aa-specific name decodes but is
 //! answered with `ObjectAccessUnsupported`, because the reporting engine also
 //! handles only domain-specific data sets.
+//!
+//! Such a data set is persistent: it outlives the association that created it.
+//! [`DynamicDatasetQuota`] bounds how many exist across the server and how many
+//! of them one association has created; a request beyond either limit is
+//! answered with `Resource(CapabilityUnavailable)`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
@@ -28,6 +34,7 @@ use iec61850_mms::mms::pdu::{
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
 use iec61850_model::IedModel;
 
+use crate::connection::ConnectionId;
 use crate::reporting::{DatasetError, DatasetRegistry, DynamicDatasetOps};
 
 /// Keys of the data sets created at runtime, shared with the dispatcher.
@@ -42,6 +49,60 @@ pub fn new_dynamic_dataset_keys() -> DynamicDatasetKeys {
     Arc::new(Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Limits on the data sets clients create at run time, and the association
+/// that created each one.
+///
+/// The total counts every data set in the dynamic-key set. The per-association
+/// count covers the data sets an association created that have not been
+/// deleted. A connection id is never reused, so the data sets an association
+/// leaves behind when it closes count towards the total only.
+#[derive(Debug)]
+pub struct DynamicDatasetQuota {
+    max_total: usize,
+    max_per_association: usize,
+    /// Creating association of each run-time data set, keyed as the registry.
+    owners: Mutex<HashMap<(String, String), ConnectionId>>,
+}
+
+impl DynamicDatasetQuota {
+    /// Default limit on the run-time data sets across the server.
+    pub const DEFAULT_MAX_TOTAL: usize = 64;
+    /// Default limit on the run-time data sets one association may create.
+    pub const DEFAULT_MAX_PER_ASSOCIATION: usize = 16;
+
+    /// Creates a quota with the given limits and no data sets.
+    pub fn new(max_total: usize, max_per_association: usize) -> Self {
+        Self {
+            max_total,
+            max_per_association,
+            owners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the limit across the server.
+    pub fn max_total(&self) -> usize {
+        self.max_total
+    }
+
+    /// Returns the limit for one association.
+    pub fn max_per_association(&self) -> usize {
+        self.max_per_association
+    }
+
+    /// Stops charging a deleted data set to the association that created it.
+    pub(crate) fn forget(&self, key: &(String, String)) {
+        if let Ok(mut owners) = self.owners.lock() {
+            owners.remove(key);
+        }
+    }
+}
+
+impl Default for DynamicDatasetQuota {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_TOTAL, Self::DEFAULT_MAX_PER_ASSOCIATION)
+    }
+}
+
 /// Handles a DefineNamedVariableList request (confirmed service tag 0xab).
 pub(crate) fn handle_define_named_variable_list(
     invoke_id: u32,
@@ -49,6 +110,8 @@ pub(crate) fn handle_define_named_variable_list(
     ied_model: &IedModel,
     registry: &DatasetRegistry,
     dynamic_keys: &DynamicDatasetKeys,
+    quota: &DynamicDatasetQuota,
+    conn_id: ConnectionId,
 ) -> ConfirmedResponse {
     let req = match DefineNamedVariableListRequest::decode(body) {
         Ok(r) => r,
@@ -88,8 +151,42 @@ pub(crate) fn handle_define_named_variable_list(
         .map(|e| (e.domain_id.clone(), e.item_id.clone()))
         .collect();
 
+    // Held until the data set is registered, so concurrent requests cannot
+    // both pass the limit check.
+    let Ok(mut owners) = quota.owners.lock() else {
+        tracing::warn!(
+            invoke_id,
+            "dynamic dataset quota is poisoned, answering resource error"
+        );
+        return crate::service::make_confirmed_error_pub(
+            invoke_id,
+            ErrorClass::Resource(resource::OTHER),
+        );
+    };
+    let total = match dynamic_keys.lock() {
+        Ok(keys) => keys.len(),
+        Err(_) => quota.max_total,
+    };
+    let created_here = owners.values().filter(|owner| **owner == conn_id).count();
+    if total >= quota.max_total || created_here >= quota.max_per_association {
+        tracing::warn!(
+            invoke_id,
+            conn_id,
+            total,
+            created_here,
+            max_total = quota.max_total,
+            max_per_association = quota.max_per_association,
+            "define-named-variable-list exceeds the run-time data set limit, answering capability-unavailable"
+        );
+        return crate::service::make_confirmed_error_pub(
+            invoke_id,
+            ErrorClass::Resource(resource::CAPABILITY_UNAVAILABLE),
+        );
+    }
+
     match DynamicDatasetOps::add_dynamic(registry, ied_model, &domain, &list_name, members) {
         Ok(_meta) => {
+            owners.insert((domain.clone(), list_name.clone()), conn_id);
             match dynamic_keys.lock() {
                 Ok(mut keys) => {
                     keys.insert((domain.clone(), list_name.clone()));

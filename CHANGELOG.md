@@ -24,9 +24,12 @@ Every crate in the workspace shares one version number.
   a subscriber built without it delivers every ASDU whatever its sample length.
   `SvSubscriber::expected_sample_size` returns the configured length, or 0.
 - **`iec61850-server`** — `IedServerConfig` has new public fields,
-  `association_setup_timeout_ms`, `association_idle_timeout_ms` and
-  `association_send_timeout_ms`. A configuration written as a struct literal
-  without `..Default::default()` no longer compiles and needs the fields added.
+  `association_setup_timeout_ms`, `association_idle_timeout_ms`,
+  `association_send_timeout_ms`, `max_dynamic_datasets` and
+  `max_dynamic_datasets_per_association`, and
+  `MmsModelDispatcher` has a new public field, `dynamic_dataset_quota`. A
+  configuration or a dispatcher written as a struct literal without
+  `..Default::default()` no longer compiles and needs the fields added.
 - **`iec61850-server`** — an established association that neither receives a
   PDU nor completes the send of one for
   `IedServerConfig::association_idle_timeout_ms`, 300 000 ms by default, is
@@ -38,6 +41,15 @@ Every crate in the workspace shares one version number.
   `IedServerConfig::association_send_timeout_ms`, 10 000 ms by default. A peer
   that stops reading has its connection closed without a further write, and
   what its association holds is released.
+- **`iec61850-server`** — DefineNamedVariableList, the ACSI CreateDataSet
+  service, is answered with errorClass `resource capability-unavailable` once
+  the data sets created at run time reach
+  `IedServerConfig::max_dynamic_datasets`, 64 by default, or the requesting
+  association has created
+  `IedServerConfig::max_dynamic_datasets_per_association` of them, 16 by
+  default. Deleting a data set makes room again. A data set created at run
+  time is persistent: it outlives its association and counts against the
+  total until it is deleted.
 
 ### Added
 
@@ -50,6 +62,9 @@ Every crate in the workspace shares one version number.
   Presentation and ACSE envelope.
 - **`iec61850-sv`** — `SvSubscriberBuilder::sample_size`, the sample length
   every delivered ASDU must have.
+- **`iec61850-server`** — `DynamicDatasetQuota`, the limits on the data sets
+  DefineNamedVariableList creates, installed on a dispatcher through
+  `MmsModelDispatcher::with_dynamic_dataset_quota`.
 
 ### Fixed
 

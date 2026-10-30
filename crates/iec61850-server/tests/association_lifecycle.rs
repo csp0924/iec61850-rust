@@ -5,8 +5,9 @@
 //! that ends on a transport error, whose URCB reservation and setting group
 //! edit session must be released at once; and sockets that never associate,
 //! which count against the connection limit from accept and are closed once
-//! the association setup timeout runs out. The idle and send timeouts are
-//! covered on a paused clock in the `lifecycle` unit tests.
+//! the association setup timeout runs out; and the data sets an association
+//! creates, which are limited per association and outlive it. The idle and
+//! send timeouts are covered on a paused clock in the `lifecycle` unit tests.
 //!
 //! Every test binds 127.0.0.1:0 so concurrent tests cannot collide on a port.
 
@@ -384,5 +385,66 @@ async fn stalled_setup_is_closed_after_the_setup_timeout() {
         reconnected.is_ok(),
         "a client that completes setup in time associates"
     );
+    handle.stop().await;
+}
+
+/// An association that has created its quota of data sets is refused another,
+/// a later association can create one, and the data sets the first left behind
+/// still exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_set_limit_applies_per_association() {
+    use iec61850_mms::mms::pdu::DefineNamedVariableEntry;
+
+    let (model, _vendor) = model_with_writable_vendor();
+    let server = build_server(
+        model,
+        IedServerConfig {
+            max_dynamic_datasets_per_association: 1,
+            ..Default::default()
+        },
+    );
+    let handle = server.start().await.expect("start");
+    let port = handle.bound_addr.port();
+    let member = || {
+        vec![DefineNamedVariableEntry::domain(
+            "TESTLD0",
+            "LLN0$DC$NamPlt$vendor",
+        )]
+    };
+
+    let mut first = connect(port).await;
+    first
+        .define_named_variable_list("TESTLD0", "LLN0$ds1", member())
+        .await
+        .expect("the first data set is created");
+    assert!(
+        first
+            .define_named_variable_list("TESTLD0", "LLN0$ds2", member())
+            .await
+            .is_err(),
+        "a second data set exceeds the per-association limit"
+    );
+    let _ = first.disconnect().await;
+
+    let created = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let mut next = connect(port).await;
+            let ok = next
+                .define_named_variable_list("TESTLD0", "LLN0$ds2", member())
+                .await
+                .is_ok();
+            let _ = next.disconnect().await;
+            if ok {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        created.is_ok(),
+        "a later association is not charged for the first one's data sets"
+    );
+    assert_eq!(server.dynamic_dataset_count(), 2);
     handle.stop().await;
 }

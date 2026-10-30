@@ -211,6 +211,10 @@ pub struct MmsModelDispatcher {
     /// both agree on which data sets may be deleted.
     #[cfg(feature = "reporting")]
     pub dynamic_dataset_keys: define_named_variable_list::DynamicDatasetKeys,
+    /// Limits on the data sets DefineNamedVariableList creates, shared with the
+    /// server.
+    #[cfg(feature = "reporting")]
+    pub dynamic_dataset_quota: Arc<define_named_variable_list::DynamicDatasetQuota>,
     /// GOOSE control blocks. Read and Write try the `GO$` path before the
     /// setting-group and reporting routes, and GetNameList adds
     /// `<LN>$GO$<gcb>[$<DA>]` entries from here. Empty by default.
@@ -260,6 +264,10 @@ impl MmsModelDispatcher {
             setting_groups: Arc::new(crate::setting_groups::SettingGroupRegistry::new()),
             #[cfg(feature = "reporting")]
             dynamic_dataset_keys: define_named_variable_list::new_dynamic_dataset_keys(),
+            #[cfg(feature = "reporting")]
+            dynamic_dataset_quota: Arc::new(
+                define_named_variable_list::DynamicDatasetQuota::default(),
+            ),
             #[cfg(feature = "goose-mapping")]
             gocb_registry: Arc::new(GoCBRegistry::new()),
         }
@@ -281,6 +289,17 @@ impl MmsModelDispatcher {
         keys: define_named_variable_list::DynamicDatasetKeys,
     ) -> Self {
         self.dynamic_dataset_keys = keys;
+        self
+    }
+
+    /// Installs the run-time data set limits, which the server builder shares
+    /// with the server itself.
+    #[cfg(feature = "reporting")]
+    pub fn with_dynamic_dataset_quota(
+        mut self,
+        quota: Arc<define_named_variable_list::DynamicDatasetQuota>,
+    ) -> Self {
+        self.dynamic_dataset_quota = quota;
         self
     }
 
@@ -520,6 +539,8 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &self.model,
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
+                &self.dynamic_dataset_quota,
+                conn_id,
             ),
             // GetNamedVariableListAttributes, the mapping of GetDataSetDirectory.
             #[cfg(feature = "reporting")]
@@ -536,6 +557,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &body,
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
+                &self.dynamic_dataset_quota,
             ),
             other => {
                 tracing::warn!(
@@ -3496,6 +3518,137 @@ mod tests {
             MmsValue::Integer(0),
             "a refused member keeps its value"
         );
+    }
+
+    // ── DefineNamedVariableList limits ───────────────────────────────
+
+    /// A dispatcher whose run-time data sets are limited to `max_total` across
+    /// the server and `max_per_association` per association.
+    #[cfg(feature = "reporting")]
+    fn dispatcher_with_quota(max_total: usize, max_per_association: usize) -> MmsModelDispatcher {
+        build_dispatcher().with_dynamic_dataset_quota(Arc::new(
+            define_named_variable_list::DynamicDatasetQuota::new(max_total, max_per_association),
+        ))
+    }
+
+    /// Sends DefineNamedVariableList for `IED1LD0/GGIO1$<name>` over one member
+    /// on the association `conn_id`.
+    #[cfg(feature = "reporting")]
+    fn define_dataset(
+        dispatcher: &MmsModelDispatcher,
+        conn_id: u64,
+        name: &str,
+    ) -> ConfirmedResponse {
+        use iec61850_mms::mms::pdu::define_named_variable_list::{
+            encode_confirmed_define_named_variable_list_request, DefineNamedVariableEntry,
+            DefineNamedVariableListRequest,
+        };
+
+        let req = DefineNamedVariableListRequest::domain(
+            "IED1LD0",
+            format!("GGIO1${name}"),
+            vec![DefineNamedVariableEntry::domain(
+                "IED1LD0",
+                "GGIO1$CF$Mod$ctlModel",
+            )],
+        );
+        let mut full = BytesMut::new();
+        encode_confirmed_define_named_variable_list_request(21, &req, &mut full)
+            .expect("the request encodes");
+        let mut conn = make_conn();
+        conn.set_connection_id(conn_id);
+        dispatcher.dispatch(
+            &conn,
+            ConfirmedRequest {
+                invoke_id: 21,
+                service_body: extract_service_body_from_confirmed_request(&full),
+            },
+        )
+    }
+
+    #[cfg(feature = "reporting")]
+    fn assert_defined(resp: ConfirmedResponse) {
+        assert!(
+            matches!(resp, ConfirmedResponse::Response(_)),
+            "the data set must be created, got {:?}",
+            resp
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn assert_capability_unavailable(resp: ConfirmedResponse) {
+        use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
+
+        match resp {
+            ConfirmedResponse::Error(bytes) => {
+                let (_, service_error) =
+                    decode_confirmed_error_pdu(&bytes).expect("the confirmed error must decode");
+                assert_eq!(
+                    service_error.error_class,
+                    ErrorClass::Resource(resource::CAPABILITY_UNAVAILABLE)
+                );
+            }
+            other => panic!("expected capability-unavailable, got {:?}", other),
+        }
+    }
+
+    /// One association can create only `max_per_association` data sets while
+    /// another still can, and deleting one of them, from any association, lets
+    /// it create another.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn define_named_variable_list_is_bounded_per_association() {
+        let dispatcher = dispatcher_with_quota(8, 2);
+        assert_defined(define_dataset(&dispatcher, 1, "a1"));
+        assert_defined(define_dataset(&dispatcher, 1, "a2"));
+        assert_capability_unavailable(define_dataset(&dispatcher, 1, "a3"));
+        assert_defined(define_dataset(&dispatcher, 2, "b1"));
+
+        assert!(matches!(
+            delete_dataset(&dispatcher, "a1"),
+            ConfirmedResponse::Response(_)
+        ));
+        assert_defined(define_dataset(&dispatcher, 1, "a3"));
+    }
+
+    /// Sends DeleteNamedVariableList for `IED1LD0/GGIO1$<name>`.
+    #[cfg(feature = "reporting")]
+    fn delete_dataset(dispatcher: &MmsModelDispatcher, name: &str) -> ConfirmedResponse {
+        use iec61850_mms::mms::pdu::delete_named_variable_list::{
+            encode_confirmed_delete_named_variable_list_request, DeleteNamedVariableListRequest,
+        };
+
+        let mut full = BytesMut::new();
+        encode_confirmed_delete_named_variable_list_request(
+            22,
+            &DeleteNamedVariableListRequest::specific_domain("IED1LD0", format!("GGIO1${name}")),
+            &mut full,
+        );
+        dispatcher.dispatch(
+            &make_conn(),
+            ConfirmedRequest {
+                invoke_id: 22,
+                service_body: extract_service_body_from_confirmed_request(&full),
+            },
+        )
+    }
+
+    /// The run-time data sets across all associations stop at `max_total`, and
+    /// deleting one makes room for another.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn define_named_variable_list_is_bounded_in_total() {
+        let dispatcher = dispatcher_with_quota(2, 8);
+        assert_defined(define_dataset(&dispatcher, 1, "d1"));
+        assert_defined(define_dataset(&dispatcher, 2, "d2"));
+        assert_capability_unavailable(define_dataset(&dispatcher, 3, "d3"));
+        assert_eq!(dispatcher.dataset_registry.read().unwrap().len(), 2);
+
+        assert!(matches!(
+            delete_dataset(&dispatcher, "d1"),
+            ConfirmedResponse::Response(_)
+        ));
+        assert_defined(define_dataset(&dispatcher, 3, "d3"));
     }
 
     // ── GetVarAccessAttrs → Response ─────────────────────────────────

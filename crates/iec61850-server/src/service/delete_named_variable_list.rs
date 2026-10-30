@@ -22,13 +22,14 @@ use iec61850_mms::mms::pdu::{
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
 
 use crate::reporting::{DatasetRegistry, DynamicDatasetOps};
-use crate::service::define_named_variable_list::DynamicDatasetKeys;
+use crate::service::define_named_variable_list::{DynamicDatasetKeys, DynamicDatasetQuota};
 
 pub(crate) fn handle_delete_named_variable_list(
     invoke_id: u32,
     body: &[u8],
     registry: &DatasetRegistry,
     dynamic_keys: &DynamicDatasetKeys,
+    quota: &DynamicDatasetQuota,
 ) -> ConfirmedResponse {
     let req = match DeleteNamedVariableListRequest::decode(body) {
         Ok(r) => r,
@@ -112,6 +113,7 @@ pub(crate) fn handle_delete_named_variable_list(
                 if let Ok(mut g) = dynamic_keys.lock() {
                     g.remove(&(domain.clone(), list_name.clone()));
                 }
+                quota.forget(&(domain.clone(), list_name.clone()));
             }
             Ok(false) => {
                 tracing::warn!(
@@ -123,6 +125,7 @@ pub(crate) fn handle_delete_named_variable_list(
                 if let Ok(mut g) = dynamic_keys.lock() {
                     g.remove(&(domain.clone(), list_name.clone()));
                 }
+                quota.forget(&(domain.clone(), list_name.clone()));
             }
             Err(_) => {
                 tracing::warn!(

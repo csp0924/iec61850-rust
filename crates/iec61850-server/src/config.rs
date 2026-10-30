@@ -36,6 +36,15 @@ pub struct IedServerConfig {
     /// association; a peer that stops reading has its connection closed once a
     /// write exceeds it. Defaults to 10 000 ms.
     pub association_send_timeout_ms: u64,
+
+    /// Maximum number of data sets clients may create at run time through
+    /// DefineNamedVariableList, across all associations. Defaults to 64.
+    pub max_dynamic_datasets: usize,
+
+    /// Maximum number of run-time data sets one open association may have
+    /// created. Defaults to 16.
+    pub max_dynamic_datasets_per_association: usize,
+
     /// IEC 61850 edition the server presents. Defaults to `Ed2`.
     pub edition: Edition,
 
@@ -64,6 +73,8 @@ impl Default for IedServerConfig {
             association_setup_timeout_ms: 10_000,
             association_idle_timeout_ms: Some(300_000),
             association_send_timeout_ms: 10_000,
+            max_dynamic_datasets: 64,
+            max_dynamic_datasets_per_association: 16,
             edition: Edition::Ed2,
             write_access_policies: WriteAccessPolicies::default(),
             time_quality: TimeQuality::default(),

@@ -1147,6 +1147,12 @@ impl IedServerBuilder<Bound> {
 
         let dynamic_dataset_keys: crate::service::define_named_variable_list::DynamicDatasetKeys =
             crate::service::define_named_variable_list::new_dynamic_dataset_keys();
+        let dynamic_dataset_quota = Arc::new(
+            crate::service::define_named_variable_list::DynamicDatasetQuota::new(
+                self.config.max_dynamic_datasets,
+                self.config.max_dynamic_datasets_per_association,
+            ),
+        );
 
         let gocb_registry: Arc<crate::goose_mapping::GoCBRegistry> =
             Arc::new(crate::goose_mapping::GoCBRegistry::new());
@@ -1179,6 +1185,7 @@ impl IedServerBuilder<Bound> {
                 .with_log_controls(log_controls.clone())
                 .with_setting_groups(setting_groups.clone())
                 .with_dynamic_dataset_keys(dynamic_dataset_keys.clone())
+                .with_dynamic_dataset_quota(dynamic_dataset_quota)
                 .with_gocb_registry(gocb_registry.clone());
                 Arc::new(dispatcher)
             }
