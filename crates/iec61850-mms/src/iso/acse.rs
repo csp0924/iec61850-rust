@@ -237,9 +237,9 @@ impl AcseConnection {
                 Ok((AcseIndication::Associate, user_data))
             }
             0x61 => {
-                // AARE
+                // AARE; one without a result field accepts nothing
                 let (result, user_data) = self.parse_aare(buf)?;
-                if result == 0 {
+                if result == Some(0) {
                     Ok((AcseIndication::Associate, user_data))
                 } else {
                     Ok((AcseIndication::AssociateFailed, user_data))
@@ -394,8 +394,14 @@ impl AcseConnection {
     /// Parses an AARE PDU, tag 0x61, and returns the result code with the
     /// user-information payload. Result 0 accepts, any other value rejects.
     ///
+    /// The result field is mandatory in an AARE (ISO 8650-1); `None` reports one
+    /// that is absent or not an INTEGER, which the caller treats as a rejection.
+    ///
     /// Every TLV is bounds checked before it is read.
-    fn parse_aare<'buf>(&mut self, buf: &'buf [u8]) -> Result<(u32, &'buf [u8]), AcseError> {
+    fn parse_aare<'buf>(
+        &mut self,
+        buf: &'buf [u8],
+    ) -> Result<(Option<u32>, &'buf [u8]), AcseError> {
         let mut pos = 1usize; // skip the outer tag 0x61
         let outer_len = ber_decode_length(buf, &mut pos, buf.len())?;
         let end = pos + outer_len;
@@ -472,7 +478,8 @@ impl AcseConnection {
         }
 
         if !saw_result {
-            warn!("aare is missing the result field (0xa2), treating it as accepted");
+            warn!("aare is missing the result field (0xa2), treating it as a rejection");
+            return Ok((None, user_data.unwrap_or(&[])));
         }
 
         // user-information is mandatory when result is 0 and optional otherwise
@@ -488,7 +495,7 @@ impl AcseConnection {
             }
         };
 
-        Ok((result_code, ud))
+        Ok((Some(result_code), ud))
     }
 }
 
