@@ -8,6 +8,8 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-31
+
 ### Added
 
 - **`iec61850-server`** — `IedServer::update_bit_string` and
@@ -383,7 +385,8 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.1
 [0.3.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.0
 [0.2.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.2.0
 [0.1.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.1
