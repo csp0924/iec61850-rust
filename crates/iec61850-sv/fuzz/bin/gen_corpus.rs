@@ -8,8 +8,9 @@
 //!    including the IEC 61850-9-2 LE profile shape.
 //! 2. Malformed inputs for the robustness cases the decoder must survive (a
 //!    long-form sample length, a zero-length sample, an inner length overflow,
-//!    an indefinite length, an over-long svID, an over-long datSet), plus two
-//!    length-encoding cases a decoder meets on a live network.
+//!    an indefinite length, an over-long svID, an over-long datSet, a noASDU
+//!    that disagrees with the ASDUs carried), plus two length-encoding cases a
+//!    decoder meets on a live network.
 //!
 //! Seeds land in `corpus/sv_pdu_parse/` and `corpus/sv_frame_parse/`. Each seed
 //! has a fixed file name, so a corpus grown by the mutator is not overwritten.
@@ -263,6 +264,46 @@ fn poison_too_many_asdus() -> Vec<u8> {
     ]
 }
 
+/// noASDU 2 over a single ASDU, which must be rejected as a count mismatch.
+fn poison_no_asdu_count_mismatch() -> Vec<u8> {
+    let inner = vec![
+        0x80, 0x03, b's', b'v', b'1', // svID
+        0x82, 0x02, 0x00, 0x01, // smpCnt
+        0x83, 0x04, 0x00, 0x00, 0x00, 0x01, // confRev
+        0x85, 0x01, 0x00, // smpSynch
+        0x87, 0x02, 0x00, 0x00, // sample
+    ];
+    let mut asdu = vec![0x30, inner.len() as u8];
+    asdu.extend(&inner);
+    let mut asdu_seq = vec![0xA2, asdu.len() as u8];
+    asdu_seq.extend(&asdu);
+    let mut body = vec![0x80, 0x01, 0x02]; // noASDU=2
+    body.extend(&asdu_seq);
+    let mut pdu = vec![0x60, body.len() as u8];
+    pdu.extend(&body);
+    pdu
+}
+
+/// A two-octet noASDU of 257 over a single ASDU; its low octet alone would match.
+fn poison_no_asdu_multi_octet() -> Vec<u8> {
+    let inner = vec![
+        0x80, 0x03, b's', b'v', b'1', // svID
+        0x82, 0x02, 0x00, 0x01, // smpCnt
+        0x83, 0x04, 0x00, 0x00, 0x00, 0x01, // confRev
+        0x85, 0x01, 0x00, // smpSynch
+        0x87, 0x02, 0x00, 0x00, // sample
+    ];
+    let mut asdu = vec![0x30, inner.len() as u8];
+    asdu.extend(&inner);
+    let mut asdu_seq = vec![0xA2, asdu.len() as u8];
+    asdu_seq.extend(&asdu);
+    let mut body = vec![0x80, 0x02, 0x01, 0x01]; // noASDU=257
+    body.extend(&asdu_seq);
+    let mut pdu = vec![0x60, body.len() as u8];
+    pdu.extend(&body);
+    pdu
+}
+
 // -- Frame builders --
 
 fn make_frame(pdu_bytes: Vec<u8>, vlan: Option<VlanTag>) -> Vec<u8> {
@@ -356,6 +397,16 @@ fn main() {
         &pdu_dir,
         "indefinite_length.bin",
         &poison_indefinite_length(),
+    );
+    write_seed(
+        &pdu_dir,
+        "no_asdu_count_mismatch.bin",
+        &poison_no_asdu_count_mismatch(),
+    );
+    write_seed(
+        &pdu_dir,
+        "no_asdu_multi_octet.bin",
+        &poison_no_asdu_multi_octet(),
     );
     write_seed(
         &pdu_dir,

@@ -364,6 +364,9 @@ fn encode_asdu(asdu: &Asdu, buf: &mut BytesMut) -> Result<(), SvError> {
 /// - `WrongPduTag` when the outer tag is not `0x60`.
 /// - `TruncatedInput` when a length reaches past the buffer.
 /// - `TooManyAsdus` when noASDU exceeds `MAX_ASDU_PER_FRAME`.
+/// - `MissingRequiredField` when noASDU is absent, and `InvalidFieldLength`
+///   with tag `0xA2` when it differs from the number of ASDUs in the sequence.
+/// - `DuplicateField` when noASDU or the sequence of ASDU appears twice.
 /// - `InvalidFieldLength`, `AsduFieldOutOfBounds`, `MissingRequiredField`,
 ///   `SvIdTooLong`, `DatSetTooLong`, and `InvalidUtf8` from the ASDUs.
 /// - `Asn1` when a BER length field is malformed.
@@ -393,8 +396,9 @@ pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
         });
     }
 
-    let mut no_asdu: Option<u8> = None;
+    let mut no_asdu: Option<usize> = None;
     let mut asdus: Vec<Asdu> = Vec::new();
+    let mut asdu_seq_seen = false;
 
     while pos < pdu_end {
         if pos >= data.len() {
@@ -414,6 +418,13 @@ pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
             });
         }
 
+        // noASDU and the sequence of ASDU each appear once; a repeated member is
+        // rejected before it is decoded rather than overriding the first.
+        if (tag == 0x80 && no_asdu.is_some()) || (tag == TAG_ASDU_SEQ && asdu_seq_seen) {
+            tracing::warn!("savpdu repeats member tag 0x{:02x}, dropping", tag);
+            return Err(SvError::DuplicateField(tag));
+        }
+
         match tag {
             0x80 => {
                 if field_len == 0 {
@@ -423,20 +434,26 @@ pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
                         actual: 0,
                     });
                 }
-                // The count is small, so the least significant byte carries it.
-                let val = data[field_end - 1];
-                if val as usize > MAX_ASDU_PER_FRAME {
+                // noASDU is INTEGER (1..65535). Every content octet is read, so a
+                // multi-byte count is never taken for its low octet; a value that
+                // overflows the range saturates and fails the bound below.
+                let val = data[pos..field_end]
+                    .iter()
+                    .try_fold(0u16, |acc, &b| acc.checked_mul(256)?.checked_add(b.into()))
+                    .map_or(usize::MAX, usize::from);
+                if val > MAX_ASDU_PER_FRAME {
                     tracing::warn!(
                         "sv noasdu {} exceeds the maximum of {}",
                         val,
                         MAX_ASDU_PER_FRAME
                     );
-                    return Err(SvError::TooManyAsdus(val));
+                    return Err(SvError::TooManyAsdus(u8::try_from(val).unwrap_or(u8::MAX)));
                 }
                 no_asdu = Some(val);
                 pos = field_end;
             }
             TAG_ASDU_SEQ => {
+                asdu_seq_seen = true;
                 asdus = decode_asdu_sequence(&data[pos..field_end])?;
                 pos = field_end;
             }
@@ -448,15 +465,13 @@ pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
         }
     }
 
-    if let Some(n) = no_asdu {
-        if n as usize != asdus.len() {
-            tracing::warn!(
-                "noasdu {} does not match the {} asdus decoded",
-                n,
-                asdus.len()
-            );
-        }
-    }
+    let Some(no_asdu) = no_asdu else {
+        tracing::warn!("savpdu has no noasdu, dropping");
+        return Err(SvError::MissingRequiredField {
+            tag: 0x80,
+            name: "noASDU",
+        });
+    };
 
     // noASDU is mandatory and at least 1, and the encoder refuses to build an
     // empty PDU; the decoder rejects one symmetrically so that decode and
@@ -468,10 +483,28 @@ pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
         });
     }
 
+    // A frame whose count disagrees with its ASDUs is dropped whole rather than
+    // trusting either one.
+    if no_asdu != asdus.len() {
+        tracing::warn!(
+            "noasdu {} does not match the {} asdus decoded, dropping",
+            no_asdu,
+            asdus.len()
+        );
+        return Err(SvError::InvalidFieldLength {
+            tag: TAG_ASDU_SEQ,
+            expected: no_asdu,
+            actual: asdus.len(),
+        });
+    }
+
     Ok(SavPdu { asdus })
 }
 
 /// Decodes the contents of the SEQUENCE OF ASDU member.
+///
+/// At most `MAX_ASDU_PER_FRAME` ASDUs are decoded, whatever noASDU declares; the
+/// next one returns `TooManyAsdus` before it is parsed.
 fn decode_asdu_sequence(data: &[u8]) -> Result<Vec<Asdu>, SvError> {
     let mut pos = 0usize;
     let mut asdus = Vec::new();
@@ -479,6 +512,15 @@ fn decode_asdu_sequence(data: &[u8]) -> Result<Vec<Asdu>, SvError> {
     while pos < data.len() {
         if pos >= data.len() {
             break;
+        }
+        if asdus.len() == MAX_ASDU_PER_FRAME {
+            tracing::warn!(
+                "sv asdu sequence holds more than {} asdus, dropping",
+                MAX_ASDU_PER_FRAME
+            );
+            return Err(SvError::TooManyAsdus(
+                u8::try_from(MAX_ASDU_PER_FRAME + 1).unwrap_or(u8::MAX),
+            ));
         }
         let tag = data[pos];
         pos += 1;
@@ -863,6 +905,72 @@ mod tests {
         assert_eq!(decoded.asdus.len(), 10);
     }
 
+    /// A savPdu repeating noASDU or the sequence of ASDU is rejected with
+    /// `DuplicateField` rather than letting the later copy replace the first.
+    #[test]
+    fn duplicate_sav_pdu_member_rejected() {
+        let good = sav_pdu_with_no_asdu(Some(&[0x01]));
+        let (_, hdr) = decode_length(&good[1..]).unwrap();
+        let body = &good[1 + hdr..];
+        let seq = &body[3..];
+        let wrap = |inner: &[u8]| {
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&[TAG_SAV_PDU]);
+            encode_length(inner.len(), &mut buf);
+            buf.extend_from_slice(inner);
+            buf
+        };
+        // noASDU twice, then the sequence of ASDU
+        let twice_count = wrap(&[&[0x80, 0x01, 0x01], body].concat());
+        assert_eq!(
+            decode_sav_pdu(&twice_count),
+            Err(SvError::DuplicateField(0x80))
+        );
+        // noASDU, then the sequence of ASDU twice
+        let twice_seq = wrap(&[body, seq].concat());
+        assert_eq!(
+            decode_sav_pdu(&twice_seq),
+            Err(SvError::DuplicateField(TAG_ASDU_SEQ))
+        );
+    }
+
+    /// An ASDU sequence holding more than `MAX_ASDU_PER_FRAME` ASDUs is rejected
+    /// whatever noASDU declares, before the eleventh ASDU is parsed: here that
+    /// ASDU is malformed, and the error is still `TooManyAsdus`.
+    #[test]
+    fn asdu_sequence_past_limit_rejected() {
+        let mut good = BytesMut::new();
+        encode_sav_pdu(
+            &SavPdu {
+                asdus: vec![minimal_asdu("sv1", 1)],
+            },
+            &mut good,
+        )
+        .unwrap();
+        // 0x60 <len> 0x80 0x01 0x01 0xa2 <len> <asdu>; keep the one ASDU TLV
+        let (_, hdr) = decode_length(&good[1..]).unwrap();
+        let seq_tlv = &good[1 + hdr + 3..];
+        let (_, seq_hdr) = decode_length(&seq_tlv[1..]).unwrap();
+        let asdu = &seq_tlv[1 + seq_hdr..];
+
+        let mut seq = Vec::new();
+        for _ in 0..MAX_ASDU_PER_FRAME {
+            seq.extend_from_slice(asdu);
+        }
+        seq.extend_from_slice(&[0x30, 0x02, 0xff, 0x00]);
+        let mut inner = vec![0x80, 0x01, 0x01, TAG_ASDU_SEQ];
+        let mut seq_len = BytesMut::new();
+        encode_length(seq.len(), &mut seq_len);
+        inner.extend_from_slice(&seq_len);
+        inner.extend_from_slice(&seq);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[TAG_SAV_PDU]);
+        encode_length(inner.len(), &mut buf);
+        buf.extend_from_slice(&inner);
+
+        assert_eq!(decode_sav_pdu(&buf), Err(SvError::TooManyAsdus(11)));
+    }
+
     #[test]
     fn no_asdu_11_rejected() {
         // A savPdu announcing 11 ASDUs with an empty ASDU sequence.
@@ -873,6 +981,73 @@ mod tests {
         buf.extend_from_slice(&inner);
         let result = decode_sav_pdu(&buf);
         assert!(matches!(result, Err(SvError::TooManyAsdus(11))));
+    }
+
+    /// Encodes one minimal ASDU and wraps it in a savPdu whose noASDU member
+    /// carries `no_asdu` as its content octets, or is absent when `None`.
+    fn sav_pdu_with_no_asdu(no_asdu: Option<&[u8]>) -> BytesMut {
+        let mut good = BytesMut::new();
+        encode_sav_pdu(
+            &SavPdu {
+                asdus: vec![minimal_asdu("sv1", 1)],
+            },
+            &mut good,
+        )
+        .unwrap();
+        // the encoder writes 0x60 <len> 0x80 0x01 0x01 0xa2 ...; keep the sequence
+        let (_, hdr) = decode_length(&good[1..]).unwrap();
+        let seq = &good[1 + hdr + 3..];
+        let mut inner = Vec::new();
+        if let Some(count) = no_asdu {
+            inner.push(0x80);
+            inner.push(count.len() as u8);
+            inner.extend_from_slice(count);
+        }
+        inner.extend_from_slice(seq);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[TAG_SAV_PDU]);
+        encode_length(inner.len(), &mut buf);
+        buf.extend_from_slice(&inner);
+        buf
+    }
+
+    /// A noASDU that differs from the number of ASDUs the frame carries is
+    /// rejected, including a multi-byte count whose low octet alone would match.
+    #[test]
+    fn no_asdu_count_mismatch_rejected() {
+        let buf = sav_pdu_with_no_asdu(Some(&[0x02]));
+        assert_eq!(
+            decode_sav_pdu(&buf),
+            Err(SvError::InvalidFieldLength {
+                tag: TAG_ASDU_SEQ,
+                expected: 2,
+                actual: 1,
+            })
+        );
+        // noASDU 257 over one ASDU
+        let buf = sav_pdu_with_no_asdu(Some(&[0x01, 0x01]));
+        assert_eq!(decode_sav_pdu(&buf), Err(SvError::TooManyAsdus(u8::MAX)));
+    }
+
+    #[test]
+    fn no_asdu_absent_rejected() {
+        let buf = sav_pdu_with_no_asdu(None);
+        assert_eq!(
+            decode_sav_pdu(&buf),
+            Err(SvError::MissingRequiredField {
+                tag: 0x80,
+                name: "noASDU",
+            })
+        );
+    }
+
+    /// A count with a redundant leading zero octet still decodes to its value.
+    #[test]
+    fn no_asdu_matching_count_accepted() {
+        for count in [&[0x01u8][..], &[0x00, 0x01][..]] {
+            let buf = sav_pdu_with_no_asdu(Some(count));
+            assert_eq!(decode_sav_pdu(&buf).unwrap().asdus.len(), 1);
+        }
     }
 
     #[test]

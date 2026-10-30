@@ -23,11 +23,11 @@ pub enum SvError {
     #[error("sv header length field {0} is below the 8 byte header")]
     InvalidHeaderLength(u16),
 
-    /// noASDU exceeds `MAX_ASDU_PER_FRAME`.
+    /// noASDU, or the number of ASDUs in a frame, exceeds `MAX_ASDU_PER_FRAME`.
     ///
     /// The bound keeps a single frame from steering the decoder into a large
-    /// number of ASDU parses.
-    #[error("noasdu {0} exceeds the maximum of {max}", max = crate::pdu::MAX_ASDU_PER_FRAME)]
+    /// number of ASDU parses. A count above 255 is reported as 255.
+    #[error("asdu count {0} exceeds the maximum of {max}", max = crate::pdu::MAX_ASDU_PER_FRAME)]
     TooManyAsdus(u8),
 
     /// BER length error from `iec61850-asn1`.
@@ -51,7 +51,8 @@ pub enum SvError {
     WrongAsduTag(u8),
 
     /// A field length differs from its definition, such as a smpCnt that is not
-    /// 2 bytes or a confRev that is not 4 bytes.
+    /// 2 bytes or a confRev that is not 4 bytes. With tag `0xA2`, the sequence of
+    /// ASDU holds `actual` ASDUs where noASDU declared `expected`.
     #[error("field tag 0x{tag:02x} length is {actual}, expected {expected}")]
     InvalidFieldLength {
         tag: u8,
@@ -59,10 +60,15 @@ pub enum SvError {
         actual: usize,
     },
 
-    /// A mandatory field is absent: svID, smpCnt, confRev, smpSynch, or the
-    /// sample data.
+    /// A mandatory field is absent: noASDU, svID, smpCnt, confRev, smpSynch, or
+    /// the sample data.
     #[error("missing required field tag 0x{tag:02x} ({name})")]
     MissingRequiredField { tag: u8, name: &'static str },
+
+    /// A savPdu member that appears at most once, noASDU or the sequence of
+    /// ASDU, appears again.
+    #[error("savpdu member tag 0x{0:02x} appears more than once")]
+    DuplicateField(u8),
 
     /// A string field is not valid UTF-8.
     #[error("svid / datset is not valid utf-8")]

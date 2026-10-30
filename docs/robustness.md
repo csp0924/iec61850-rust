@@ -55,6 +55,7 @@ buffer, never loop without bound, and never leave partial state behind.
 |---|---|---|
 | A sample longer than 127 bytes, whose length needs the long BER form | The total PDU length is computed from the long form, so the frame encodes and decodes intact | `large_sample_ber_length` in `crates/iec61850-sv/src/pdu.rs` and `crates/iec61850-sv/tests/sv_pdu_roundtrip.rs`; fuzz target `sv_pdu_parse` |
 | A zero-length sample OCTET STRING | Decoded as an empty sample rather than treated as a length underflow | Seed `sample_size_zero.bin` from `crates/iec61850-sv/fuzz/bin/gen_corpus.rs`; fuzz target `sv_pdu_parse` |
+| A savPdu whose noASDU is absent, differs from the number of ASDUs it carries, or is a multi-byte count whose low octet alone would match, or whose sequence of ASDU holds more than `MAX_ASDU_PER_FRAME` ASDUs, or that repeats either member | The frame is dropped with `MissingRequiredField`, `InvalidFieldLength`, `TooManyAsdus` or `DuplicateField`; every content octet of noASDU is decoded, and no ASDU past the limit is parsed | `no_asdu_count_mismatch_rejected`, `no_asdu_absent_rejected`, `no_asdu_matching_count_accepted`, `asdu_sequence_past_limit_rejected`, `duplicate_sav_pdu_member_rejected` in `crates/iec61850-sv/src/pdu.rs`; seeds `no_asdu_count_mismatch.bin`, `no_asdu_multi_octet.bin` from `crates/iec61850-sv/fuzz/bin/gen_corpus.rs`; fuzz target `sv_pdu_parse` |
 
 ## `iec61850-server`
 

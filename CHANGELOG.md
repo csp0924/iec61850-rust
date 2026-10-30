@@ -49,6 +49,15 @@ Every crate in the workspace shares one version number.
   count is above 7, or is non-zero on an empty bit string, is rejected with
   `InvalidPdu` instead of being decoded into a `BitString` or `BooleanArray`
   that no conforming encoder produces.
+- **`iec61850-sv`** — `decode_sav_pdu` decodes every content octet of
+  noASDU and drops a frame whose count differs from the ASDUs it carries,
+  returning `InvalidFieldLength` with tag `0xA2`, or that has no noASDU at all,
+  returning `MissingRequiredField`. Only the low octet of the count was read
+  before, and a mismatch was logged but the frame accepted. The sequence of
+  ASDU is decoded up to `MAX_ASDU_PER_FRAME` ASDUs whatever noASDU declares; a
+  further ASDU returns `TooManyAsdus` before it is parsed. A frame repeating
+  noASDU or the sequence of ASDU is dropped with the new
+  `SvError::DuplicateField` instead of the later copy replacing the first.
 
 ## [0.2.0] - 2026-09-06
 
