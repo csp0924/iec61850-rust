@@ -3,6 +3,7 @@
 //! the journal a LogRef names.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
@@ -13,7 +14,10 @@ use iec61850_model::{
     DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, IedModelBuilder,
     LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
 };
-use iec61850_server::logging::{InMemoryLogStorage, LogControl, LogControlBlock, LogStorage};
+use iec61850_server::logging::{
+    InMemoryLogStorage, JournalEntry, LogControl, LogControlBlock, LogEntryId, LogEntryVisitor,
+    LogStorage, LogStorageError,
+};
 use iec61850_server::reporting::{Dataset, DatasetEntry, TriggerOptions};
 use iec61850_server::{IedServer, IedServerConfig};
 
@@ -427,6 +431,123 @@ async fn get_name_list_lists_the_journals_of_a_domain() {
     assert!(
         !variables.iter().any(|n| n == EVENT_LOG),
         "a journal is not a named variable"
+    );
+    c.disconnect().await.ok();
+    h.stop().await;
+}
+
+/// A storage backend that counts the entries it hands to a visitor.
+#[derive(Debug)]
+struct CountingStorage {
+    inner: InMemoryLogStorage,
+    visited: AtomicUsize,
+}
+
+struct CountingVisitor<'a> {
+    inner: &'a mut dyn LogEntryVisitor,
+    visited: &'a AtomicUsize,
+}
+
+impl LogEntryVisitor for CountingVisitor<'_> {
+    fn visit(&mut self, entry: &JournalEntry) -> bool {
+        self.visited.fetch_add(1, Ordering::Relaxed);
+        self.inner.visit(entry)
+    }
+}
+
+impl LogStorage for CountingStorage {
+    fn add_entry(&self, time_ms: u64) -> Result<LogEntryId, LogStorageError> {
+        self.inner.add_entry(time_ms)
+    }
+    fn add_entry_data(
+        &self,
+        entry_id: LogEntryId,
+        data_ref: &str,
+        value: MmsValue,
+        reason_code: u8,
+    ) -> Result<(), LogStorageError> {
+        self.inner
+            .add_entry_data(entry_id, data_ref, value, reason_code)
+    }
+    fn query_by_time(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        visitor: &mut dyn LogEntryVisitor,
+    ) -> Result<(), LogStorageError> {
+        let mut v = CountingVisitor {
+            inner: visitor,
+            visited: &self.visited,
+        };
+        self.inner.query_by_time(start_ms, end_ms, &mut v)
+    }
+    fn query_after(
+        &self,
+        starting_time_ms: u64,
+        entry_id: LogEntryId,
+        visitor: &mut dyn LogEntryVisitor,
+    ) -> Result<(), LogStorageError> {
+        let mut v = CountingVisitor {
+            inner: visitor,
+            visited: &self.visited,
+        };
+        self.inner.query_after(starting_time_ms, entry_id, &mut v)
+    }
+    fn oldest_and_newest(
+        &self,
+    ) -> Result<
+        Option<(
+            iec61850_server::logging::storage::EntryMeta,
+            iec61850_server::logging::storage::EntryMeta,
+        )>,
+        LogStorageError,
+    > {
+        self.inner.oldest_and_newest()
+    }
+    fn count(&self) -> usize {
+        self.inner.count()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_page_stops_visiting_once_the_pdu_is_full() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage = Arc::new(CountingStorage {
+        inner: InMemoryLogStorage::new(),
+        visited: AtomicUsize::new(0),
+    });
+    let lc = LogControl::new(
+        format!("{DOM}/{LCB_ITEM}"),
+        lcb(TriggerOptions::DATA_CHANGED),
+    )
+    .with_storage(storage.clone());
+    lc.set_log_ena(true).unwrap();
+    for i in 0..1_000u64 {
+        lc.log_single_value(
+            1_700_000_000_000 + i,
+            ST_VAL_REF,
+            MmsValue::Boolean(i % 2 == 0),
+            0x02,
+        )
+        .unwrap();
+    }
+    srv.register_log_control(DOM, LCB_ITEM, Arc::new(lc));
+    let h = srv.start().await.unwrap();
+
+    let mut c = client_with(
+        MmsClientBuilder::new().local_max_pdu_size(2_000),
+        h.bound_addr.port(),
+    )
+    .await;
+    let page = read_all(&mut c, LCB_ITEM).await;
+    assert_eq!(page.more_follows, Some(true));
+    assert!(!page.entries.is_empty());
+    let visited = storage.visited.load(Ordering::Relaxed);
+    assert_eq!(
+        visited,
+        page.entries.len() + 1,
+        "the walk stops at the first entry that does not fit"
     );
     c.disconnect().await.ok();
     h.stop().await;

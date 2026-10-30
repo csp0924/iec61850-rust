@@ -97,8 +97,7 @@ use crate::handler::HandlerRegistry;
 use crate::handler::{canonicalize_attr_path, fc_from_canonical_path, ReadContext, ReadOutcome};
 #[cfg(feature = "logging")]
 use crate::logging::{
-    new_log_control_registry, storage::CollectingVisitor, LogControl, LogControlRegistry,
-    LogEntryId, LogStorageError,
+    new_log_control_registry, LogControl, LogControlRegistry, LogEntryId, LogStorageError,
 };
 use crate::mapping::MmsDeviceModel;
 use crate::policy::WriteAccessPolicies;
@@ -3183,7 +3182,8 @@ fn dispatch_read_journal(
     };
 
     // A log control block with no storage attached yields an empty list.
-    let mut visitor = CollectingVisitor::new();
+    let mut visitor =
+        BudgetedJournalVisitor::new(invoke_id, read_journal_budget(negotiated_max_pdu_size));
     let query_result = match &req.range {
         JournalRange::TimeRange { start_ms, end_ms } => {
             lc.query_by_time(*start_ms, *end_ms, &mut visitor)
@@ -3206,33 +3206,11 @@ fn dispatch_read_journal(
         return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
     }
 
-    let budget = read_journal_budget(negotiated_max_pdu_size);
-    let baseline = empty_response_baseline();
-    let mut accepted: Vec<WireJournalEntry> = Vec::new();
-    let mut consumed: usize = 0;
-    let mut more_follows = false;
-
-    for entry in visitor.entries.into_iter() {
-        let wire = journal_entry_to_wire(entry);
-        let entry_size = estimate_entry_wire_size(&wire, baseline);
-        if consumed + entry_size > budget {
-            // Even a first entry larger than the whole PDU stops here with
-            // moreFollows set, so the client never mistakes a truncated result
-            // for a complete one.
-            tracing::warn!(
-                invoke_id,
-                budget,
-                consumed,
-                entry_size,
-                accepted = accepted.len(),
-                "read-journal: the PDU budget is spent, truncating and setting moreFollows"
-            );
-            more_follows = true;
-            break;
-        }
-        consumed += entry_size;
-        accepted.push(wire);
-    }
+    let BudgetedJournalVisitor {
+        accepted,
+        more_follows,
+        ..
+    } = visitor;
 
     let resp = ReadJournalResponse {
         entries: accepted,
@@ -3242,6 +3220,61 @@ fn dispatch_read_journal(
     let mut buf = BytesMut::new();
     encode_confirmed_read_journal_response(invoke_id, &resp, &mut buf);
     ConfirmedResponse::Response(buf.freeze())
+}
+
+/// Collects the journal entries of one ReadJournal response while they fit the
+/// PDU budget.
+///
+/// Each entry is converted and measured as it is visited, and the walk stops
+/// at the first entry that does not fit, so a query holds one response worth
+/// of entries rather than every matching entry. Even a first entry larger than
+/// the whole budget stops the walk with `more_follows` set, so the client never
+/// mistakes a truncated result for a complete one.
+#[cfg(feature = "logging")]
+struct BudgetedJournalVisitor {
+    invoke_id: u32,
+    budget: usize,
+    baseline: usize,
+    consumed: usize,
+    accepted: Vec<WireJournalEntry>,
+    more_follows: bool,
+}
+
+#[cfg(feature = "logging")]
+impl BudgetedJournalVisitor {
+    fn new(invoke_id: u32, budget: usize) -> Self {
+        Self {
+            invoke_id,
+            budget,
+            baseline: empty_response_baseline(),
+            consumed: 0,
+            accepted: Vec::new(),
+            more_follows: false,
+        }
+    }
+}
+
+#[cfg(feature = "logging")]
+impl crate::logging::LogEntryVisitor for BudgetedJournalVisitor {
+    fn visit(&mut self, entry: &crate::logging::JournalEntry) -> bool {
+        let wire = journal_entry_to_wire(entry);
+        let entry_size = estimate_entry_wire_size(&wire, self.baseline);
+        if self.consumed + entry_size > self.budget {
+            tracing::warn!(
+                invoke_id = self.invoke_id,
+                budget = self.budget,
+                consumed = self.consumed,
+                entry_size,
+                accepted = self.accepted.len(),
+                "read-journal: the PDU budget is spent, truncating and setting moreFollows"
+            );
+            self.more_follows = true;
+            return false;
+        }
+        self.consumed += entry_size;
+        self.accepted.push(wire);
+        true
+    }
 }
 
 /// Computes the bytes available to journal entries in a ReadJournal response.
@@ -3308,15 +3341,15 @@ fn empty_response_baseline() -> usize {
 
 /// Converts a stored journal entry into its wire representation.
 #[cfg(feature = "logging")]
-fn journal_entry_to_wire(entry: crate::logging::JournalEntry) -> WireJournalEntry {
+fn journal_entry_to_wire(entry: &crate::logging::JournalEntry) -> WireJournalEntry {
     WireJournalEntry {
         entry_id: entry.entry_id.to_be_bytes(),
         occurence_time_ms: entry.time_ms,
         variables: entry
             .variables
-            .into_iter()
+            .iter()
             .map(|v| WireJournalVariable {
-                data_ref: v.data_ref,
+                data_ref: v.data_ref.clone(),
                 value: crate::service::convert::mms_value_to_mms_data(&v.value),
                 reason_code: v.reason_code,
             })
