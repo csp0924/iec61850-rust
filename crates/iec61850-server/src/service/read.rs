@@ -385,12 +385,19 @@ fn lookup_domain_specific_value(
     // A sub-data-object may nest to any depth before the path reaches a data
     // attribute, as WYE holds CMV in IEC 61850-7-3. The walk is iterative, and
     // the segment count is bounded by the MMS identifier length, so no path
-    // can drive the descent past the model's own depth.
+    // can drive the descent past the model's own depth. A data attribute
+    // belongs to the path only under its own functional constraint, as
+    // IEC 61850-8-1 groups the named variables of a logical node by it.
     let mut current_do = do_node;
     let mut next = 3;
     let mut reached_da: Option<&DataAttribute> = None;
     while next < parts.len() {
-        match current_do.child_by_name(parts[next]) {
+        let step = parts[next];
+        let child = current_do.children.iter().find(|c| match c {
+            DoChild::SubDo(sub) => sub.name == step,
+            DoChild::Da(da) => da.name == step && da.fc == target_fc,
+        });
+        match child {
             Some(DoChild::SubDo(sub)) => {
                 current_do = sub;
                 next += 1;
