@@ -661,3 +661,30 @@ fn ber_header(tlv: &[u8]) -> (usize, usize) {
         .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
     (2 + n, len)
 }
+
+/// A Read that sets specificationWithResult gets its access specification
+/// back, for a list of variables and for a data set; one that does not set it
+/// gets none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_echoes_the_access_specification_on_request() {
+    let m = model(false);
+    let server = server_with(m.clone(), IedServerConfig::default());
+    server.register_dataset(DOM, status_data_set(&m));
+    let handle = server.start().await.unwrap();
+    let mut conn: MmsConnection = MmsConnection::new();
+    t!(conn.connect("127.0.0.1", handle.bound_addr.port())).expect("connect");
+
+    let list = ReadRequest::single_domain(DOM, "GGIO1$ST$Ind1$stVal").variable_access_spec;
+    let named = VariableAccessSpecification::VariableListName(ObjectName::DomainSpecific {
+        domain_id: DOM.into(),
+        item_id: "LLN0$dsStatus".into(),
+    });
+    for (invoke_id, spec) in [(1, list), (2, named)] {
+        let echoed = raw_read(&mut conn, invoke_id, &read_request(spec.clone(), true)).await;
+        assert_eq!(echoed.variable_access_spec.as_ref(), Some(&spec));
+        assert!(!echoed.list_of_access_result.is_empty());
+        let plain = raw_read(&mut conn, invoke_id + 10, &read_request(spec, false)).await;
+        assert_eq!(plain.variable_access_spec, None);
+    }
+    handle.stop().await;
+}

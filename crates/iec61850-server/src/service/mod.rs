@@ -107,14 +107,6 @@ use crate::reporting::{NullReportSink, ReportingEngine};
 
 use get_name_list::{handle_get_name_list_with_extras, GetNameListResult};
 use get_var_access_attrs::{handle_get_var_access_attrs, GetVarAccessAttrsResult};
-// `pdu_budget_for_access_results` serves the routed Read path.
-#[cfg(any(
-    feature = "reporting",
-    feature = "control",
-    feature = "setting-groups",
-    feature = "goose-mapping",
-    feature = "logging"
-))]
 use read::pdu_budget_for_access_results;
 use write::handle_single_write;
 
@@ -833,6 +825,31 @@ fn dispatch_get_var_access_attrs(
     }
 }
 
+/// The access specification a ReadResponse carries: the one of the request
+/// when it sets specificationWithResult, as ISO 9506-1 requires, and none
+/// otherwise.
+fn echoed_access_spec(
+    req: &ReadRequest,
+) -> Option<iec61850_mms::mms::pdu::common::VariableAccessSpecification> {
+    req.specification_with_result
+        .then(|| req.variable_access_spec.clone())
+}
+
+/// Bytes the list of access results of a ReadResponse may occupy: the budget
+/// of [`pdu_budget_for_access_results`], less the echoed access specification
+/// when the request asks for one.
+fn read_results_budget(req: &ReadRequest, negotiated_max_pdu_size: Option<u32>) -> Option<usize> {
+    let budget = pdu_budget_for_access_results(negotiated_max_pdu_size)?;
+    if !req.specification_with_result {
+        return Some(budget);
+    }
+    let mut spec = BytesMut::new();
+    req.variable_access_spec.encode(&mut spec);
+    // The echo sits inside a `[0]` wrapper whose tag and length take at most
+    // four more bytes.
+    Some(budget.saturating_sub(spec.len() + 4))
+}
+
 /// Dispatches a Read request (`0xa4`) with data set, control, reporting,
 /// setting group, and GOOSE control block routing.
 ///
@@ -893,7 +910,7 @@ fn dispatch_read(
                         "read: only a domain-specific data set name is served"
                     );
                     let resp = ReadResponse {
-                        variable_access_spec: None,
+                        variable_access_spec: echoed_access_spec(&req),
                         list_of_access_result: vec![AccessResult::Failure(
                             DataAccessError::ObjectAccessUnsupported,
                         )],
@@ -934,7 +951,7 @@ fn dispatch_read(
             // values are refused at the same size whichever way the read names
             // them.
             use crate::service::convert::mms_value_to_mms_data;
-            let mut remaining_budget = pdu_budget_for_access_results(negotiated_max_pdu_size);
+            let mut remaining_budget = read_results_budget(&req, negotiated_max_pdu_size);
             let mut results: Vec<AccessResult> = Vec::with_capacity(dataset.entries.len());
             for entry in &dataset.entries {
                 let baseline = match entry.read_value() {
@@ -970,7 +987,7 @@ fn dispatch_read(
                 results.push(result);
             }
             let resp = ReadResponse {
-                variable_access_spec: None,
+                variable_access_spec: echoed_access_spec(&req),
                 list_of_access_result: results,
             };
             let mut buf = BytesMut::new();
@@ -986,7 +1003,7 @@ fn dispatch_read(
                 "read: data sets are not served in a build without reporting"
             );
             let resp = ReadResponse {
-                variable_access_spec: None,
+                variable_access_spec: echoed_access_spec(&req),
                 list_of_access_result: vec![AccessResult::Failure(
                     DataAccessError::ObjectAccessUnsupported,
                 )],
@@ -999,7 +1016,7 @@ fn dispatch_read(
 
     // One budget covers the whole list of access results; each entry deducts
     // what it occupies.
-    let mut remaining_budget = pdu_budget_for_access_results(negotiated_max_pdu_size);
+    let mut remaining_budget = read_results_budget(&req, negotiated_max_pdu_size);
 
     let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -1056,7 +1073,7 @@ fn dispatch_read(
     }
 
     let resp = ReadResponse {
-        variable_access_spec: None,
+        variable_access_spec: echoed_access_spec(&req),
         list_of_access_result: results,
     };
     let mut buf = BytesMut::new();
@@ -1099,7 +1116,7 @@ fn dispatch_read(
         iec61850_mms::mms::pdu::common::VariableAccessSpecification::VariableListName(_) => {
             tracing::warn!(invoke_id, "read: data sets are not served in this build");
             let resp = ReadResponse {
-                variable_access_spec: None,
+                variable_access_spec: echoed_access_spec(&req),
                 list_of_access_result: vec![AccessResult::Failure(
                     DataAccessError::ObjectAccessUnsupported,
                 )],
@@ -1109,7 +1126,7 @@ fn dispatch_read(
             return ConfirmedResponse::Response(buf.freeze());
         }
     };
-    let mut remaining = negotiated_max_pdu_size.map(|n| n as usize);
+    let mut remaining = read_results_budget(&req, negotiated_max_pdu_size);
     let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
     for entry in &entries {
         match handle_single_read_with_budget(
@@ -1138,7 +1155,7 @@ fn dispatch_read(
         }
     }
     let resp = ReadResponse {
-        variable_access_spec: None,
+        variable_access_spec: echoed_access_spec(&req),
         list_of_access_result: results,
     };
     let mut buf = BytesMut::new();
