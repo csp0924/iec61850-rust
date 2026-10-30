@@ -6,9 +6,10 @@
 //! list rejects rather than accepts, because a whitelist that matches nothing
 //! must not mean "match everything".
 //!
-//! Ignore validity time: `Expired`, `NotValidYet` and their `*Context`
-//! variants are downgraded to a warning event when validity-time checking is
-//! off. Every other chain error still propagates.
+//! Ignore validity time: when validity-time checking is off, a certificate
+//! that has expired or is not valid yet is verified again at a time inside its
+//! validity period, and the outcome of that verification decides. Every other
+//! chain error, the allow-only-known check included, still applies.
 
 use std::sync::Arc;
 
@@ -253,16 +254,104 @@ impl ClientCertVerifier for AllowOnlyKnownCertsClientVerifier {
 }
 
 // -----------------------------------------------------------------------------
+// Validity-time override
+// -----------------------------------------------------------------------------
+
+/// Upper bound on the verifications one validity-time override may run.
+///
+/// Each run moves the validation time into the validity period of one more
+/// certificate of the chain, so the bound caps the chain length the override
+/// can cover.
+const MAX_VALIDITY_TIME_RUNS: usize = 8;
+
+/// The validity-time errors one override encountered.
+#[derive(Debug, Default, Clone, Copy)]
+struct ValidityTimeFindings {
+    expired: bool,
+    not_yet_valid: bool,
+}
+
+/// Runs `verify` at `now`, and again at a time inside the validity period of
+/// any certificate the previous run found expired or not yet valid.
+///
+/// The result is the outcome of the last run, so every check other than
+/// validity time, such as the signature chain, revocation, the name and the
+/// allow-only-known list, still decides. An expiry error without its
+/// `*Context` data carries no usable time and is returned unchanged.
+fn verify_ignoring_validity_time<T>(
+    now: UnixTime,
+    mut verify: impl FnMut(UnixTime) -> Result<T, RustlsError>,
+) -> Result<(T, ValidityTimeFindings), RustlsError> {
+    let mut findings = ValidityTimeFindings::default();
+    let mut at = now;
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        let err = match verify(at) {
+            Ok(v) => return Ok((v, findings)),
+            Err(e) => e,
+        };
+        let retry_at = match &err {
+            RustlsError::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+                not_after,
+                ..
+            }) => {
+                findings.expired = true;
+                *not_after
+            }
+            RustlsError::InvalidCertificate(rustls::CertificateError::NotValidYetContext {
+                not_before,
+                ..
+            }) => {
+                findings.not_yet_valid = true;
+                *not_before
+            }
+            _ => return Err(err),
+        };
+        if runs >= MAX_VALIDITY_TIME_RUNS || retry_at == at {
+            return Err(err);
+        }
+        at = retry_at;
+    }
+}
+
+/// Raises the warning events for the validity-time errors an accepted
+/// certificate carried.
+fn report_validity_time_findings(
+    handler: &dyn TlsEventHandler,
+    peer: &str,
+    findings: ValidityTimeFindings,
+) {
+    if findings.expired {
+        let msg = format!("{peer} cert expired; time_validation=false, allowing");
+        handler.on_event(TlsEventLevel::Warning, TlsEventCode::WrnCertExpired, &msg);
+        tracing::warn!("{}", msg);
+    }
+    if findings.not_yet_valid {
+        let msg = format!("{peer} cert not yet valid; time_validation=false, allowing");
+        handler.on_event(
+            TlsEventLevel::Warning,
+            TlsEventCode::WrnCertNotYetValid,
+            &msg,
+        );
+        tracing::warn!("{}", msg);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // IgnoreValidityTimeServerVerifier
 // -----------------------------------------------------------------------------
 
 /// Server verifier that can ignore certificate validity time.
 ///
-/// Only `Expired` and `NotValidYet`, including their `*Context` variants, are
-/// downgraded to a warning event. Every other chain error, such as a bad
-/// signature, a revoked certificate or an unknown CA, still rejects. That is
-/// what IEC 62351-3 requires: switching validity-time checking off relaxes the
-/// expiry check and nothing else.
+/// With `ignore_validity_time` set, a certificate that has expired or is not
+/// valid yet is verified again at a time inside its validity period. It is
+/// accepted, with a warning event, only when that verification passes, so a
+/// bad signature, a revoked certificate, an unknown CA or a peer outside the
+/// allow-only-known list still rejects. That is what IEC 62351-3 requires:
+/// switching validity-time checking off relaxes the expiry check and nothing
+/// else. An inner verifier that reports expiry without the `*Context`
+/// variants gives no validity period to verify in, so its error rejects.
 pub struct IgnoreValidityTimeServerVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     /// `false` keeps the strict default; `true` ignores validity time and is
@@ -272,7 +361,7 @@ pub struct IgnoreValidityTimeServerVerifier {
 }
 
 impl IgnoreValidityTimeServerVerifier {
-    /// Wraps `inner` with the validity-time downgrade.
+    /// Wraps `inner` with the validity-time override.
     pub fn new(
         inner: Arc<dyn ServerCertVerifier>,
         ignore_validity_time: bool,
@@ -294,18 +383,6 @@ impl std::fmt::Debug for IgnoreValidityTimeServerVerifier {
     }
 }
 
-/// Reports whether a rustls error is validity-time related, and may therefore
-/// be downgraded when validity-time checking is off.
-fn is_validity_time_error(err: &RustlsError) -> bool {
-    matches!(
-        err,
-        RustlsError::InvalidCertificate(rustls::CertificateError::Expired)
-            | RustlsError::InvalidCertificate(rustls::CertificateError::ExpiredContext { .. })
-            | RustlsError::InvalidCertificate(rustls::CertificateError::NotValidYet)
-            | RustlsError::InvalidCertificate(rustls::CertificateError::NotValidYetContext { .. })
-    )
-}
-
 impl ServerCertVerifier for IgnoreValidityTimeServerVerifier {
     fn verify_server_cert(
         &self,
@@ -315,40 +392,21 @@ impl ServerCertVerifier for IgnoreValidityTimeServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        match self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(v) => Ok(v),
-            Err(ref e) if self.ignore_validity_time && is_validity_time_error(e) => {
-                // Downgrade to a warning and let the connection through.
-                let (code, msg) = if matches!(
-                    e,
-                    RustlsError::InvalidCertificate(rustls::CertificateError::NotValidYet)
-                        | RustlsError::InvalidCertificate(
-                            rustls::CertificateError::NotValidYetContext { .. }
-                        )
-                ) {
-                    (
-                        TlsEventCode::WrnCertNotYetValid,
-                        "server cert not yet valid; time_validation=false, allowing",
-                    )
-                } else {
-                    (
-                        TlsEventCode::WrnCertExpired,
-                        "server cert expired; time_validation=false, allowing",
-                    )
-                };
-                self.event_handler
-                    .on_event(TlsEventLevel::Warning, code, msg);
-                tracing::warn!("{}", msg);
-                Ok(ServerCertVerified::assertion())
-            }
-            Err(e) => Err(e),
+        if !self.ignore_validity_time {
+            return self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
         }
+        let (verified, findings) = verify_ignoring_validity_time(now, |at| {
+            self.inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, at)
+        })?;
+        report_validity_time_findings(self.event_handler.as_ref(), "server", findings);
+        Ok(verified)
     }
 
     fn verify_tls12_signature(

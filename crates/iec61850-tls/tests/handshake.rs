@@ -1,15 +1,22 @@
 //! End-to-end handshakes over TCP between configurations built by
 //! `TlsConfigBuilder`.
+//!
+//! Covered here: the cipher whitelist, validity time, client authentication
+//! modes, session resumption, name checking, revocation and the events each
+//! outcome raises.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iec61850_tls::{
-    TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsVersion, IEC62351_3_TLS12_CIPHERS,
+    TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsEventCode, TlsEventHandler, TlsEventLevel,
+    TlsVersion, IEC62351_3_TLS12_CIPHERS,
 };
 use rcgen::{
-    BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
+    date_time_ymd, BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    SerialNumber,
 };
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -86,10 +93,15 @@ impl Ca {
         let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
         params.subject_alt_names = vec![SanType::DnsName(name.try_into().unwrap())];
         params.serial_number = Some(SerialNumber::from(serial));
+        if kind.expired {
+            params.not_before = date_time_ymd(2000, 1, 1);
+            params.not_after = date_time_ymd(2001, 1, 1);
+        }
         let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
         Leaf {
             pem: cert.pem(),
             key_pem: key.serialize_pem(),
+            der: CertificateDer::from(cert.der().to_vec()),
         }
     }
 }
@@ -97,11 +109,13 @@ impl Ca {
 #[derive(Default, Clone, Copy)]
 struct LeafKind {
     rsa: bool,
+    expired: bool,
 }
 
 struct Leaf {
     pem: String,
     key_pem: String,
+    der: CertificateDer<'static>,
 }
 
 /// A server builder presenting `leaf`.
@@ -123,7 +137,44 @@ fn client_trusting(ca: &Ca) -> TlsConfigBuilder {
 /// An RSA leaf for `name`, so TLS 1.2 handshakes do not depend on the ECDSA
 /// suites.
 fn rsa_leaf(ca: &Ca, name: &str) -> Leaf {
-    ca.issue(name, 1, LeafKind { rsa: true })
+    ca.issue(
+        name,
+        1,
+        LeafKind {
+            rsa: true,
+            ..LeafKind::default()
+        },
+    )
+}
+
+fn expired() -> LeafKind {
+    LeafKind {
+        expired: true,
+        ..LeafKind::default()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Event recording
+// -----------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Recorder(Mutex<Vec<(TlsEventLevel, TlsEventCode)>>);
+
+impl TlsEventHandler for Recorder {
+    fn on_event(&self, level: TlsEventLevel, code: TlsEventCode, _message: &str) {
+        self.0.lock().unwrap().push((level, code));
+    }
+}
+
+impl Recorder {
+    fn codes(&self) -> Vec<TlsEventCode> {
+        self.0.lock().unwrap().iter().map(|(_, c)| *c).collect()
+    }
+
+    fn has(&self, level: TlsEventLevel, code: TlsEventCode) -> bool {
+        self.0.lock().unwrap().contains(&(level, code))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -251,5 +302,85 @@ async fn rsa_certificate_negotiates_tls12() {
     assert_eq!(
         cli.expect("client side").version,
         Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Validity time
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_with_time_validation_off_accepts_an_expired_certificate_from_its_ca() {
+    let ca = Ca::new();
+    let leaf = ca.issue(SERVER_NAME, 1, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .time_validation(false)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+    assert!(
+        events.has(TlsEventLevel::Warning, TlsEventCode::WrnCertExpired),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn client_with_time_validation_off_rejects_an_expired_certificate_from_an_untrusted_ca() {
+    let trusted_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let rogue_leaf = rogue_ca.issue(SERVER_NAME, 1, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&rogue_leaf).build_server().unwrap();
+    let client = client_trusting(&trusted_ca)
+        .time_validation(false)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        !events.codes().contains(&TlsEventCode::WrnCertExpired),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn expired_unknown_server_is_refused_in_allow_only_known_mode_with_time_validation_off() {
+    let ca = Ca::new();
+    let known = ca.leaf(SERVER_NAME, 1);
+    let expired_other = ca.issue(SERVER_NAME, 2, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&expired_other).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .add_known_peer_der(known.der.clone())
+        .allow_only_known_peers(true)
+        .time_validation(false)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertNotConfigured),
+        "events: {:?}",
+        events.codes()
     );
 }

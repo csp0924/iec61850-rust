@@ -107,8 +107,8 @@ pub struct TlsConfigBuilder {
     // Verification settings
     /// Runs chain validation against the trust anchors. Defaults to true.
     chain_validation: bool,
-    /// Checks certificate validity time. Defaults to true; false downgrades
-    /// expiry errors to warnings.
+    /// Checks certificate validity time. Defaults to true; false accepts an
+    /// expired or not yet valid certificate whose chain is otherwise valid.
     time_validation: bool,
 
     // TLS versions
@@ -268,7 +268,11 @@ impl TlsConfigBuilder {
     }
 
     /// Enables or disables certificate validity-time checking. Defaults to
-    /// true; switching it off downgrades expiry errors to warnings.
+    /// true.
+    ///
+    /// When disabled, an expired or not yet valid peer certificate is
+    /// accepted, with a `WrnCertExpired` or `WrnCertNotYetValid` event, only if
+    /// it passes every other check at a time inside its validity period.
     pub fn time_validation(mut self, v: bool) -> Self {
         self.time_validation = v;
         self
