@@ -8,7 +8,16 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-30
+
 ### Changed
+
+> Upgrading from 0.2.x: an `IedServerConfig` or `MmsModelDispatcher` written as
+> a struct literal needs the new fields or `..Default::default()`, and an
+> exhaustive `match` on `SvError` needs an arm for `DuplicateField`. A server now
+> aborts an association that stays silent past the idle timeout or stops reading
+> past the send timeout, and a client or server closes a connection whose
+> reassembled TSDU passes the bound; each limit is set through the configuration.
 
 - **`iec61850-mms`** — `CotpConnection` bounds a reassembled TSDU at
   `DEFAULT_MAX_TSDU_SIZE`, 73192 bytes, where it was unbounded unless
@@ -50,6 +59,11 @@ Every crate in the workspace shares one version number.
   default. Deleting a data set makes room again. A data set created at run
   time is persistent: it outlives its association and counts against the
   total until it is deleted.
+
+- **`iec61850-sv`** — `SvError` has a new variant, `DuplicateField`, and
+  `TooManyAsdus` reports the ASDU count, saturated at 255, where it reported the
+  noASDU value; its message reads `asdu count`. An exhaustive `match` on
+  `SvError` no longer compiles and needs the new arm.
 
 ### Added
 
@@ -333,7 +347,8 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.0
 [0.2.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.2.0
 [0.1.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.1.0
