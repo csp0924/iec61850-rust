@@ -1,9 +1,10 @@
 //! SNTP unicast server.
 //!
 //! `bind` opens the UDP socket and `run` enters the receive loop. Every valid
-//! client request is answered with a reply stamped from the current system
-//! clock. A per-packet failure is reported with `tracing::warn!` and never
-//! breaks the loop.
+//! client or symmetric-active request is answered with a reply stamped from
+//! the current system clock. A per-datagram failure, including a receive
+//! error that concerns one datagram only, is reported with `tracing::warn!`
+//! and never breaks the loop.
 
 use std::io;
 use std::net::SocketAddr;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
 use crate::error::SntpError;
-use crate::packet::{LeapIndicator, Mode, SntpPacket, SNTP_PACKET_LEN};
+use crate::packet::{LeapIndicator, Mode, SntpPacket, MAX_DATAGRAM_LEN};
 use crate::time::NtpTimestamp;
 
 /// SNTP server configuration.
@@ -84,16 +85,26 @@ impl SntpServer {
         self.socket.local_addr()
     }
 
-    /// Enters the receive loop, answering every valid client request.
+    /// Enters the receive loop, answering every valid request.
     ///
     /// Returns only when the socket fails, and then propagates the
-    /// unrecoverable I/O error. A per-packet failure, such as a decode error
-    /// or a mode other than client, is logged at warn level and the loop
-    /// continues.
+    /// unrecoverable I/O error. A per-datagram failure is logged at warn level
+    /// and the loop continues: a decode error, a mode other than client or
+    /// symmetric active, a datagram longer than the receive buffer, and the
+    /// connection-reset error some platforms raise after a reply met an ICMP
+    /// port unreachable. Octets after the 48-octet header, such as an
+    /// authenticator, are ignored.
     pub async fn run(self) -> io::Result<()> {
-        let mut buf = [0u8; SNTP_PACKET_LEN];
+        let mut buf = [0u8; MAX_DATAGRAM_LEN];
         loop {
-            let (len, peer) = self.socket.recv_from(&mut buf).await?;
+            let (len, peer) = match self.socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                Err(err) if is_per_datagram_error(&err) => {
+                    tracing::warn!(?err, "dropped an SNTP datagram that failed to receive");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             // Stamp the receive time at once, so reply processing does not bias it.
             let recv_ts = match NtpTimestamp::now() {
                 Ok(ts) => ts,
@@ -129,6 +140,29 @@ impl SntpServer {
     ) -> Result<SntpPacket, SntpError> {
         build_reply(&self.config, buf, recv_ts)
     }
+}
+
+/// Windows `WSAEMSGSIZE`: the datagram was longer than the receive buffer.
+#[cfg(windows)]
+const WSAEMSGSIZE: i32 = 10040;
+
+/// Tells whether a receive error concerns one datagram only, so the socket
+/// stays usable for the next one.
+fn is_per_datagram_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(WSAEMSGSIZE) {
+        return true;
+    }
+    false
 }
 
 /// Builds the reply for one request packet.
@@ -180,6 +214,20 @@ mod tests {
 
     fn cfg() -> SntpServerConfig {
         SntpServerConfig::default()
+    }
+
+    #[test]
+    fn per_datagram_errors_are_told_apart_from_socket_failures() {
+        assert!(is_per_datagram_error(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(!is_per_datagram_error(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        #[cfg(windows)]
+        assert!(is_per_datagram_error(&io::Error::from_raw_os_error(
+            WSAEMSGSIZE
+        )));
     }
 
     #[test]

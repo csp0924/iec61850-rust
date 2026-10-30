@@ -37,6 +37,11 @@ use crate::time::NtpTimestamp;
 /// Fixed SNTP packet length, excluding the optional authenticator.
 pub const SNTP_PACKET_LEN: usize = 48;
 
+/// Receive buffer length of the client and the server: room for the 48-octet
+/// header plus an authenticator or extension fields. Only the header is
+/// decoded.
+pub(crate) const MAX_DATAGRAM_LEN: usize = 1024;
+
 /// Leap indicator (RFC 4330 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -152,7 +157,8 @@ impl SntpPacket {
         }
     }
 
-    /// Decodes a 48-byte wire packet.
+    /// Decodes a 48-byte wire packet. Octets after the header, such as an
+    /// authenticator, are ignored.
     ///
     /// The length is validated before any field is read, so an external byte
     /// slice is never indexed unchecked.

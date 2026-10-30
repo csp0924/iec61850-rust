@@ -27,7 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::error::SntpError;
-use crate::packet::{LeapIndicator, Mode, SntpPacket, SNTP_PACKET_LEN};
+use crate::packet::{LeapIndicator, Mode, SntpPacket, MAX_DATAGRAM_LEN};
 use crate::time::{NtpTimestamp, NTP_UNIX_OFFSET_S};
 
 /// SNTP unicast client.
@@ -90,7 +90,7 @@ impl SntpClient {
         let wire = req.encode();
         socket.send(&wire).await?;
 
-        let mut buf = [0u8; SNTP_PACKET_LEN];
+        let mut buf = [0u8; MAX_DATAGRAM_LEN];
         let len = timeout(recv_timeout, socket.recv(&mut buf))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SNTP recv timed out"))??;
