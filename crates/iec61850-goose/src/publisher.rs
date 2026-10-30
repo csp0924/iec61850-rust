@@ -40,8 +40,9 @@ pub struct CommParameters {
     pub app_id: u16,
     /// Destination MAC address, normally a multicast address.
     pub dst_mac: [u8; 6],
-    /// Source MAC address; when `None` the frame template is built with an
-    /// all-zero address for the sending interface to fill in.
+    /// Source MAC address; when `None` the frame carries an all-zero address,
+    /// which the `iec61850-hal` AF_PACKET backend, and its pcap backend on
+    /// Linux, replace with the interface address when sending.
     pub src_mac: Option<[u8; 6]>,
     /// Optional 802.1Q VLAN tag.
     pub vlan: Option<VlanTag>,

@@ -15,7 +15,8 @@
 //! Implemented here: `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` bound to
 //! an interface index, multicast join through `PACKET_ADD_MEMBERSHIP` with
 //! `packet_mreq`, blocking and timed receive through `SO_RCVTIMEO`, send, and
-//! promiscuous mode through `PACKET_MR_PROMISC`.
+//! promiscuous mode through `PACKET_MR_PROMISC`. `send` replaces an all-zero
+//! source address with the address of the bound interface.
 //!
 //! TODO: VLAN tag inject and strip for the GOOSE 5-tuple.
 //! TODO: PACKET_MMAP zero-copy fast path.
@@ -27,8 +28,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use libc::{
-    bind, c_int, c_void, close, if_nametoindex, packet_mreq, recv, send, setsockopt, sockaddr_ll,
-    socket, socklen_t, timeval, AF_PACKET, ETH_P_ALL, PACKET_ADD_MEMBERSHIP,
+    bind, c_int, c_void, close, getsockname, if_nametoindex, packet_mreq, recv, send, setsockopt,
+    sockaddr_ll, socket, socklen_t, timeval, AF_PACKET, ETH_P_ALL, PACKET_ADD_MEMBERSHIP,
     PACKET_DROP_MEMBERSHIP, PACKET_MR_MULTICAST, PACKET_MR_PROMISC, SOCK_RAW, SOL_PACKET,
     SOL_SOCKET, SO_RCVTIMEO,
 };
@@ -43,9 +44,13 @@ use super::{EthernetAddr, EthernetConfig, EthernetError, EthernetSink, EthernetS
 pub struct AfPacketSocket {
     fd: OwnedFd,
     ifindex: u32,
+    /// Hardware address of the bound interface, when it has a 6-byte one.
+    hw_addr: Option<EthernetAddr>,
     /// Groups joined so far, so `Drop` can leave them explicitly. The kernel
     /// would release them at close anyway.
     joined_groups: Vec<EthernetAddr>,
+    /// Copy of an outgoing frame whose source address is filled in.
+    send_scratch: Vec<u8>,
 }
 
 impl AfPacketSocket {
@@ -87,10 +92,14 @@ impl AfPacketSocket {
             return Err(EthernetError::Os(io::Error::last_os_error().to_string()));
         }
 
+        let hw_addr = bound_hw_addr(&fd);
+
         let mut me = AfPacketSocket {
             fd,
             ifindex,
+            hw_addr,
             joined_groups: Vec::new(),
+            send_scratch: Vec::new(),
         };
 
         for group in &cfg.multicast_groups {
@@ -106,6 +115,12 @@ impl AfPacketSocket {
         }
 
         Ok(me)
+    }
+
+    /// Returns the hardware address of the bound interface, or `None` when the
+    /// interface has no 6-byte address or it is all zero, as on loopback.
+    pub fn hw_addr(&self) -> Option<EthernetAddr> {
+        self.hw_addr
     }
 
     /// Joins one multicast group, through `PACKET_ADD_MEMBERSHIP` with
@@ -206,7 +221,20 @@ impl EthernetSource for AfPacketSocket {
 }
 
 impl EthernetSink for AfPacketSocket {
+    /// Sends one frame; an all-zero source address is replaced with
+    /// [`hw_addr`](AfPacketSocket::hw_addr) when the interface has one.
     fn send(&mut self, frame: &[u8]) -> Result<usize, EthernetError> {
+        let frame = match self.hw_addr {
+            Some(addr) if has_zero_source(frame) => {
+                self.send_scratch.clear();
+                self.send_scratch.extend_from_slice(frame);
+                if let Some(src) = self.send_scratch.get_mut(6..12) {
+                    src.copy_from_slice(&addr.0);
+                }
+                self.send_scratch.as_slice()
+            }
+            _ => frame,
+        };
         let n = unsafe {
             send(
                 self.fd.as_raw_fd(),
@@ -223,6 +251,34 @@ impl EthernetSink for AfPacketSocket {
 }
 
 // --- helpers ------------------------------------------------------------------
+
+/// Reads the hardware address of the interface a packet socket is bound to.
+fn bound_hw_addr(fd: &OwnedFd) -> Option<EthernetAddr> {
+    // SAFETY: `sockaddr_ll` is a plain C struct of integers and byte arrays,
+    // for which all-zero bytes are a valid value.
+    let mut sll: sockaddr_ll = unsafe { zeroed() };
+    let mut len = size_of::<sockaddr_ll>() as socklen_t;
+    // SAFETY: `sll` is a writable `sockaddr_ll` of the size passed in `len`.
+    let rc = unsafe {
+        getsockname(
+            fd.as_raw_fd(),
+            &mut sll as *mut sockaddr_ll as *mut _,
+            &mut len,
+        )
+    };
+    if rc < 0 || sll.sll_halen != 6 {
+        return None;
+    }
+    let addr = EthernetAddr::from_slice(sll.sll_addr.get(..6)?)?;
+    (addr.0 != [0; 6]).then_some(addr)
+}
+
+/// Returns whether `frame` carries an all-zero source address.
+fn has_zero_source(frame: &[u8]) -> bool {
+    frame
+        .get(6..12)
+        .is_some_and(|src| src.iter().all(|b| *b == 0))
+}
 
 fn lookup_ifindex(name: &str) -> Result<u32, EthernetError> {
     let cstr = std::ffi::CString::new(name)
@@ -301,6 +357,16 @@ impl Drop for AfPacketSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_source_is_detected() {
+        let mut f = [0xffu8; 20];
+        f[6..12].fill(0);
+        assert!(has_zero_source(&f));
+        f[11] = 1;
+        assert!(!has_zero_source(&f));
+        assert!(!has_zero_source(&[0u8; 11]));
+    }
 
     /// A missing interface yields `InterfaceNotFound`. The test runs without
     /// `CAP_NET_RAW`, because `if_nametoindex` needs no privilege.

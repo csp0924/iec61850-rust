@@ -25,13 +25,16 @@
 //! Multicast groups are not joined explicitly, because libpcap has no
 //! portable join API; the backend relies on the OS and NIC defaults.
 //!
+//! On Linux, `send` replaces an all-zero source address with the
+//! interface address read from sysfs; elsewhere the caller supplies it.
+//!
 //! TODO: filter on EtherType with BPF to cut per-frame callback overhead.
 
 use std::time::Duration;
 
 use ::pcap::{Active, Capture, Device, Error as PcapError};
 
-use super::{EthernetConfig, EthernetError, EthernetSink, EthernetSource};
+use super::{EthernetAddr, EthernetConfig, EthernetError, EthernetSink, EthernetSource};
 
 /// The libpcap and NPCAP backend.
 ///
@@ -42,12 +45,17 @@ pub struct PcapSocket {
     /// The configured timeout. pcap fixes it when the capture is opened, so
     /// it cannot be changed per receive.
     open_timeout_ms: Option<i32>,
+    /// Hardware address of the interface, when the platform reports one.
+    hw_addr: Option<EthernetAddr>,
+    /// Copy of an outgoing frame whose source address is filled in.
+    send_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for PcapSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PcapSocket")
             .field("open_timeout_ms", &self.open_timeout_ms)
+            .field("hw_addr", &self.hw_addr)
             .finish()
     }
 }
@@ -75,6 +83,7 @@ impl PcapSocket {
         }
 
         let device = find_device(&cfg.interface)?;
+        let hw_addr = interface_hw_addr(&device.name);
 
         let timeout_ms = cfg
             .recv_timeout
@@ -106,7 +115,15 @@ impl PcapSocket {
             open_timeout_ms: cfg
                 .recv_timeout
                 .map(|d| d.as_millis().min(i32::MAX as u128) as i32),
+            hw_addr,
+            send_scratch: Vec::new(),
         })
+    }
+
+    /// Returns the hardware address of the interface, or `None` when the
+    /// platform does not report one or it is all zero.
+    pub fn hw_addr(&self) -> Option<EthernetAddr> {
+        self.hw_addr
     }
 
     /// Returns the underlying capture, for advanced use such as installing a
@@ -134,7 +151,20 @@ impl EthernetSource for PcapSocket {
 }
 
 impl EthernetSink for PcapSocket {
+    /// Sends one frame; an all-zero source address is replaced with
+    /// [`hw_addr`](PcapSocket::hw_addr) when the interface has one.
     fn send(&mut self, frame: &[u8]) -> Result<usize, EthernetError> {
+        let frame = match self.hw_addr {
+            Some(addr) if has_zero_source(frame) => {
+                self.send_scratch.clear();
+                self.send_scratch.extend_from_slice(frame);
+                if let Some(src) = self.send_scratch.get_mut(6..12) {
+                    src.copy_from_slice(&addr.0);
+                }
+                self.send_scratch.as_slice()
+            }
+            _ => frame,
+        };
         self.cap
             .sendpacket(frame)
             .map_err(|e| EthernetError::Os(format!("pcap sendpacket: {e}")))?;
@@ -143,6 +173,49 @@ impl EthernetSink for PcapSocket {
 }
 
 // --- helpers -----------------------------------------------------------------
+
+/// Returns whether `frame` carries an all-zero source address.
+fn has_zero_source(frame: &[u8]) -> bool {
+    frame
+        .get(6..12)
+        .is_some_and(|src| src.iter().all(|b| *b == 0))
+}
+
+/// Reads the hardware address of interface `name` from
+/// `/sys/class/net/<name>/address`.
+#[cfg(target_os = "linux")]
+fn interface_hw_addr(name: &str) -> Option<EthernetAddr> {
+    if name.contains('/') {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/sys/class/net/{name}/address")).ok()?;
+    parse_mac(text.trim())
+}
+
+/// Hardware address lookup is only implemented for Linux.
+#[cfg(not(target_os = "linux"))]
+fn interface_hw_addr(_name: &str) -> Option<EthernetAddr> {
+    None
+}
+
+/// Parses `aa:bb:cc:dd:ee:ff`, returning `None` for any other form and for
+/// the all-zero address.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_mac(text: &str) -> Option<EthernetAddr> {
+    let mut out = [0u8; 6];
+    let mut parts = text.split(':');
+    for byte in &mut out {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    if parts.next().is_some() || out == [0; 6] {
+        return None;
+    }
+    Some(EthernetAddr(out))
+}
 
 fn find_device(name: &str) -> Result<Device, EthernetError> {
     // Try the name directly first: a full NPCAP device path or a Linux
@@ -209,6 +282,37 @@ mod tests {
     fn list_devices_does_not_panic() {
         // May fail where libpcap is absent, but must not panic.
         let _ = list_devices();
+    }
+
+    #[test]
+    fn parse_mac_accepts_sysfs_form() {
+        assert_eq!(
+            parse_mac("02:42:ac:11:00:02"),
+            Some(EthernetAddr([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]))
+        );
+    }
+
+    #[test]
+    fn parse_mac_rejects_other_forms() {
+        for bad in [
+            "",
+            "00:00:00:00:00:00",
+            "02:42:ac:11:00",
+            "02:42:ac:11:00:02:03",
+            "2:42:ac:11:00:02",
+            "zz:42:ac:11:00:02",
+        ] {
+            assert_eq!(parse_mac(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn zero_source_is_detected() {
+        let mut f = [0xffu8; 20];
+        f[6..12].fill(0);
+        assert!(has_zero_source(&f));
+        f[6] = 2;
+        assert!(!has_zero_source(&f));
     }
 
     /// An empty interface name is rejected before pcap is reached.
