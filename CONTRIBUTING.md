@@ -193,10 +193,15 @@ documentation pass are three pull requests, because a reviewer checking a
 protocol fix against the standard should not be reading a rename at the same
 time.
 
-Write the commit message in the imperative mood, with a subject under about
-seventy characters and a body explaining what the change does and, where the
-answer is not obvious, why. Cite the clause of the standard that a protocol
-change follows.
+Write the commit subject as a [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+header, `type(scope): description`: the type is one of `feat`, `fix`, `docs`,
+`test`, `refactor`, `perf`, `build`, `ci` or `chore`, and the scope names the
+crate or area without its `iec61850-` prefix, as in
+`fix(mms): bound the reassembled tsdu by default`. Keep the subject in the
+imperative mood and under about seventy characters, and give the commit a
+body explaining what the change does and, where the answer is not obvious,
+why. Cite the clause of the standard that a protocol change follows, and close
+the body with `Refs #N` or `Closes #N` when the change answers an issue.
 
 Say in the description what you ran and what you saw. "Tests pass" is worth
 less than the command and its output, and a reviewer cannot verify a claim that
