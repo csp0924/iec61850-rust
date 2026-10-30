@@ -84,6 +84,8 @@ pub mod __rt {
     };
     pub use iec61850_model::types::{DataAttributeType, TrgOps};
     pub use iec61850_model::value::MmsValue;
+
+    pub use crate::build_model::instance_target;
 }
 
 /// Codegen-only helper re-exports, giving a build script the same lookup

@@ -716,26 +716,65 @@ fn emit_sgcb_expr(
 // 7. DOI / SDI / DAI overrides
 // -----------------------------------------------------------------------------
 
-/// Flattens every DAI under `RawLogicalNode.doi` into a `(do_path, MmsValue)`
-/// pair and emits the lookup and the write that applies it.
+/// One `<DAI>` value: the path from the logical node, the data object name
+/// first, and the parsed value.
+#[derive(Debug, Clone, PartialEq)]
+struct DaiOverride {
+    path: Vec<String>,
+    value: MmsValue,
+}
+
+/// Emits the statements that apply every DAI value under `RawLogicalNode.doi`
+/// to the built logical node `__ln`.
 ///
 /// DAI strings are parsed while the build script runs, through the runtime
 /// `parse_val_for_b_type` helper, and the result is emitted as a literal by
-/// `emit_mms_value`, so the user's run time performs no string parsing.
-///
-/// Path lookup uses the model crate's existing public API
-/// (`LogicalNode::do_by_name`, `DataObject::child_by_name`,
-/// `DataAttribute::child_by_name`), and adds nothing to that crate.
-///
-/// A failing override, such as a path that does not resolve or a DAI landing on
-/// a constructed DA, is warned about and skipped at run time. Here it is caught
-/// while the build script runs and reported there, instead of being carried
-/// into the user's binary.
+/// `emit_mms_value`, so the user's run time performs no string parsing. Each
+/// statement finds its attribute through `__rt::instance_target`, which walks
+/// sub-objects, data attributes and nested attributes alike; a path that does
+/// not resolve is skipped, as on the runtime path.
 fn emit_doi_overrides(
     ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
 ) -> Result<Vec<TokenStream>, CompileError> {
+    Ok(collect_doi_overrides(ln, dtt, ld_inst)?
+        .iter()
+        .map(emit_dai_override)
+        .collect())
+}
+
+/// Emits the lookup and the write of one DAI value.
+fn emit_dai_override(o: &DaiOverride) -> TokenStream {
+    let (do_name, rest) = match o.path.split_first() {
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("", &[][..]),
+    };
+    let names = rest.iter().map(|s| s.as_str());
+    let value_tok = emit_mms_value(&o.value);
+    quote! {
+        if let ::std::option::Option::Some(__da) =
+            ::iec61850_scl::__rt::instance_target(&__ln, #do_name, &[ #( #names ),* ])
+        {
+            *__da
+                .value
+                .write()
+                .expect("codegen: MmsValue lock poisoned during DAI override")
+                = #value_tok;
+        }
+    }
+}
+
+/// Flattens every DAI under `RawLogicalNode.doi` into a [`DaiOverride`].
+///
+/// A failing override, such as a DAI landing on a constructed DA, is reported
+/// while the build script runs instead of being carried into the user's
+/// binary.
+fn collect_doi_overrides(
+    ln: &RawLogicalNode,
+    dtt: &DataTypeTemplates,
+    ld_inst: &str,
+) -> Result<Vec<DaiOverride>, CompileError> {
     let lnt = dtt.ln_node_types.get(&ln.ln_type_ref).ok_or_else(|| {
         CompileError::Emit(format!(
             "LN ln_type_ref `{}` is absent from ln_node_types; the resolve stage should have rejected it",
@@ -743,7 +782,7 @@ fn emit_doi_overrides(
         ))
     })?;
 
-    let mut out: Vec<TokenStream> = Vec::new();
+    let mut out: Vec<DaiOverride> = Vec::new();
     for raw_doi in &ln.doi {
         let raw_do_def = match lnt.dos.iter().find(|d| d.name == raw_doi.name) {
             Some(d) => d,
@@ -795,7 +834,7 @@ fn emit_instances_at_do(
     dtt: &DataTypeTemplates,
     parent_path: &str,
     base_path: &mut Vec<String>,
-    out: &mut Vec<TokenStream>,
+    out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     for inst in children {
         if skip_indexed_instance(inst) {
@@ -842,7 +881,7 @@ fn handle_sdi_at_do(
     dtt: &DataTypeTemplates,
     parent_path: &str,
     base_path: &mut Vec<String>,
-    out: &mut Vec<TokenStream>,
+    out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     // Two possibilities: a sub-DO, or a constructed DA with bType=Struct.
     if let Some(sdo) = dot.sdos.iter().find(|s| s.name == sdi.name) {
@@ -899,7 +938,7 @@ fn emit_instances_at_da(
     dtt: &DataTypeTemplates,
     parent_path: &str,
     base_path: &mut Vec<String>,
-    out: &mut Vec<TokenStream>,
+    out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     for inst in children {
         if skip_indexed_instance(inst) {
@@ -976,8 +1015,8 @@ fn emit_instances_at_da(
     Ok(())
 }
 
-/// Parses one DAI value while the build script runs and emits it as a literal,
-/// together with the path lookup on `__ln` and the write.
+/// Parses one DAI value while the build script runs and records it with its
+/// path from the logical node.
 fn emit_dai_assignment(
     dai: &RawDai,
     b_type: &str,
@@ -985,7 +1024,7 @@ fn emit_dai_assignment(
     dtt: &DataTypeTemplates,
     path: &str,
     base_path: &[String],
-    out: &mut Vec<TokenStream>,
+    out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     if dai.values.is_empty() {
         // No Val element: the DAI only declares valKind or valImport and
@@ -1003,111 +1042,17 @@ fn emit_dai_assignment(
         .map_err(|e| {
             CompileError::Emit(format!("failed to parse the DAI value at {}: {}", path, e))
         })?;
-    let value_tok = emit_mms_value(&parsed);
-
-    // base_path[0] is the DO name; the remaining segments are resolved one level
-    // at a time down the LN, DO and DA trees.
-    let do_name = base_path
-        .first()
-        .ok_or_else(|| CompileError::Emit(format!("{}: the DAI override path is empty", path)))?;
-    let do_name_lit = do_name.as_str();
-    // The middle segments, between the DO and the final DA, are looked up among
-    // the DO children as either a SubDo or a Da.
-    let mid_segments: Vec<&str> = base_path[1..base_path.len() - 1]
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let leaf_name = base_path.last().expect("base_path is non-empty").as_str();
-
-    // A non-empty middle means the path crosses an SDO or a constructed DA, so
-    // the lookup descends level by level: `do_by_name` yields the data object;
-    // an empty middle takes `child_by_name(leaf)` straight to a `DoChild::Da`;
-    // a non-empty middle resolves the intermediate segments first.
-    //
-    // The whole lookup is emitted as an `if let Some(_)` chain, so a segment
-    // that does not resolve is skipped silently, as the runtime path does.
-    let stmt = if mid_segments.is_empty() {
-        // Straight from the logical node to the data object to the leaf.
-        quote! {
-            if let ::std::option::Option::Some(__do) = __ln.do_by_name(#do_name_lit) {
-                if let ::std::option::Option::Some(::iec61850_scl::__rt::DoChild::Da(__da))
-                    = __do.child_by_name(#leaf_name)
-                {
-                    *__da
-                        .value
-                        .write()
-                        .expect("codegen: MmsValue lock poisoned during DAI override")
-                        = #value_tok;
-                }
-            }
-        }
-    } else {
-        // The middle segments form a SubDo chain whose last element may be a
-        // SubDo or a Da, after which the remaining names walk the DA tree.
-        //
-        // The lookup is emitted as an expanded if-let chain rather than a
-        // recursive helper, because emit must not add a free function to the
-        // model crate. A middle is rarely more than three levels deep.
-        let mid_lits: Vec<&str> = mid_segments.clone();
-        emit_nested_lookup_assign(do_name_lit, &mid_lits, leaf_name, value_tok)
-    };
-    out.push(stmt);
-    Ok(())
-}
-
-/// Emits the nested lookup from a data object, through a chain of SubDo or DA
-/// nodes, to the leaf.
-///
-/// Expands `do_by_name`, the intermediate `child_by_name` calls and the final
-/// write into nested if-lets. A segment that does not resolve is skipped, which
-/// mirrors the warn-and-skip behavior of the runtime path.
-fn emit_nested_lookup_assign(
-    do_name: &str,
-    mid_segments: &[&str],
-    leaf_name: &str,
-    value_tok: TokenStream,
-) -> TokenStream {
-    // Two shapes of path exist: one where a middle segment resolves to a data
-    // attribute and the rest walks the DA tree, and one where every middle
-    // segment is a SubDo and the leaf is a child of the last sub-DO.
-    //
-    // This helper handles the second shape and emits a SubDo chain; the first
-    // shape is not routed through it.
-    //
-    // TODO: emit the DA-tree branch as well, so a middle segment holding a
-    // constructed DA is generated the way the runtime path walks it.
-
-    // Join the middle segments into a nested if-let SubDo chain.
-    let inner = mid_segments.iter().rfold(
-        // Endpoint: `child_by_name(leaf)` on `__cur_do` yields the `DoChild::Da`
-        // to write into.
-        quote! {
-            if let ::std::option::Option::Some(::iec61850_scl::__rt::DoChild::Da(__da))
-                = __cur_do.child_by_name(#leaf_name)
-            {
-                *__da
-                    .value
-                    .write()
-                    .expect("codegen: MmsValue lock poisoned during DAI override")
-                    = #value_tok;
-            }
-        },
-        |acc, seg| {
-            quote! {
-                if let ::std::option::Option::Some(::iec61850_scl::__rt::DoChild::SubDo(__cur_do))
-                    = __cur_do.child_by_name(#seg)
-                {
-                    #acc
-                }
-            }
-        },
-    );
-
-    quote! {
-        if let ::std::option::Option::Some(__cur_do) = __ln.do_by_name(#do_name) {
-            #inner
-        }
+    if base_path.is_empty() {
+        return Err(CompileError::Emit(format!(
+            "{}: the DAI override path is empty",
+            path
+        )));
     }
+    out.push(DaiOverride {
+        path: base_path.to_vec(),
+        value: parsed,
+    });
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -1437,6 +1382,94 @@ mod tests {
         .to_string();
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         assert!(emitted.contains(&expected), "{emitted}");
+    }
+
+    /// Every DAI value is emitted, including those under a constructed
+    /// attribute or a sub-object, and the generated lookup lands on the
+    /// attribute the runtime model holds the same value in.
+    #[test]
+    fn emitted_dai_values_under_structured_attributes_match_runtime() {
+        let xml = r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
+    <LN lnClass="GGIO" inst="3" lnType="GGIO_T">
+      <DOI name="AnIn3">
+        <SDI name="rangeC">
+          <SDI name="min"><DAI name="f"><Val>-5</Val></DAI></SDI>
+          <SDI name="max"><DAI name="f"><Val>5</Val></DAI></SDI>
+        </SDI>
+        <SDI name="units"><DAI name="SIUnit"><Val>V</Val></DAI></SDI>
+        <DAI name="db"><Val>100</Val></DAI>
+      </DOI>
+      <DOI name="Har"><SDI name="phsA"><DAI name="db"><Val>7</Val></DAI></SDI></DOI>
+    </LN>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="ENC_T"/></LNodeType>
+    <LNodeType id="GGIO_T" lnClass="GGIO">
+      <DO name="AnIn3" type="MV_T"/>
+      <DO name="Har" type="WYE_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC"><DA name="stVal" fc="ST" bType="BOOLEAN"/></DOType>
+    <DOType id="MV_T" cdc="MV">
+      <DA name="rangeC" fc="CF" bType="Struct" type="RangeConfig"/>
+      <DA name="units" fc="CF" bType="Struct" type="Unit"/>
+      <DA name="db" fc="CF" bType="INT32U"/>
+    </DOType>
+    <DOType id="WYE_T" cdc="WYE"><SDO name="phsA" type="CMV_T"/></DOType>
+    <DOType id="CMV_T" cdc="CMV"><DA name="db" fc="CF" bType="INT32U"/></DOType>
+    <DAType id="RangeConfig">
+      <BDA name="min" bType="Struct" type="AV"/>
+      <BDA name="max" bType="Struct" type="AV"/>
+    </DAType>
+    <DAType id="AV"><BDA name="f" bType="FLOAT32"/></DAType>
+    <DAType id="Unit"><BDA name="SIUnit" bType="Enum" type="SIUnit"/></DAType>
+    <EnumType id="SIUnit"><EnumVal ord="1">none</EnumVal><EnumVal ord="29">V</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>"#;
+        let resolved = parse_scl(xml).unwrap().resolve().unwrap();
+        let runtime = resolved.build_model("IED1").unwrap();
+        let raw = resolved.raw();
+        let ld = &raw.ieds[0].access_points[0]
+            .server
+            .as_ref()
+            .unwrap()
+            .logical_devices[0];
+        let raw_ln = ld
+            .logical_nodes
+            .iter()
+            .find(|l| l.ln_class == "GGIO")
+            .unwrap();
+        let overrides = collect_doi_overrides(raw_ln, &raw.data_type_templates, "LD0").unwrap();
+        let paths: Vec<String> = overrides.iter().map(|o| o.path.join(".")).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "AnIn3.rangeC.min.f",
+                "AnIn3.rangeC.max.f",
+                "AnIn3.units.SIUnit",
+                "AnIn3.db",
+                "Har.phsA.db",
+            ]
+        );
+        let ln = runtime
+            .ld_by_inst("LD0")
+            .unwrap()
+            .ln_by_name("GGIO3")
+            .unwrap();
+        let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
+        for o in &overrides {
+            let names: Vec<&str> = o.path[1..].iter().map(|s| s.as_str()).collect();
+            let da = iec61850_scl::__rt::instance_target(ln, &o.path[0], &names)
+                .unwrap_or_else(|| panic!("{:?} does not resolve", o.path));
+            assert_eq!(da.snapshot(), o.value, "{:?}", o.path);
+            assert_ne!(da.snapshot(), MmsValue::default_for(da.ty), "{:?}", o.path);
+            assert!(
+                emitted.contains(&emit_dai_override(o).to_string()),
+                "{:?} is not emitted",
+                o.path
+            );
+        }
     }
 
     /// Generated code and the runtime build path must produce the same

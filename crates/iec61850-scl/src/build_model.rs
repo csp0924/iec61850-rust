@@ -1138,6 +1138,38 @@ pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
     }
 }
 
+/// Finds the leaf data attribute that an instance path names below a logical
+/// node: `do_name` names the data object, and each name of `path` names a
+/// sub-object, a data attribute or a nested attribute below the previous
+/// node, the last one being the leaf.
+///
+/// Returns `None` when a name does not resolve or the path ends at a data
+/// object. The code a build script generates applies its `<DAI>` values
+/// through this lookup, so a value under a sub-object or a constructed
+/// attribute lands where the runtime path writes it.
+#[doc(hidden)]
+pub fn instance_target<'a>(
+    ln: &'a iec61850_model::LogicalNode,
+    do_name: &str,
+    path: &[&str],
+) -> Option<&'a DataAttribute> {
+    let mut dobj = ln.do_by_name(do_name)?;
+    let mut da: Option<&DataAttribute> = None;
+    for name in path {
+        da = Some(match da {
+            None => match dobj.child_by_name(name)? {
+                iec61850_model::tree::DoChild::SubDo(s) => {
+                    dobj = s;
+                    continue;
+                }
+                iec61850_model::tree::DoChild::Da(a) => a,
+            },
+            Some(a) => a.child_by_name(name)?,
+        });
+    }
+    da
+}
+
 /// Picks the value to apply out of several `<Val>` elements: the one without a
 /// setting group, or the first one with a warning.
 ///
