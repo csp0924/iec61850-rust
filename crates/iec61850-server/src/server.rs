@@ -868,12 +868,17 @@ impl IedServer {
     /// returned guard drops.
     pub(crate) fn try_acquire_connection_slot(&self) -> Option<ConnectionSlot> {
         let max = self.inner.config.max_mms_connections;
-        self.inner
-            .open_sockets
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()?;
+        let open = &self.inner.open_sockets;
+        let mut n = open.load(Ordering::SeqCst);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match open.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(current) => n = current,
+            }
+        }
         Some(ConnectionSlot {
             server: self.clone(),
         })
