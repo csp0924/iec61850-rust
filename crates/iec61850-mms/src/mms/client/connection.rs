@@ -7,11 +7,16 @@
 //!    Presentation CP, ACSE AARQ and the MMS Initiate request in one message, and
 //!    the matching Session AC with Presentation CPA, ACSE AARE and the MMS Initiate
 //!    response.
-//! 3. Running the release sequence: MMS Conclude request, Conclude response, close.
+//! 3. Running the release sequence: MMS Conclude request and response, then the
+//!    ACSE A-RELEASE (RLRQ carried by a Session FN, RLRE by the DN), then close.
+//!    The abort sequence sends an ACSE ABRT inside a Session AB and closes.
 //! 4. Sending and receiving MMS PDUs inside TPKT and COTP framing, through
 //!    [`crate::iso::cotp::CotpConnection`].
-//! 5. An encoded PDU larger than `negotiated_max_pdu_size` is rejected
+//! 5. An encoded MMS PDU larger than `negotiated_max_pdu_size` is rejected
 //!    instead of being sent.
+//! 6. A confirmed response is bound to its request by invokeID (ISO 9506-2). The
+//!    invokeID of a request that timed out is remembered, so its late answer is
+//!    discarded instead of being taken for the answer to a later request.
 //!
 //! ## Design
 //!
@@ -19,16 +24,20 @@
 //!   `CotpConnection`, which is transport generic.
 //! - Synchronous callers use the `BlockingMmsClient` wrapper.
 //! - `connect_timeout_ms` and `request_timeout_ms` are applied with
-//!   `iec61850_hal::time::with_timeout`, so the runtime stays pluggable.
+//!   `iec61850_hal::time::with_timeout`, so the runtime stays pluggable. Each
+//!   receive is bounded by exactly one timeout.
 //!
 //! ## Behavior
 //!
-//! A Conclude request arriving from the server (`0x8b`) is answered with `0x8c`
-//! and reported to the caller as a lost connection.
+//! - A Conclude request arriving from the server (`0x8b`) is answered with `0x8c`,
+//!   the transport is closed and the caller sees `ConnectionLost`.
+//! - The end of the transport, a COTP DR, and a Session AB, FN or DN close the
+//!   connection and surface as `ConnectionLost`.
 
 use super::error::ClientError;
 use crate::compat::prelude::*;
-use crate::compat::VecDeque;
+use crate::compat::{Arc, VecDeque};
+use crate::error::CotpError;
 use crate::iso::acse::{self, AcseConnection, AcseIndication};
 use crate::iso::cotp::{CotpConnection, CotpOptions};
 use crate::iso::params::IsoConnectionParameters;
@@ -39,6 +48,7 @@ use crate::mms::pdu::{
     DEFAULT_MAX_SERV_OUTSTANDING_CALLING,
 };
 use bytes::{Bytes, BytesMut};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use iec61850_hal::time::{with_timeout, Timer};
 use iec61850_hal::transport::AsyncTransport;
@@ -65,8 +75,22 @@ pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 /// Default request timeout in milliseconds.
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
+/// Default ceiling on the Unconfirmed PDUs stashed while a confirmed call is in
+/// flight; see [`MmsConnection::max_pending_unconfirmed`].
+pub const DEFAULT_MAX_PENDING_UNCONFIRMED: usize = 1024;
+
+/// Number of timed-out invokeIDs remembered so that their late answers are
+/// recognized and discarded; the oldest is forgotten first.
+const MAX_ABANDONED_INVOKE_IDS: usize = 64;
+
 /// indirect-reference written into the AARQ user-information; MMS uses 3.
 const ACSE_INDIRECT_REFERENCE: u32 = 3;
+
+/// Tag of the Conclude-ErrorPDU, `[13] IMPLICIT ServiceError` (ISO 9506-2).
+const TAG_CONCLUDE_ERROR: u8 = 0xad;
+
+/// Tag of the ACSE RLRE APDU (ISO 8650-1).
+const TAG_ACSE_RLRE: u8 = 0x63;
 
 // ConnectionState
 
@@ -127,12 +151,16 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     /// Request timeout in milliseconds.
     pub request_timeout_ms: u64,
     /// `localDetail` proposed in the Initiate request, the proposedMaxPduSize.
-    /// `None` uses `DEFAULT_MAX_PDU_SIZE`, that is 65000. A smaller value exercises
-    /// the outbound size guard end to end.
+    /// `None` uses `DEFAULT_MAX_PDU_SIZE`, that is 65000. The negotiated size never
+    /// exceeds this proposal, whatever the server answers.
     pub local_max_pdu_size: Option<u32>,
     /// ISO addressing offered by the next association: the T, S and P selectors
     /// and the AP-title and AE-qualifier of both sides.
     pub iso_parameters: IsoConnectionParameters,
+    /// Ceiling on the number of stashed Unconfirmed PDUs. When it is reached the
+    /// oldest stashed PDU is dropped with a warning. Defaults to
+    /// [`DEFAULT_MAX_PENDING_UNCONFIRMED`].
+    pub max_pending_unconfirmed: usize,
     /// Inner bytes of Unconfirmed PDUs, such as InformationReport, that arrived while
     /// a confirmed service was awaiting its response.
     ///
@@ -141,6 +169,10 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     /// stashed here and drained by `recv_unconfirmed_pdu_with_timeout`, which keeps
     /// the caller from mistaking it for the response. The queue preserves arrival order.
     pending_unconfirmed: VecDeque<Bytes>,
+    /// invokeIDs of requests that timed out, oldest first.
+    abandoned_invoke_ids: VecDeque<u32>,
+    /// Flag mirroring whether the state is `Connected`, shared with observers.
+    connected_flag: Option<Arc<AtomicBool>>,
 }
 
 /// The no_std form of `MmsConnection`, without type parameter defaults. Its fields
@@ -168,7 +200,11 @@ pub struct MmsConnection<T, Tm> {
     pub local_max_pdu_size: Option<u32>,
     /// ISO addressing offered by the next association.
     pub iso_parameters: IsoConnectionParameters,
+    /// Ceiling on the number of stashed Unconfirmed PDUs.
+    pub max_pending_unconfirmed: usize,
     pending_unconfirmed: VecDeque<Bytes>,
+    abandoned_invoke_ids: VecDeque<u32>,
+    connected_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<T, Tm: Default> MmsConnection<T, Tm> {
@@ -200,7 +236,10 @@ impl<T, Tm> MmsConnection<T, Tm> {
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             local_max_pdu_size: None,
             iso_parameters: IsoConnectionParameters::default(),
+            max_pending_unconfirmed: DEFAULT_MAX_PENDING_UNCONFIRMED,
             pending_unconfirmed: VecDeque::new(),
+            abandoned_invoke_ids: VecDeque::new(),
+            connected_flag: None,
         }
     }
 
@@ -210,6 +249,19 @@ impl<T, Tm> MmsConnection<T, Tm> {
     /// goes through `MmsClientBuilder`.
     pub fn set_iso_parameters(&mut self, params: IsoConnectionParameters) {
         self.iso_parameters = params;
+    }
+
+    /// Returns a flag that is `true` exactly while the state is `Connected`.
+    ///
+    /// Every later call returns the same flag. The connection updates it on each
+    /// state change, including a transport loss detected inside a service call,
+    /// so an observer can test liveness without taking the connection.
+    pub fn connected_flag(&mut self) -> Arc<AtomicBool> {
+        let connected = self.state == ConnectionState::Connected;
+        Arc::clone(
+            self.connected_flag
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(connected))),
+        )
     }
 
     /// Removes the oldest stashed Unconfirmed PDU, if any.
@@ -225,9 +277,58 @@ impl<T, Tm> MmsConnection<T, Tm> {
     /// Returns a set of Unconfirmed PDU inner bytes to the back of the stash.
     ///
     /// A command-termination wait that takes an InformationReport and finds it is a
-    /// different kind of report puts it back here for the report dispatcher.
+    /// different kind of report puts it back here for the report dispatcher. The
+    /// stash is bounded by `max_pending_unconfirmed`, dropping the oldest entry.
     pub fn push_pending_unconfirmed(&mut self, inner: Bytes) {
+        if self.max_pending_unconfirmed == 0 {
+            warn!(
+                len = inner.len(),
+                "unconfirmed pdu stash has a limit of 0, dropping the pdu"
+            );
+            return;
+        }
+        while self.pending_unconfirmed.len() >= self.max_pending_unconfirmed {
+            let Some(dropped) = self.pending_unconfirmed.pop_front() else {
+                break;
+            };
+            warn!(
+                dropped_len = dropped.len(),
+                limit = self.max_pending_unconfirmed,
+                "unconfirmed pdu stash is full, dropping the oldest entry"
+            );
+        }
         self.pending_unconfirmed.push_back(inner);
+    }
+
+    /// Moves to `state` and updates the shared connected flag.
+    fn set_state(&mut self, state: ConnectionState) {
+        self.state = state;
+        if let Some(flag) = self.connected_flag.as_ref() {
+            flag.store(state == ConnectionState::Connected, Ordering::Release);
+        }
+    }
+
+    /// Remembers the invokeID of a request whose answer did not arrive in time.
+    fn abandon_invoke_id(&mut self, invoke_id: u32) {
+        if self.abandoned_invoke_ids.len() >= MAX_ABANDONED_INVOKE_IDS {
+            self.abandoned_invoke_ids.pop_front();
+        }
+        self.abandoned_invoke_ids.push_back(invoke_id);
+    }
+
+    /// Forgets `invoke_id` and reports whether it was an abandoned request.
+    fn take_abandoned(&mut self, invoke_id: u32) -> bool {
+        match self
+            .abandoned_invoke_ids
+            .iter()
+            .position(|&id| id == invoke_id)
+        {
+            Some(pos) => {
+                self.abandoned_invoke_ids.remove(pos);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -240,17 +341,30 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// The sequence is TCP, COTP CR and CC, then Session CN with Presentation CP,
     /// ACSE AARQ and the MMS Initiate request, and the matching Session AC with
     /// Presentation CPA, ACSE AARE and the MMS Initiate response.
+    ///
+    /// # Errors
+    ///
+    /// - `ConnectTimeout` when no TCP connection is established within
+    ///   `connect_timeout_ms`.
+    /// - `IsoError` when the address does not parse or the connection is refused.
+    /// - The errors of [`Self::connect_via`] for the association itself.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         let addr: std::net::SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|e| ClientError::IsoError(format!("address parse: {e}")))?;
-        let connect_dur = Duration::from_millis(self.connect_timeout_ms);
-
-        // Step 0: TCP connect with timeout
-        let tcp = with_timeout(&self.timer, connect_dur, TcpStream::connect(addr))
-            .await
-            .map_err(|_| ClientError::IsoError("TCP connect timeout".to_string()))?
-            .map_err(|e| ClientError::IsoError(format!("TCP connect: {e}")))?;
+        let timeout_ms = self.connect_timeout_ms;
+        let timer = self.timer;
+        let tcp = with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| {
+            warn!(%addr, timeout_ms, "tcp connect timed out");
+            ClientError::ConnectTimeout { timeout_ms }
+        })?
+        .map_err(|e| ClientError::IsoError(format!("TCP connect: {e}")))?;
         // disable Nagle to keep the latency of small PDUs down
         let _ = tcp.set_nodelay(true);
 
@@ -261,7 +375,8 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// Runs the association sequence over TLS.
     ///
     /// The TLS handshake is inserted after the TCP connection, and every later step
-    /// is identical to the plaintext path.
+    /// is identical to the plaintext path. On failure the connection is left
+    /// `Closed`.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,
@@ -269,13 +384,29 @@ impl MmsConnection<TcpStream, TokioTimer> {
         connector: &TlsConnector,
         server_name: ServerName<'static>,
     ) -> Result<(), ClientError> {
-        self.state = ConnectionState::Connecting;
-        let connect_dur = Duration::from_millis(self.connect_timeout_ms);
+        let result = self.associate_tls(addr, connector, server_name).await;
+        if result.is_err() {
+            self.close_raw();
+        }
+        result
+    }
+
+    #[cfg(feature = "tls")]
+    async fn associate_tls(
+        &mut self,
+        addr: std::net::SocketAddr,
+        connector: &TlsConnector,
+        server_name: ServerName<'static>,
+    ) -> Result<(), ClientError> {
+        self.reset_association_state();
+        self.set_state(ConnectionState::Connecting);
+        let timeout_ms = self.connect_timeout_ms;
+        let connect_dur = Duration::from_millis(timeout_ms);
 
         // Step 0: TCP connect
         let tcp = with_timeout(&self.timer, connect_dur, TcpStream::connect(addr))
             .await
-            .map_err(|_| ClientError::IsoError("TCP connect timeout".to_string()))?
+            .map_err(|_| ClientError::ConnectTimeout { timeout_ms })?
             .map_err(|e| ClientError::IsoError(format!("TCP connect: {e}")))?;
         let _ = tcp.set_nodelay(true);
 
@@ -306,10 +437,13 @@ impl MmsConnection<TcpStream, TokioTimer> {
 
         // Step 4: Session AC + Presentation CPA + ACSE AARE + MMS Initiate-Response
         {
-            let req_dur = Duration::from_millis(self.request_timeout_ms);
+            let request_timeout_ms = self.request_timeout_ms;
+            let req_dur = Duration::from_millis(request_timeout_ms);
             let raw = with_timeout(&self.timer, req_dur, cotp.recv_data())
                 .await
-                .map_err(|_| ClientError::IsoError("recv timeout (initiate tls)".to_string()))?
+                .map_err(|_| ClientError::ServiceTimeout {
+                    timeout_ms: request_timeout_ms,
+                })?
                 .map_err(|e| ClientError::IsoError(format!("cotp tls recv: {e}")))?;
 
             let sess_ind = self
@@ -340,10 +474,8 @@ impl MmsConnection<TcpStream, TokioTimer> {
 
             match init_pdu {
                 MmsPdu::InitiateResponse(resp) => {
-                    let local_max = DEFAULT_MAX_PDU_SIZE as usize;
-                    let server_max =
-                        resp.local_detail_called.unwrap_or(DEFAULT_MAX_PDU_SIZE) as usize;
-                    self.negotiated_max_pdu_size = local_max.min(server_max);
+                    self.negotiated_max_pdu_size =
+                        negotiate_max_pdu_size(self.local_max_pdu_size, resp.local_detail_called);
                     self.negotiated_max_calling = resp.negotiated_max_serv_outstanding_calling;
                     self.negotiated_max_called = resp.negotiated_max_serv_outstanding_called;
                     debug!(
@@ -374,7 +506,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         }
 
         self.cotp_tls = Some(cotp);
-        self.state = ConnectionState::Connected;
+        self.set_state(ConnectionState::Connected);
         Ok(())
     }
 }
@@ -389,23 +521,46 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// Session, Presentation, ACSE and MMS Initiate negotiation happen here.
     ///
     /// `connect` performs the TCP connection and then calls this; the TLS path uses
-    /// `connect_tls`, which drives its own COTP connection instead.
+    /// `connect_tls`, which drives its own COTP connection instead. On failure the
+    /// connection is left `Closed`.
+    ///
+    /// # Errors
+    ///
+    /// - `ServiceTimeout` when the Initiate response does not arrive within
+    ///   `request_timeout_ms`.
+    /// - `SessionRefused`, `AssociateFailed` or `InitiateFailed` when the peer
+    ///   refuses at the Session, ACSE or MMS level.
+    /// - `IsoError` or `PduParse` for a malformed answer.
     pub async fn connect_via(&mut self, transport: T) -> Result<(), ClientError> {
-        self.state = ConnectionState::Connecting;
+        self.reset_association_state();
+        self.set_state(ConnectionState::Connecting);
 
         // Step 1+2: COTP CR/CC handshake
         let opts = cotp_options(&self.iso_parameters);
-        let mut cotp = CotpConnection::connect(transport, opts)
-            .await
-            .map_err(|e| ClientError::IsoError(format!("cotp: {e}")))?;
+        let mut cotp = match CotpConnection::connect(transport, opts).await {
+            Ok(cotp) => cotp,
+            Err(e) => {
+                self.set_state(ConnectionState::Closed);
+                return Err(ClientError::IsoError(format!("cotp: {e}")));
+            }
+        };
         debug!("cotp connection established over the supplied transport");
 
         // ISO negotiation and the MMS Initiate exchange
-        self.run_initiate_handshake(&mut cotp).await?;
+        if let Err(e) = self.run_initiate_handshake(&mut cotp).await {
+            self.set_state(ConnectionState::Closed);
+            return Err(e);
+        }
 
         self.cotp = Some(cotp);
-        self.state = ConnectionState::Connected;
+        self.set_state(ConnectionState::Connected);
         Ok(())
+    }
+
+    /// Clears the per-association queues before a new association starts.
+    fn reset_association_state(&mut self) {
+        self.pending_unconfirmed.clear();
+        self.abandoned_invoke_ids.clear();
     }
 
     /// Builds the Session CN SPDU carrying the Presentation CP, the ACSE AARQ and
@@ -469,10 +624,13 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         }
 
         // Step 4
-        let req_dur = Duration::from_millis(self.request_timeout_ms);
+        let request_timeout_ms = self.request_timeout_ms;
+        let req_dur = Duration::from_millis(request_timeout_ms);
         let raw = with_timeout(&self.timer, req_dur, cotp.recv_data())
             .await
-            .map_err(|_| ClientError::IsoError("recv timeout (initiate)".to_string()))?
+            .map_err(|_| ClientError::ServiceTimeout {
+                timeout_ms: request_timeout_ms,
+            })?
             .map_err(|e| ClientError::IsoError(format!("cotp recv: {e}")))?;
 
         let sess_ind = self
@@ -503,9 +661,8 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
 
         match init_pdu {
             MmsPdu::InitiateResponse(resp) => {
-                let local_max = DEFAULT_MAX_PDU_SIZE as usize;
-                let server_max = resp.local_detail_called.unwrap_or(DEFAULT_MAX_PDU_SIZE) as usize;
-                self.negotiated_max_pdu_size = local_max.min(server_max);
+                self.negotiated_max_pdu_size =
+                    negotiate_max_pdu_size(self.local_max_pdu_size, resp.local_detail_called);
                 self.negotiated_max_calling = resp.negotiated_max_serv_outstanding_calling;
                 self.negotiated_max_called = resp.negotiated_max_serv_outstanding_called;
                 debug!(
@@ -536,38 +693,91 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         }
     }
 
-    /// Runs the MMS Conclude sequence and closes the connection.
+    /// Releases the association and closes the connection.
+    ///
+    /// The sequence is the MMS Conclude exchange, then the ACSE A-RELEASE: an RLRQ
+    /// carried by a Session FN, answered by an RLRE carried by the Session DN
+    /// (ISO 8650-1, ISO 8327-1). The release response is awaited for at most
+    /// `request_timeout_ms`; a peer that closes the transport instead, or does
+    /// not answer, still ends with the connection closed. InformationReports
+    /// arriving before the Conclude response are stashed, not taken for it.
     ///
     /// A caller-initiated disconnect does not invoke the connection-lost handler.
+    ///
+    /// # Errors
+    ///
+    /// - `NotConnected` when no association is established.
+    /// - `ConcludeRejected` when the peer answers with a Conclude-ErrorPDU; the
+    ///   association then stays `Connected`.
+    /// - The transport error when the Conclude request cannot be sent; the
+    ///   connection is closed.
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
         if self.state != ConnectionState::Connected {
             return Err(ClientError::NotConnected {
                 state: format!("{:?}", self.state),
             });
         }
-        self.state = ConnectionState::Closing;
+        self.set_state(ConnectionState::Closing);
 
-        // send the Conclude request
-        self.send_mms_pdu(&MmsPdu::ConcludeRequest).await?;
+        if let Err(e) = self.send_mms_pdu(&MmsPdu::ConcludeRequest).await {
+            self.close_raw();
+            return Err(e);
+        }
 
-        // await the Conclude response
-        match self.recv_mms_pdu().await {
-            Ok(MmsPdu::ConcludeResponse) => {
-                debug!("received a conclude response (0x8c), closing normally");
+        let timeout_ms = self.request_timeout_ms;
+        let timer = self.timer.clone();
+        match with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            self.await_conclude_response(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                debug!("received a conclude response, releasing the association");
+                self.release_association().await;
             }
-            Ok(other) => {
-                warn!(
-                    "expected a conclude response, got tag=0x{:02X}, closing anyway",
-                    other.tag_byte()
-                );
+            Ok(Err(ClientError::ConcludeRejected)) => {
+                self.set_state(ConnectionState::Connected);
+                return Err(ClientError::ConcludeRejected);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("failed to receive a conclude response: {e}, closing anyway");
+            }
+            Err(_) => {
+                warn!(timeout_ms, "no conclude response arrived, closing anyway");
             }
         }
 
         self.close_raw();
         Ok(())
+    }
+
+    /// Aborts the association and closes the connection.
+    ///
+    /// Sends an ACSE ABRT with abort-source acse-service-user inside a Session
+    /// AB (ISO 8650-1 A-ABORT), then closes the transport without waiting for any
+    /// answer. A connection that is already closed is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// The transport error when the abort cannot be sent; the connection is
+    /// closed either way.
+    pub async fn abort(&mut self) -> Result<(), ClientError> {
+        if self.state == ConnectionState::Closed {
+            return Ok(());
+        }
+        let mut abrt = [0u8; 5];
+        acse::encode_abrt(false, &mut abrt);
+        let mut pres_buf = BytesMut::new();
+        presentation::encode_abort(&self.presentation, &abrt, &mut pres_buf);
+        let mut sess_buf = BytesMut::new();
+        let result = match session::encode_abort(&pres_buf, &mut sess_buf) {
+            Ok(()) => self.send_tsdu(&sess_buf, "abort").await,
+            Err(e) => Err(ClientError::IsoError(format!("session ab: {e}"))),
+        };
+        self.close_raw();
+        result
     }
 
     /// Closes the transport immediately, without any release handshake.
@@ -580,64 +790,54 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         {
             self.cotp_tls = None;
         }
-        self.state = ConnectionState::Closed;
+        self.abandoned_invoke_ids.clear();
+        self.set_state(ConnectionState::Closed);
     }
 
     /// Sends an MMS PDU wrapped in the full ISO stack.
     ///
-    /// An encoded PDU larger than `negotiated_max_pdu_size`
-    /// returns an error instead of being sent.
+    /// An encoded MMS PDU larger than `negotiated_max_pdu_size` returns
+    /// `PduTooLarge` instead of being sent; the Presentation and Session
+    /// wrappers do not count toward the limit.
+    ///
+    /// # Errors
+    ///
+    /// - `PduTooLarge` as above.
+    /// - `NotConnected` when there is no transport.
+    /// - `ConnectionLost` when the transport fails; the connection is closed.
     pub async fn send_mms_pdu(&mut self, pdu: &MmsPdu) -> Result<(), ClientError> {
         // MMS PDU encode
         let mut mms_buf = BytesMut::new();
         pdu.encode(&mut mms_buf);
 
-        // wrap in Presentation Fully-Encoded-Data
-        let mut pres_buf = BytesMut::new();
-        presentation::encode_user_data(&self.presentation, &mms_buf, &mut pres_buf);
-
         // outbound PDU size guard
-        if pres_buf.len() > self.negotiated_max_pdu_size {
+        if mms_buf.len() > self.negotiated_max_pdu_size {
             warn!(
-                pdu_size = pres_buf.len(),
+                pdu_size = mms_buf.len(),
                 max_size = self.negotiated_max_pdu_size,
                 "pdu exceeds the negotiated maximum size, refusing to send"
             );
             return Err(ClientError::PduTooLarge {
-                pdu_size: pres_buf.len(),
+                pdu_size: mms_buf.len(),
                 max_size: self.negotiated_max_pdu_size,
             });
         }
+
+        // wrap in Presentation Fully-Encoded-Data
+        let mut pres_buf = BytesMut::new();
+        presentation::encode_user_data(&self.presentation, &mms_buf, &mut pres_buf);
 
         // wrap in a Session data SPDU
         let mut session_buf = BytesMut::new();
         session::encode_data(&pres_buf, &mut session_buf);
 
-        // CotpConnection adds the TPKT header and segments as needed;
-        // the TLS transport takes precedence when the feature is enabled
-        #[cfg(feature = "tls")]
-        if let Some(cotp) = self.cotp_tls.as_mut() {
-            cotp.send_data(&session_buf)
-                .await
-                .map_err(|e| ClientError::IsoError(format!("cotp tls send: {e}")))?;
-            return Ok(());
-        }
-
-        let cotp = self
-            .cotp
-            .as_mut()
-            .ok_or_else(|| ClientError::NotConnected {
-                state: format!("{:?}", self.state),
-            })?;
-        cotp.send_data(&session_buf)
-            .await
-            .map_err(|e| ClientError::IsoError(format!("cotp send: {e}")))?;
-        Ok(())
+        self.send_tsdu(&session_buf, "send").await
     }
 
     /// Receives one MMS PDU, parsing the full ISO stack, under a timeout.
     ///
-    /// A `timeout_dur` of `None` uses `request_timeout_ms`, and `Some(d)` uses `d`.
+    /// A `timeout_dur` of `None` uses `request_timeout_ms`, and `Some(d)` uses `d`;
+    /// no other timeout applies.
     ///
     /// Cancel safety: `cotp.recv_data` and `read_tpkt` keep their partial state inside
     /// the COTP connection, so a timeout loses no bytes and the next call resumes from
@@ -645,137 +845,409 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     ///
     /// Returns:
     /// - `Ok(Some(pdu))` when a PDU arrived.
-    /// - `Ok(None)` when the link stayed idle and not a single byte arrived.
-    /// - `Err(_)` on an I/O failure, a parse failure, or a partly received PDU.
-    ///
-    /// A PDU that arrives only partly, a TPKT header without its body for instance,
-    /// yields `Err` rather than `Ok(None)`, leaving the caller to retry or close; the
-    /// next receive continues from where it stopped.
+    /// - `Ok(None)` when no complete PDU arrived within the timeout.
+    /// - `Err(_)` on an I/O failure or a parse failure; `ConnectionLost` when the
+    ///   peer ended the connection.
     pub async fn recv_mms_pdu_with_timeout(
         &mut self,
         timeout_dur: Option<Duration>,
     ) -> Result<Option<MmsPdu>, ClientError> {
         let dur = timeout_dur.unwrap_or_else(|| Duration::from_millis(self.request_timeout_ms));
         // The timer is cloned so borrowing it does not conflict with the mutable
-        // borrow of self taken by recv_mms_pdu. Timer requires Clone and is cheap
-        // to clone in every backend.
+        // borrow of self. Timer requires Clone and is cheap to clone in every backend.
         let timer = self.timer.clone();
-        match with_timeout(&timer, dur, self.recv_mms_pdu()).await {
+        match with_timeout(&timer, dur, self.recv_pdu()).await {
             Ok(Ok(pdu)) => Ok(Some(pdu)),
             Ok(Err(e)) => Err(e),
-            Err(_) => {
-                // The timeout expired; the partial read state stays in cotp.read_state.
-                // Ok(None) covers both an idle link and a stalled partial read, and the
-                // next call keeps accumulating.
-                Ok(None)
-            }
+            // the partial read state stays in the COTP connection
+            Err(_) => Ok(None),
         }
     }
 
     /// Receives one PDU for a confirmed call, stashing any Unconfirmed PDU in
     /// `pending_unconfirmed` and reading on until a non-Unconfirmed PDU arrives.
     ///
-    /// A server may push an InformationReport while a control, read or write call is
-    /// awaiting its response. Stashing it here keeps the caller from mistaking it for
-    /// the response; `MmsClient::recv_unconfirmed_pdu_with_timeout` drains the stash
-    /// afterwards.
+    /// The invokeID of the answer is not examined; [`Self::recv_confirmed_response`]
+    /// binds the answer to its request. The whole wait is bounded by
+    /// `request_timeout_ms`.
+    ///
+    /// # Errors
+    ///
+    /// `ServiceTimeout` when nothing but Unconfirmed PDUs arrives in time, and the
+    /// receive errors of [`Self::recv_mms_pdu`].
     pub async fn recv_mms_pdu_confirmed(&mut self) -> Result<MmsPdu, ClientError> {
-        loop {
-            let pdu = self.recv_mms_pdu().await?;
-            if let MmsPdu::Unconfirmed(inner) = pdu {
-                debug!(
-                    "stashing an unconfirmed pdu of {} bytes for a later unconfirmed read",
-                    inner.len()
-                );
-                self.pending_unconfirmed.push_back(inner);
-                continue;
-            }
-            return Ok(pdu);
+        let timeout_ms = self.request_timeout_ms;
+        let timer = self.timer.clone();
+        match with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            self.await_non_unconfirmed(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::ServiceTimeout { timeout_ms }),
         }
     }
 
-    /// Receives one MMS PDU, parsing the full ISO stack.
+    /// Receives the answer to the confirmed request sent with `invoke_id`.
     ///
-    /// A Conclude request from the server (`0x8b`) is answered with `0x8c`, moves the
-    /// connection to `Closing`, and is reported as `Err(ConnectionLost)`.
-    pub async fn recv_mms_pdu(&mut self) -> Result<MmsPdu, ClientError> {
-        // Take the raw bytes first so the borrow of self.cotp ends before
-        // self.session and self.presentation are borrowed.
-        let req_dur = Duration::from_millis(self.request_timeout_ms);
-        // The timer is cloned so borrowing it does not conflict with the mutable
-        // borrow of self.cotp. Timer requires Clone and is cheap to clone.
+    /// Unconfirmed PDUs arriving meanwhile are stashed in `pending_unconfirmed`. A
+    /// Confirmed-Response, Confirmed-Error or Reject PDU carrying another invokeID
+    /// is discarded with a warning; when that invokeID belongs to a request that
+    /// timed out earlier, it is forgotten at the same time. A Reject without an
+    /// originalInvokeID is taken as the answer. The whole wait is bounded by
+    /// `request_timeout_ms`.
+    ///
+    /// # Errors
+    ///
+    /// - `ServiceTimeout` when no answer arrives in time. `invoke_id` is then
+    ///   remembered as abandoned and the association stays usable.
+    /// - `PduParse` when the invokeID of an answer does not decode.
+    /// - The receive errors of [`Self::recv_mms_pdu`].
+    pub async fn recv_confirmed_response(&mut self, invoke_id: u32) -> Result<MmsPdu, ClientError> {
+        let timeout_ms = self.request_timeout_ms;
         let timer = self.timer.clone();
+        match with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            self.await_response(invoke_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    invoke_id,
+                    timeout_ms, "no answer within the request timeout, abandoning the request"
+                );
+                if self.state == ConnectionState::Connected {
+                    self.abandon_invoke_id(invoke_id);
+                }
+                Err(ClientError::ServiceTimeout { timeout_ms })
+            }
+        }
+    }
 
-        // the TLS transport takes precedence when the feature is enabled
-        #[cfg(feature = "tls")]
-        let raw = if let Some(cotp) = self.cotp_tls.as_mut() {
-            with_timeout(&timer, req_dur, cotp.recv_data())
-                .await
-                .map_err(|_| ClientError::IsoError("recv timeout (tls)".to_string()))?
-                .map_err(|e| ClientError::IsoError(format!("cotp tls recv: {e}")))?
-        } else {
-            let cotp = self
-                .cotp
-                .as_mut()
-                .ok_or_else(|| ClientError::NotConnected {
-                    state: format!("{:?}", self.state),
-                })?;
-            with_timeout(&timer, req_dur, cotp.recv_data())
-                .await
-                .map_err(|_| ClientError::IsoError("recv timeout".to_string()))?
-                .map_err(|e| ClientError::IsoError(format!("cotp recv: {e}")))?
-        };
+    /// Receives one MMS PDU, parsing the full ISO stack, within `request_timeout_ms`.
+    ///
+    /// A Conclude request from the server (`0x8b`) is answered with `0x8c`, the
+    /// transport is closed, and the call returns `Err(ConnectionLost)`.
+    ///
+    /// # Errors
+    ///
+    /// - `ServiceTimeout` when no complete PDU arrives in time.
+    /// - `ConnectionLost` when the transport ends, a COTP DR arrives, or the peer
+    ///   sends a Session AB, FN or DN; the connection is closed.
+    /// - `NotConnected` when there is no transport.
+    /// - `IsoError` or `PduParse` for a PDU that does not decode.
+    pub async fn recv_mms_pdu(&mut self) -> Result<MmsPdu, ClientError> {
+        let timeout_ms = self.request_timeout_ms;
+        let timer = self.timer.clone();
+        match with_timeout(&timer, Duration::from_millis(timeout_ms), self.recv_pdu()).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::ServiceTimeout { timeout_ms }),
+        }
+    }
 
-        #[cfg(not(feature = "tls"))]
-        let raw = {
-            let cotp = self
-                .cotp
-                .as_mut()
-                .ok_or_else(|| ClientError::NotConnected {
-                    state: format!("{:?}", self.state),
-                })?;
-            with_timeout(&timer, req_dur, cotp.recv_data())
-                .await
-                .map_err(|_| ClientError::IsoError("recv timeout".to_string()))?
-                .map_err(|e| ClientError::IsoError(format!("cotp recv: {e}")))?
-        };
+    /// Receives the next Unconfirmed PDU within `timeout_dur`.
+    ///
+    /// The late answer to an abandoned request is discarded on the way. Returns
+    /// `Ok(None)` when no Unconfirmed PDU arrives in time.
+    pub(crate) async fn recv_unconfirmed(
+        &mut self,
+        timeout_dur: Duration,
+    ) -> Result<Option<Bytes>, ClientError> {
+        let timer = self.timer.clone();
+        match with_timeout(&timer, timeout_dur, self.await_unconfirmed()).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
 
-        // Session data SPDU
-        let sess_ind = self
-            .session
-            .parse_message(&raw)
-            .map_err(|e| ClientError::IsoError(format!("session: {e}")))?;
-        if sess_ind != SessionIndication::Data {
-            warn!("received a non-data session spdu: {:?}", sess_ind);
-            return Err(ClientError::IsoError(format!(
-                "unexpected session indication: {sess_ind:?}"
+    // Receive loops; each caller bounds one with a single timeout.
+
+    async fn await_non_unconfirmed(&mut self) -> Result<MmsPdu, ClientError> {
+        loop {
+            match self.recv_pdu().await? {
+                MmsPdu::Unconfirmed(inner) => self.stash_unconfirmed(inner),
+                pdu => return Ok(pdu),
+            }
+        }
+    }
+
+    async fn await_response(&mut self, invoke_id: u32) -> Result<MmsPdu, ClientError> {
+        loop {
+            let pdu = self.recv_pdu().await?;
+            if let MmsPdu::Unconfirmed(inner) = pdu {
+                self.stash_unconfirmed(inner);
+                continue;
+            }
+            match response_invoke_id(&pdu) {
+                Ok(Some(id)) if id == invoke_id => return Ok(pdu),
+                Ok(Some(id)) => self.discard_stray_answer(id, &pdu),
+                Ok(None) => return Ok(pdu),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn await_unconfirmed(&mut self) -> Result<Bytes, ClientError> {
+        loop {
+            let pdu = self.recv_pdu().await?;
+            if let MmsPdu::Unconfirmed(inner) = pdu {
+                if inner.is_empty() {
+                    warn!("discarding an unconfirmed pdu without an unconfirmed service");
+                    continue;
+                }
+                return Ok(inner);
+            }
+            if let Ok(Some(id)) = response_invoke_id(&pdu) {
+                if self.take_abandoned(id) {
+                    warn!(
+                        invoke_id = id,
+                        "discarding the late answer to a request that timed out"
+                    );
+                    continue;
+                }
+            }
+            warn!(
+                tag = format!("0x{:02x}", pdu.tag_byte()),
+                "received a pdu that is not unconfirmed while no request is outstanding, discarding it"
+            );
+            return Err(ClientError::PduParse(format!(
+                "expected Unconfirmed (0xa3), got tag=0x{:02x}",
+                pdu.tag_byte()
             )));
         }
+    }
 
-        let sess_payload: Vec<u8> = self.session.user_data(&raw).to_vec();
+    async fn await_conclude_response(&mut self) -> Result<(), ClientError> {
+        loop {
+            let mms_bytes = self.recv_mms_bytes().await?;
+            if mms_bytes.first() == Some(&TAG_CONCLUDE_ERROR) {
+                warn!("the peer refused the conclude request");
+                return Err(ClientError::ConcludeRejected);
+            }
+            let pdu = MmsPdu::decode(&mms_bytes).map_err(|e| {
+                warn!("mms pdu failed to decode: {e}");
+                ClientError::PduParse(format!("{e}"))
+            })?;
+            match pdu {
+                MmsPdu::ConcludeResponse => return Ok(()),
+                MmsPdu::Unconfirmed(inner) => self.stash_unconfirmed(inner),
+                other => warn!(
+                    tag = format!("0x{:02x}", other.tag_byte()),
+                    "discarding a pdu received while awaiting the conclude response"
+                ),
+            }
+        }
+    }
 
-        // Presentation layer
-        let ud_result = presentation::parse_user_data(&mut self.presentation, &sess_payload)
-            .map_err(|e| ClientError::IsoError(format!("presentation: {e}")))?;
-        let mms_bytes: Vec<u8> = ud_result.payload(&sess_payload).to_vec();
+    /// Sends the A-RELEASE request and waits, within `request_timeout_ms`, for
+    /// the peer to answer or close.
+    async fn release_association(&mut self) {
+        let mut rlrq = [0u8; 5];
+        acse::encode_rlrq(&mut rlrq);
+        let mut pres_buf = BytesMut::new();
+        presentation::encode_user_data_acse(&self.presentation, &rlrq, &mut pres_buf);
+        let mut sess_buf = BytesMut::new();
+        if let Err(e) = session::encode_finish(&pres_buf, &mut sess_buf) {
+            warn!("session fn failed to encode: {e}");
+            return;
+        }
+        if self.send_tsdu(&sess_buf, "release").await.is_err() {
+            return;
+        }
+        let timeout_ms = self.request_timeout_ms;
+        let timer = self.timer.clone();
+        if with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            self.await_release_response(),
+        )
+        .await
+        .is_err()
+        {
+            warn!(timeout_ms, "no release response arrived, closing anyway");
+        }
+    }
 
-        // outermost MMS PDU
+    async fn await_release_response(&mut self) {
+        loop {
+            let Ok(raw) = self.recv_tsdu().await else {
+                return;
+            };
+            match self.session.parse_message(&raw) {
+                Ok(SessionIndication::Disconnect) => {
+                    let user_data = self.session.user_data(&raw).to_vec();
+                    let carries_rlre =
+                        presentation::parse_user_data(&mut self.presentation, &user_data)
+                            .ok()
+                            .and_then(|ud| user_data.get(ud.payload_start).copied())
+                            == Some(TAG_ACSE_RLRE);
+                    if carries_rlre {
+                        debug!("received the release response");
+                    } else {
+                        warn!("the session disconnect carries no acse rlre");
+                    }
+                    return;
+                }
+                Ok(SessionIndication::Abort) => {
+                    warn!("the peer aborted the association during the release");
+                    return;
+                }
+                Ok(SessionIndication::Finish) => {
+                    debug!("release collision: the peer sent its own session finish");
+                }
+                Ok(other) => {
+                    debug!(
+                        indication = ?other,
+                        "discarding an spdu received while awaiting the release response"
+                    );
+                }
+                Err(e) => {
+                    warn!("session spdu failed to parse during the release: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    // Single-PDU receive, without a timeout of its own.
+
+    /// Receives one MMS PDU; a Conclude request from the server ends the connection.
+    async fn recv_pdu(&mut self) -> Result<MmsPdu, ClientError> {
+        let mms_bytes = self.recv_mms_bytes().await?;
         let pdu = MmsPdu::decode(&mms_bytes).map_err(|e| {
             warn!("mms pdu failed to decode: {e}");
             ClientError::PduParse(format!("{e}"))
         })?;
 
-        // a Conclude request from the server ends the association
         if pdu == MmsPdu::ConcludeRequest {
             warn!(
                 "received a conclude request (0x8b) from the server, answering with 0x8c and reporting a lost connection"
             );
             let _ = self.send_mms_pdu(&MmsPdu::ConcludeResponse).await;
-            self.state = ConnectionState::Closing;
+            self.close_raw();
             return Err(ClientError::ConnectionLost);
         }
 
         Ok(pdu)
+    }
+
+    /// Receives one TSDU and returns the MMS bytes of its Session DT and
+    /// Presentation user data.
+    async fn recv_mms_bytes(&mut self) -> Result<Vec<u8>, ClientError> {
+        let raw = self.recv_tsdu().await?;
+
+        let sess_ind = self
+            .session
+            .parse_message(&raw)
+            .map_err(|e| ClientError::IsoError(format!("session: {e}")))?;
+        match sess_ind {
+            SessionIndication::Data => {}
+            SessionIndication::Abort
+            | SessionIndication::Finish
+            | SessionIndication::Disconnect => {
+                warn!(indication = ?sess_ind, "the peer ended the session, closing the connection");
+                self.close_raw();
+                return Err(ClientError::ConnectionLost);
+            }
+            other => {
+                warn!("received a non-data session spdu: {:?}", other);
+                return Err(ClientError::IsoError(format!(
+                    "unexpected session indication: {other:?}"
+                )));
+            }
+        }
+
+        let sess_payload: Vec<u8> = self.session.user_data(&raw).to_vec();
+        let ud_result = presentation::parse_user_data(&mut self.presentation, &sess_payload)
+            .map_err(|e| ClientError::IsoError(format!("presentation: {e}")))?;
+        Ok(ud_result.payload(&sess_payload).to_vec())
+    }
+
+    /// Sends one TSDU over whichever transport is open; the TLS one takes
+    /// precedence when the feature is enabled.
+    async fn send_tsdu(&mut self, data: &[u8], context: &str) -> Result<(), ClientError> {
+        let state = self.state;
+        #[cfg(feature = "tls")]
+        if let Some(cotp) = self.cotp_tls.as_mut() {
+            let result = cotp.send_data(data).await;
+            return result.map_err(|e| self.transport_failed(context, e));
+        }
+        let result = match self.cotp.as_mut() {
+            Some(cotp) => cotp.send_data(data).await,
+            None => return Err(not_connected(state)),
+        };
+        result.map_err(|e| self.transport_failed(context, e))
+    }
+
+    /// Receives one TSDU from whichever transport is open.
+    async fn recv_tsdu(&mut self) -> Result<Bytes, ClientError> {
+        let state = self.state;
+        #[cfg(feature = "tls")]
+        if let Some(cotp) = self.cotp_tls.as_mut() {
+            let result = cotp.recv_data().await;
+            return result.map_err(|e| self.transport_failed("recv", e));
+        }
+        let result = match self.cotp.as_mut() {
+            Some(cotp) => cotp.recv_data().await,
+            None => return Err(not_connected(state)),
+        };
+        result.map_err(|e| self.transport_failed("recv", e))
+    }
+
+    /// Closes the connection after a COTP failure and maps the failure.
+    ///
+    /// The end of the transport, an I/O error and a COTP DR become
+    /// `ConnectionLost`; a framing error becomes `IsoError`.
+    fn transport_failed(&mut self, context: &str, e: CotpError) -> ClientError {
+        self.close_raw();
+        match e {
+            CotpError::UnexpectedEof | CotpError::Io(_) | CotpError::DisconnectRequest { .. } => {
+                warn!(error = %e, "cotp {context}: the transport connection was lost");
+                ClientError::ConnectionLost
+            }
+            other => {
+                warn!(error = %other, "cotp {context} failed, closing the connection");
+                ClientError::IsoError(format!("cotp {context}: {other}"))
+            }
+        }
+    }
+
+    /// Stashes an Unconfirmed PDU received during a confirmed exchange.
+    ///
+    /// An Unconfirmed PDU without content carries no unconfirmedService, which
+    /// is mandatory, so it is discarded rather than stashed.
+    fn stash_unconfirmed(&mut self, inner: Bytes) {
+        if inner.is_empty() {
+            warn!("discarding an unconfirmed pdu without an unconfirmed service");
+            return;
+        }
+        debug!(
+            "stashing an unconfirmed pdu of {} bytes for a later unconfirmed read",
+            inner.len()
+        );
+        self.push_pending_unconfirmed(inner);
+    }
+
+    /// Discards an answer whose invokeID is not the one awaited.
+    fn discard_stray_answer(&mut self, invoke_id: u32, pdu: &MmsPdu) {
+        if self.take_abandoned(invoke_id) {
+            warn!(
+                invoke_id,
+                tag = format!("0x{:02x}", pdu.tag_byte()),
+                "discarding the late answer to a request that timed out"
+            );
+        } else {
+            warn!(
+                invoke_id,
+                tag = format!("0x{:02x}", pdu.tag_byte()),
+                "discarding an answer whose invokeid matches no outstanding request"
+            );
+        }
     }
 }
 
@@ -795,6 +1267,67 @@ fn cotp_options(params: &IsoConnectionParameters) -> CotpOptions {
         tsel_dst: params.remote_t_sel.clone(),
         tpdu_size: crate::iso::cotp::TpduSize::default(),
     }
+}
+
+/// Returns the negotiated maximum PDU size: the smaller of the local proposal
+/// and the size the server answered. A server that omits `localDetailCalled`
+/// leaves the local proposal in force.
+fn negotiate_max_pdu_size(local_proposal: Option<u32>, server_answer: Option<u32>) -> usize {
+    let local = local_proposal.unwrap_or(DEFAULT_MAX_PDU_SIZE);
+    let server = server_answer.unwrap_or(local);
+    local.min(server) as usize
+}
+
+fn not_connected(state: ConnectionState) -> ClientError {
+    ClientError::NotConnected {
+        state: format!("{state:?}"),
+    }
+}
+
+/// Returns the invokeID a confirmed answer carries.
+///
+/// `Ok(None)` for a PDU that carries none: a Reject without originalInvokeID,
+/// or a PDU that is not an answer to a confirmed request.
+fn response_invoke_id(pdu: &MmsPdu) -> Result<Option<u32>, ClientError> {
+    let decoded = match pdu {
+        // invokeID Unsigned32, a UNIVERSAL INTEGER
+        MmsPdu::ConfirmedResponse(inner) => leading_unsigned32(inner, 0x02),
+        // invokeID [0] IMPLICIT Unsigned32
+        MmsPdu::ConfirmedError(inner) => leading_unsigned32(inner, 0x80),
+        MmsPdu::Reject(reject) => return Ok(reject.invoke_id),
+        _ => return Ok(None),
+    };
+    match decoded {
+        Some(id) => Ok(Some(id)),
+        None => {
+            warn!(
+                tag = format!("0x{:02x}", pdu.tag_byte()),
+                "the invokeid of a confirmed answer does not decode, rejecting it"
+            );
+            Err(ClientError::PduParse(
+                "the invokeid of a confirmed answer does not decode".to_string(),
+            ))
+        }
+    }
+}
+
+/// Decodes the Unsigned32 that opens `content` under `tag`.
+fn leading_unsigned32(content: &[u8], tag: u8) -> Option<u32> {
+    if content.first() != Some(&tag) {
+        return None;
+    }
+    let (len, header) = iec61850_asn1::decode_length(content.get(1..)?).ok()?;
+    let start = 1 + header;
+    let value = content.get(start..start.checked_add(len)?)?;
+    // a value of 2^31 or more carries a leading zero octet
+    let value = match value {
+        [0x00, rest @ ..] if rest.len() == 4 => rest,
+        _ => value,
+    };
+    if value.is_empty() || value.len() > 4 {
+        return None;
+    }
+    Some(value.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b)))
 }
 
 /// Accepts a Session AC and turns every other indication into an error.
@@ -855,6 +1388,31 @@ mod tests {
     /// Reports whether `haystack` contains `needle`.
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn abandoned_invoke_ids_are_bounded_and_the_oldest_is_forgotten() {
+        let mut conn = MmsConnection::<TcpStream, TokioTimer>::new();
+        let count = MAX_ABANDONED_INVOKE_IDS as u32 + 1;
+        for id in 1..=count {
+            conn.abandon_invoke_id(id);
+        }
+        assert_eq!(conn.abandoned_invoke_ids.len(), MAX_ABANDONED_INVOKE_IDS);
+        assert!(!conn.take_abandoned(1), "the oldest invokeid is forgotten");
+        assert!(conn.take_abandoned(count), "the newest invokeid is kept");
+        assert!(!conn.take_abandoned(count), "an invokeid is taken once");
+    }
+
+    #[test]
+    fn negotiated_pdu_size_never_exceeds_the_local_proposal() {
+        assert_eq!(negotiate_max_pdu_size(Some(100), Some(65_000)), 100);
+        assert_eq!(negotiate_max_pdu_size(Some(100), Some(64)), 64);
+        assert_eq!(negotiate_max_pdu_size(Some(100), None), 100);
+        assert_eq!(negotiate_max_pdu_size(None, Some(1_000)), 1_000);
+        assert_eq!(
+            negotiate_max_pdu_size(None, Some(u32::MAX)),
+            DEFAULT_MAX_PDU_SIZE as usize
+        );
     }
 
     #[test]

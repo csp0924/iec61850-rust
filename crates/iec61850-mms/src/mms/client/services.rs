@@ -5,9 +5,16 @@
 //! 1. Take a fresh invokeID from the allocator.
 //! 2. Encode the confirmed request, invokeID and service body included.
 //! 3. Send it with `conn.send_mms_pdu`.
-//! 4. Await the answer with `conn.recv_mms_pdu_confirmed` and dispatch on its type.
+//! 4. Await the answer carrying the same invokeID with
+//!    `conn.recv_confirmed_response` and dispatch on its type.
 //! 5. A confirmed response succeeds, a confirmed error becomes a `ServiceError`,
 //!    and a reject becomes a `RejectError`.
+//!
+//! ## Timeouts
+//!
+//! A request whose answer does not arrive within the request timeout returns
+//! `ClientError::ServiceTimeout`. The association stays usable: the late answer
+//! is recognized by its invokeID and discarded.
 //!
 //! ## PDU size guard
 //!
@@ -120,6 +127,28 @@ fn strip_confirmed_wrapper(full: BytesMut) -> Result<Bytes, ClientError> {
     Ok(data.slice(content_start..))
 }
 
+/// Sends a confirmed request encoded under `invoke_id` and returns the answer
+/// bound to it.
+///
+/// `full` is the complete ConfirmedRequestPdu, outer `0xa0` included. The
+/// invokeID is released whatever the outcome.
+async fn exchange<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    alloc: &mut InvokeIdAllocator,
+    invoke_id: u32,
+    full: BytesMut,
+) -> Result<MmsPdu, ClientError> {
+    let result = match strip_confirmed_wrapper(full) {
+        Ok(inner) => match conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(inner)).await {
+            Ok(()) => conn.recv_confirmed_response(invoke_id).await,
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    alloc.release(invoke_id);
+    result
+}
+
 // Service functions
 
 /// Reads one MMS variable.
@@ -144,25 +173,7 @@ pub async fn read_variable<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_read_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    // send it; the PDU size guard lives inside send_mms_pdu
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    // await the response
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_read_response(resp_pdu)
 }
 
@@ -208,23 +219,7 @@ pub async fn read_single_array_element<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_read_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_read_response(resp_pdu)
 }
 
@@ -264,23 +259,7 @@ pub async fn write_single_array_element<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_write_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_write_response(resp_pdu)
 }
 
@@ -305,23 +284,7 @@ pub async fn write_variable<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_write_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_write_response(resp_pdu)
 }
 
@@ -353,23 +316,7 @@ pub async fn read_named_variable_list_values<T: AsyncTransport, Tm: Timer>(
     // invokeID, so strip_confirmed_wrapper behaves as it does for read_variable
     let mut full = BytesMut::new();
     encode_confirmed_read_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_read_list_response(resp_pdu)
 }
 
@@ -396,23 +343,7 @@ pub async fn write_named_variable_list_values<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_write_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_write_list_response(resp_pdu)
 }
 
@@ -444,23 +375,7 @@ pub async fn get_name_list<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_get_name_list_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_get_name_list_response(resp_pdu)
 }
 
@@ -478,23 +393,7 @@ pub async fn read_journal<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(invoke_id, req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_read_journal_response(resp_pdu)
 }
 
@@ -539,23 +438,7 @@ pub async fn get_variable_access_attributes<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_get_var_access_attrs_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_get_var_access_attrs_response(resp_pdu)
 }
 
@@ -571,8 +454,9 @@ fn dispatch_read_response(pdu: MmsPdu) -> Result<MmsValue, ClientError> {
                 warn!("read response failed to decode: {e}");
                 ClientError::PduParse(format!("{e}"))
             })?;
-            // take the first AccessResult
-            match resp.list_of_access_result.into_iter().next() {
+            // one variable was requested, so exactly one AccessResult answers it
+            let results = check_access_result_count(resp.list_of_access_result, 1)?;
+            match results.into_iter().next() {
                 Some(AccessResult::Success(data)) => Ok(data),
                 Some(AccessResult::Failure(err)) => {
                     warn!("read returned a data access error: {:?}", err);
@@ -655,23 +539,7 @@ pub async fn define_named_variable_list<T: AsyncTransport, Tm: Timer>(
         alloc.release(invoke_id);
         return Err(ClientError::PduParse(format!("{e}")));
     }
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_define_named_variable_list_response(resp_pdu)
 }
 
@@ -692,23 +560,7 @@ pub async fn delete_named_variable_list<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_delete_named_variable_list_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_delete_named_variable_list_response(resp_pdu)
 }
 
@@ -730,23 +582,7 @@ pub async fn get_named_variable_list_attributes<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_get_named_variable_list_attrs_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     dispatch_get_named_variable_list_attrs_response(resp_pdu)
 }
 
@@ -871,8 +707,18 @@ fn dispatch_write_response(pdu: MmsPdu) -> Result<(), ClientError> {
                 warn!("write response failed to decode: {e}");
                 ClientError::PduParse(format!("{e}"))
             })?;
-            // take the first WriteOutcome
+            // one variable was written, so exactly one WriteOutcome answers it
             use crate::mms::pdu::WriteOutcome;
+            if resp.outcomes.len() != 1 {
+                warn!(
+                    "write: the response carries {} outcomes for 1 written variable",
+                    resp.outcomes.len()
+                );
+                return Err(ClientError::PduParse(format!(
+                    "write response carries {} outcomes for 1 written variable",
+                    resp.outcomes.len()
+                )));
+            }
             match resp.outcomes.into_iter().next() {
                 Some(WriteOutcome::Success) => Ok(()),
                 Some(WriteOutcome::Failure(err)) => {
@@ -961,8 +807,8 @@ fn dispatch_get_var_access_attrs_response(pdu: MmsPdu) -> Result<TypeSpecificati
 /// 0xa2 <len> ...          -- serviceError [2] IMPLICIT ServiceError
 /// ```
 ///
-/// The invokeID is already known to the caller, which matched the answer to its
-/// request, so only the errorClass is carried out.
+/// The invokeID has already been matched against the request by
+/// `recv_confirmed_response`, so only the errorClass is carried out.
 fn handle_confirmed_error(inner: &[u8]) -> ClientError {
     match decode_confirmed_error_inner(inner) {
         Ok((invoke_id, se)) => {
@@ -1019,23 +865,7 @@ pub async fn read_list<T: AsyncTransport, Tm: Timer>(
 
     let mut full = BytesMut::new();
     encode_confirmed_read_request(invoke_id, &req, &mut full);
-    let inner = strip_confirmed_wrapper(full).inspect_err(|_| alloc.release(invoke_id))?;
-    let pdu = MmsPdu::ConfirmedRequest(inner);
-
-    if let Err(e) = conn.send_mms_pdu(&pdu).await {
-        alloc.release(invoke_id);
-        return Err(e);
-    }
-
-    let resp_pdu = match conn.recv_mms_pdu_confirmed().await {
-        Ok(p) => p,
-        Err(e) => {
-            alloc.release(invoke_id);
-            return Err(e);
-        }
-    };
-
-    alloc.release(invoke_id);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
     check_access_result_count(dispatch_read_list_response(resp_pdu)?, requested)
 }
 
@@ -1052,7 +882,7 @@ fn check_access_result_count(
 ) -> Result<Vec<AccessResult>, ClientError> {
     if results.len() != requested {
         warn!(
-            "read_list: the response carries {} access results for {} requested variables",
+            "read: the response carries {} access results for {} requested variables",
             results.len(),
             requested
         );

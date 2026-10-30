@@ -352,11 +352,14 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// background dispatcher should use `spawn_report_dispatcher` with an
     /// interval around 100 ms instead.
     ///
+    /// The whole `timeout` applies even when it exceeds the request timeout of
+    /// the MMS client, so an idle association returns `Ok(0)`.
+    ///
     /// # Errors
     ///
     /// `NotConnected` if the association is not established, and also if the
-    /// transport reports the connection lost, in which case the connection is
-    /// marked disconnected first.
+    /// receive finds the connection lost, which marks it disconnected. Any other
+    /// receive failure is returned as `Mms`.
     ///
     /// Requires `std` for its monotonic deadline. An embedded caller drives
     /// `MmsClient::recv_unconfirmed_pdu_with_timeout` and
@@ -393,9 +396,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
                     Ok(Some(b)) => Some(b),
                     Ok(None) => None,
                     Err(e) => {
-                        if matches!(e, iec61850_mms::ClientError::ConnectionLost) {
-                            self.is_connected
-                                .store(false, core::sync::atomic::Ordering::Release);
+                        if !self.is_connected() {
+                            tracing::warn!(error = %e, "the connection was lost while polling reports");
+                            return Err(ClientError::NotConnected);
                         }
                         return Err(e.into());
                     }
@@ -430,9 +433,13 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// holds the MMS client lock against concurrent reads and writes; 50 ms to
     /// 200 ms is a reasonable range.
     ///
-    /// The task ends when the connection is closed or a receive fails. Dropping
-    /// the returned handle does not cancel it; call `disconnect` to stop it at
-    /// the next iteration.
+    /// `poll_interval` is the only timeout applied to each receive, so it may
+    /// exceed the request timeout of the MMS client.
+    ///
+    /// The task ends when the connection is closed or found lost; a receive
+    /// failure that leaves the association established is logged and the task
+    /// carries on. Dropping the returned handle does not cancel it; call
+    /// `disconnect` to stop it at the next iteration.
     ///
     /// The transport and timer must be `Send + 'static`, as required by the
     /// spawned future. A backend that is not `Send` has to use `poll_reports`.
@@ -460,11 +467,12 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
                         Ok(Some(b)) => Some(b),
                         Ok(None) => None,
                         Err(e) => {
-                            if matches!(e, iec61850_mms::ClientError::ConnectionLost) {
-                                is_connected.store(false, core::sync::atomic::Ordering::Release);
+                            if !is_connected.load(core::sync::atomic::Ordering::Acquire) {
+                                tracing::warn!(error = ?e, "report dispatcher stopping: the connection was lost");
+                                return;
                             }
-                            tracing::warn!(error = ?e, "report dispatcher stopping: receive failed");
-                            return;
+                            tracing::warn!(error = ?e, "report dispatcher: receive failed, continuing");
+                            None
                         }
                     }
                 };

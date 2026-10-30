@@ -24,6 +24,11 @@
 //! - The API is async throughout and all framing goes through `CotpConnection`.
 //! - An exhausted invokeID space returns `ClientError::InvokeIdExhausted`.
 //! - A PDU above the negotiated maximum returns `ClientError::PduTooLarge`.
+//! - An answer is bound to its request by invokeID. A request without an answer
+//!   within the request timeout returns `ClientError::ServiceTimeout` and its late
+//!   answer is discarded; the association stays usable.
+//! - The end of the transport, or a Session abort, finish or disconnect from the
+//!   peer, closes the client and returns `ClientError::ConnectionLost`.
 //! - A Conclude request from the server is answered with `0x8c` and reported as a
 //!   lost connection.
 
@@ -42,8 +47,10 @@ pub use error::ClientError;
 pub use services::MmsValue;
 
 use crate::compat::prelude::*;
+use crate::compat::Arc;
 use crate::iso::params::IsoConnectionParameters;
 use crate::mms::pdu::{ObjectClass, TypeSpecification};
+use core::sync::atomic::AtomicBool;
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
 
@@ -69,6 +76,7 @@ pub struct MmsClientBuilder {
     max_outstanding: Option<u32>,
     local_max_pdu_size: Option<u32>,
     iso_parameters: Option<IsoConnectionParameters>,
+    max_pending_unconfirmed: Option<usize>,
 }
 
 impl MmsClientBuilder {
@@ -116,6 +124,16 @@ impl MmsClientBuilder {
         self
     }
 
+    /// Sets how many Unconfirmed PDUs, such as InformationReports, may wait for
+    /// the report dispatcher while confirmed calls are in flight.
+    ///
+    /// When the ceiling is reached the oldest waiting PDU is dropped with a
+    /// warning. Without it `DEFAULT_MAX_PENDING_UNCONFIRMED`, 1024, applies.
+    pub fn max_pending_unconfirmed(mut self, n: usize) -> Self {
+        self.max_pending_unconfirmed = Some(n);
+        self
+    }
+
     /// Builds a client over the default std transport and timer.
     ///
     /// This method is std only. An embedded caller uses
@@ -134,6 +152,9 @@ impl MmsClientBuilder {
         }
         if let Some(params) = self.iso_parameters {
             conn.set_iso_parameters(params);
+        }
+        if let Some(n) = self.max_pending_unconfirmed {
+            conn.max_pending_unconfirmed = n;
         }
         let max_out = self.max_outstanding.unwrap_or(DEFAULT_MAX_OUTSTANDING);
         MmsClient {
@@ -225,6 +246,15 @@ impl<T, Tm> MmsClient<T, Tm> {
     pub fn negotiated_max_pdu_size(&self) -> usize {
         self.conn.negotiated_max_pdu_size
     }
+
+    /// Returns a flag that is `true` exactly while the association is established.
+    ///
+    /// Every call returns the same flag, which the client keeps current on every
+    /// state change, including a transport loss found inside a service call. An
+    /// observer can therefore test liveness without waiting for an in-flight call.
+    pub fn connected_flag(&mut self) -> Arc<AtomicBool> {
+        self.conn.connected_flag()
+    }
 }
 
 impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
@@ -263,9 +293,27 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
 
     // Association management
 
-    /// Runs the MMS Conclude sequence and closes the connection.
+    /// Releases the association, MMS Conclude followed by the ACSE A-RELEASE, and
+    /// closes the connection.
+    ///
+    /// # Errors
+    ///
+    /// - `NotConnected` when no association is established.
+    /// - `ConcludeRejected` when the server refuses the Conclude; the association
+    ///   stays established.
     pub async fn disconnect(&mut self) -> Result<(), ClientError> {
         self.conn.disconnect().await
+    }
+
+    /// Aborts the association: sends an ACSE ABRT inside a Session AB and closes
+    /// the transport without waiting for an answer.
+    ///
+    /// # Errors
+    ///
+    /// The transport error when the abort cannot be sent; the client is closed
+    /// either way.
+    pub async fn abort(&mut self) -> Result<(), ClientError> {
+        self.conn.abort().await
     }
 
     /// Closes the transport immediately, without any release handshake.
@@ -496,16 +544,17 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
     /// Cancel safety: the transport keeps its partial read state, so a timeout loses
     /// no bytes and the next poll continues from the same point.
     ///
+    /// `timeout_dur` is the only timeout applied, so it may exceed the request
+    /// timeout. The late answer to a request that timed out is discarded on the way.
+    ///
     /// Returns:
     /// - `Ok(Some(inner))` for an unconfirmed PDU whose outer `0xa3` has been stripped,
     ///   leaving `0xa0 <combined_body>` for the InformationReport decoder.
-    /// - `Ok(None)` when no complete PDU arrived within the timeout.
-    /// - `Err(_)` on an I/O or parse failure, or when a confirmed response arrives with
-    ///   no request outstanding, which means the exchange is out of step and the caller
-    ///   should close the connection.
-    ///
-    /// A Conclude request from the server is answered with `0x8c` one layer down and
-    /// surfaces here as `Err(ConnectionLost)`.
+    /// - `Ok(None)` when no unconfirmed PDU arrived within the timeout.
+    /// - `Err(ConnectionLost)` when the peer ended the connection, which is then
+    ///   closed; a Conclude request from the server is answered with `0x8c` first.
+    /// - `Err(_)` otherwise on an I/O or parse failure, or when a confirmed answer
+    ///   arrives that matches no request, which means the exchange is out of step.
     pub async fn recv_unconfirmed_pdu_with_timeout(
         &mut self,
         timeout_dur: core::time::Duration,
@@ -514,24 +563,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
         if let Some(inner) = self.conn.pop_pending_unconfirmed() {
             return Ok(Some(inner));
         }
-        match self
-            .conn
-            .recv_mms_pdu_with_timeout(Some(timeout_dur))
-            .await?
-        {
-            None => Ok(None),
-            Some(crate::mms::pdu::MmsPdu::Unconfirmed(inner)) => Ok(Some(inner)),
-            Some(other) => {
-                tracing::warn!(
-                    tag = format!("0x{:02x}", other.tag_byte()),
-                    "recv_unconfirmed_pdu: received a pdu that is not unconfirmed, discarding it and reporting an error"
-                );
-                Err(ClientError::PduParse(format!(
-                    "expected Unconfirmed (0xa3), got tag=0x{:02x}",
-                    other.tag_byte()
-                )))
-            }
-        }
+        self.conn.recv_unconfirmed(timeout_dur).await
     }
 
     /// Reads several MMS variables with one Read service.

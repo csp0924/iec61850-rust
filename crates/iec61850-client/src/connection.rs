@@ -25,7 +25,7 @@ use core::sync::atomic::AtomicBool;
 
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
-use iec61850_mms::mms::client::{ConnectionState, MmsClient};
+use iec61850_mms::mms::client::MmsClient;
 
 use crate::error::ClientError;
 use crate::prelude::Arc;
@@ -89,6 +89,10 @@ impl<T, Tm> IedConnection<T, Tm> {
     }
 
     /// Reports whether the association is established.
+    ///
+    /// The flag is shared with the MMS client, so it turns false as soon as a
+    /// service call finds the transport lost or the peer ending the association,
+    /// and every later service call then returns `NotConnected`.
     pub fn is_connected(&self) -> bool {
         self.is_connected
             .load(core::sync::atomic::Ordering::Acquire)
@@ -104,17 +108,17 @@ impl<T, Tm> IedConnection<T, Tm> {
     /// the client with `MmsClient::from_transport_with_timer`, which completes
     /// the ISO and MMS Initiate exchange, then pass it here.
     ///
-    /// The connected flag is taken from the client's own state rather than
-    /// forced to false, so that an already-initiated client is usable
-    /// immediately; a client from `MmsClientBuilder::build()` is still closed,
-    /// which is what `IedConnection::new()` relies on.
-    pub fn with_mms_client(mms_client: MmsClient<T, Tm>) -> Self {
-        let connected = mms_client.state() == ConnectionState::Connected;
+    /// The connected flag is the client's own [`MmsClient::connected_flag`], so
+    /// an already-initiated client is usable immediately; a client from
+    /// `MmsClientBuilder::build()` is still closed, which is what
+    /// `IedConnection::new()` relies on.
+    pub fn with_mms_client(mut mms_client: MmsClient<T, Tm>) -> Self {
+        let is_connected: Arc<AtomicBool> = mms_client.connected_flag();
         Self {
             #[cfg(feature = "reporting")]
             reports: Arc::new(crate::report::dispatch::ReportRegistry::new()),
             mms_client: Arc::new(Mutex::new(mms_client)),
-            is_connected: Arc::new(AtomicBool::new(connected)),
+            is_connected,
             device_model: Arc::new(Mutex::new(None)),
         }
     }
@@ -123,7 +127,13 @@ impl<T, Tm> IedConnection<T, Tm> {
 // Disconnect and abort, available for any transport and timer.
 
 impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
-    /// Closes the association: sends MMS Conclude, then closes the transport.
+    /// Closes the association: MMS Conclude, then the ACSE release, then the
+    /// transport is closed.
+    ///
+    /// # Errors
+    ///
+    /// `Mms` when the server refuses the Conclude; the association then stays
+    /// established and `is_connected` reports true again.
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.is_connected
             .store(false, core::sync::atomic::Ordering::Release);
@@ -135,15 +145,19 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         Ok(())
     }
 
-    /// Closes the transport immediately, without the Conclude exchange.
+    /// Aborts the association without the Conclude exchange: an ACSE ABRT is
+    /// sent inside a Session AB and the transport is closed.
     ///
-    /// This is the abort path; the peer sees the association drop.
+    /// The association ends even when the abort cannot be sent, so that case is
+    /// logged rather than returned.
     pub async fn abort(&self) -> Result<(), ClientError> {
         self.is_connected
             .store(false, core::sync::atomic::Ordering::Release);
         *self.device_model.lock().await = None;
         let mut client = self.mms_client.lock().await;
-        client.close_raw();
+        if let Err(e) = client.abort().await {
+            tracing::debug!(error = %e, "the abort could not be sent, the transport is closed");
+        }
         Ok(())
     }
 }
