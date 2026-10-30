@@ -16,8 +16,11 @@
 //!   `LastApplError`, when it refuses. Without a dynamic check the answer is
 //!   immediate. With a dynamic check the write response is deferred: the
 //!   connection holds it back and sends the outcome the task posts. A write of
-//!   more than one variable cannot be deferred and is answered when the Operate
-//!   is accepted.
+//!   more than one variable cannot be deferred and is answered positively when
+//!   the Operate is accepted; when its dynamic check then refuses, an
+//!   enhanced-security command is ended with a negative CommandTermination, the
+//!   only way left to end its command sequence, and a normal-security one is
+//!   logged.
 //! - Under enhanced security the outcome of the command travels in the
 //!   CommandTermination that ends it; normal security reports no outcome.
 
@@ -26,6 +29,7 @@ use super::model::{CancelParams, ControlAddCause, ControlLastApplError, OperPara
 use super::registry::{ControlObjectEntry, ControlObjectsRegistry};
 use super::service::{
     admit_operate, cancel, select_with_value, AcceptedOperate, CoAttr, CommandTerminationSink,
+    ConnectionTerminationEvent,
 };
 use bytes::Bytes;
 use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName, WriteOutcome};
@@ -54,6 +58,10 @@ pub(crate) struct DeferredWrite {
     /// InformationReport carrying `LastApplError`, sent before the response when
     /// the command failed.
     pub(crate) last_appl_error: Option<Bytes>,
+    /// Negative CommandTermination of an enhanced-security command whose
+    /// dynamic check refused it, sent instead when the write could not wait and
+    /// was answered positively at acceptance.
+    pub(crate) termination: Option<ConnectionTerminationEvent>,
 }
 
 struct Slot {
@@ -356,8 +364,8 @@ fn operate(
         let checked = accepted.dynamic_check().await;
         match deferral {
             Some((id, tx)) => {
-                let (outcome, last_appl_error) = match checked {
-                    Ok(()) => (WriteOutcome::Success, None),
+                let (outcome, last_appl_error, termination) = match checked {
+                    Ok(()) => (WriteOutcome::Success, None, None),
                     Err(cause) => (
                         WriteOutcome::Failure(add_cause_to_data_access_error(cause)),
                         Some(encode_last_appl_error(
@@ -366,6 +374,7 @@ fn operate(
                             ctl_num,
                             cause,
                         )),
+                        accepted.negative_termination(cause),
                     ),
                 };
                 if tx
@@ -373,6 +382,7 @@ fn operate(
                         id,
                         outcome,
                         last_appl_error,
+                        termination,
                     })
                     .is_err()
                 {

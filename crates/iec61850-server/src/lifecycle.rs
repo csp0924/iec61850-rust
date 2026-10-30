@@ -704,6 +704,18 @@ where
                                 send_user_data_mms(&mut cotp, &session, &pres, &buf),
                             )
                             .await?;
+                        } else if let Some(event) = &done.termination {
+                            tracing::warn!(
+                                conn_id,
+                                "the dynamic check refused an operate whose write was answered at acceptance, terminating it negatively"
+                            );
+                            send_bounded(
+                                conn_id,
+                                send_timeout,
+                                &mut last_activity,
+                                send_command_termination(&mut cotp, &session, &pres, event),
+                            )
+                            .await?;
                         } else {
                             tracing::warn!(
                                 conn_id,

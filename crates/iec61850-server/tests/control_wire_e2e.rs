@@ -9,9 +9,14 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
+use iec61850_mms::mms::client::connection::MmsConnection;
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::common::VariableAccessSpecification;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName};
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
+use iec61850_mms::mms::pdu::write::{encode_confirmed_write_request, WriteRequest};
+use iec61850_mms::mms::pdu::MmsPdu;
 use iec61850_model::cdc::{self, CdcOptions, ControlOptions};
 use iec61850_model::{
     ControlModel, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue,
@@ -786,5 +791,102 @@ async fn object_without_a_control_handler_refuses_operate_with_not_supported() {
     assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
     let lae = last_appl_error_only(queued_report(&mut a).await);
     assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO1$Oper"), 4, 1);
+    h.stop().await;
+}
+
+// ── Writes the client stack does not issue on its own ──────────────────────
+
+/// Connects an MMS association without the request API, so a test can send a
+/// PDU of its own and see exactly what arrived before each response.
+async fn raw_connect(handle: &ServerHandle) -> MmsConnection {
+    let mut conn: MmsConnection = MmsConnection::new();
+    conn.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+    conn
+}
+
+/// Returns the content of a ConfirmedRequest PDU encoded by the PDU encoders,
+/// which include the outer tag and length.
+fn request_content(full: BytesMut) -> Bytes {
+    let pdu = full.freeze();
+    let start = if pdu[1] <= 0x7f {
+        2
+    } else {
+        2 + (pdu[1] & 0x7f) as usize
+    };
+    pdu.slice(start..)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_enhanced_operate_in_a_multi_variable_write_is_terminated() {
+    let s = server();
+    s.control_objects().register(
+        ControlObjectEntry::new(object("SPCSO3", ControlModel::DirectEnhanced))
+            .with_wait(Arc::new(GatedCheck::open(Err(
+                ControlAddCause::BlockedBySynchroCheck,
+            ))) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    register(
+        &s,
+        object("SPCSO1", ControlModel::DirectNormal),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut conn = raw_connect(&h).await;
+
+    let name = |item: &str| ObjectName::DomainSpecific {
+        domain_id: DOMAIN.into(),
+        item_id: item.into(),
+    };
+    let req = WriteRequest {
+        variable_access_spec: VariableAccessSpecification::ListOfVariable(vec![
+            name("GGIO1$CO$SPCSO3$Oper").into(),
+            name("GGIO1$CO$SPCSO1$Oper").into(),
+        ]),
+        list_of_data: vec![oper(on(), 21), oper(on(), 22)],
+    };
+    let mut full = BytesMut::new();
+    encode_confirmed_write_request(1, &req, &mut full);
+    conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(request_content(full)))
+        .await
+        .expect("send");
+
+    // A write of two variables cannot wait for the dynamic check, so both
+    // variables are answered positively.
+    match conn.recv_mms_pdu_confirmed().await.expect("response") {
+        MmsPdu::ConfirmedResponse(content) => assert!(
+            content.ends_with(&[0xa5, 0x04, 0x81, 0x00, 0x81, 0x00]),
+            "expected two successes, got {content:02x?}"
+        ),
+        other => panic!("expected a confirmed response, got {other:?}"),
+    }
+    // The refused enhanced command still ends its sequence, negatively.
+    let inner = match conn.pop_pending_unconfirmed() {
+        Some(inner) => inner,
+        None => match conn
+            .recv_mms_pdu_with_timeout(Some(WAIT))
+            .await
+            .expect("receive")
+        {
+            Some(MmsPdu::Unconfirmed(inner)) => inner,
+            other => panic!("expected a CommandTermination, got {other:?}"),
+        },
+    };
+    let report = decode_information_report(&inner).expect("information report");
+    let VariableAccessSpec::ListOfVariable(names) = report.variable_access_spec else {
+        panic!("unexpected variable access specification")
+    };
+    assert_eq!(
+        names.len(),
+        2,
+        "a negative termination names LastApplError and Oper"
+    );
+    assert!(is_last_appl_error(&names[0]));
+    let MmsData::Structure(lae) = &report.list_of_access_result[0] else {
+        panic!("LastApplError is not a structure")
+    };
+    assert_last_appl_error(lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"), 21, 11);
     h.stop().await;
 }

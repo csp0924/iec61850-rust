@@ -707,6 +707,20 @@ impl AcceptedOperate {
         result
     }
 
+    /// Returns the negative CommandTermination that ends this command with
+    /// `cause` under enhanced security, or `None` under normal security.
+    pub(crate) fn negative_termination(
+        &self,
+        cause: ControlAddCause,
+    ) -> Option<ConnectionTerminationEvent> {
+        self.is_enhanced()
+            .then(|| ConnectionTerminationEvent::Negative {
+                obj_ref: self.obj.object_ref(),
+                add_cause: cause,
+                oper_value: self.oper_value.clone(),
+            })
+    }
+
     /// Sends the CommandTermination of a command that ran when the object uses
     /// enhanced security; does nothing under normal security.
     pub(crate) fn terminate(
