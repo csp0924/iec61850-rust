@@ -16,6 +16,14 @@ Every crate in the workspace shares one version number.
   triggers a quality change, so a report control block enabled for `qchg`
   reports it and one enabled for `dchg` alone does not; every update used to
   trigger a data change. Every other attribute still triggers a data change.
+- **`iec61850-server`** — a Write, or a SetDataSetValues member, carrying a
+  bit string whose length does not fit the declared size of the attribute is
+  refused with `type-inconsistent` and the attribute keeps its value: a
+  fixed-size bit string such as a `Dbpos` takes exactly its declared number of
+  bits, and a bounded one such as a `Quality` from one bit up to its bound. The
+  value variant was the only check, so an empty or 13-bit string could replace
+  a two-bit `Dbpos`. A read handler value of such a length is not sent either;
+  the read answers `object-value-invalid`.
 
 ## [0.3.0] - 2026-10-30
 

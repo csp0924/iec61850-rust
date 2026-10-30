@@ -2405,7 +2405,15 @@ fn handle_read_with_co_routing(
     };
     let r = match handler.read(&ctx) {
         ReadOutcome::CacheHit(value) => {
-            AccessResult::Success(crate::service::convert::mms_value_to_mms_data(&value))
+            if handler_bit_string_fits(mms_model, name, &value) {
+                AccessResult::Success(crate::service::convert::mms_value_to_mms_data(&value))
+            } else {
+                tracing::warn!(
+                    path = %canonical_path,
+                    "read: the read handler returned a bit string that does not fit the data attribute, answering object-value-invalid"
+                );
+                AccessResult::Failure(DataAccessError::ObjectValueInvalid)
+            }
         }
         ReadOutcome::CacheMiss => baseline,
         ReadOutcome::Error(e) => {
@@ -2418,6 +2426,37 @@ fn handle_read_with_co_routing(
         }
     };
     ReadRoutingOutcome::Result(r)
+}
+
+/// Reports whether a value a read handler supplies may be sent for `name`: a
+/// bit string must fit the declared size of a bit-string attribute, and any
+/// other value passes.
+#[cfg(any(
+    feature = "reporting",
+    feature = "control",
+    feature = "setting-groups",
+    feature = "goose-mapping",
+    feature = "logging"
+))]
+fn handler_bit_string_fits(
+    mms_model: &MmsDeviceModel,
+    name: &iec61850_mms::mms::pdu::common::ObjectName,
+    value: &iec61850_model::MmsValue,
+) -> bool {
+    use crate::mapping::{bit_string_fits, MmsLeafType, MmsTypeSpec};
+    use iec61850_mms::mms::pdu::common::ObjectName;
+    let iec61850_model::MmsValue::BitString { padding, data } = value else {
+        return true;
+    };
+    let ObjectName::DomainSpecific { domain_id, item_id } = name else {
+        return true;
+    };
+    match mms_model.spec_at(domain_id, item_id) {
+        Some(MmsTypeSpec::Leaf(MmsLeafType::BitString(size))) => {
+            bit_string_fits(*size, data.len(), *padding)
+        }
+        _ => true,
+    }
 }
 
 /// Canonicalizes a domain-specific object name into the attribute path the

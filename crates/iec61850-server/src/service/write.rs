@@ -14,9 +14,10 @@
 //!
 //! The type check compares the variant of the decoded wire value against the
 //! variant currently held in the model and answers `ObjectValueInvalid` on a
-//! mismatch. A path is served down to one data attribute,
-//! `LN$FC$DO[$SDO...]$DA`, crossing any depth of sub-data-objects on the way.
-//! A path that stops on a data object, and a path that continues into a
+//! mismatch; a bit string whose length does not fit the declared size of the
+//! attribute answers `TypeInconsistent`. A path is served down to one data
+//! attribute, `LN$FC$DO[$SDO...]$DA`, crossing any depth of sub-data-objects on
+//! the way. A path that stops on a data object, and a path that continues into a
 //! sub-attribute below the attribute, both answer `ObjectAccessUnsupported`:
 //! the value of a constructed node lives in its leaves, which are written one
 //! at a time.
@@ -32,7 +33,7 @@ use alloc::{
 use crate::handler::{
     canonicalize_attr_path, HandlerRegistry, WriteContext, WriteOutcome as HandlerWriteOutcome,
 };
-use crate::mapping::MmsDeviceModel;
+use crate::mapping::{bit_string_fits, declared_bit_string_size, MmsDeviceModel};
 use crate::policy::WriteAccessPolicies;
 use crate::service::convert::{mms_data_to_mms_value, same_data_variant};
 // Writing under FC SE belongs to the setting-group subsystem.
@@ -387,6 +388,22 @@ fn write_to_da(
             "write: the value type does not match the data attribute"
         );
         return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
+    }
+
+    // A bit string whose length does not fit the declared size of the attribute,
+    // such as 13 bits for a two-bit Dbpos, is refused with type-inconsistent
+    // and the attribute keeps its value.
+    if let MmsData::BitString { padding, data } | MmsData::BooleanArray { padding, data } = data {
+        if let Some(size) = declared_bit_string_size(da.ty) {
+            if !bit_string_fits(size, data.len(), *padding) {
+                tracing::warn!(
+                    domain = domain,
+                    da = da_name,
+                    "write: the bit string length does not fit the data attribute, answering type-inconsistent"
+                );
+                return WriteOutcome::Failure(DataAccessError::TypeInconsistent);
+            }
+        }
     }
 
     let new_value = mms_data_to_mms_value(data);
@@ -1318,5 +1335,84 @@ mod tests {
             .unwrap();
         let value = da.snapshot();
         assert_eq!(value, MmsValue::Integer(42));
+    }
+
+    // ── A bit string sent as a boolean-array fits the declared size ─────
+
+    /// A wire boolean-array maps onto a model bit string, so it is held to the
+    /// declared size too: 13 elements written to a two-bit Dbpos answer
+    /// type-inconsistent and the attribute keeps its value; two elements fit.
+    #[test]
+    fn write_boolean_array_of_other_length_returns_type_inconsistent() {
+        let pos = DataAttribute::new(
+            "pos",
+            FC::Cf,
+            DataAttributeType::CodedEnum,
+            TrgOps::default(),
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0x40],
+            },
+        );
+        let value = Arc::clone(&pos.value);
+        let cfg_do = DataObject {
+            name: "Cfg".into(),
+            array_count: None,
+            children: vec![DoChild::Da(pos)],
+        };
+        let ggio_ln = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(cfg_do)
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio_ln)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
+        let mut policies = WriteAccessPolicies::default();
+        policies.set(FC::Cf, true);
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$CF$Cfg$pos".to_string(),
+        };
+
+        let data = MmsData::BooleanArray {
+            padding: 3,
+            data: vec![0, 0],
+        };
+        let result =
+            handle_single_write(&model, &mms_model, &policies, None, None, 0, &name, &data);
+        assert_eq!(
+            result,
+            WriteOutcome::Failure(DataAccessError::TypeInconsistent)
+        );
+        assert_eq!(
+            *value.read().unwrap(),
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0x40],
+            }
+        );
+
+        let data = MmsData::BooleanArray {
+            padding: 6,
+            data: vec![0x80],
+        };
+        let result =
+            handle_single_write(&model, &mms_model, &policies, None, None, 0, &name, &data);
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *value.read().unwrap(),
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0x80],
+            }
+        );
     }
 }

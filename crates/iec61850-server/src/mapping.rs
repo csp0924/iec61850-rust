@@ -232,6 +232,30 @@ impl MmsDeviceModel {
         self.domains[*idx].get_variable_spec(var)
     }
 
+    /// Returns the type specification an item id names, `LN[$FC[$DO...]]`,
+    /// walking the structure of its logical node one name at a time.
+    ///
+    /// `None` means the domain or a step does not exist, or a step passes
+    /// through something other than a structure.
+    #[cfg(any(
+        feature = "reporting",
+        feature = "control",
+        feature = "setting-groups",
+        feature = "goose-mapping",
+        feature = "logging"
+    ))]
+    pub(crate) fn spec_at(&self, domain: &str, item_id: &str) -> Option<&MmsTypeSpec> {
+        let mut steps = item_id.split('$');
+        let mut spec = self.get_variable_spec(domain, steps.next()?)?;
+        for step in steps {
+            let MmsTypeSpec::Structure(members) = spec else {
+                return None;
+            };
+            spec = &members.iter().find(|m| m.name == step)?.type_spec;
+        }
+        Some(spec)
+    }
+
     /// Returns the view of one domain by name.
     pub fn domain(&self, name: &str) -> Option<&DomainView> {
         let idx = self.domain_index.get(name)?;
@@ -422,6 +446,41 @@ fn build_da_type_spec(da: &DataAttribute) -> Result<MmsTypeSpec> {
 
     let leaf = leaf_from_da_type(da.ty)?;
     Ok(MmsTypeSpec::Leaf(leaf))
+}
+
+/// Returns the declared size of a bit-string data attribute type, or `None` for
+/// a type that is not a bit string.
+pub(crate) fn declared_bit_string_size(ty: DataAttributeType) -> Option<StringSize> {
+    match leaf_from_da_type(ty) {
+        Ok(MmsLeafType::BitString(size)) => Some(size),
+        _ => None,
+    }
+}
+
+/// Returns the bit count of a bit string of `byte_len` bytes with `padding`
+/// unused bits in its last byte, or `None` when `padding` is 8 or more, or
+/// nonzero for an empty string.
+pub(crate) fn bit_string_len(byte_len: usize, padding: u8) -> Option<usize> {
+    if padding >= 8 || (byte_len == 0 && padding != 0) {
+        return None;
+    }
+    byte_len.checked_mul(8)?.checked_sub(usize::from(padding))
+}
+
+/// Reports whether a bit string of `byte_len` bytes with `padding` unused bits
+/// in its last byte fits a declared size: exactly N bits for `Fixed(N)`, 1 to N
+/// bits for `Max(N)`, any length for `Generic`.
+///
+/// A padding [`bit_string_len`] refuses never fits.
+pub(crate) fn bit_string_fits(size: StringSize, byte_len: usize, padding: u8) -> bool {
+    let Some(bits) = bit_string_len(byte_len, padding) else {
+        return false;
+    };
+    match size {
+        StringSize::Fixed(n) => bits == usize::from(n),
+        StringSize::Max(n) => (1..=usize::from(n)).contains(&bits),
+        StringSize::Generic => true,
+    }
 }
 
 /// Maps a scalar data attribute type onto an MMS leaf type, per

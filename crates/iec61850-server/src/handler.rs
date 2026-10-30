@@ -64,6 +64,9 @@ pub struct WriteContext<'a> {
 #[derive(Debug, Clone)]
 pub enum ReadOutcome {
     /// The handler supplies this value and the model is not consulted.
+    ///
+    /// A bit string that does not fit the declared size of a bit-string
+    /// attribute is not sent; the client receives `ObjectValueInvalid`.
     CacheHit(MmsValue),
     /// The handler declines this read; the model answers it.
     CacheMiss,
