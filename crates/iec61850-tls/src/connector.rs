@@ -45,8 +45,9 @@ impl TlsConnector {
     /// Runs the TLS handshake over an already connected TCP stream.
     ///
     /// `server_name` is presented in SNI and checked against the server
-    /// certificate. The returned `TlsStream<TcpStream>` is the generic
-    /// argument of `CotpConnection<T>`.
+    /// certificate, unless the configuration was built with
+    /// `with_dangerous_no_sni_verify()`. The returned `TlsStream<TcpStream>` is
+    /// the generic argument of `CotpConnection<T>`.
     ///
     /// # Errors
     ///

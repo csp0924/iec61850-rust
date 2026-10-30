@@ -747,3 +747,94 @@ fn resumption_lifetime_leaves_the_ticket_count_unchanged() {
         .send_tls13_tickets;
     assert_eq!(with_lifetime, default_count);
 }
+
+// -----------------------------------------------------------------------------
+// Name checking
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn no_sni_verify_accepts_a_certificate_without_a_matching_name() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .with_dangerous_no_sni_verify()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake_as(
+        TlsAcceptor::new(server),
+        &TlsConnector::new(client),
+        "ied.example",
+    )
+    .await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+}
+
+#[tokio::test]
+async fn name_mismatch_is_rejected_without_no_sni_verify() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca).build_client().unwrap();
+
+    let (srv, cli) = handshake_as(
+        TlsAcceptor::new(server),
+        &TlsConnector::new(client),
+        "ied.example",
+    )
+    .await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_sni_verify_still_rejects_an_untrusted_chain() {
+    let trusted_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let rogue_leaf = rogue_ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&rogue_leaf).build_server().unwrap();
+    let client = client_trusting(&trusted_ca)
+        .with_dangerous_no_sni_verify()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake_as(
+        TlsAcceptor::new(server),
+        &TlsConnector::new(client),
+        "ied.example",
+    )
+    .await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_sni_verify_still_rejects_an_expired_certificate() {
+    let ca = Ca::new();
+    let leaf = ca.issue(SERVER_NAME, 1, expired());
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .with_dangerous_no_sni_verify()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake_as(
+        TlsAcceptor::new(server),
+        &TlsConnector::new(client),
+        "ied.example",
+    )
+    .await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}

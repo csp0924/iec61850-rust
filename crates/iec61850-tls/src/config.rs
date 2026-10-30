@@ -129,8 +129,8 @@ pub struct TlsConfigBuilder {
     max_version: TlsVersion,
 
     // Hostname verification
-    /// Records the intent to skip SNI hostname verification. Dangerous;
-    /// defaults to false.
+    /// Skips matching the server certificate against the server name.
+    /// Dangerous; defaults to false.
     dangerous_no_sni_verify: bool,
 
     // -- CRL ------------------------------------------------------------------
@@ -322,10 +322,13 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Records the intent to skip SNI hostname verification.
+    /// Skips matching the server certificate against the server name passed
+    /// to [`crate::TlsConnector::connect`].
     ///
-    /// Dangerous, and off by default; intended for development and interop
-    /// testing. See `NoSniServerVerifier` for what is currently enforced.
+    /// Dangerous, and off by default; intended for IEDs whose certificates
+    /// carry no matching DNS or IP subject alternative name. Chain validation,
+    /// revocation, validity time and the allow-only-known list still apply.
+    /// Has no effect on `build_server`.
     pub fn with_dangerous_no_sni_verify(mut self) -> Self {
         self.dangerous_no_sni_verify = true;
         self
@@ -437,7 +440,6 @@ impl TlsConfigBuilder {
         // IgnoreValidityTime(AllowOnlyKnownCerts(WebPki or NoSni wrapper)).
         let base_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             if self.dangerous_no_sni_verify {
-                // Wrapped to record the no-SNI intent; see NoSniServerVerifier.
                 Arc::new(NoSniServerVerifier::new(webpki_verifier))
             } else {
                 webpki_verifier
@@ -591,13 +593,14 @@ impl TlsConfigBuilder {
 // NoSniServerVerifier
 // -----------------------------------------------------------------------------
 
-/// Verifier wrapper that records the intent to skip SNI hostname checking.
+/// Server verifier that skips matching the certificate against the server
+/// name.
 ///
 /// IEC 62351-3 does not require the SAN to match the server hostname, unlike
-/// Web PKI. Reached only through `with_dangerous_no_sni_verify()`.
-///
-/// TODO: implement genuine SAN-free verification; this wrapper still forwards
-/// to the inner verifier, which does check the SAN.
+/// Web PKI. Reached only through `with_dangerous_no_sni_verify()`. The inner
+/// verifier must be a `WebPkiServerVerifier`, which checks the name after the
+/// chain, revocation and validity time; a name mismatch therefore means every
+/// other check has passed, and only that error is turned into acceptance.
 struct NoSniServerVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
 }
@@ -623,11 +626,19 @@ impl rustls::client::danger::ServerCertVerifier for NoSniServerVerifier {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // The inner verifier still performs chain validation, and its SAN
-        // check with it. Skipping the SAN would mean reimplementing chain
-        // validation against the webpki API; see the TODO on this type.
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. },
+            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            other => other,
+        }
     }
 
     fn verify_tls12_signature(
