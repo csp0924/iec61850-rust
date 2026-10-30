@@ -51,9 +51,10 @@ pub struct JournalEntryData {
     pub data_ref: String,
     /// The value recorded.
     pub value: MmsValue,
-    /// Reason code bit string, one byte with the same padding rules as a report
-    /// control block: data change 0x02, quality change 0x04, data update 0x08,
-    /// integrity 0x10, general interrogation 0x20.
+    /// Reason code (ReasonForInclusionInLog): mask `1 << n` holds bit `n` of
+    /// the BIT STRING sent on the wire, so data change is 0x02, quality change
+    /// 0x04, data update 0x08, integrity 0x10, general interrogation 0x20 and
+    /// application trigger 0x40.
     pub reason_code: u8,
 }
 

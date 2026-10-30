@@ -56,7 +56,10 @@ pub struct ClientJournalEntryData {
     pub data_ref: String,
     /// Value that was logged.
     pub value: MmsValue,
-    /// The reasonCode bit string data byte, padded as an RCB bit string is.
+    /// reasonCode (ReasonForInclusionInLog): mask `1 << n` holds bit `n` of
+    /// the BIT STRING, so data-change is 0x02, quality-change 0x04,
+    /// data-update 0x08, integrity 0x10, general-interrogation 0x20 and
+    /// application-trigger 0x40.
     pub reason_code: u8,
 }
 

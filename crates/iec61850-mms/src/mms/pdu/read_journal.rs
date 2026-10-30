@@ -427,7 +427,13 @@ pub struct WireJournalVariable {
     pub data_ref: String,
     /// The decoded value.
     pub value: MmsData,
-    /// reasonCode, carried as a seven-bit BitString with one padding bit.
+    /// reasonCode (ReasonForInclusionInLog): bit `n` of this byte, mask
+    /// `1 << n`, holds bit `n` of the wire BIT STRING, so data-change is 0x02,
+    /// quality-change 0x04, data-update 0x08, integrity 0x10,
+    /// general-interrogation 0x20 and application-trigger 0x40; bit 0 is
+    /// reserved. On the wire the BIT STRING is seven bits long and its bit 0
+    /// is the most significant bit of the first octet; bit 7 of this byte is
+    /// not sent, and wire bits after bit 7 are not kept.
     pub reason_code: u8,
 }
 
@@ -539,6 +545,21 @@ fn encode_data_variable(data_ref: &str, value: &MmsData, buf: &mut BytesMut) {
     buf.extend_from_slice(&var_buf);
 }
 
+/// Bit count of the ReasonForInclusionInLog BIT STRING on the wire.
+const REASON_CODE_BITS: u8 = 7;
+
+/// Maps a reason code byte to the first octet of its wire BIT STRING, where
+/// bit `n` of the BIT STRING is the octet bit of mask `0x80 >> n`.
+fn reason_code_to_wire(reason_code: u8) -> u8 {
+    reason_code.reverse_bits() & (0xff << (8 - REASON_CODE_BITS))
+}
+
+/// Inverse of [`reason_code_to_wire`] for the first octet of a decoded BIT
+/// STRING.
+fn reason_code_from_wire(first_octet: u8) -> u8 {
+    first_octet.reverse_bits()
+}
+
 fn encode_reason_code_variable(reason_code: u8, buf: &mut BytesMut) {
     // the second variable is tagged "ReasonCode" and carries a BitString of seven bits
     let mut var_buf = BytesMut::new();
@@ -548,8 +569,8 @@ fn encode_reason_code_variable(reason_code: u8, buf: &mut BytesMut) {
     var_buf.extend_from_slice(tag_bytes);
     // BitString MmsData wire = 0x84 <len> <padding=1> <data byte>
     let bs = MmsData::BitString {
-        padding: 1,
-        data: vec![reason_code],
+        padding: 8 - REASON_CODE_BITS,
+        data: vec![reason_code_to_wire(reason_code)],
     };
     let mut data_buf = BytesMut::new();
     bs.encode(&mut data_buf);
@@ -806,7 +827,7 @@ fn decode_raw_variable(data: &[u8]) -> Result<RawVariable, MmsError> {
 
     if tag_str == "ReasonCode" {
         if let MmsData::BitString { data, .. } = value {
-            let rc = data.first().copied().unwrap_or(0);
+            let rc = reason_code_from_wire(data.first().copied().unwrap_or(0));
             Ok(RawVariable::ReasonCode(rc))
         } else {
             tracing::warn!("the valuespec of a reasoncode variable is not a bitstring");
@@ -1120,4 +1141,79 @@ mod tests {
             "the wire bytes must contain the fixed originatingApplication"
         );
     }
+
+    fn encoded_reason_code(reason_code: u8) -> Vec<u8> {
+        let resp = ReadJournalResponse {
+            entries: vec![WireJournalEntry {
+                entry_id: [0, 0, 0, 0, 0, 0, 0, 1],
+                occurence_time_ms: 1_700_000_000_000,
+                variables: vec![WireJournalVariable {
+                    data_ref: "LD0/GGIO1$ST$Ind1$stVal".into(),
+                    value: MmsData::Boolean(true),
+                    reason_code,
+                }],
+            }],
+            more_follows: None,
+        };
+        let mut buf = BytesMut::new();
+        resp.encode(&mut buf);
+        let tag = b"ReasonCode";
+        let at = buf
+            .windows(tag.len())
+            .position(|w| w == tag)
+            .expect("a reason code variable");
+        // tag, then valueSpec 0xa1 <len>, then the BIT STRING 0x84 <len> <pad> <octet>.
+        buf[at + tag.len() + 2..at + tag.len() + 6].to_vec()
+    }
+
+    #[test]
+    fn reason_code_bits_follow_the_bit_string_numbering() {
+        // Bit n of the BIT STRING is the octet bit of mask 0x80 >> n.
+        for (reason, wire) in [
+            (0x02, 0x40), // data-change, bit 1
+            (0x04, 0x20), // quality-change, bit 2
+            (0x08, 0x10), // data-update, bit 3
+            (0x10, 0x08), // integrity, bit 4
+            (0x20, 0x04), // general-interrogation, bit 5
+            (0x40, 0x02), // application-trigger, bit 6
+        ] {
+            assert_eq!(
+                encoded_reason_code(reason),
+                vec![0x84, 0x02, 0x01, wire],
+                "reason code {reason:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_code_is_seven_bits_long() {
+        // Bit 7 lies outside the seven-bit BIT STRING.
+        assert_eq!(encoded_reason_code(0x82), vec![0x84, 0x02, 0x01, 0x40]);
+    }
+
+    #[test]
+    fn decoded_reason_code_maps_wire_bits_back() {
+        for reason in [0x02u8, 0x04, 0x08, 0x10, 0x20, 0x40, 0x06] {
+            let resp = ReadJournalResponse {
+                entries: vec![WireJournalEntry {
+                    entry_id: [0, 0, 0, 0, 0, 0, 0, 1],
+                    occurence_time_ms: 1_700_000_000_000,
+                    variables: vec![WireJournalVariable {
+                        data_ref: "LD0/A".into(),
+                        value: MmsData::Boolean(true),
+                        reason_code: reason,
+                    }],
+                }],
+                more_follows: None,
+            };
+            let mut buf = BytesMut::new();
+            resp.encode(&mut buf);
+            let back = ReadJournalResponse::decode(&buf).unwrap();
+            assert_eq!(back.entries[0].variables[0].reason_code, reason);
+        }
+        // A wider BIT STRING from a peer keeps its first seven bits.
+        assert_eq!(reason_code_from_wire(0x40), 0x02);
+        assert_eq!(reason_code_from_wire(0x02), 0x40);
+    }
+
 }
