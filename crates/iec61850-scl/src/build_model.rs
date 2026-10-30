@@ -556,15 +556,14 @@ fn build_rcb(raw_rcb: &RawReportControlBlock) -> ReportControlBlock {
 
 /// Converts a `<GSEControl>` into a [`GooseControlBlock`].
 ///
-/// SCL gives a `<GSEControl>` no goID attribute, so the control block name is
-/// used as the goID.
+/// The `appID` attribute is the GoID of the control block (IEC 61850-6), the
+/// identifier a subscriber filters on.
 fn build_gocb(raw_gcb: &RawGseControl) -> GooseControlBlock {
     GooseControlBlock {
         name: raw_gcb.name.clone(),
         dataset_ref: raw_gcb.data_set.clone(),
         conf_rev: raw_gcb.conf_rev,
-        // SCL carries no goID attribute, so the name is used instead.
-        go_id: raw_gcb.name.clone(),
+        go_id: raw_gcb.appl_id.clone(),
     }
 }
 
@@ -1879,9 +1878,9 @@ mod tests {
         assert_eq!(urcb.rpt_id, "");
     }
 
-    /// A GSEControl becomes a GooseControlBlock whose goID defaults to the name.
+    /// A GSEControl becomes a GooseControlBlock whose goID is its appID.
     #[test]
-    fn gse_control_maps_with_default_goid_eq_name() {
+    fn gse_control_maps_with_goid_from_app_id() {
         let xml = r#"<SCL>
   <DataTypeTemplates>
     <LNodeType id="LLN0_T" lnClass="LLN0">
@@ -1920,7 +1919,7 @@ mod tests {
         assert_eq!(gcb.name, "gcb1");
         assert_eq!(gcb.dataset_ref, "DSGoose");
         assert_eq!(gcb.conf_rev, 2);
-        assert_eq!(gcb.go_id, "gcb1");
+        assert_eq!(gcb.go_id, "APPID-1");
     }
 
     /// A SampledValueControl becomes an SvControlBlock.

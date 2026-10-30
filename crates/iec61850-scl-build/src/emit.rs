@@ -620,8 +620,8 @@ fn emit_gocb_expr(g: &RawGseControl) -> TokenStream {
     let name = g.name.as_str();
     let dataset_ref = g.data_set.as_str();
     let conf_rev = g.conf_rev;
-    // The SCL carries no goID, so the control block name is used instead.
-    let go_id = g.name.as_str();
+    // The `appID` of a `<GSEControl>` is its GoID, as on the runtime path.
+    let go_id = g.appl_id.as_str();
     quote! {
         GooseControlBlock {
             name: ::std::string::String::from(#name),
@@ -1362,6 +1362,31 @@ mod tests {
             .to_string();
         let sbo = emit_mms_value(&MmsValue::Unsigned(30000)).to_string();
         assert!(emitted.contains(&sbo), "sboTimeout is not emitted as 30000");
+    }
+
+    /// The generated GoCB carries the `appID` as its GoID, as the runtime
+    /// model does.
+    #[test]
+    fn emitted_go_id_is_the_app_id() {
+        let xml = r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
+      <DataSet name="DS1"><FCDA ldInst="LD0" lnClass="LLN0" doName="Mod" daName="stVal" fc="ST"/></DataSet>
+      <GSEControl name="gcbEvents" appID="events" datSet="DS1" confRev="1"/>
+    </LN0>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="ENC_T"/></LNodeType>
+    <DOType id="ENC_T" cdc="ENC"><DA name="stVal" fc="ST" bType="BOOLEAN"/></DOType>
+  </DataTypeTemplates>
+</SCL>"#;
+        let resolved = parse_scl(xml).unwrap().resolve().unwrap();
+        let runtime = resolved.build_model("IED1").unwrap();
+        let go_id = runtime.lds[0].lns[0].gocbs[0].go_id.clone();
+        assert_eq!(go_id, "events");
+        let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
+        let expected = quote! { go_id: ::std::string::String::from(#go_id) }.to_string();
+        assert!(emitted.contains(&expected), "{emitted}");
     }
 
     /// Generated code and the runtime build path must produce the same

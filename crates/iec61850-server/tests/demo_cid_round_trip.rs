@@ -568,8 +568,8 @@ fn emit_rcb(out: &mut String, rcb: &ReportControlBlock) {
 }
 
 fn emit_gocb(out: &mut String, gocb: &GooseControlBlock) {
-    // The parser derives goID from the GSEControl name, so appID is free to
-    // carry the goID without changing the rebuilt block.
+    // The parser takes goID from the GSEControl appID, so writing the goID as
+    // appID rebuilds the same block.
     let _ = writeln!(
         out,
         r#"            <GSEControl name="{}" appID="{}" datSet="{}" confRev="{}" type="GOOSE"/>"#,

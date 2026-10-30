@@ -196,3 +196,36 @@ fn template_val_of_the_wrong_type_fails_the_build() {
     .expect_err("an INT32U default of `many` must be rejected");
     assert!(err.contains("many"), "{err}");
 }
+
+const GGIO_SPS: &str = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO">
+      <DO name="Ind1" type="SPS_T"/>
+    </LNodeType>
+    <DOType id="SPS_T" cdc="SPS">
+      <DA name="stVal" fc="ST" bType="BOOLEAN" dchg="true"/>
+    </DOType>"#;
+
+const GGIO1: &str = r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#;
+
+/// The `appID` of a `<GSEControl>` is its GoID; the control block keeps its
+/// own name.
+#[test]
+fn gse_control_app_id_is_the_go_id() {
+    let ln0 = r#"
+            <DataSet name="DSGoose">
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Ind1" daName="stVal" fc="ST"/>
+            </DataSet>
+            <GSEControl name="gcb1" appID="IED1_GOOSE_PROT" datSet="DSGoose" confRev="1" type="GOOSE"/>
+            <GSEControl name="gcbEvents" appID="events" datSet="DSGoose" confRev="1"/>"#;
+    let m = build(&wrap(GGIO_SPS, ln0, GGIO1));
+    let ln0 = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
+    let ids: Vec<(&str, &str)> = ln0
+        .gocbs
+        .iter()
+        .map(|g| (g.name.as_str(), g.go_id.as_str()))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![("gcb1", "IED1_GOOSE_PROT"), ("gcbEvents", "events")]
+    );
+}
