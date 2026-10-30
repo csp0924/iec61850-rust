@@ -26,7 +26,7 @@ use iec61850_model::MmsValue;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,6 +127,12 @@ pub struct ReportingEngine {
     /// Peer address of every open association, which identifies the owner of a
     /// BRCB reservation across connections.
     peers: HashMap<ConnectionId, IpAddr>,
+    /// Data sets a DatSet write may name, shared with the server.
+    dataset_registry: Option<super::DatasetRegistry>,
+    /// Attribute reference of every member bound to a control block, keyed by the
+    /// address of its value lock. The weak handle confirms that the address still
+    /// belongs to the same value.
+    value_index: HashMap<usize, (Weak<RwLock<MmsValue>>, DataAttributeRef)>,
 }
 
 /// Buffer-time accumulation state for one BRCB.
@@ -212,6 +218,8 @@ impl ReportingEngine {
             channel_sink: None,
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
+            dataset_registry: None,
+            value_index: HashMap::new(),
         }
     }
 
@@ -235,6 +243,8 @@ impl ReportingEngine {
             channel_sink: Some(sink),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
+            dataset_registry: None,
+            value_index: HashMap::new(),
         }
     }
 
@@ -278,6 +288,7 @@ impl ReportingEngine {
                 .or_default()
                 .push(weak);
         }
+        self.index_values(&dataset);
 
         self.rcbs.insert(mms_path, rc);
         Ok(())
@@ -372,6 +383,7 @@ impl ReportingEngine {
                 .or_default()
                 .push(weak);
         }
+        self.index_values(&dataset);
         self.brcb_datasets.insert(mms_path.clone(), dataset);
         self.brcbs.insert(mms_path, brcb_arc);
         Ok(())
@@ -395,6 +407,107 @@ impl ReportingEngine {
     /// Returns the engine-level metrics block.
     pub fn engine_metrics(&self) -> Arc<ReportingEngineMetrics> {
         self.metrics.clone()
+    }
+
+    // ─── Data set binding ─────────────────────────────────────────────────────
+
+    /// Installs the data set registry that DatSet writes are resolved against.
+    ///
+    /// A write of DatSet must name a data set in this registry, keyed by
+    /// `(domain, <LN>$<name>)`; a value without a domain names one in the domain
+    /// of the control block. Without a registry, no DatSet write that changes the
+    /// value is accepted.
+    pub fn set_dataset_registry(&mut self, registry: super::DatasetRegistry) {
+        self.dataset_registry = Some(registry);
+    }
+
+    /// Returns the attribute reference a control block knows the value lock
+    /// `value` by, when a bound data set has it as a member.
+    pub(crate) fn attr_ref_for_value(
+        &self,
+        value: &Arc<RwLock<MmsValue>>,
+    ) -> Option<DataAttributeRef> {
+        let (weak, attr_ref) = self.value_index.get(&(Arc::as_ptr(value) as usize))?;
+        (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(value)))
+            .then(|| attr_ref.clone())
+    }
+
+    /// Records the attribute reference of every member of `dataset`.
+    fn index_values(&mut self, dataset: &Dataset) {
+        for entry in &dataset.entries {
+            self.value_index.insert(
+                Arc::as_ptr(&entry.value) as usize,
+                (Arc::downgrade(&entry.value), entry.attr_ref.clone()),
+            );
+        }
+    }
+
+    /// Looks up the data set a DatSet value names, for the control block at
+    /// `rcb_mms_path`.
+    pub(crate) fn resolve_dataset(&self, rcb_mms_path: &str, dat_set: &str) -> Option<Dataset> {
+        let key = dataset_key(rcb_mms_path, dat_set)?;
+        let registry = self.dataset_registry.as_ref()?.read().ok()?;
+        registry.get(&key).map(|ds| Dataset::clone(ds))
+    }
+
+    /// Moves the URCB `rc` from the members of `old` to those of `new` in the
+    /// inverted index.
+    pub(crate) fn rebind_rcb_watches(
+        &mut self,
+        rc: &Arc<Mutex<ReportControl>>,
+        old: Option<&Dataset>,
+        new: Option<&Dataset>,
+    ) {
+        for entry in old.map(|d| d.entries.as_slice()).unwrap_or_default() {
+            if let Some(list) = self.watch_map.get_mut(&entry.attr_ref) {
+                list.retain(|w| !std::ptr::eq(w.as_ptr(), Arc::as_ptr(rc)));
+                if list.is_empty() {
+                    self.watch_map.remove(&entry.attr_ref);
+                }
+            }
+        }
+        if let Some(ds) = new {
+            for entry in &ds.entries {
+                self.watch_map
+                    .entry(entry.attr_ref.clone())
+                    .or_default()
+                    .push(Arc::downgrade(rc));
+            }
+            self.index_values(ds);
+        }
+    }
+
+    /// Binds the BRCB at `mms_path` to `dataset`, or unbinds it for `None`.
+    ///
+    /// Rebuilds its inverted index entries and drops any buffer-time window
+    /// accumulated against the previous data set.
+    pub(crate) fn rebind_brcb_dataset(&mut self, mms_path: &str, dataset: Option<Dataset>) {
+        let Some(brcb) = self.brcbs.get(mms_path).cloned() else {
+            return;
+        };
+        if let Some(old) = self.brcb_datasets.remove(mms_path) {
+            for entry in &old.entries {
+                if let Some(list) = self.brcb_watch_map.get_mut(&entry.attr_ref) {
+                    list.retain(|w| !std::ptr::eq(w.as_ptr(), Arc::as_ptr(&brcb)));
+                    if list.is_empty() {
+                        self.brcb_watch_map.remove(&entry.attr_ref);
+                    }
+                }
+            }
+        }
+        if let Ok(mut pending) = self.brcb_buftm_pending.lock() {
+            pending.remove(mms_path);
+        }
+        if let Some(ds) = dataset {
+            for entry in &ds.entries {
+                self.brcb_watch_map
+                    .entry(entry.attr_ref.clone())
+                    .or_default()
+                    .push(Arc::downgrade(&brcb));
+            }
+            self.index_values(&ds);
+            self.brcb_datasets.insert(mms_path.to_string(), ds);
+        }
     }
 
     /// Releases every BRCB reservation whose timeout has elapsed.
@@ -1596,6 +1709,23 @@ enum TickAction {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the data set registry key `(domain, list_name)` a DatSet value names.
+///
+/// A value of the form `<domain>/<LN>$<name>` carries its domain; a value without
+/// one names a data set in the domain of the control block at `rcb_mms_path`. An
+/// empty value names no data set.
+fn dataset_key(rcb_mms_path: &str, dat_set: &str) -> Option<(String, String)> {
+    if dat_set.is_empty() {
+        return None;
+    }
+    match dat_set.split_once('/') {
+        Some((domain, item)) => Some((domain.to_string(), item.to_string())),
+        None => rcb_mms_path
+            .split_once('/')
+            .map(|(domain, _)| (domain.to_string(), dat_set.to_string())),
+    }
+}
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
 fn current_time_ms() -> u64 {

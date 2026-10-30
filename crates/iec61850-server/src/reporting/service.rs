@@ -9,6 +9,11 @@
 //! |---|---|
 //! | Resv | any client, moving the block from idle to reserved |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
+//!
+//! A DatSet write must name a data set the server knows; a name it does not
+//! know is refused with ObjectValueInvalid. An accepted DatSet write binds the
+//! control block to the members of the named data set, for URCBs and BRCBs
+//! alike.
 //! | RptEna = true | reserved, and the writer owns the reservation |
 //! | RptEna = false | enabled, and the writer owns the reservation |
 //! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
@@ -119,9 +124,9 @@ pub enum RcbWriteValue {
 ///
 /// Returns the `DataAccessError` the client is to be answered with: a
 /// non-writable field or a writer that does not own the reservation gives
-/// `ObjectAccessDenied`, a wrong value type gives `TypeInconsistent`, an enabled
-/// control block gives `TemporarilyUnavailable`, and a poisoned mutex gives
-/// `HardwareFault`.
+/// `ObjectAccessDenied`, a wrong value type gives `TypeInconsistent`, a DatSet
+/// naming no known data set gives `ObjectValueInvalid`, an enabled control block
+/// gives `TemporarilyUnavailable`, and a poisoned mutex gives `HardwareFault`.
 pub fn handle_set_rcb_field(
     engine: &Arc<Mutex<ReportingEngine>>,
     mms_path: &str,
@@ -129,12 +134,13 @@ pub fn handle_set_rcb_field(
     value: RcbWriteValue,
     conn_id: ConnectionId,
 ) -> Result<(), DataAccessError> {
-    let eng = engine.lock().map_err(|_| DataAccessError::HardwareFault)?;
+    // The engine lock is held throughout, before the control block lock as on
+    // every other path, so a DatSet write rebinds the inverted index atomically.
+    let mut eng = engine.lock().map_err(|_| DataAccessError::HardwareFault)?;
 
     let rc_arc = eng
         .get_rcb(mms_path)
         .ok_or(DataAccessError::ObjectNonExistent)?;
-    drop(eng); // release the engine lock before taking the control block lock
 
     let rc = rc_arc.lock().map_err(|_| DataAccessError::HardwareFault)?;
     let mut state = rc
@@ -322,6 +328,26 @@ pub fn handle_set_rcb_field(
                 _ => return Err(DataAccessError::TypeInconsistent),
             };
             if s != state.dat_set {
+                let dataset = if s.is_empty() {
+                    None
+                } else {
+                    match eng.resolve_dataset(mms_path, &s) {
+                        Some(ds) => Some(ds),
+                        None => {
+                            tracing::warn!(
+                                mms_path,
+                                dat_set = s.as_str(),
+                                "SetURCBValues DatSet: no such data set, answering ObjectValueInvalid"
+                            );
+                            return Err(DataAccessError::ObjectValueInvalid);
+                        }
+                    }
+                };
+                eng.rebind_rcb_watches(&rc_arc, state.dataset.as_ref(), dataset.as_ref());
+                state.dataset = dataset;
+                state.pending = None;
+                state.triggered = false;
+                state.report_due = None;
                 state.dat_set = s;
                 state.increase_conf_rev();
             }
@@ -595,7 +621,7 @@ fn set_brcb_field(
         // Configuration fields; each is refused with TemporarilyUnavailable while
         // RptEna is true.
         RcbField::RptId => set_brcb_config_string(&brcb, value, "RptID"),
-        RcbField::DatSet => set_brcb_config_string(&brcb, value, "DatSet"),
+        RcbField::DatSet => set_brcb_dat_set(engine, &brcb, value),
         RcbField::OptFlds => set_brcb_opt_flds(&brcb, value),
         RcbField::BufTm => set_brcb_unsigned32(&brcb, value, "BufTm"),
         RcbField::TrgOps => set_brcb_trg_ops(&brcb, value),
@@ -886,13 +912,79 @@ fn set_brcb_config_string(
     }
     let field = match which {
         "RptID" => BrcbConfigField::RptId(s),
-        "DatSet" => BrcbConfigField::DatSet(s),
         _ => return None,
     };
     match brcb.set_config_field(field) {
         Ok(_) => Some(Ok(())),
         Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
             // Configuration may not change while RptEna is true.
+            Some(Err(DataAccessError::TemporarilyUnavailable))
+        }
+        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+    }
+}
+
+/// Applies a DatSet write: the name must resolve to a known data set, and the
+/// BRCB is then bound to its members. A non-persistent data set, whose name
+/// starts with `@`, may not be the DatSet of a BRCB, per IEC 61850-7-2.
+fn set_brcb_dat_set(
+    engine: &Arc<Mutex<ReportingEngine>>,
+    brcb: &Arc<super::brcb::BufferedReportControl>,
+    value: RcbWriteValue,
+) -> Option<Result<(), DataAccessError>> {
+    let s = match value {
+        RcbWriteValue::VisibleString(s) => s,
+        _ => return Some(Err(DataAccessError::TypeInconsistent)),
+    };
+    if s.len() > 129 {
+        tracing::warn!(mms_path = %brcb.mms_path, len = s.len(), "brcb DatSet longer than 129 bytes");
+        return Some(Err(DataAccessError::ObjectValueInvalid));
+    }
+    // The engine lock is held across resolution and rebinding.
+    let Ok(mut eng) = engine.lock() else {
+        return Some(Err(DataAccessError::HardwareFault));
+    };
+    let (enabled, unchanged) = match brcb.lock_state() {
+        Ok(state) => (state.rpt_ena, state.dat_set == s),
+        Err(_) => return Some(Err(DataAccessError::HardwareFault)),
+    };
+    if enabled {
+        return Some(Err(DataAccessError::TemporarilyUnavailable));
+    }
+    if unchanged {
+        return Some(Ok(()));
+    }
+    let item = s.split_once('/').map_or(s.as_str(), |(_, item)| item);
+    if item.starts_with('@') {
+        tracing::warn!(
+            mms_path = %brcb.mms_path,
+            dat_set = s.as_str(),
+            "SetBRCBValues DatSet: a non-persistent data set, answering ObjectValueInvalid"
+        );
+        return Some(Err(DataAccessError::ObjectValueInvalid));
+    }
+    let dataset = if s.is_empty() {
+        None
+    } else {
+        match eng.resolve_dataset(&brcb.mms_path, &s) {
+            Some(ds) => Some(ds),
+            None => {
+                tracing::warn!(
+                    mms_path = %brcb.mms_path,
+                    dat_set = s.as_str(),
+                    "SetBRCBValues DatSet: no such data set, answering ObjectValueInvalid"
+                );
+                return Some(Err(DataAccessError::ObjectValueInvalid));
+            }
+        }
+    };
+    match brcb.set_config_field(BrcbConfigField::DatSet(s)) {
+        Ok(super::brcb::ConfigChangeResult::NoChange) => Some(Ok(())),
+        Ok(_) => {
+            eng.rebind_brcb_dataset(&brcb.mms_path, dataset);
+            Some(Ok(()))
+        }
+        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
             Some(Err(DataAccessError::TemporarilyUnavailable))
         }
         Err(_) => Some(Err(DataAccessError::HardwareFault)),
@@ -1068,6 +1160,222 @@ mod tests {
         ));
         engine.register_rcb(rc, ds).unwrap();
         (Arc::new(Mutex::new(engine)), path)
+    }
+
+    /// Installs a registry on `engine` holding one single-member data set per
+    /// `(domain, list_name, member)`, and returns the member value locks.
+    fn install_registry(
+        engine: &Arc<Mutex<ReportingEngine>>,
+        sets: &[(&str, &str, &str)],
+    ) -> Vec<Arc<RwLock<MmsValue>>> {
+        let registry: super::super::DatasetRegistry = Default::default();
+        let mut values = Vec::new();
+        for (domain, list_name, member) in sets {
+            let value = Arc::new(RwLock::new(MmsValue::Integer(0)));
+            let mut ds = Dataset::new(*list_name);
+            ds.push(DatasetEntry::new(*member, value.clone()));
+            registry
+                .write()
+                .unwrap()
+                .insert((domain.to_string(), list_name.to_string()), Arc::new(ds));
+            values.push(value);
+        }
+        engine.lock().unwrap().set_dataset_registry(registry);
+        values
+    }
+
+    // ── DatSet resolution and rebinding ──────────────────────────────────────
+
+    const DS2_MEMBER: &str = "IED1LD0/GGIO1$ST$Ind2$stVal";
+
+    fn urcb_dataset_refs(engine: &Arc<Mutex<ReportingEngine>>, path: &str) -> Vec<String> {
+        let rc_arc = engine.lock().unwrap().get_rcb(path).unwrap();
+        let rc = rc_arc.lock().unwrap();
+        let state = rc.state.lock().unwrap();
+        state
+            .dataset
+            .as_ref()
+            .map(|d| d.entries.iter().map(|e| e.attr_ref.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn urcb_dat_set_naming_no_data_set_is_refused() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "GGIO1$ds2", DS2_MEMBER)]);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        let res = handle_set_rcb_field(
+            &engine,
+            &path,
+            RcbField::DatSet,
+            RcbWriteValue::VisibleString("IED1LD0/GGIO1$noSuchDs".to_string()),
+            1,
+        );
+        assert_eq!(res, Err(DataAccessError::ObjectValueInvalid));
+        let get = handle_get_rcb_field(&engine, &path, RcbField::DatSet);
+        assert!(matches!(
+            get,
+            Some(iec61850_mms::mms::pdu::common::AccessResult::Success(
+                iec61850_mms::mms::pdu::common::MmsData::VisibleString(ref v)
+            )) if v == "GGIO1$ds1"
+        ));
+        assert_eq!(
+            urcb_dataset_refs(&engine, &path),
+            ["IED1LD0/GGIO1$ST$Ind1$stVal"]
+        );
+    }
+
+    #[test]
+    fn urcb_dat_set_write_rebinds_the_members() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        let values = install_registry(&engine, &[("IED1LD0", "GGIO1$ds2", DS2_MEMBER)]);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        for dat_set in ["IED1LD0/GGIO1$ds2", "GGIO1$ds2"] {
+            handle_set_rcb_field(
+                &engine,
+                &path,
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString(String::new()),
+                1,
+            )
+            .unwrap();
+            handle_set_rcb_field(
+                &engine,
+                &path,
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString(dat_set.to_string()),
+                1,
+            )
+            .unwrap();
+            assert_eq!(urcb_dataset_refs(&engine, &path), [DS2_MEMBER], "{dat_set}");
+        }
+        handle_set_rcb_field(
+            &engine,
+            &path,
+            RcbField::RptEna,
+            RcbWriteValue::Bool(true),
+            1,
+        )
+        .unwrap();
+
+        let eng = engine.lock().unwrap();
+        assert_eq!(
+            eng.attr_ref_for_value(&values[0]).as_deref(),
+            Some(DS2_MEMBER)
+        );
+        let flag = crate::flags::InclusionFlag::VALUE_CHANGED;
+        // The previous member no longer triggers the control block.
+        eng.on_value_updated(
+            &"IED1LD0/GGIO1$ST$Ind1$stVal".to_string(),
+            MmsValue::Boolean(true),
+            flag,
+            1,
+        );
+        let rc_arc = eng.get_rcb(&path).unwrap();
+        assert!(rc_arc
+            .lock()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .is_none());
+        eng.on_value_updated(&DS2_MEMBER.to_string(), MmsValue::Integer(5), flag, 2);
+        let rc = rc_arc.lock().unwrap();
+        let state = rc.state.lock().unwrap();
+        let pending = state.pending.as_ref().expect("the new member triggers");
+        assert_eq!(pending.snapshot, [Some(MmsValue::Integer(5))]);
+    }
+
+    #[test]
+    fn brcb_dat_set_naming_no_data_set_is_refused() {
+        let (engine, path) = make_engine_with_brcb("05", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "MMXU1$ds2", DS2_MEMBER)]);
+        let res = handle_set_brcb_field(
+            &engine,
+            &path,
+            RcbField::DatSet,
+            RcbWriteValue::VisibleString("MMXU1$noSuchDs".to_string()),
+        );
+        assert_eq!(res, Some(Err(DataAccessError::ObjectValueInvalid)));
+        let b = engine.lock().unwrap().get_brcb(&path).unwrap();
+        assert_eq!(b.state.lock().unwrap().dat_set, "MMXU1$ds1");
+    }
+
+    #[test]
+    fn brcb_dat_set_naming_a_non_persistent_data_set_is_refused() {
+        let (engine, path) = make_engine_with_brcb("05", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "@dsTmp", DS2_MEMBER)]);
+        for dat_set in ["@dsTmp", "IED1LD0/@dsTmp"] {
+            let res = handle_set_brcb_field(
+                &engine,
+                &path,
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString(dat_set.to_string()),
+            );
+            assert_eq!(
+                res,
+                Some(Err(DataAccessError::ObjectValueInvalid)),
+                "{dat_set}"
+            );
+        }
+
+        // Control: a URCB may refer to it.
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "@dsTmp", DS2_MEMBER)]);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        handle_set_rcb_field(
+            &engine,
+            &path,
+            RcbField::DatSet,
+            RcbWriteValue::VisibleString("@dsTmp".to_string()),
+            1,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn brcb_dat_set_write_rebinds_the_members() {
+        let (engine, path) = make_engine_with_brcb("05", TriggerOptions::DATA_CHANGED);
+        let values = install_registry(&engine, &[("IED1LD0", "MMXU1$ds2", DS2_MEMBER)]);
+        let res = handle_set_brcb_field(
+            &engine,
+            &path,
+            RcbField::DatSet,
+            RcbWriteValue::VisibleString("IED1LD0/MMXU1$ds2".to_string()),
+        );
+        assert_eq!(res, Some(Ok(())));
+        let eng = engine.lock().unwrap();
+        let refs: Vec<_> = eng
+            .brcb_dataset(&path)
+            .expect("bound")
+            .entries
+            .iter()
+            .map(|e| e.attr_ref.clone())
+            .collect();
+        assert_eq!(refs, [DS2_MEMBER]);
+        assert_eq!(
+            eng.attr_ref_for_value(&values[0]).as_deref(),
+            Some(DS2_MEMBER)
+        );
+        eng.on_brcb_value_updated(
+            &DS2_MEMBER.to_string(),
+            MmsValue::Integer(5),
+            crate::flags::InclusionFlag::VALUE_CHANGED,
+            1_000,
+        );
+        let b = eng.get_brcb(&path).unwrap();
+        let entries = b.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 1, "the new member triggers the BRCB");
+        let snap = entries[0].snapshot.as_ref().expect("snapshot");
+        assert_eq!(snap.values, [Some(MmsValue::Integer(5))]);
+    }
+
+    #[test]
+    fn attr_ref_for_value_ignores_a_value_no_data_set_holds() {
+        let (engine, _path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        let other = Arc::new(RwLock::new(MmsValue::Integer(0)));
+        assert_eq!(engine.lock().unwrap().attr_ref_for_value(&other), None);
     }
 
     // ── RcbField parsing ─────────────────────────────────────────────────────
@@ -1327,6 +1635,7 @@ mod tests {
     #[test]
     fn dat_set_change_increments_conf_rev() {
         let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "GGIO1$ds2", DS2_MEMBER)]);
         handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
 
         let initial_conf_rev = {
@@ -1498,6 +1807,7 @@ mod tests {
     #[test]
     fn brcb_set_dat_set_increments_conf_rev() {
         let (engine, path) = make_engine_with_brcb("05", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "MMXU1$ds2", DS2_MEMBER)]);
         let initial = {
             let eng = engine.lock().unwrap();
             let b = eng.get_brcb(&path).unwrap();
