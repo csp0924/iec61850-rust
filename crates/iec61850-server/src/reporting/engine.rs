@@ -510,6 +510,26 @@ impl ReportingEngine {
         }
     }
 
+    /// Reports whether the DatSet of a control block names the data set
+    /// `(domain, list_name)`.
+    pub(crate) fn dataset_in_use(&self, domain: &str, list_name: &str) -> bool {
+        let names = |path: &str, dat_set: &str| {
+            dataset_key(path, dat_set).is_some_and(|(d, l)| d == domain && l == list_name)
+        };
+        let urcb = self.rcbs.iter().any(|(path, rc)| {
+            rc.lock()
+                .ok()
+                .and_then(|rc| rc.state.lock().ok().map(|s| names(path, &s.dat_set)))
+                .unwrap_or(true)
+        });
+        urcb || self.brcbs.iter().any(|(path, b)| {
+            b.state
+                .lock()
+                .map(|s| names(path, &s.dat_set))
+                .unwrap_or(true)
+        })
+    }
+
     /// Releases every BRCB reservation whose timeout has elapsed.
     ///
     /// Returns how many reservations fired. Driven from the `tick` path, where once

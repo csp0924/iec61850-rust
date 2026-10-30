@@ -1372,6 +1372,30 @@ mod tests {
     }
 
     #[test]
+    fn dataset_in_use_follows_the_dat_set_of_every_control_block() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "GGIO1$ds2", DS2_MEMBER)]);
+        {
+            let eng = engine.lock().unwrap();
+            assert!(eng.dataset_in_use("IED1LD0", "GGIO1$ds1"));
+            assert!(!eng.dataset_in_use("IED1LD0", "GGIO1$ds2"));
+            assert!(!eng.dataset_in_use("OTHER", "GGIO1$ds1"));
+        }
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        handle_set_rcb_field(
+            &engine,
+            &path,
+            RcbField::DatSet,
+            RcbWriteValue::VisibleString("IED1LD0/GGIO1$ds2".to_string()),
+            1,
+        )
+        .unwrap();
+        let eng = engine.lock().unwrap();
+        assert!(!eng.dataset_in_use("IED1LD0", "GGIO1$ds1"));
+        assert!(eng.dataset_in_use("IED1LD0", "GGIO1$ds2"));
+    }
+
+    #[test]
     fn attr_ref_for_value_ignores_a_value_no_data_set_holds() {
         let (engine, _path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
         let other = Arc::new(RwLock::new(MmsValue::Integer(0)));

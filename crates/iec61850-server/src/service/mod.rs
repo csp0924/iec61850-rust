@@ -560,6 +560,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &self.dataset_registry,
                 &self.dynamic_dataset_keys,
                 &self.dynamic_dataset_quota,
+                &self.reporting_engine,
             ),
             other => {
                 tracing::warn!(
