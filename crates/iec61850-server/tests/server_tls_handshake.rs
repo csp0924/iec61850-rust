@@ -161,3 +161,68 @@ async fn run_plain_tcp_sanity() -> Result<(), Box<dyn std::error::Error>> {
     handle.stop().await;
     Ok(())
 }
+
+/// A TLS connection that never sends a ClientHello is closed once the
+/// association setup timeout has passed, and its connection slot is freed.
+#[tokio::test]
+async fn stalled_tls_handshake_is_closed_after_the_setup_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let (ca_cert_pem, server_cert_pem, server_key_pem) = gen_certs();
+    let server_tls_config = TlsConfigBuilder::new()
+        .with_cert_pem(&server_cert_pem, &server_key_pem)
+        .unwrap()
+        .add_ca_pem(&ca_cert_pem)
+        .unwrap()
+        .build_server()
+        .unwrap();
+    let server = IedServer::builder()
+        .model(minimal_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .config(iec61850_server::IedServerConfig {
+            max_mms_connections: 1,
+            association_setup_timeout_ms: 300,
+            ..Default::default()
+        })
+        .with_tls(TlsAcceptor::new(server_tls_config))
+        .build()
+        .unwrap();
+    let handle = server.start().await.unwrap();
+
+    let mut silent = tokio::net::TcpStream::connect(handle.bound_addr)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match silent.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a stalled TLS handshake must be closed at the setup timeout"
+    );
+
+    let freed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let mut probe = tokio::net::TcpStream::connect(handle.bound_addr)
+                .await
+                .unwrap();
+            // The slot is free when this socket is held open past a short wait
+            // rather than closed at once by the connection limit.
+            let refused = tokio::time::timeout(Duration::from_millis(100), probe.read(&mut buf))
+                .await
+                .is_ok();
+            if !refused {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(freed.is_ok(), "the slot must be freed with the connection");
+    handle.stop().await;
+}

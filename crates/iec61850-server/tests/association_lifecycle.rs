@@ -3,7 +3,9 @@
 //! The cases are: an AARQ whose user information is not an Initiate-RequestPDU,
 //! which must be refused without running the PDU it carries; and a connection
 //! that ends on a transport error, whose URCB reservation and setting group
-//! edit session must be released at once.
+//! edit session must be released at once; and sockets that never associate,
+//! which count against the connection limit from accept and are closed once
+//! the association setup timeout runs out.
 //!
 //! Every test binds 127.0.0.1:0 so concurrent tests cannot collide on a port.
 
@@ -33,6 +35,7 @@ use iec61850_server::{IedServer, IedServerConfig, WriteAccessPolicies};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 /// A model whose `TESTLD0/LLN0$DC$NamPlt$vendor` is writable, with the handle
@@ -275,5 +278,110 @@ async fn transport_error_releases_association_state() {
         .expect("a second association selects the control object");
     assert_eq!(pos.state(), ControlState::Ready);
     let _ = second.disconnect().await;
+    handle.stop().await;
+}
+
+/// Reads from a raw socket until the server closes it, failing if that takes
+/// longer than `within`.
+async fn expect_raw_closed(stream: &mut TcpStream, within: Duration) {
+    let mut buf = [0u8; 64];
+    let closed = tokio::time::timeout(within, async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the server did not close the socket within {within:?}"
+    );
+}
+
+async fn try_connect(port: u16) -> bool {
+    let mut client = MmsClientBuilder::new()
+        .connect_timeout_ms(1_000)
+        .request_timeout_ms(1_000)
+        .build();
+    let ok = client.connect("127.0.0.1", port).await.is_ok();
+    if ok {
+        let _ = client.disconnect().await;
+    }
+    ok
+}
+
+/// A socket that has been accepted but has sent nothing holds one of the
+/// `max_mms_connections` slots, so with a limit of one a client that would
+/// otherwise associate is refused. Closing the idle socket frees the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unassociated_socket_counts_against_the_limit() {
+    let (model, _vendor) = model_with_writable_vendor();
+    let server = build_server(
+        model,
+        IedServerConfig {
+            max_mms_connections: 1,
+            ..Default::default()
+        },
+    );
+    let handle = server.start().await.expect("start");
+    let port = handle.bound_addr.port();
+
+    let idle = TcpStream::connect(handle.bound_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !try_connect(port).await,
+        "the only slot is held by the unassociated socket"
+    );
+
+    drop(idle);
+    let freed = tokio::time::timeout(Duration::from_secs(3), async {
+        while !try_connect(port).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(freed.is_ok(), "closing the socket must free its slot");
+    handle.stop().await;
+}
+
+/// A socket that stops before associating, either before the COTP connection
+/// request or between the COTP handshake and the Session connect, is closed
+/// once `association_setup_timeout_ms` has elapsed since accept, and its slot
+/// is freed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_setup_is_closed_after_the_setup_timeout() {
+    let (model, _vendor) = model_with_writable_vendor();
+    let server = build_server(
+        model,
+        IedServerConfig {
+            max_mms_connections: 1,
+            association_setup_timeout_ms: 300,
+            ..Default::default()
+        },
+    );
+    let handle = server.start().await.expect("start");
+    let port = handle.bound_addr.port();
+
+    let mut silent = TcpStream::connect(handle.bound_addr).await.unwrap();
+    expect_raw_closed(&mut silent, Duration::from_secs(3)).await;
+
+    let stream = TcpStream::connect(handle.bound_addr).await.unwrap();
+    let mut cotp = CotpConnection::connect(stream, CotpOptions::default())
+        .await
+        .expect("COTP handshake");
+    expect_closed(&mut cotp).await;
+
+    let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+        while !try_connect(port).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "a client that completes setup in time associates"
+    );
     handle.stop().await;
 }

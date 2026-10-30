@@ -33,7 +33,7 @@ use iec61850_tls::TlsAcceptor;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +56,9 @@ struct IedServerInner {
 
     /// Open associations, keyed by connection id.
     connections: RwLock<HashMap<ConnectionId, ClientConnection>>,
+    /// Accepted sockets, from accept until their task ends, whether or not
+    /// they have finished associating; `max_mms_connections` bounds it.
+    open_sockets: AtomicUsize,
     /// Source of the next connection id.
     #[allow(dead_code)]
     next_connection_id: AtomicU64,
@@ -160,6 +163,22 @@ impl std::fmt::Debug for IedServerInner {
 impl std::fmt::Debug for IedServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.fmt(f)
+    }
+}
+
+/// One of the `max_mms_connections` slots, held by an accepted socket for the
+/// life of its connection task and given back on drop.
+#[derive(Debug)]
+pub(crate) struct ConnectionSlot {
+    server: IedServer,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.server
+            .inner
+            .open_sockets
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -844,10 +863,30 @@ impl IedServer {
         self.inner.running.store(on, Ordering::SeqCst);
     }
 
-    /// Reports whether another association fits within the configured limit.
-    #[allow(dead_code)]
-    pub(crate) fn can_accept_new(&self) -> bool {
-        self.connection_count() < self.inner.config.max_mms_connections
+    /// Takes one of the `max_mms_connections` slots for an accepted socket, or
+    /// returns `None` when every slot is taken. The slot is given back when the
+    /// returned guard drops.
+    pub(crate) fn try_acquire_connection_slot(&self) -> Option<ConnectionSlot> {
+        let max = self.inner.config.max_mms_connections;
+        self.inner
+            .open_sockets
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(ConnectionSlot {
+            server: self.clone(),
+        })
+    }
+
+    /// Returns how many accepted sockets hold a connection slot.
+    pub(crate) fn open_socket_count(&self) -> usize {
+        self.inner.open_sockets.load(Ordering::SeqCst)
+    }
+
+    /// Returns the configured start-up settings.
+    pub(crate) fn config(&self) -> &IedServerConfig {
+        &self.inner.config
     }
 
     // ── Setting groups ──────────────────────────────────────────────────
@@ -1151,6 +1190,7 @@ impl IedServerBuilder<Bound> {
                 config: self.config,
                 bind_addr,
                 connections: RwLock::new(HashMap::new()),
+                open_sockets: AtomicUsize::new(0),
                 next_connection_id: AtomicU64::new(1),
                 write_access_policies: RwLock::new(write_access_policies),
                 running: AtomicBool::new(false),
@@ -1445,10 +1485,19 @@ mod tests {
     }
 
     #[test]
-    fn can_accept_new_until_max() {
-        // The default limit is five; this covers the empty case only.
+    fn connection_slots_stop_at_max_and_return_on_drop() {
         let server = test_server();
-        assert!(server.can_accept_new());
+        let max = IedServerConfig::default().max_mms_connections;
+        let slots: Vec<_> = (0..max)
+            .map(|_| server.try_acquire_connection_slot().expect("a free slot"))
+            .collect();
+        assert!(
+            server.try_acquire_connection_slot().is_none(),
+            "no slot is handed out beyond the limit"
+        );
+        drop(slots);
+        assert_eq!(server.open_socket_count(), 0);
+        assert!(server.try_acquire_connection_slot().is_some());
     }
 
     // ── Request blocking and connection abort ───────────────────────────

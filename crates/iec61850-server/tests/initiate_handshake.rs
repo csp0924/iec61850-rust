@@ -9,7 +9,7 @@ use iec61850_server::{IedServer, IedServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 fn minimal_model() -> Arc<IedModel> {
@@ -112,22 +112,24 @@ async fn rejects_garbage_first_payload_after_cotp() {
 
 #[tokio::test]
 async fn over_max_connections_drops_socket() {
-    // A connection beyond max_mms_connections has its socket closed. A
-    // connection only joins the server pool once Initiate completes, so until
-    // then connection_count stays 0 and the limit cannot fire; this test only
-    // asserts that the listener does not reset the second socket before that.
-    // TODO: assert that connection N+1 is dropped after full negotiation
+    // A connection beyond max_mms_connections has its socket closed. A socket
+    // counts from accept, so the second one is closed even though the first has
+    // not started the COTP handshake.
     let server = build_server_with_max(1);
     let handle = server.start().await.expect("start");
     let addr = handle.bound_addr;
 
-    let mut s1 = TcpStream::connect(addr).await.expect("client1 connect");
+    let _s1 = TcpStream::connect(addr).await.expect("client1 connect");
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut s2 = TcpStream::connect(addr).await.expect("client2 connect");
 
-    // Both sockets are still before the COTP handshake, so the connection limit
-    // cannot have fired yet.
-    let _ = s1.write_all(&[]).await;
-    let _ = s2.write_all(&[]).await;
+    let mut buf = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_secs(2), s2.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("no data must arrive on the refused socket, got {n} bytes"),
+        Err(_) => panic!("the server did not close the second socket within 2s"),
+    }
 
     handle.stop().await;
 }

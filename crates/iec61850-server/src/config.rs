@@ -15,8 +15,16 @@ use crate::policy::WriteAccessPolicies;
 /// configured.
 #[derive(Debug, Clone)]
 pub struct IedServerConfig {
-    /// Maximum number of concurrent MMS associations. Defaults to 5.
+    /// Maximum number of concurrent MMS connections. A connection counts from
+    /// the moment its socket is accepted, before it has associated, until its
+    /// socket closes. Defaults to 5.
     pub max_mms_connections: usize,
+
+    /// Time an accepted connection has to complete the TLS handshake, when TLS
+    /// is configured, and association setup through the MMS Initiate exchange;
+    /// a connection that has not associated by then is closed. Defaults to
+    /// 10 000 ms.
+    pub association_setup_timeout_ms: u64,
 
     /// IEC 61850 edition the server presents. Defaults to `Ed2`.
     pub edition: Edition,
@@ -43,6 +51,7 @@ impl Default for IedServerConfig {
     fn default() -> Self {
         Self {
             max_mms_connections: 5,
+            association_setup_timeout_ms: 10_000,
             edition: Edition::Ed2,
             write_access_policies: WriteAccessPolicies::default(),
             time_quality: TimeQuality::default(),

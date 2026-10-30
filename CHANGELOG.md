@@ -23,6 +23,9 @@ Every crate in the workspace shares one version number.
   the data set the stream publishes, and an ASDU of any other length is dropped;
   a subscriber built without it delivers every ASDU whatever its sample length.
   `SvSubscriber::expected_sample_size` returns the configured length, or 0.
+- **`iec61850-server`** — `IedServerConfig` has a new public field,
+  `association_setup_timeout_ms`. A configuration written as a struct literal
+  without `..Default::default()` no longer compiles and needs the field added.
 
 ### Added
 
@@ -94,6 +97,14 @@ Every crate in the workspace shares one version number.
   session is now released on every close, where it used to be held until its
   reservation time expired. A BRCB reservation is still kept until its
   `ResvTms` expires, so the client can resume after reconnecting.
+- **`iec61850-server`** — `max_mms_connections` counts a connection from the
+  moment its socket is accepted until it closes, where it used to count only
+  associations that had completed the Initiate exchange. Sockets that connect
+  and then send nothing can no longer accumulate without bound. A connection
+  that has not completed the TLS handshake, when TLS is configured, and
+  association setup through the Initiate response within
+  `IedServerConfig::association_setup_timeout_ms`, 10 000 ms by default, is
+  closed.
 
 ## [0.2.0] - 2026-09-06
 

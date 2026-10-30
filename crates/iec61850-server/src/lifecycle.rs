@@ -13,7 +13,11 @@
 //! Behavior a peer can rely on:
 //!
 //! - A connection beyond `max_mms_connections` has its socket closed with no
-//!   COTP disconnect-request.
+//!   COTP disconnect-request. A connection counts from accept, before it has
+//!   associated, until its socket closes.
+//! - A connection that has not completed the TLS handshake, if TLS is
+//!   configured, and association setup through the MMS Initiate response within
+//!   `association_setup_timeout_ms` is closed.
 //! - An Initiate the server refuses is answered with an ACSE AARE reject before
 //!   the socket closes, so the client learns why rather than seeing a bare
 //!   disconnect.
@@ -52,7 +56,9 @@ use iec61850_mms::mms::pdu::information_report::{
     encode_command_termination_negative, encode_command_termination_positive, LastApplErrorRef,
     OriginRef,
 };
-use iec61850_mms::mms::server::{parse_message, MessageOutcome, MmsServerConnection};
+use iec61850_mms::mms::server::{
+    parse_message, MessageOutcome, MmsServerConnection, MmsServiceDispatcher,
+};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -200,17 +206,21 @@ async fn run_accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
-                        if !server.can_accept_new() {
-                            // D1 carry C [DECIDED 2026-04-25]
+                        // The slot is taken before anything is read from the
+                        // socket, so connections that never associate count
+                        // against the limit as well.
+                        let Some(slot) = server.try_acquire_connection_slot() else {
                             tracing::warn!(
                                 ?peer,
-                                count = server.connection_count(),
+                                count = server.open_socket_count(),
                                 "connection limit reached, closing the socket without a disconnect-request"
                             );
                             drop(stream);
                             continue;
-                        }
+                        };
                         tracing::info!(?peer, "accepted a client connection");
+                        let setup_deadline = tokio::time::Instant::now()
+                            + Duration::from_millis(server.config().association_setup_timeout_ms);
                         let server_for_conn = server.clone();
                         // With a TLS acceptor configured, the handshake runs
                         // before COTP; otherwise the connection is plain TCP.
@@ -218,27 +228,33 @@ async fn run_accept_loop(
                         {
                             if let Some(acceptor) = server.tls_acceptor().cloned() {
                                 tokio::spawn(async move {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
+                                    let _slot = slot;
+                                    match tokio::time::timeout_at(setup_deadline, acceptor.accept(stream)).await {
+                                        Ok(Ok(tls_stream)) => {
                                             handle_connection_inner(
-                                                server_for_conn, tls_stream, peer,
+                                                server_for_conn, tls_stream, peer, setup_deadline,
                                             ).await;
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             tracing::warn!(?peer, error = %e, "TLS handshake failed, closing the connection");
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(?peer, "TLS handshake did not complete within the association setup timeout, closing the connection");
                                         }
                                     }
                                 });
                             } else {
                                 tokio::spawn(async move {
-                                    handle_connection_inner(server_for_conn, stream, peer).await;
+                                    let _slot = slot;
+                                    handle_connection_inner(server_for_conn, stream, peer, setup_deadline).await;
                                 });
                             }
                         }
                         #[cfg(not(feature = "tls"))]
                         {
                             tokio::spawn(async move {
-                                handle_connection_inner(server_for_conn, stream, peer).await;
+                                let _slot = slot;
+                                handle_connection_inner(server_for_conn, stream, peer, setup_deadline).await;
                             });
                         }
                     }
@@ -276,14 +292,21 @@ enum ConnError {
     InitiateRejected,
     #[error("unexpected session indication {0:?}")]
     UnexpectedSessionIndication(SessionIndication),
+    #[error("association setup did not complete within the setup timeout")]
+    SetupTimedOut,
 }
 
 /// Runs one association from accept to close.
 ///
 /// The stream is generic so that a plain TCP connection and a TLS connection
-/// take the same path.
-async fn handle_connection_inner<S>(server: IedServer, stream: S, peer: std::net::SocketAddr)
-where
+/// take the same path. Setup through the Initiate response must finish by
+/// `setup_deadline`.
+async fn handle_connection_inner<S>(
+    server: IedServer,
+    stream: S,
+    peer: std::net::SocketAddr,
+    setup_deadline: tokio::time::Instant,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let conn_id = server.next_connection_id();
@@ -293,7 +316,7 @@ where
     };
     tracing::debug!(conn_id, ?peer, "connection task started");
 
-    match run_connection(server.clone(), stream, peer, conn_id).await {
+    match run_connection(server.clone(), stream, peer, conn_id, setup_deadline).await {
         Ok(()) => {
             tracing::debug!(conn_id, ?peer, "connection closed normally");
         }
@@ -340,7 +363,42 @@ async fn run_connection<S>(
     stream: S,
     peer: std::net::SocketAddr,
     conn_id: ConnectionId,
+    setup_deadline: tokio::time::Instant,
 ) -> std::result::Result<(), ConnError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let dispatcher = server.dispatcher();
+    let setup = establish_association(&server, stream, conn_id, dispatcher.as_ref());
+    let established = match tokio::time::timeout_at(setup_deadline, setup).await {
+        Ok(established) => established?,
+        Err(_) => {
+            tracing::warn!(
+                conn_id,
+                "association setup did not complete within the setup timeout, closing the socket"
+            );
+            return Err(ConnError::SetupTimedOut);
+        }
+    };
+    serve_association(server, peer, conn_id, dispatcher, established).await
+}
+
+/// The protocol state of an association once the Initiate response is sent.
+struct Established<S> {
+    cotp: CotpConnection<S>,
+    session: IsoSession,
+    pres: IsoPresentation,
+    mms_conn: MmsServerConnection,
+}
+
+/// Runs COTP CR/CC through the MMS Initiate exchange and sends the Initiate
+/// response.
+async fn establish_association<S>(
+    server: &IedServer,
+    stream: S,
+    conn_id: ConnectionId,
+    dispatcher: &dyn MmsServiceDispatcher,
+) -> std::result::Result<Established<S>, ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -356,7 +414,6 @@ where
     // ── The first data TPDU carries Session CN, Presentation CP, ACSE
     //    AARQ, and the MMS Initiate all at once ────────────────────────
     let first_payload = cotp.recv_data().await?;
-    let dispatcher = server.dispatcher();
 
     let mut session = IsoSession::new();
     match session.parse_message(&first_payload)? {
@@ -416,7 +473,7 @@ where
         return Err(ConnError::InitiateRejected);
     }
     let mut mms_conn = MmsServerConnection::new();
-    let outcome = parse_message(&mms_conn, dispatcher.as_ref(), &initiate_bytes);
+    let outcome = parse_message(&mms_conn, dispatcher, &initiate_bytes);
 
     match outcome {
         MessageOutcome::SendInitiateResponse {
@@ -464,6 +521,32 @@ where
             return Err(ConnError::InitiateRejected);
         }
     }
+    Ok(Established {
+        cotp,
+        session,
+        pres,
+        mms_conn,
+    })
+}
+
+/// Registers an established association and dispatches its requests until it
+/// closes.
+async fn serve_association<S>(
+    server: IedServer,
+    peer: std::net::SocketAddr,
+    conn_id: ConnectionId,
+    dispatcher: std::sync::Arc<dyn MmsServiceDispatcher>,
+    established: Established<S>,
+) -> std::result::Result<(), ConnError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Established {
+        mut cotp,
+        mut session,
+        mut pres,
+        mms_conn,
+    } = established;
 
     // ── Register the association with the server ────────────────────────
     let client_conn = ClientConnection::new(conn_id, peer, mms_conn);

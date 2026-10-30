@@ -327,13 +327,9 @@ async fn hundred_parallel_handshakes_no_deadlock() {
     assert_eq!(success, N, "every client must complete the handshake");
 }
 
-// With a limit of two connections, further clients are refused.
-//
-// The clients are staged rather than launched together: the accept loop tests
-// the limit when it accepts a socket, but the connection count only rises once
-// ACSE and Initiate complete. Launching every socket at once would find the
-// count still at zero and accept them all.
-// TODO: reserve the slot at accept time so the limit holds without staging
+// With a limit of two connections, further clients are refused. The two
+// holding clients connect first, so every further client finds both slots
+// taken.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn max_connections_caps_concurrent() {
@@ -395,12 +391,11 @@ async fn max_connections_caps_concurrent() {
         }
     }
 
-    assert!(
-        failure >= 1,
+    assert_eq!(
+        failure, EXTRA_CLIENTS,
         "with both slots held, {EXTRA_CLIENTS} further clients gave \
-         success={success} failure={failure}; at least one must be refused"
+         success={success} failure={failure}; every one must be refused"
     );
-    assert_eq!(success + failure, EXTRA_CLIENTS);
 
     // Release the clients holding the slots.
     for mut c in hold_clients {

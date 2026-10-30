@@ -20,8 +20,8 @@
 //! - The data model lock is a fine-grained `RwLock` plus an `is_model_locked`
 //!   flag: a reentrant `lock_data_model` returns `Err(AlreadyLocked)` instead
 //!   of deadlocking.
-//! - An association beyond `max_mms_connections` has its socket closed without
-//!   a COTP disconnect-request.
+//! - A connection beyond `max_mms_connections`, counted from accept, has its
+//!   socket closed without a COTP disconnect-request.
 //! - A single access point is supported.
 //! - `set_write_access_policy` accepts `FC::Bl`.
 //! - `servicesSupportedCalling` proposed by the client is parsed and retained
