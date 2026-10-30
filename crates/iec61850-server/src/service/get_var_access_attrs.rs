@@ -16,6 +16,8 @@ use alloc::{
     vec::Vec,
 };
 
+#[cfg(any(feature = "reporting", feature = "logging"))]
+use crate::mapping::ln_spec_with_control_blocks;
 use crate::mapping::MmsDeviceModel;
 use crate::mapping::MmsTypeSpec;
 use crate::service::convert::mms_type_spec_to_type_spec;
@@ -57,6 +59,74 @@ pub fn handle_get_var_access_attrs(
     model: &MmsDeviceModel,
     req: &GetVariableAccessAttributesRequest,
 ) -> GetVarAccessAttrsResult {
+    handle_get_var_access_attrs_merged(model, req, &|_, _, _| None)
+}
+
+/// Answers a GetVariableAccessAttributes request against the mapped model with
+/// the control blocks registered at run time merged in.
+///
+/// `control_blocks` lists the control blocks of one logical node, given its
+/// domain and name. They are merged into the structure of the logical node as
+/// [`ln_spec_with_control_blocks`] lays them out, which is also the layout a
+/// Read of the node, of one of its groups, or of a control block returns. A
+/// member of a log control block also resolves by the ACSI name of
+/// [`lcb_member_name`](crate::mapping::lcb_member_name).
+#[cfg(any(feature = "reporting", feature = "logging"))]
+pub(crate) fn handle_get_var_access_attrs_with_control_blocks(
+    model: &MmsDeviceModel,
+    req: &GetVariableAccessAttributesRequest,
+    control_blocks: &dyn Fn(&str, &str) -> Vec<crate::mapping::ControlBlockEntry>,
+) -> GetVarAccessAttrsResult {
+    #[cfg(feature = "logging")]
+    let aliased = lcb_member_alias_request(req, control_blocks);
+    #[cfg(feature = "logging")]
+    let req = aliased.as_ref().unwrap_or(req);
+    handle_get_var_access_attrs_merged(model, req, &|domain, ln, base| {
+        let blocks = control_blocks(domain, ln);
+        (!blocks.is_empty()).then(|| ln_spec_with_control_blocks(base, &blocks))
+    })
+}
+
+/// Rewrites a request for `LN$LG$<block>$<member>` whose member is the ACSI name
+/// of a log control block component onto the MMS component name; `None`
+/// leaves the request as it is.
+#[cfg(feature = "logging")]
+fn lcb_member_alias_request(
+    req: &GetVariableAccessAttributesRequest,
+    control_blocks: &dyn Fn(&str, &str) -> Vec<crate::mapping::ControlBlockEntry>,
+) -> Option<GetVariableAccessAttributesRequest> {
+    use crate::mapping::{lcb_member_name, ControlBlockKind};
+    let ObjectName::DomainSpecific { domain_id, item_id } = &req.object_name else {
+        return None;
+    };
+    let parts: Vec<&str> = item_id.split('$').collect();
+    let [ln, "LG", block, member] = parts[..] else {
+        return None;
+    };
+    let component = lcb_member_name(member);
+    if component == member
+        || !control_blocks(domain_id, ln)
+            .iter()
+            .any(|b| b.kind == ControlBlockKind::Log && b.name == block)
+    {
+        return None;
+    }
+    Some(GetVariableAccessAttributesRequest {
+        object_name: ObjectName::DomainSpecific {
+            domain_id: domain_id.clone(),
+            item_id: format!("{ln}$LG${block}${component}"),
+        },
+    })
+}
+
+/// Answers a GetVariableAccessAttributes request, letting `merge` replace the
+/// structure of the logical node the path starts at; `None` keeps the
+/// structure of the model.
+fn handle_get_var_access_attrs_merged(
+    model: &MmsDeviceModel,
+    req: &GetVariableAccessAttributesRequest,
+    merge: &dyn Fn(&str, &str, &MmsTypeSpec) -> Option<MmsTypeSpec>,
+) -> GetVarAccessAttrsResult {
     let (domain, item_id) = match &req.object_name {
         ObjectName::DomainSpecific { domain_id, item_id } => (domain_id.as_str(), item_id.as_str()),
         ObjectName::VmdSpecific(name) => {
@@ -85,7 +155,7 @@ pub fn handle_get_var_access_attrs(
 
     let ln_name = parts[0];
 
-    let ln_ts = match model.get_variable_spec(domain, ln_name) {
+    let model_ln_ts = match model.get_variable_spec(domain, ln_name) {
         Some(ts) => ts,
         None => {
             tracing::warn!(
@@ -96,6 +166,8 @@ pub fn handle_get_var_access_attrs(
             return GetVarAccessAttrsResult::NotFound;
         }
     };
+    let merged = merge(domain, ln_name, model_ln_ts);
+    let ln_ts = merged.as_ref().unwrap_or(model_ln_ts);
 
     // An item_id without a `$` names the logical node itself and answers with
     // its whole structure; model-driven clients use this to enumerate a node.

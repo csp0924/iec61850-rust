@@ -199,17 +199,19 @@ fn children_inner_size_sum(data: &MmsData) -> usize {
 }
 
 /// Expands every data object of a logical node under one functional constraint
-/// into a structure.
+/// into a structure, after the `lead` members.
 ///
 /// Per IEC 61850-8-1 each functional-constraint group is a structure whose
-/// members are themselves structures, one per data object. `Ok(None)` means the
-/// group is empty for this node.
+/// members are themselves structures, one per data object; a control block of
+/// the group, which the caller supplies in `lead` and has already charged to
+/// the budget, comes first. `Ok(None)` means the group is empty for this node.
 fn expand_ln_for_fc(
     ln: &LogicalNode,
     fc: FC,
+    lead: Vec<MmsData>,
     budget: &mut BudgetGuard,
 ) -> Result<Option<MmsData>, ()> {
-    let mut do_groups = Vec::new();
+    let mut do_groups = lead;
     for d in &ln.dos {
         if let Some(do_struct) = expand_do_for_fc(d, fc, budget)? {
             do_groups.push(do_struct);
@@ -231,7 +233,7 @@ fn expand_ln_for_fc(
 fn expand_whole_ln(ln: &LogicalNode, budget: &mut BudgetGuard) -> Result<MmsData, ()> {
     let mut fc_groups = Vec::new();
     for fc in FC::WIRE_ORDER {
-        if let Some(group) = expand_ln_for_fc(ln, fc, budget)? {
+        if let Some(group) = expand_ln_for_fc(ln, fc, Vec::new(), budget)? {
             fc_groups.push(group);
         }
     }
@@ -329,7 +331,7 @@ fn lookup_domain_specific_value(
 
     // ── Two segments: one functional-constraint group ───────────────
     if parts.len() == 2 {
-        return match expand_ln_for_fc(ln, target_fc, budget) {
+        return match expand_ln_for_fc(ln, target_fc, Vec::new(), budget) {
             Ok(Some(st)) => LookupResult::Result(AccessResult::Success(st)),
             Ok(None) => {
                 tracing::warn!(
@@ -485,6 +487,99 @@ fn lookup_domain_specific_value(
         }
     }
     LookupResult::Result(access)
+}
+
+/// The members a group of a logical node holds ahead of its data objects, such
+/// as the control blocks of the group: `Ok` with the values in order, possibly
+/// none, or the error that fails the whole read.
+#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+pub(crate) type LeadingMembers<'a> =
+    dyn FnMut(&LogicalNode, FC) -> Result<Vec<MmsData>, DataAccessError> + 'a;
+
+/// Reads a whole logical node, `LN`, or one of its functional-constraint
+/// groups, `LN$FC`, with the members `leading` supplies placed ahead of the
+/// data objects of each group.
+///
+/// The value follows the structure GetVariableAccessAttributes describes for
+/// the same name once the control blocks of the node are merged into it: a
+/// group appears when it has a leading member or a data object, in the
+/// IEC 61850-8-1 order. `None` means `item_id` names something below a group,
+/// which the caller reads by its own route. The leading members are charged to
+/// the budget like the rest of the value.
+#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+pub(crate) fn read_ln_with_leading_members(
+    ied_model: &IedModel,
+    domain: &str,
+    item_id: &str,
+    leading: &mut LeadingMembers<'_>,
+    budget: Option<usize>,
+) -> Option<LookupResult> {
+    let mut parts = item_id.split('$');
+    let ln_name = parts.next()?;
+    let fc_name = parts.next();
+    if parts.next().is_some() || ln_name.is_empty() {
+        return None;
+    }
+    let not_found =
+        || LookupResult::Result(AccessResult::Failure(DataAccessError::ObjectNonExistent));
+    let Some(ln) = ied_model
+        .ld_by_domain(domain)
+        .and_then(|ld| ld.ln_by_name(ln_name))
+    else {
+        tracing::warn!(domain, ln = ln_name, "read: no such logical node");
+        return Some(not_found());
+    };
+
+    let mut guard = BudgetGuard::new(budget);
+    let mut group = |fc: FC, guard: &mut BudgetGuard| -> Result<Option<MmsData>, LookupResult> {
+        let lead = leading(ln, fc).map_err(|e| LookupResult::Result(AccessResult::Failure(e)))?;
+        for member in &lead {
+            if !guard.consume(member.estimated_encoded_size()) {
+                return Err(LookupResult::OverBudget);
+            }
+        }
+        expand_ln_for_fc(ln, fc, lead, guard).map_err(|()| LookupResult::OverBudget)
+    };
+
+    let Some(fc_name) = fc_name else {
+        let mut fc_groups = Vec::new();
+        for fc in FC::WIRE_ORDER {
+            match group(fc, &mut guard) {
+                Ok(Some(g)) => fc_groups.push(g),
+                Ok(None) => {}
+                Err(r) => return Some(r),
+            }
+        }
+        let st = MmsData::Structure(fc_groups);
+        let outer = st.estimated_encoded_size() - children_inner_size_sum(&st);
+        if !guard.consume(outer) {
+            return Some(LookupResult::OverBudget);
+        }
+        return Some(LookupResult::Result(AccessResult::Success(st)));
+    };
+
+    let Ok(fc) = FC::parse(fc_name) else {
+        tracing::warn!(
+            domain,
+            ln = ln_name,
+            fc = fc_name,
+            "read: not a functional-constraint name"
+        );
+        return Some(not_found());
+    };
+    Some(match group(fc, &mut guard) {
+        Ok(Some(g)) => LookupResult::Result(AccessResult::Success(g)),
+        Ok(None) => {
+            tracing::warn!(
+                domain,
+                ln = ln_name,
+                fc = fc_name,
+                "read: the logical node has nothing under this functional constraint"
+            );
+            not_found()
+        }
+        Err(r) => r,
+    })
 }
 
 /// Reads one object name with no PDU size limit.

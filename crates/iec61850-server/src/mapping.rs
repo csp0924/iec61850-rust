@@ -322,10 +322,10 @@ fn build_ln_structure(ln: &LogicalNode) -> Result<MmsTypeSpec> {
         let mut fc_children = Vec::new();
 
         // The setting group control block comes first in the SP group.
-        if has_sgcb_for_fc {
+        if let Some(sgcb) = ln.sgcb.as_ref().filter(|_| has_sgcb_for_fc) {
             fc_children.push(NamedVariableSpec {
                 name: "SGCB".to_string(),
-                type_spec: build_sgcb_type_spec(),
+                type_spec: build_sgcb_type_spec(sgcb.has_resv_tms),
             });
         }
 
@@ -555,31 +555,198 @@ fn map_size(n: u16, _max_a: u16, fixed_b: u16, _max_c: u16) -> StringSize {
     }
 }
 
-/// Builds the structure of a setting group control block, whose five members
-/// are `NumOfSG`, `ActSG`, `EditSG`, `CnfEdit`, and `LActTm`.
-fn build_sgcb_type_spec() -> MmsTypeSpec {
-    MmsTypeSpec::Structure(vec![
-        NamedVariableSpec {
-            name: "NumOfSG".into(),
-            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(8)),
-        },
-        NamedVariableSpec {
-            name: "ActSG".into(),
-            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(8)),
-        },
-        NamedVariableSpec {
-            name: "EditSG".into(),
-            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(8)),
-        },
-        NamedVariableSpec {
-            name: "CnfEdit".into(),
-            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Boolean),
-        },
-        NamedVariableSpec {
-            name: "LActTm".into(),
-            type_spec: MmsTypeSpec::Leaf(MmsLeafType::UtcTime),
-        },
-    ])
+/// Builds the structure of a setting group control block: `NumOfSG`, `ActSG`,
+/// `EditSG`, `CnfEdit`, and `LActTm`, followed by `ResvTms` when the control
+/// block exposes it, as IEC 61850-8-1 Ed2 maps it.
+fn build_sgcb_type_spec(has_resv_tms: bool) -> MmsTypeSpec {
+    use MmsLeafType as L;
+    let mut members = vec![
+        leaf_member("NumOfSG", L::Unsigned(8)),
+        leaf_member("ActSG", L::Unsigned(8)),
+        leaf_member("EditSG", L::Unsigned(8)),
+        leaf_member("CnfEdit", L::Boolean),
+        leaf_member("LActTm", L::UtcTime),
+    ];
+    if has_resv_tms {
+        members.push(leaf_member("ResvTms", L::Unsigned(16)));
+    }
+    MmsTypeSpec::Structure(members)
+}
+
+fn leaf_member(name: &str, leaf: MmsLeafType) -> NamedVariableSpec {
+    NamedVariableSpec {
+        name: name.to_string(),
+        type_spec: MmsTypeSpec::Leaf(leaf),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Control blocks registered at run time
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The kind of a control block a server registers at run time, which decides
+/// the functional-constraint group it appears in and its MMS structure.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlBlockKind {
+    /// An unbuffered report control block, under RP.
+    #[cfg(feature = "reporting")]
+    Unbuffered,
+    /// A buffered report control block, under BR.
+    #[cfg(feature = "reporting")]
+    Buffered,
+    /// A log control block, under LG.
+    #[cfg(feature = "logging")]
+    Log,
+}
+
+#[cfg(any(feature = "reporting", feature = "logging"))]
+impl ControlBlockKind {
+    /// The functional-constraint group the control block belongs to.
+    pub(crate) fn fc(self) -> FC {
+        match self {
+            #[cfg(feature = "reporting")]
+            Self::Unbuffered => FC::Rp,
+            #[cfg(feature = "reporting")]
+            Self::Buffered => FC::Br,
+            #[cfg(feature = "logging")]
+            Self::Log => FC::Lg,
+        }
+    }
+
+    /// The MMS structure of the control block, members in the order
+    /// IEC 61850-8-1 maps them.
+    ///
+    /// A report control block ends in `Owner`. A log control block has the nine
+    /// members `LogEna`, `LogRef`, `DatSet`, `OldEntrTm`, `NewEntrTm`, `OldEnt`,
+    /// `NewEnt`, `TrgOps`, and `IntgPd`: the ACSI attributes OldEntr and NewEntr
+    /// map onto the MMS components `OldEnt` and `NewEnt`.
+    pub(crate) fn type_spec(self) -> MmsTypeSpec {
+        use MmsLeafType as L;
+        let object_ref = || L::VisibleString(StringSize::Max(129));
+        let members = match self {
+            #[cfg(feature = "reporting")]
+            Self::Unbuffered => vec![
+                leaf_member("RptID", object_ref()),
+                leaf_member("RptEna", L::Boolean),
+                leaf_member("Resv", L::Boolean),
+                leaf_member("DatSet", object_ref()),
+                leaf_member("ConfRev", L::Unsigned(32)),
+                leaf_member("OptFlds", L::BitString(StringSize::Max(10))),
+                leaf_member("BufTm", L::Unsigned(32)),
+                leaf_member("SqNum", L::Unsigned(8)),
+                leaf_member("TrgOps", L::BitString(StringSize::Max(6))),
+                leaf_member("IntgPd", L::Unsigned(32)),
+                leaf_member("GI", L::Boolean),
+                leaf_member("Owner", L::OctetString(StringSize::Max(64))),
+            ],
+            #[cfg(feature = "reporting")]
+            Self::Buffered => vec![
+                leaf_member("RptID", object_ref()),
+                leaf_member("RptEna", L::Boolean),
+                leaf_member("DatSet", object_ref()),
+                leaf_member("ConfRev", L::Unsigned(32)),
+                leaf_member("OptFlds", L::BitString(StringSize::Max(10))),
+                leaf_member("BufTm", L::Unsigned(32)),
+                leaf_member("SqNum", L::Unsigned(16)),
+                leaf_member("TrgOps", L::BitString(StringSize::Max(6))),
+                leaf_member("IntgPd", L::Unsigned(32)),
+                leaf_member("GI", L::Boolean),
+                leaf_member("PurgeBuf", L::Boolean),
+                leaf_member("EntryID", L::OctetString(StringSize::Fixed(8))),
+                leaf_member("TimeofEntry", L::BinaryTime { size: 6 }),
+                leaf_member("ResvTms", L::Integer(16)),
+                leaf_member("Owner", L::OctetString(StringSize::Max(64))),
+            ],
+            #[cfg(feature = "logging")]
+            Self::Log => vec![
+                leaf_member("LogEna", L::Boolean),
+                leaf_member("LogRef", object_ref()),
+                leaf_member("DatSet", object_ref()),
+                leaf_member("OldEntrTm", L::BinaryTime { size: 6 }),
+                leaf_member("NewEntrTm", L::BinaryTime { size: 6 }),
+                leaf_member("OldEnt", L::OctetString(StringSize::Fixed(8))),
+                leaf_member("NewEnt", L::OctetString(StringSize::Fixed(8))),
+                leaf_member("TrgOps", L::BitString(StringSize::Max(6))),
+                leaf_member("IntgPd", L::Unsigned(32)),
+            ],
+        };
+        MmsTypeSpec::Structure(members)
+    }
+}
+
+/// Maps a member name a client may use for a log control block onto the MMS
+/// component it stands for: the ACSI attribute names `OldEntr` and `NewEntr`
+/// are accepted for `OldEnt` and `NewEnt`. Any other name maps onto itself.
+///
+/// The ACSI names are never listed; they only resolve.
+#[cfg(feature = "logging")]
+pub(crate) fn lcb_member_name(name: &str) -> &str {
+    match name {
+        "OldEntr" => "OldEnt",
+        "NewEntr" => "NewEnt",
+        other => other,
+    }
+}
+
+/// One control block of a logical node, registered at run time.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ControlBlockEntry {
+    /// The control block kind.
+    pub(crate) kind: ControlBlockKind,
+    /// The control block name, the member name within its group.
+    pub(crate) name: String,
+}
+
+/// Returns the structure of a logical node with its run-time control blocks
+/// merged in.
+///
+/// Each control block becomes a member of the group of its functional
+/// constraint, ahead of the data objects of that group and in the order
+/// `blocks` lists them; a group the model has no data for is created in its
+/// place in the IEC 61850-8-1 order. A Read of a logical node or of one of its
+/// groups lays its value out the same way.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+pub(crate) fn ln_spec_with_control_blocks(
+    base: &MmsTypeSpec,
+    blocks: &[ControlBlockEntry],
+) -> MmsTypeSpec {
+    let MmsTypeSpec::Structure(groups) = base else {
+        return base.clone();
+    };
+    let mut merged = Vec::with_capacity(groups.len() + 3);
+    for &fc in LN_FC_ORDER {
+        let mut members: Vec<NamedVariableSpec> = blocks
+            .iter()
+            .filter(|b| b.kind.fc() == fc)
+            .map(|b| NamedVariableSpec {
+                name: b.name.clone(),
+                type_spec: b.kind.type_spec(),
+            })
+            .collect();
+        if let Some(group) = groups.iter().find(|g| g.name == fc.as_str()) {
+            if let MmsTypeSpec::Structure(existing) = &group.type_spec {
+                members.extend(existing.iter().cloned());
+            }
+        }
+        if !members.is_empty() {
+            merged.push(NamedVariableSpec {
+                name: fc.as_str().to_string(),
+                type_spec: MmsTypeSpec::Structure(members),
+            });
+        }
+    }
+    MmsTypeSpec::Structure(merged)
+}
+
+/// Returns the path of `prefix` and of every structure member beneath it, the
+/// flattened form GetNameList reports.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+pub(crate) fn flat_paths(prefix: &str, spec: &MmsTypeSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    push_flat_paths(prefix, spec, &mut out);
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

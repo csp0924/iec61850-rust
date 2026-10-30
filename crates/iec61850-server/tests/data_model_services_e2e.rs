@@ -355,7 +355,159 @@ async fn read_resolves_an_attribute_only_under_its_own_fc() {
 
 // ── Report and log control blocks ───────────────────────────────────────
 
+/// Every report and log control block GetNameList lists has a type
+/// description, its members in IEC 61850-8-1 order, and the list carries the
+/// group, the block, and each member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listed_control_blocks_have_type_descriptions() {
+    let server = server_with_control_blocks();
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let listed = all_names(&mut c).await;
+    for (group, block, members) in [
+        ("LLN0$RP", "urcbA", &URCB_MEMBERS[..]),
+        ("LLN0$BR", "brcbA", &BRCB_MEMBERS[..]),
+        ("LLN0$LG", "evlog", &LCB_MEMBERS[..]),
+    ] {
+        let item = format!("{group}${block}");
+        let spec = t!(c.get_variable_access_attributes(DOM, &item))
+            .unwrap_or_else(|e| panic!("{item} has no type description: {e:?}"));
+        assert_eq!(member_names(&spec), members, "{item}");
+        for name in [group.to_string(), item.clone()]
+            .into_iter()
+            .chain(members.iter().map(|m| format!("{item}${m}")))
+        {
+            assert!(listed.contains(&name), "{name} is not listed");
+            assert!(
+                t!(c.get_variable_access_attributes(DOM, &name)).is_ok(),
+                "{name} is listed but has no type description"
+            );
+        }
+    }
+    let lln0 = t!(c.get_variable_access_attributes(DOM, "LLN0")).unwrap();
+    assert_eq!(member_names(&lln0), ["ST", "SP", "RP", "LG", "BR"]);
+    handle.stop().await;
+}
+
+/// The member types of a log control block follow the IEC 61850-8-1 mapping,
+/// and the ACSI names of OldEnt and NewEnt resolve to the same components
+/// without being listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_control_block_member_types() {
+    let server = server_with_control_blocks();
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let listed = all_names(&mut c).await;
+    for (acsi, mms_name) in [("OldEntr", "OldEnt"), ("NewEntr", "NewEnt")] {
+        let by_acsi = t!(c.get_variable_access_attributes(DOM, &format!("LLN0$LG$evlog${acsi}")))
+            .unwrap_or_else(|e| panic!("{acsi}: {e:?}"));
+        let by_mms =
+            t!(c.get_variable_access_attributes(DOM, &format!("LLN0$LG$evlog${mms_name}")))
+                .unwrap();
+        assert_eq!(by_acsi, by_mms);
+        assert!(!listed.contains(&format!("LLN0$LG$evlog${acsi}")));
+    }
+
+    let TypeSpecification::Structure { components } =
+        t!(c.get_variable_access_attributes(DOM, "LLN0$LG$evlog")).unwrap()
+    else {
+        panic!("a log control block is a structure");
+    };
+    use TypeSpecification as T;
+    let types: Vec<_> = components.into_iter().map(|c| c.type_spec).collect();
+    assert_eq!(
+        types,
+        [
+            T::Boolean,
+            T::VisibleString { max_chars: -129 },
+            T::VisibleString { max_chars: -129 },
+            T::BinaryTime {
+                use_long_form: true
+            },
+            T::BinaryTime {
+                use_long_form: true
+            },
+            T::OctetString { max_octets: 8 },
+            T::OctetString { max_octets: 8 },
+            T::BitString { bits: -6 },
+            T::Unsigned { width_bits: 32 },
+        ]
+    );
+    handle.stop().await;
+}
+
+/// A read of a report control block, of its group, and of the whole logical
+/// node returns the layout the type description gives the same name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn report_control_block_reads_follow_their_type_description() {
+    let server = server_with_control_blocks();
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    for item in ["LLN0$RP$urcbA", "LLN0$BR$brcbA", "LLN0$RP", "LLN0$BR"] {
+        let spec = t!(c.get_variable_access_attributes(DOM, item)).unwrap();
+        let value = t!(c.read(DOM, item)).unwrap_or_else(|e| panic!("{item}: {e:?}"));
+        assert!(
+            fits(&spec, &value),
+            "{item}: {value:?} does not fit {spec:?}"
+        );
+    }
+    let spec = t!(c.get_variable_access_attributes(DOM, "LLN0")).unwrap();
+    let value = t!(c.read(DOM, "LLN0")).unwrap();
+    let (TypeSpecification::Structure { components }, MmsData::Structure(groups)) = (&spec, &value)
+    else {
+        panic!("LLN0 is a structure");
+    };
+    assert_eq!(components.len(), groups.len());
+    for (c, g) in components.iter().zip(groups) {
+        if c.name != "LG" {
+            assert!(fits(&c.type_spec, g), "LLN0${}: {g:?}", c.name);
+        }
+    }
+    handle.stop().await;
+}
+
 // ── Setting group control block ─────────────────────────────────────────
+
+/// The type description of a setting group control block carries ResvTms
+/// when the block exposes it, and every read of the block, of the SP group,
+/// and of LLN0 returns the layout the type description gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setting_group_control_block_reads_follow_their_type_description() {
+    for resv_tms in [true, false] {
+        let server = server_with(model(resv_tms), IedServerConfig::default());
+        let handle = server.start().await.unwrap();
+        let mut c = mms(&handle).await;
+
+        let spec = t!(c.get_variable_access_attributes(DOM, "LLN0$SP$SGCB")).unwrap();
+        let mut expected = vec!["NumOfSG", "ActSG", "EditSG", "CnfEdit", "LActTm"];
+        if resv_tms {
+            expected.push("ResvTms");
+        }
+        assert_eq!(member_names(&spec), expected);
+        assert_eq!(
+            t!(c.get_variable_access_attributes(DOM, "LLN0$SP$SGCB$ResvTms")).is_ok(),
+            resv_tms
+        );
+        assert_eq!(
+            all_names(&mut c)
+                .await
+                .contains(&"LLN0$SP$SGCB$ResvTms".to_string()),
+            resv_tms
+        );
+        for item in ["LLN0$SP$SGCB", "LLN0$SP", "LLN0"] {
+            let spec = t!(c.get_variable_access_attributes(DOM, item)).unwrap();
+            let value = t!(c.read(DOM, item)).unwrap_or_else(|e| panic!("{item}: {e:?}"));
+            assert!(
+                fits(&spec, &value),
+                "{item}: {value:?} does not fit {spec:?}"
+            );
+        }
+        handle.stop().await;
+    }
+}
 
 /// A setting group control block exists only in LLN0: the same path under
 /// another logical node neither reads nor writes, and the control block of

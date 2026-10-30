@@ -106,7 +106,7 @@ use crate::policy::WriteAccessPolicies;
 use crate::reporting::{NullReportSink, ReportingEngine};
 
 use get_name_list::{handle_get_name_list_with_extras, GetNameListResult};
-use get_var_access_attrs::{handle_get_var_access_attrs, GetVarAccessAttrsResult};
+use get_var_access_attrs::GetVarAccessAttrsResult;
 use read::pdu_budget_for_access_results;
 use write::handle_single_write;
 
@@ -482,9 +482,15 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "logging")]
                 &self.log_controls,
             ),
-            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => {
-                dispatch_get_var_access_attrs(invoke_id, &body, &self.mms_model)
-            }
+            SERVICE_TAG_GET_VAR_ACCESS_ATTRS => dispatch_get_var_access_attrs(
+                invoke_id,
+                &body,
+                &self.mms_model,
+                #[cfg(feature = "reporting")]
+                &self.reporting_engine,
+                #[cfg(feature = "logging")]
+                &self.log_controls,
+            ),
             SERVICE_TAG_IDENTIFY => dispatch_identify(invoke_id, &self.identification),
             SERVICE_TAG_READ => dispatch_read(
                 invoke_id,
@@ -663,17 +669,16 @@ fn dispatch_get_name_list(
 /// this returns is a name a client can go on to read. The model is deliberately
 /// not a second source: a control block or data set the model declares but
 /// nothing registered has no Read handler, and listing it would advertise a
-/// name that answers object-non-existent. A log control block resolves to the
-/// attributes of [`LCB_SERVED_FIELDS`]; the rest of its attributes answer
-/// object-access-unsupported, which reports the name as existing.
+/// name that answers object-non-existent.
 ///
 /// Only two combinations have members. Domain-scope named variables gain the
-/// GOOSE control blocks of the domain, the MMS path tail of every report
-/// control block the reporting engine holds, `<LN>$RP$<name>` or
-/// `<LN>$BR$<name>`, and the `<LN>$LG$<name>` path of every log control block
-/// the log control registry holds. Domain-scope named variable lists gain the
-/// data sets of the registry, which covers both those the application
-/// registered and those a client created with DefineNamedVariableList.
+/// GOOSE control blocks of the domain and, flattened the way the model's own
+/// names are, every report and log control block of
+/// [`domain_control_blocks`]: the `<LN>$RP`, `<LN>$BR` or `<LN>$LG` group, the
+/// block itself and each of its members, as GetVariableAccessAttributes
+/// describes them. Domain-scope named variable lists gain the data sets of the
+/// registry, which covers both those the application registered and those a
+/// client created with DefineNamedVariableList.
 ///
 /// A poisoned registry lock yields the names it can still contribute rather
 /// than failing the request: an incomplete directory is more useful to a
@@ -692,39 +697,21 @@ fn runtime_extras(
             let mut out = Vec::new();
             #[cfg(feature = "goose-mapping")]
             out.extend(gocb_registry.list_mms_names_in_domain(domain));
-            #[cfg(feature = "reporting")]
-            {
-                // The engine keys a control block by `<domain>/<LN>$FC$<name>`,
-                // while a name list carries the part after the domain.
-                let prefix = format!("{domain}/");
-                match reporting_engine.lock() {
-                    Ok(engine) => out.extend(
-                        engine
-                            .rcb_paths()
-                            .into_iter()
-                            .chain(engine.brcb_paths())
-                            .filter_map(|p| p.strip_prefix(&prefix).map(String::from)),
-                    ),
-                    Err(_) => tracing::warn!(
-                        domain = %domain,
-                        "get-name-list: the reporting engine lock is poisoned, no report control block is listed"
-                    ),
-                }
-            }
-            #[cfg(feature = "logging")]
-            {
-                match log_controls.read() {
-                    Ok(registry) => out.extend(
-                        registry
-                            .keys()
-                            .filter(|(d, item)| d == domain && is_lcb_path(item))
-                            .map(|(_, item)| item.clone()),
-                    ),
-                    Err(_) => tracing::warn!(
-                        domain = %domain,
-                        "get-name-list: the log control registry lock is poisoned, no log control block is listed"
-                    ),
-                }
+            #[cfg(any(feature = "reporting", feature = "logging"))]
+            for (ln, block) in domain_control_blocks(
+                domain,
+                None,
+                #[cfg(feature = "reporting")]
+                reporting_engine,
+                #[cfg(feature = "logging")]
+                log_controls,
+            ) {
+                let group = format!("{ln}${}", block.kind.fc().as_str());
+                out.extend(crate::mapping::flat_paths(
+                    &format!("{group}${}", block.name),
+                    &block.kind.type_spec(),
+                ));
+                out.push(group);
             }
             out
         }
@@ -749,6 +736,101 @@ fn runtime_extras(
     }
 }
 
+/// The report and log control blocks registered in `domain`, as the logical
+/// node each belongs to and its entry, sorted by logical node, then by the
+/// IEC 61850-8-1 order of their groups, then by name. `ln` limits the answer
+/// to one logical node.
+///
+/// The reporting engine and the log control registry are the registries the
+/// Read paths resolve a control block against, so every block this returns is
+/// one a client can go on to read. A report control block counts only under
+/// the group its table serves, unbuffered under RP and buffered under BR, and
+/// a log control registry key only in its `<LN>$LG$<name>` form. A poisoned
+/// registry contributes nothing rather than failing the caller.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+fn domain_control_blocks(
+    domain: &str,
+    ln: Option<&str>,
+    #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
+    #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
+) -> Vec<(String, crate::mapping::ControlBlockEntry)> {
+    use crate::mapping::{ControlBlockEntry, ControlBlockKind};
+    let mut out: Vec<(String, ControlBlockEntry)> = Vec::new();
+    let mut push = |item: &str, kind: ControlBlockKind| {
+        let mut segments = item.split('$');
+        let (Some(ln_name), Some(fc), Some(name), None) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return;
+        };
+        if ln_name.is_empty()
+            || name.is_empty()
+            || fc != kind.fc().as_str()
+            || ln.is_some_and(|l| l != ln_name)
+        {
+            return;
+        }
+        out.push((
+            ln_name.to_string(),
+            ControlBlockEntry {
+                kind,
+                name: name.to_string(),
+            },
+        ));
+    };
+    #[cfg(feature = "reporting")]
+    {
+        // The engine keys a control block by `<domain>/<LN>$FC$<name>`.
+        let prefix = format!("{domain}/");
+        match reporting_engine.lock() {
+            Ok(engine) => {
+                for path in engine.rcb_paths() {
+                    if let Some(item) = path.strip_prefix(&prefix) {
+                        push(item, ControlBlockKind::Unbuffered);
+                    }
+                }
+                for path in engine.brcb_paths() {
+                    if let Some(item) = path.strip_prefix(&prefix) {
+                        push(item, ControlBlockKind::Buffered);
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(
+                domain,
+                "the reporting engine lock is poisoned, no report control block is listed"
+            ),
+        }
+    }
+    #[cfg(feature = "logging")]
+    match log_controls.read() {
+        Ok(registry) => {
+            for (d, item) in registry.keys() {
+                if d == domain && is_lcb_path(item) {
+                    push(item, ControlBlockKind::Log);
+                }
+            }
+        }
+        Err(_) => tracing::warn!(
+            domain,
+            "the log control registry lock is poisoned, no log control block is listed"
+        ),
+    }
+    out.sort_by(|(ln_a, a), (ln_b, b)| {
+        let rank = |k: ControlBlockKind| {
+            iec61850_model::FC::WIRE_ORDER
+                .iter()
+                .position(|f| *f == k.fc())
+        };
+        ln_a.cmp(ln_b)
+            .then(rank(a.kind).cmp(&rank(b.kind)))
+            .then(a.name.cmp(&b.name))
+    });
+    out
+}
+
 /// Whether a log control registry item names a log control block, as opposed to
 /// a log instance.
 ///
@@ -770,6 +852,10 @@ fn is_lcb_path(item: &str) -> bool {
 
 /// Dispatches a GetVariableAccessAttributes request (`0xa6`).
 ///
+/// The report and log control blocks of [`domain_control_blocks`] are merged
+/// into the structure of their logical node, so every control block name
+/// GetNameList reports has a type description.
+///
 /// The type specification of a logical node grows with the model, so a
 /// response can outgrow the negotiated maximum PDU size; the dispatcher's
 /// outbound guard bounds it.
@@ -777,6 +863,8 @@ fn dispatch_get_var_access_attrs(
     invoke_id: u32,
     body: &Bytes,
     mms_model: &MmsDeviceModel,
+    #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
+    #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
 ) -> ConfirmedResponse {
     let req = match GetVariableAccessAttributesRequest::decode(body) {
         Ok(r) => r,
@@ -790,7 +878,28 @@ fn dispatch_get_var_access_attrs(
         }
     };
 
-    match handle_get_var_access_attrs(mms_model, &req) {
+    #[cfg(any(feature = "reporting", feature = "logging"))]
+    let result = get_var_access_attrs::handle_get_var_access_attrs_with_control_blocks(
+        mms_model,
+        &req,
+        &|domain, ln| {
+            domain_control_blocks(
+                domain,
+                Some(ln),
+                #[cfg(feature = "reporting")]
+                reporting_engine,
+                #[cfg(feature = "logging")]
+                log_controls,
+            )
+            .into_iter()
+            .map(|(_, block)| block)
+            .collect()
+        },
+    );
+    #[cfg(not(any(feature = "reporting", feature = "logging")))]
+    let result = get_var_access_attrs::handle_get_var_access_attrs(mms_model, &req);
+
+    match result {
         GetVarAccessAttrsResult::Response(resp) => {
             let mut buf = BytesMut::new();
             match encode_confirmed_get_var_access_attrs_response(invoke_id, &resp, &mut buf) {
@@ -1018,9 +1127,10 @@ fn dispatch_read(
     // what it occupies.
     let mut remaining_budget = read_results_budget(&req, negotiated_max_pdu_size);
 
-    let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let outcome = handle_read_with_routing(
+    let route = |name: &iec61850_mms::mms::pdu::common::ObjectName,
+                 alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
+                 budget: Option<usize>| {
+        handle_read_with_routing(
             ied_model,
             mms_model,
             #[cfg(feature = "control")]
@@ -1035,10 +1145,35 @@ fn dispatch_read(
             #[cfg(feature = "logging")]
             log_controls,
             conn_id,
+            name,
+            alt_access,
+            budget,
+        )
+    };
+
+    let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        #[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+        let ln_read = read_ln_with_control_blocks(
+            ied_model,
+            #[cfg(feature = "setting-groups")]
+            setting_groups,
+            #[cfg(feature = "reporting")]
+            reporting_engine,
+            #[cfg(feature = "logging")]
+            log_controls,
+            #[cfg(any(feature = "reporting", feature = "logging"))]
+            &route,
             &entry.name,
             entry.alt_access.as_ref(),
             remaining_budget,
         );
+        #[cfg(not(any(feature = "reporting", feature = "logging", feature = "setting-groups")))]
+        let ln_read: Option<ReadRoutingOutcome> = None;
+        let outcome = match ln_read {
+            Some(outcome) => outcome,
+            None => route(&entry.name, entry.alt_access.as_ref(), remaining_budget),
+        };
         match outcome {
             ReadRoutingOutcome::Result(r) => {
                 // AlternateAccess (when requested) is now resolved inside the
@@ -1079,6 +1214,103 @@ fn dispatch_read(
     let mut buf = BytesMut::new();
     encode_confirmed_read_response(invoke_id, &resp, &mut buf);
     ConfirmedResponse::Response(buf.freeze())
+}
+
+/// Reads one object name through the ordinary read routes, under an optional
+/// alternate access and byte budget.
+#[cfg(any(feature = "reporting", feature = "logging"))]
+type ReadRoute<'a> = dyn Fn(
+        &iec61850_mms::mms::pdu::common::ObjectName,
+        Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
+        Option<usize>,
+    ) -> ReadRoutingOutcome
+    + 'a;
+
+/// Reads a whole logical node, `LN`, or one of its functional-constraint
+/// groups, `LN$FC`, with the control blocks the model view leaves out.
+///
+/// The setting group control block leads the SP group of a logical node that
+/// declares one, and each control block of [`domain_control_blocks`] leads the
+/// group of its functional constraint, in the layout
+/// [`ln_spec_with_control_blocks`](crate::mapping::ln_spec_with_control_blocks)
+/// gives GetVariableAccessAttributes. Each control block is read through its
+/// own route, so its value is the one a read of the block alone returns, and a
+/// control block that fails to read fails the whole entry.
+///
+/// `None` means the entry names something below a group, or carries an
+/// alternate access, which the ordinary routes handle.
+#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+#[allow(clippy::too_many_arguments)]
+fn read_ln_with_control_blocks(
+    ied_model: &IedModel,
+    #[cfg(feature = "setting-groups")] setting_groups: &crate::setting_groups::SettingGroupRegistry,
+    #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
+    #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
+    #[cfg(any(feature = "reporting", feature = "logging"))] route: &ReadRoute<'_>,
+    name: &iec61850_mms::mms::pdu::common::ObjectName,
+    alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
+    remaining_budget: Option<usize>,
+) -> Option<ReadRoutingOutcome> {
+    use crate::service::read::{read_ln_with_leading_members, LookupResult};
+    use iec61850_mms::mms::pdu::common::{MmsData, ObjectName};
+
+    let ObjectName::DomainSpecific { domain_id, item_id } = name else {
+        return None;
+    };
+    if alt_access.is_some() {
+        return None;
+    }
+    let domain = domain_id.as_str();
+
+    let mut leading = |ln: &iec61850_model::LogicalNode,
+                       fc: iec61850_model::FC|
+     -> Result<Vec<MmsData>, DataAccessError> {
+        let mut members = Vec::new();
+        #[cfg(feature = "setting-groups")]
+        if fc == iec61850_model::FC::Sp && ln.sgcb.is_some() {
+            match crate::setting_groups::handle_sgcb_read(
+                setting_groups,
+                domain,
+                "LLN0",
+                crate::setting_groups::SgcbField::Whole,
+            ) {
+                AccessResult::Success(d) => members.push(d),
+                AccessResult::Failure(e) => return Err(e),
+            }
+        }
+        #[cfg(any(feature = "reporting", feature = "logging"))]
+        {
+            let ln_name = format!("{}{}{}", ln.prefix, ln.class, ln.inst);
+            let blocks = domain_control_blocks(
+                domain,
+                Some(&ln_name),
+                #[cfg(feature = "reporting")]
+                reporting_engine,
+                #[cfg(feature = "logging")]
+                log_controls,
+            );
+            for (_, block) in blocks.iter().filter(|(_, b)| b.kind.fc() == fc) {
+                let block_name = ObjectName::DomainSpecific {
+                    domain_id: domain_id.clone(),
+                    item_id: format!("{ln_name}${}${}", fc.as_str(), block.name),
+                };
+                match route(&block_name, None, None) {
+                    ReadRoutingOutcome::Result(AccessResult::Success(d)) => members.push(d),
+                    ReadRoutingOutcome::Result(AccessResult::Failure(e)) => return Err(e),
+                    ReadRoutingOutcome::OverBudget => {
+                        return Err(DataAccessError::ObjectAccessUnsupported)
+                    }
+                }
+            }
+        }
+        Ok(members)
+    };
+
+    match read_ln_with_leading_members(ied_model, domain, item_id, &mut leading, remaining_budget)?
+    {
+        LookupResult::Result(r) => Some(ReadRoutingOutcome::Result(r)),
+        LookupResult::OverBudget => Some(ReadRoutingOutcome::OverBudget),
+    }
 }
 
 /// Dispatches a Read request (`0xa4`) in a build with no routed subsystems.
@@ -1740,6 +1972,63 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
     AccessResult::Success(MmsData::Structure(data_vec))
 }
 
+/// Reads every attribute of a buffered report control block into one
+/// structure, in the member order of
+/// [`ControlBlockKind::Buffered`](crate::mapping::ControlBlockKind): RptID,
+/// RptEna, DatSet, ConfRev, OptFlds, BufTm, SqNum, TrgOps, IntgPd, GI,
+/// PurgeBuf, EntryID, TimeofEntry, ResvTms, and Owner.
+///
+/// An attribute that cannot be read fails the whole structure, so it is never
+/// returned half-populated.
+#[cfg(feature = "reporting")]
+fn read_brcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> AccessResult {
+    use crate::reporting::service::{handle_get_brcb_field, RcbField};
+    use iec61850_mms::mms::pdu::common::MmsData;
+
+    let fields = [
+        RcbField::RptId,
+        RcbField::RptEna,
+        RcbField::DatSet,
+        RcbField::ConfRev,
+        RcbField::OptFlds,
+        RcbField::BufTm,
+        RcbField::SqNum,
+        RcbField::TrgOps,
+        RcbField::IntgPd,
+        RcbField::Gi,
+        RcbField::Unknown("PurgeBuf".into()),
+        RcbField::EntryId,
+        RcbField::Unknown("TimeofEntry".into()),
+        RcbField::Unknown("ResvTms".into()),
+        RcbField::Owner,
+    ];
+    let mut members: Vec<MmsData> = Vec::with_capacity(fields.len());
+    for field in fields {
+        let name = field.as_str().to_string();
+        match handle_get_brcb_field(engine, mms_path, field) {
+            Some(AccessResult::Success(d)) => members.push(d),
+            Some(AccessResult::Failure(e)) => {
+                tracing::warn!(
+                    mms_path,
+                    field = name,
+                    ?e,
+                    "read: a buffered report control block attribute could not be read"
+                );
+                return AccessResult::Failure(e);
+            }
+            None => {
+                tracing::warn!(
+                    mms_path,
+                    field = name,
+                    "read: a buffered report control block attribute has no value"
+                );
+                return AccessResult::Failure(DataAccessError::HardwareFault);
+            }
+        }
+    }
+    AccessResult::Success(MmsData::Structure(members))
+}
+
 /// The log control block attributes this server serves on a Read, in the order
 /// IEC 61850-7-2 declares them.
 ///
@@ -1931,9 +2220,9 @@ fn handle_read_with_routing(
                     DataAccessError::TypeInconsistent,
                 ));
             }
-            // A buffered control block is read one attribute at a time. A name
-            // that selects the whole block, and the URCB-only Resv, answer
-            // object-access-unsupported once the block is known to exist.
+            // A buffered control block answers the whole block or one of its
+            // attributes; the URCB-only Resv answers object-access-unsupported
+            // once the block is known to exist.
             if target.is_buffered {
                 let exists = {
                     let Ok(eng) = reporting_engine.lock() else {
@@ -1953,7 +2242,13 @@ fn handle_read_with_routing(
                         DataAccessError::ObjectNonExistent,
                     ));
                 }
-                if let Some(field) = target.field.clone() {
+                let Some(field) = target.field.clone() else {
+                    return ReadRoutingOutcome::Result(read_brcb_structure(
+                        reporting_engine,
+                        &target.mms_path,
+                    ));
+                };
+                {
                     use crate::reporting::service::handle_get_brcb_field;
                     if let Some(r) =
                         handle_get_brcb_field(reporting_engine, &target.mms_path, field)
@@ -1969,7 +2264,7 @@ fn handle_read_with_routing(
                     domain = target.domain,
                     mms_path = target.mms_path,
                     field = ?field_name,
-                    "read: a buffered report control block is read one attribute at a time, and Resv is unbuffered-only"
+                    "read: this attribute is not served on a buffered report control block, and Resv is unbuffered-only"
                 );
                 return ReadRoutingOutcome::Result(AccessResult::Failure(
                     DataAccessError::ObjectAccessUnsupported,
@@ -3904,7 +4199,10 @@ mod tests {
 
         // The expected size comes from encoding the response the model implies,
         // not from what the dispatch path returns.
-        let resp = match handle_get_var_access_attrs(&dispatcher.mms_model, &gva_req) {
+        let resp = match get_var_access_attrs::handle_get_var_access_attrs(
+            &dispatcher.mms_model,
+            &gva_req,
+        ) {
             GetVarAccessAttrsResult::Response(r) => r,
             other => panic!("the model must resolve this path, got {:?}", other),
         };
