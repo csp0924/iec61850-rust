@@ -52,8 +52,9 @@ pub enum GetNameListResult {
 /// a name in the answer.
 ///
 /// The extras are merged into the model's named variables, deduplicated, sorted
-/// together, and only then paged. A `NamedVariableList` answer is built from
-/// the extras alone, since the model contributes no named variable lists.
+/// together, and only then paged. A `NamedVariableList` or `Journal` answer is
+/// built from the extras alone, since the model contributes no named variable
+/// lists and no journals.
 /// Every other class and scope combination behaves exactly as
 /// [`handle_get_name_list`], and an empty `extras` leaves even that path
 /// unchanged.
@@ -71,10 +72,12 @@ pub fn handle_get_name_list_with_extras(
         }
         // `list_named_variables` only serves to test that the domain exists;
         // every name of this class comes from the registry.
-        (ObjectClass::NamedVariableList, ObjectScope::DomainSpecific(d)) => (
-            d,
-            model.list_named_variables(d).map(|_| Vec::<String>::new()),
-        ),
+        (ObjectClass::NamedVariableList | ObjectClass::Journal, ObjectScope::DomainSpecific(d)) => {
+            (
+                d,
+                model.list_named_variables(d).map(|_| Vec::<String>::new()),
+            )
+        }
         _ => return handle_get_name_list(model, req),
     };
     let Some(names) = names else {
