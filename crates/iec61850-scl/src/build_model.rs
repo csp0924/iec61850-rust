@@ -1167,10 +1167,12 @@ pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
 ///
 /// A Dbpos takes the IEC 61850-7-3 value names `intermediate-state`, `off`,
 /// `on` and `bad-state`, and a Tcmd `stop`, `lower`, `higher` and `reserved`;
-/// either becomes the two-bit string of its ordinal. Any other text on them,
-/// and a value on Quality, Check, Timestamp, EntryTime, Octet64, EntryID,
-/// OptFlds, TrgOps or PhyComAddr, is warned about and the attribute keeps its
-/// default.
+/// either becomes the two-bit string of its ordinal, and any other text on
+/// them keeps the default with a warning. An Octet64 is written as
+/// base64Binary and a Timestamp as an xs:dateTime such as
+/// `2007-12-31T21:01:12.345`, taken as UTC when it carries no time zone
+/// (IEC 61850-6). A value on Quality, Check, EntryTime, EntryID, OptFlds,
+/// TrgOps or PhyComAddr is warned about and the attribute keeps its default.
 ///
 /// Also used by the build-script path through [`crate::__build_internals`], so
 /// the value is parsed once while the build script runs and emitted as a
@@ -1364,10 +1366,23 @@ pub fn parse_val_for_b_type(
                 }
             }
         }
+        "Octet64" => {
+            let bytes = decode_base64(raw)
+                .map_err(|cause| invalid("Octet64 (base64Binary)", Some(cause)))?;
+            if bytes.len() > 64 {
+                return Err(invalid(
+                    "Octet64 (base64Binary)",
+                    Some(format!("{} octets exceed the limit of 64", bytes.len())),
+                ));
+            }
+            Ok(MmsValue::OctetString(bytes))
+        }
+        "Timestamp" => parse_timestamp(raw)
+            .map(MmsValue::UtcTime)
+            .map_err(|cause| invalid("Timestamp (xs:dateTime)", Some(cause))),
         // A bType this function does not parse: warn and return the zero value
         // of the corresponding type, which leaves the attribute at its default.
-        "Quality" | "Check" | "Timestamp" | "EntryTime" | "Octet64" | "EntryID" | "OptFlds"
-        | "TrgOps" | "PhyComAddr" => {
+        "Quality" | "Check" | "EntryTime" | "EntryID" | "OptFlds" | "TrgOps" | "PhyComAddr" => {
             tracing::warn!(
                 "a `<Val>` on bType=\"{}\" is not parsed yet, so the attribute keeps its default",
                 b_type
@@ -1389,6 +1404,133 @@ pub fn parse_val_for_b_type(
             Some(format!("bType `{}` is not supported", b_type)),
         )),
     }
+}
+
+/// Decodes base64Binary text: the standard alphabet with `=` padding, ASCII
+/// whitespace between characters ignored.
+fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+    let chars: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !chars.len().is_multiple_of(4) {
+        return Err(format!("{} characters is not a multiple of 4", chars.len()));
+    }
+    let value = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(chars.len() / 4 * 3);
+    let (groups, _) = chars.as_chunks::<4>();
+    for (i, group) in groups.iter().enumerate() {
+        let pad = group.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && i + 1 != groups.len()) {
+            return Err("`=` padding is only allowed at the end".to_string());
+        }
+        let mut n = 0u32;
+        for &c in &group[..4 - pad] {
+            let v = value(c).ok_or_else(|| format!("`{}` is not a base64 character", c as char))?;
+            n = (n << 6) | v;
+        }
+        n <<= 6 * pad as u32;
+        let bytes = n.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - pad]);
+    }
+    Ok(out)
+}
+
+/// Parses an xs:dateTime, such as `2007-12-31T21:01:12.345`, into the eight
+/// octets of an IEC 61850 UTC time: whole seconds since 1970-01-01T00:00:00Z,
+/// a 24-bit binary fraction of a second, and a time quality octet of 0.
+///
+/// A value without a time zone is taken as UTC; a `Z` or `±hh:mm` suffix is
+/// honored. Fraction digits beyond the ninth are ignored.
+///
+/// # Errors
+///
+/// A description of the problem when the text is not an xs:dateTime or the
+/// instant falls outside the 32-bit seconds range of the UTC time.
+fn parse_timestamp(text: &str) -> Result<[u8; 8], String> {
+    let malformed = || format!("`{text}` is not an xs:dateTime such as 2007-12-31T21:01:12.345");
+    let (date, time) = text.split_once('T').ok_or_else(malformed)?;
+    let mut date_parts = date.splitn(3, '-');
+    let num = |s: Option<&str>, len: usize| -> Result<i64, String> {
+        let s = s.ok_or_else(malformed)?;
+        if s.len() != len || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed());
+        }
+        s.parse::<i64>().map_err(|_| malformed())
+    };
+    let year = num(date_parts.next(), 4)?;
+    let month = num(date_parts.next(), 2)?;
+    let day = num(date_parts.next(), 2)?;
+
+    // Split off the time zone suffix, if any.
+    let (clock, offset_s) = if let Some(c) = time.strip_suffix('Z') {
+        (c, 0)
+    } else if time.len() > 6 && matches!(time.as_bytes()[time.len() - 6], b'+' | b'-') {
+        let (c, tz) = time.split_at(time.len() - 6);
+        let sign = if tz.starts_with('-') { -1 } else { 1 };
+        let (h, m) = tz[1..].split_once(':').ok_or_else(malformed)?;
+        let (h, m) = (num(Some(h), 2)?, num(Some(m), 2)?);
+        if h > 14 || m > 59 {
+            return Err(malformed());
+        }
+        (c, sign * (h * 3600 + m * 60))
+    } else {
+        (time, 0)
+    };
+    let (hms, fraction) = match clock.split_once('.') {
+        Some((hms, f)) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => (hms, f),
+        Some(_) => return Err(malformed()),
+        None => (clock, ""),
+    };
+    let mut hms_parts = hms.splitn(3, ':');
+    let hour = num(hms_parts.next(), 2)?;
+    let minute = num(hms_parts.next(), 2)?;
+    let second = num(hms_parts.next(), 2)?;
+
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(malformed()),
+    };
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return Err(malformed());
+    }
+
+    // Days since 1970-01-01 in the proleptic Gregorian calendar.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_s;
+    let secs = u32::try_from(secs)
+        .map_err(|_| format!("`{text}` falls outside the 32-bit seconds range from 1970"))?;
+
+    let digits = &fraction[..fraction.len().min(9)];
+    let frac24 = if digits.is_empty() {
+        0
+    } else {
+        let n: u64 = digits.parse().map_err(|_| malformed())?;
+        let scale = 10u64.pow(digits.len() as u32);
+        (n << 24) / scale
+    };
+
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&secs.to_be_bytes());
+    out[4..7].copy_from_slice(&(frac24 as u32).to_be_bytes()[1..]);
+    Ok(out)
 }
 
 /// Converts the trigger-option bits of a `<DA trgOps="...">` into [`TrgOps`],
@@ -1651,6 +1793,50 @@ pub fn b_type_to_dat(
 mod tests {
     use super::*;
     use crate::parse_scl;
+
+    #[test]
+    fn base64_decodes_with_and_without_padding() {
+        assert_eq!(decode_base64("AQID").unwrap(), vec![1, 2, 3]);
+        assert_eq!(decode_base64("AQI=").unwrap(), vec![1, 2]);
+        assert_eq!(decode_base64("AQ==").unwrap(), vec![1]);
+        assert_eq!(decode_base64(" AQ ID\n").unwrap(), vec![1, 2, 3]);
+        assert_eq!(decode_base64("").unwrap(), Vec::<u8>::new());
+        for bad in ["AQI", "AQ=D", "A===", "AQ==AQID", "AQ!D"] {
+            assert!(decode_base64(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn timestamp_parses_into_utc_time_octets() {
+        // 2007-12-31T21:01:12Z is 1199134872 s since 1970 (0x4779_5898).
+        let t = parse_timestamp("2007-12-31T21:01:12.5").unwrap();
+        assert_eq!(t, [0x47, 0x79, 0x58, 0x98, 0x80, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            parse_timestamp("2007-12-31T21:01:12Z").unwrap()[..4],
+            t[..4]
+        );
+        assert_eq!(
+            parse_timestamp("2007-12-31T22:01:12+01:00").unwrap()[..4],
+            t[..4]
+        );
+        assert_eq!(parse_timestamp("1970-01-01T00:00:00").unwrap(), [0u8; 8]);
+        assert_eq!(
+            parse_timestamp("2024-02-29T00:00:00.25").unwrap(),
+            [0x65, 0xDF, 0xC9, 0x00, 0x40, 0x00, 0x00, 0x00]
+        );
+        for bad in [
+            "2007-12-31",
+            "2007-12-31 21:01:12",
+            "2007-13-01T00:00:00",
+            "2023-02-29T00:00:00",
+            "2007-12-31T24:00:00",
+            "1969-12-31T23:59:59",
+            "2007-12-31T21:01:12.",
+            "07-12-31T21:01:12",
+        ] {
+            assert!(parse_timestamp(bad).is_err(), "{bad} accepted");
+        }
+    }
 
     fn build(xml: &str, ied_name: &str) -> IedModel {
         let resolved = parse_scl(xml).expect("parse").resolve().expect("resolve");

@@ -691,3 +691,43 @@ fn gse_control_empty_app_id_defaults_to_the_gocb_ref() {
     let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
     assert_eq!(ln.gocbs[0].go_id, "Bay1/LLN0$GO$gcb1");
 }
+
+fn octet_time_scl(doi: &str) -> String {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="R" type="R_T"/></LNodeType>
+    <DOType id="R_T" cdc="SPS">
+      <DA name="raw" fc="CF" bType="Octet64"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>"#;
+    let ln =
+        format!(r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="R">{doi}</DOI></LN>"#);
+    wrap(t, "", &ln)
+}
+
+/// An Octet64 `<Val>` is base64Binary and a Timestamp `<Val>` an xs:dateTime
+/// without a time zone, both applied to the attribute.
+#[test]
+fn octet_string_and_timestamp_vals_are_applied() {
+    let m = build(&octet_time_scl(
+        r#"<DAI name="raw"><Val>3q2+7w==</Val></DAI><DAI name="t"><Val>2007-12-31T21:01:12.345</Val></DAI>"#,
+    ));
+    assert_eq!(
+        da(&m, "GGIO1", "R", "raw").snapshot(),
+        MmsValue::OctetString(vec![0xDE, 0xAD, 0xBE, 0xEF])
+    );
+    match da(&m, "GGIO1", "R", "t").snapshot() {
+        MmsValue::UtcTime(b) => assert_eq!(b[..4], 1_199_134_872u32.to_be_bytes()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A `<Val>` that is not base64Binary or not an xs:dateTime fails the build.
+#[test]
+fn malformed_octet_string_or_timestamp_val_fails_the_build() {
+    for doi in [
+        r#"<DAI name="raw"><Val>DEADBEEF!</Val></DAI>"#,
+        r#"<DAI name="t"><Val>31.12.2007 21:01</Val></DAI>"#,
+    ] {
+        assert!(try_build(&octet_time_scl(doi)).is_err(), "{doi} accepted");
+    }
+}
