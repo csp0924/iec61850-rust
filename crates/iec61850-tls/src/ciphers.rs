@@ -13,11 +13,15 @@ use rustls::SupportedCipherSuite;
 /// TLS 1.2 suites permitted by IEC 62351-3, narrowed to what the rustls ring
 /// provider implements.
 ///
-/// Annex B also names the DHE_RSA suites; ring provides no finite-field
-/// Diffie-Hellman, so only the ECDHE suites appear here.
+/// Holds the ECDHE_RSA and ECDHE_ECDSA suites with AES-GCM, so a peer with an
+/// RSA or an ECDSA certificate can negotiate TLS 1.2. Annex B also names the
+/// DHE_RSA suites; ring provides no finite-field Diffie-Hellman, so they are
+/// absent.
 pub const IEC62351_3_TLS12_CIPHERS: &[SupportedCipherSuite] = &[
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 ];
 
 /// TLS 1.3 suites permitted by IEC 62351-3.
@@ -30,6 +34,8 @@ pub const IEC62351_3_TLS13_CIPHERS: &[SupportedCipherSuite] = &[
 pub const IEC62351_3_ALL_CIPHERS: &[SupportedCipherSuite] = &[
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
     rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
     rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
 ];

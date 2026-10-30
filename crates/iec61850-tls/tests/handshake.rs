@@ -1,0 +1,255 @@
+//! End-to-end handshakes over TCP between configurations built by
+//! `TlsConfigBuilder`.
+
+use std::time::Duration;
+
+use iec61850_tls::{
+    TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsVersion, IEC62351_3_TLS12_CIPHERS,
+};
+use rcgen::{
+    BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
+};
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+// -----------------------------------------------------------------------------
+// PKI helpers
+// -----------------------------------------------------------------------------
+
+/// RSA 2048 key; ring cannot generate RSA keys.
+const RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDkbAV8LZqTrC1s
+BlffbRZxLcmN6zzuL8fmpEFEi2mOVfAQnkZZh88nS32Tj8KrMVG/1EAljATOPXez
+DukEU/UFna+xk1TP+HjqPhfDLIJdZKmTSQYLJpQz2R2eR2RPGir6MSSgguRynXwF
+3BzcmOfxkapyipQBMkCahV83P7YQFE6drRiQojLX9wAW6I1bLzgyLjD/c1EmnQ0B
+ZYQL6ZHa1NbgxCOCojqLVtgjBwgPW5zF4yHrmY+yTYxdwiQqxwi0TlgAbY2AJu2k
+qDQMwOEGglTsX/M96OqkUfGf5fs8tf82NJgxITX5glQOQ5TP9B+3KpIcYUEu6VOZ
+V6oxwHqFAgMBAAECggEADBEAwSyPi9l+lMRJBA55LwViLlMM5vAzOSXYJMzQiKpV
+gis6QCSCdurv+UmQ2QZD8UQ/FzysTFDG7/iLqqTcvq0zyMelpU7U5FrfWnoRcOmO
+Y69p2FDzZ0HC5MeUrvEM8CaEbs47TyqukIiuJaEWL5aoUGCtrNqAuyjsfLiq33J5
+l7DIKXndpI9La5BtJDi1OclISI+VObHPsJjRPZ1zRmV+y2mxmbeCXqU7kG65UQtS
+AymzCtZjHzIzvMLocyxhN8u3czTQA18jojG4F3o6XQVLjzriKzKfLEyPcL/d7LEh
+r9O2GzvuGMukbWtv7yKgHnwr3rxjIugdqxMZ+IckiQKBgQD+g/zKlcS3DNUBTlN3
+rBD9VNDaW/l5hd6aUrOutmGznH1At5GQBizqXptV+A4YD65kIqYQnC16T0KvpkSP
+Crj1SccBFsg1u7dbqijjqqjYgMLYf130Wo84F8/5zFDtWndLiDJIDh4blsCl+4JM
+ULbwK15jROxg1cc1rf3CrMEVBwKBgQDlwRL1hZXSR0rQk/HCq0i3NG9gQ1s+nR4t
+4fm4dpt4zSX0cs+1sVJBq4E5SDvNjqP5Te0w61eHlwCWsWEZCc9XSQk+cT4sIDDw
+FjNssJm+7ZfO6Q5QqoBq5r28Rv0es7qbWspqPl6MpvQrHGDCBXumqhgGZnLQuVFm
+TE+fYDz9EwKBgEWZzo2P+2Wbirx6sPSvB05f3WV5dXW4GDHXn++NTJaTmuURziq2
+pZ3KFWyjEyedUjFsEEHGk+E4v6HNND5xzja14Ef59PJMzU2x8NChoN7kB2SxH/5s
+rXHHgUZsi0z9SlZLfoSZ573fsfsyFmXMRNrU4VEATiwFCh8x341XNM4NAoGAEevV
+hsE8xoI5G7vuh7jEm0XDykZ2v5OR3xJZYEIgLnQSGdc6zHlgaS7vjYBM6ePOdovV
+jJNO6Iymxxpe8I0LV0ujJPPAXcDFEHUq3beIxpPR25niO/iQu8Xz1tPSuqpaS/Px
+BgiHZ4E+Wn6ELZ4v3vg1l4o2OoG6D7i0HUJsf3ECgYEAktf4+rXaJ5VTtVDBq93E
+Zwsl9xI1RIneJcvmAAq2vxKVggHctd7LoyKv8+xreBTkA8nkeenkwBlFDlVbR92Q
+WX803Btd4S1rdtDQ0+EVuPkAtDg1Y5LW7daGVM641wE2xQG8TbQUfJsBBPAR1OSk
+W/za9+XssFmMrTy9l8TLvII=
+-----END PRIVATE KEY-----";
+
+const SERVER_NAME: &str = "server.test";
+
+struct Ca {
+    cert: rcgen::Certificate,
+    key: KeyPair,
+}
+
+impl Ca {
+    fn new() -> Self {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let cert = params.self_signed(&key).unwrap();
+        Self { cert, key }
+    }
+
+    fn pem(&self) -> String {
+        self.cert.pem()
+    }
+
+    /// Issues a leaf for `name` with the given serial number.
+    fn leaf(&self, name: &str, serial: u64) -> Leaf {
+        self.issue(name, serial, LeafKind::default())
+    }
+
+    fn issue(&self, name: &str, serial: u64, kind: LeafKind) -> Leaf {
+        let key = if kind.rsa {
+            KeyPair::from_pem(RSA_KEY).unwrap()
+        } else {
+            KeyPair::generate().unwrap()
+        };
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.subject_alt_names = vec![SanType::DnsName(name.try_into().unwrap())];
+        params.serial_number = Some(SerialNumber::from(serial));
+        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
+        Leaf {
+            pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct LeafKind {
+    rsa: bool,
+}
+
+struct Leaf {
+    pem: String,
+    key_pem: String,
+}
+
+/// A server builder presenting `leaf`.
+fn server_with(leaf: &Leaf) -> TlsConfigBuilder {
+    TlsConfigBuilder::new()
+        .with_cert_pem(leaf.pem.as_bytes(), leaf.key_pem.as_bytes())
+        .unwrap()
+        .add_ca_pem(Ca::new().pem().as_bytes())
+        .unwrap()
+}
+
+/// A client builder trusting `ca`.
+fn client_trusting(ca: &Ca) -> TlsConfigBuilder {
+    TlsConfigBuilder::new()
+        .add_ca_pem(ca.pem().as_bytes())
+        .unwrap()
+}
+
+/// An RSA leaf for `name`, so TLS 1.2 handshakes do not depend on the ECDSA
+/// suites.
+fn rsa_leaf(ca: &Ca, name: &str) -> Leaf {
+    ca.issue(name, 1, LeafKind { rsa: true })
+}
+
+// -----------------------------------------------------------------------------
+// Handshake driver
+// -----------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ServerSide {}
+
+#[derive(Debug)]
+struct ClientSide {
+    version: Option<rustls::ProtocolVersion>,
+}
+
+/// Runs one handshake over loopback TCP, presenting `name` to the server, and
+/// exchanges one byte each way.
+async fn handshake_as(
+    acceptor: TlsAcceptor,
+    connector: &TlsConnector,
+    name: &str,
+) -> (Result<ServerSide, String>, Result<ClientSide, String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
+        let mut byte = [0u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.write_all(&byte).await.map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())?;
+        Ok(ServerSide {})
+    });
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from(name.to_string()).unwrap();
+    let client = match connector.connect(name, tcp).await {
+        Ok(mut stream) => {
+            let conn = stream.get_ref().1;
+            let version = conn.protocol_version();
+            async {
+                stream.write_all(&[7]).await?;
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                Ok::<_, std::io::Error>(())
+            }
+            .await
+            .map(|_| ClientSide { version })
+            .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    let server = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server task finishes")
+        .unwrap();
+    (server, client)
+}
+
+async fn handshake(
+    acceptor: TlsAcceptor,
+    connector: &TlsConnector,
+) -> (Result<ServerSide, String>, Result<ClientSide, String>) {
+    handshake_as(acceptor, connector, SERVER_NAME).await
+}
+
+// -----------------------------------------------------------------------------
+// Cipher whitelist
+// -----------------------------------------------------------------------------
+
+#[test]
+fn tls12_whitelist_holds_ecdhe_rsa_and_ecdhe_ecdsa_with_aes_gcm() {
+    use rustls::CipherSuite as S;
+    let suites: Vec<S> = IEC62351_3_TLS12_CIPHERS.iter().map(|s| s.suite()).collect();
+    assert_eq!(
+        suites,
+        vec![
+            S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ecdsa_certificate_negotiates_tls12() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&leaf)
+        .max_version(TlsVersion::Tls12)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca)
+        .max_version(TlsVersion::Tls12)
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok(), "server side: {srv:?}");
+    assert_eq!(
+        cli.expect("client side").version,
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+}
+
+#[tokio::test]
+async fn rsa_certificate_negotiates_tls12() {
+    let ca = Ca::new();
+    let leaf = rsa_leaf(&ca, SERVER_NAME);
+    let server = server_with(&leaf)
+        .max_version(TlsVersion::Tls12)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca)
+        .max_version(TlsVersion::Tls12)
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok(), "server side: {srv:?}");
+    assert_eq!(
+        cli.expect("client side").version,
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+}

@@ -15,9 +15,10 @@
 //!
 //! [`TlsEventHandler`] carries the 20 event codes of IEC 62351-3 §5.
 //! [`IEC62351_3_TLS12_CIPHERS`] and [`IEC62351_3_TLS13_CIPHERS`] are the
-//! whitelist itself; it contains only ECDHE_RSA with AES-GCM, because the
-//! rustls ring provider implements no finite-field DHE suite. Library code
-//! never panics; every failure path returns `Result<_, TlsError>`.
+//! whitelist itself; its TLS 1.2 part contains ECDHE_RSA and ECDHE_ECDSA with
+//! AES-GCM, because the rustls ring provider implements no finite-field DHE
+//! suite. Library code never panics; every failure path returns
+//! `Result<_, TlsError>`.
 
 pub mod acceptor;
 pub mod ciphers;

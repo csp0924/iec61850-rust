@@ -14,9 +14,9 @@ outright. `IgnoreValidityTimeServerVerifier` downgrades only expiry errors when
 validity-time checking is off, and still rejects every other chain error.
 `TlsEventHandler` carries the 20 event codes of IEC 62351-3. The constants
 `IEC62351_3_TLS12_CIPHERS` and `IEC62351_3_TLS13_CIPHERS` are the whitelist
-itself; it contains only ECDHE_RSA with AES-GCM, because the rustls ring
-provider implements no finite-field DHE suite. Library code never panics;
-every failure path returns `Result<_, TlsError>`.
+itself; its TLS 1.2 part contains ECDHE_RSA and ECDHE_ECDSA with AES-GCM,
+because the rustls ring provider implements no finite-field DHE suite. Library
+code never panics; every failure path returns `Result<_, TlsError>`.
 
 `iec61850-client` and `iec61850-server` reach this crate through their own
 `tls` features, so a caller normally enables TLS there rather than depending
