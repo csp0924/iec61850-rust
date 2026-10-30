@@ -212,9 +212,9 @@ impl OriginValue {
 
 /// Description of one control action, handed to the application callbacks.
 ///
-/// The fields are private with accessor methods. A callback records its outcome
-/// through `set_add_cause` and `set_error`; both are read when LastApplError is
-/// assembled.
+/// The fields are private with accessor methods. A callback receives the action
+/// by shared reference and reports its outcome through the `ControlAddCause` it
+/// returns.
 #[derive(Debug, Clone)]
 pub struct ControlAction {
     /// Command sequence number, the `ctlNum` attribute.
@@ -315,13 +315,28 @@ impl ControlAction {
         self.ctl_time_ms
     }
 
-    /// Records the additional cause a callback wants reported.
+    /// Records an additional cause on the action, which has no effect.
+    ///
+    /// The value is not reported to the client. A handler receives
+    /// `&ControlAction` and reports its cause through the `ControlAddCause` it
+    /// returns. The first call logs a warning.
     pub fn set_add_cause(&mut self, cause: ControlAddCause) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("ControlAction::set_add_cause has no effect; a handler reports its cause through the ControlAddCause it returns")
+        });
         self.add_cause = cause;
     }
 
-    /// Records the error code a callback wants reported.
+    /// Records an error code on the action, which has no effect.
+    ///
+    /// The value is not reported to the client, whose LastApplError the server
+    /// assembles. The first call logs a warning.
     pub fn set_error(&mut self, error: ControlLastApplError) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("ControlAction::set_error has no effect; the LastApplError a client receives is assembled by the server")
+        });
         self.error_code = error;
     }
 
