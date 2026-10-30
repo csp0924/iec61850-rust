@@ -107,7 +107,8 @@ pub struct GoosePdu {
     /// `[0x82]` datSet, the data set object reference.
     pub dat_set: String,
     /// `[0x83]` goID. The field is always present on the wire; when this is
-    /// `None`, `gocb_ref` is encoded in its place.
+    /// `None`, `gocb_ref` is encoded in its place. `decode_ber` always sets it,
+    /// since a PDU without goID is rejected.
     pub go_id: Option<String>,
     /// `[0x84]` t, a UTC time of exactly 8 bytes.
     pub t: [u8; 8],
@@ -615,7 +616,8 @@ impl GoosePdu {
     /// `TagDecode` when the outer tag is not `0x61`; `TruncatedInput` when a
     /// length reaches past the buffer; `InvalidStateNumber` for stNum 0;
     /// `InvalidTimestamp` when t is not 8 bytes; `MissingTimestamp` when t is
-    /// absent; `UnknownTag` naming any other missing mandatory member; and
+    /// absent; `UnknownTag` naming any other missing mandatory member, goID
+    /// among them, since only simulation and ndsCom have a default; and
     /// `DataSetLengthMismatch` when numDatSetEntries disagrees with allData.
     pub fn decode_ber(data: &[u8]) -> Result<GoosePdu, GooseError> {
         let total_len = data.len();
@@ -732,6 +734,10 @@ impl GoosePdu {
         let time_allowed_to_live =
             time_allowed_to_live.ok_or(GooseError::UnknownTag(TAG_TIME_ALLOWED))?;
         let dat_set = dat_set.ok_or(GooseError::UnknownTag(TAG_DAT_SET))?;
+        if go_id.is_none() {
+            tracing::warn!("goose pdu is missing goid");
+            return Err(GooseError::UnknownTag(TAG_GO_ID));
+        }
         let t = t.ok_or_else(|| {
             tracing::warn!("goose pdu is missing timestamp field t");
             GooseError::MissingTimestamp

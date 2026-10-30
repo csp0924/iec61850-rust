@@ -9,12 +9,11 @@
 //! consumes the receiver, so the subscriber list cannot be mutated while the
 //! receive thread walks it.
 //!
-//! Decoding is strict: an unknown PDU member tag, a timestamp that is not 8
-//! bytes, and an over-long object reference are all rejected, and every member
-//! length is checked against the PDU bounds before the value is read. Frames
-//! may be injected directly with `handle_message`, or read from an
-//! `EthernetSource` by `start_thread`. Both paths also sweep the subscribers
-//! for expired publications.
+//! The PDU is decoded by `GoosePdu::decode_ber`, so a frame reaches a
+//! subscriber only when every mandatory member is present, stNum is not 0, and
+//! numDatSetEntries matches allData. Frames may be injected directly with
+//! `handle_message`, or read from an `EthernetSource` by `start_thread`. Both
+//! paths also sweep the subscribers for expired publications.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,14 +21,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use iec61850_asn1::decode_length;
 use iec61850_hal::ethernet::{EthernetError, EthernetSource};
-use iec61850_model::MmsValue;
 
 use crate::error::GooseError;
 use crate::frame::GooseFrame;
 use crate::pdu::GoosePdu;
-use crate::subscriber::{GooseSubscriber, GooseSubscriberState, GOOSE_STRING_MAX_LEN};
+use crate::subscriber::{GooseSubscriber, GooseSubscriberState};
 
 /// Size of the receive buffer, the maximum untagged Ethernet frame.
 const ETH_BUFFER_LENGTH: usize = 1518;
@@ -203,7 +200,7 @@ impl GooseReceiver<Running> {
             return Ok(());
         };
 
-        let pdu_result = parse_goose_payload(&frame.pdu_bytes);
+        let pdu_result = GoosePdu::decode_ber(&frame.pdu_bytes);
 
         match pdu_result {
             Err(e) => {
@@ -224,15 +221,15 @@ impl GooseReceiver<Running> {
                 let state = GooseSubscriberState {
                     gocb_ref: parsed.gocb_ref.clone(),
                     dat_set: parsed.dat_set.clone(),
-                    go_id: parsed.go_id.clone(),
+                    go_id: parsed.go_id.clone().unwrap_or_default(),
                     time_allowed_to_live_ms: parsed.time_allowed_to_live,
                     st_num: parsed.st_num,
                     sq_num: parsed.sq_num,
                     conf_rev: parsed.conf_rev,
-                    timestamp_raw: parsed.timestamp_raw,
+                    timestamp_raw: parsed.t,
                     simulation: parsed.simulation,
                     nds_com: parsed.nds_com,
-                    dataset_values: parsed.dataset_values,
+                    dataset_values: parsed.all_data,
                     src_mac,
                     dst_mac,
                     vlan,
@@ -379,261 +376,6 @@ impl GooseReceiver<Idle> {
             running,
         }
     }
-}
-
-/// Fields decoded from a GOOSE PDU before they are turned into a subscriber
-/// state snapshot.
-#[derive(Debug)]
-struct ParsedGoosePdu {
-    gocb_ref: String,
-    dat_set: String,
-    go_id: String,
-    time_allowed_to_live: u32,
-    st_num: u32,
-    sq_num: u32,
-    conf_rev: u32,
-    timestamp_raw: [u8; 8],
-    simulation: bool,
-    nds_com: bool,
-    dataset_values: Vec<MmsValue>,
-}
-
-/// Decodes a GOOSE PDU starting at the outer `0x61` tag.
-///
-/// The cursor checks `pos + element_length <= end`
-/// before every member, so a length field that overstates the payload is
-/// rejected instead of read past.
-///
-/// # Errors
-///
-/// - `TagDecode` when the outer tag is not `0x61`.
-/// - `TruncatedInput` when a member reaches past the PDU.
-/// - `FieldTooLong` when gocbRef, datSet, or goID exceeds 129 bytes.
-/// - `TimestampBadLength` when the timestamp is not 8 bytes.
-/// - `UnknownTag` for any member tag not defined for the PDU.
-fn parse_goose_payload(buf: &[u8]) -> Result<ParsedGoosePdu, GooseError> {
-    let total = buf.len();
-    if total < 2 {
-        return Err(GooseError::TruncatedInput {
-            needed: 2,
-            available: total,
-        });
-    }
-
-    if buf[0] != 0x61 {
-        tracing::warn!("goose pdu outer tag is 0x{:02x}, expected 0x61", buf[0]);
-        return Err(GooseError::TagDecode);
-    }
-
-    let (goose_length, mut pos) = {
-        let mut tmp_pos = 1usize;
-        let (len, consumed) = decode_length(&buf[tmp_pos..])?;
-        tmp_pos += consumed;
-        (len, tmp_pos)
-    };
-
-    // The declared PDU length must fit the buffer.
-    let end = pos
-        .checked_add(goose_length)
-        .ok_or(GooseError::TruncatedInput {
-            needed: pos + goose_length,
-            available: total,
-        })?;
-    if end > total {
-        return Err(GooseError::TruncatedInput {
-            needed: end,
-            available: total,
-        });
-    }
-
-    let mut gocb_ref = String::new();
-    let mut dat_set = String::new();
-    let mut go_id = String::new();
-    let mut time_allowed_to_live = 0u32;
-    let mut st_num = 0u32;
-    let mut sq_num = 0u32;
-    let mut conf_rev = 0u32;
-    let mut timestamp_raw = [0u8; 8];
-    let mut has_timestamp = false;
-    let mut simulation = false;
-    let mut nds_com = false;
-    let mut _num_dataset_entries = 0u32;
-    let mut all_data_pos: Option<(usize, usize)> = None;
-
-    while pos < end {
-        // A member needs at least a tag and one length byte.
-        if pos + 2 > end {
-            break;
-        }
-        let tag = buf[pos];
-        pos += 1;
-
-        let (element_length, consumed) = decode_length(&buf[pos..])?;
-        pos += consumed;
-
-        if pos + element_length > end {
-            tracing::warn!(
-                "goose pdu tag 0x{:02x} element length {} reaches past the pdu",
-                tag,
-                element_length
-            );
-            return Err(GooseError::TruncatedInput {
-                needed: pos + element_length,
-                available: end,
-            });
-        }
-
-        let val_start = pos;
-        pos += element_length;
-
-        match tag {
-            0x80 => {
-                if element_length > GOOSE_STRING_MAX_LEN {
-                    tracing::warn!(
-                        "goose gocbref length {} exceeds the {} byte limit",
-                        element_length,
-                        GOOSE_STRING_MAX_LEN
-                    );
-                    return Err(GooseError::FieldTooLong(element_length));
-                }
-                gocb_ref = parse_ia5string(&buf[val_start..val_start + element_length])?;
-            }
-            0x81 => {
-                time_allowed_to_live = decode_uint32(&buf[val_start..val_start + element_length])?;
-            }
-            0x82 => {
-                if element_length > GOOSE_STRING_MAX_LEN {
-                    tracing::warn!(
-                        "goose datset length {} exceeds the {} byte limit",
-                        element_length,
-                        GOOSE_STRING_MAX_LEN
-                    );
-                    return Err(GooseError::FieldTooLong(element_length));
-                }
-                dat_set = parse_ia5string(&buf[val_start..val_start + element_length])?;
-            }
-            0x83 => {
-                if element_length > GOOSE_STRING_MAX_LEN {
-                    tracing::warn!(
-                        "goose goid length {} exceeds the {} byte limit",
-                        element_length,
-                        GOOSE_STRING_MAX_LEN
-                    );
-                    return Err(GooseError::FieldTooLong(element_length));
-                }
-                go_id = parse_ia5string(&buf[val_start..val_start + element_length])?;
-            }
-            0x84 => {
-                if element_length != 8 {
-                    tracing::warn!(
-                        "goose timestamp field is {} bytes, expected 8",
-                        element_length
-                    );
-                    return Err(GooseError::TimestampBadLength(element_length));
-                }
-                timestamp_raw.copy_from_slice(&buf[val_start..val_start + 8]);
-                has_timestamp = true;
-            }
-            0x85 => {
-                st_num = decode_uint32(&buf[val_start..val_start + element_length])?;
-            }
-            0x86 => {
-                sq_num = decode_uint32(&buf[val_start..val_start + element_length])?;
-            }
-            0x87 => {
-                if element_length < 1 {
-                    return Err(GooseError::LengthMismatch);
-                }
-                simulation = buf[val_start] != 0x00;
-            }
-            0x88 => {
-                conf_rev = decode_uint32(&buf[val_start..val_start + element_length])?;
-            }
-            0x89 => {
-                if element_length < 1 {
-                    return Err(GooseError::LengthMismatch);
-                }
-                nds_com = buf[val_start] != 0x00;
-            }
-            0x8a => {
-                _num_dataset_entries = decode_uint32(&buf[val_start..val_start + element_length])?;
-            }
-            0xab => {
-                // Decoded after the loop, once the whole member is bounded.
-                all_data_pos = Some((val_start, element_length));
-            }
-            other => {
-                tracing::warn!("goose pdu rejected unknown tag 0x{:02x}", other);
-                return Err(GooseError::UnknownTag(other));
-            }
-        }
-    }
-
-    // A publication without tag 0x84 is reported and its timestamp stays zero.
-    if !has_timestamp {
-        tracing::warn!(
-            "goose pdu gocbref={:?} has no timestamp field, using zero",
-            gocb_ref
-        );
-    }
-
-    let dataset_values = if let Some((start, length)) = all_data_pos {
-        decode_all_data(&buf[start..start + length])?
-    } else {
-        Vec::new()
-    };
-
-    Ok(ParsedGoosePdu {
-        gocb_ref,
-        dat_set,
-        go_id,
-        time_allowed_to_live,
-        st_num,
-        sq_num,
-        conf_rev,
-        timestamp_raw,
-        simulation,
-        nds_com,
-        dataset_values,
-    })
-}
-
-/// Decodes an IA5String field.
-///
-/// # Errors
-///
-/// Returns `FieldTooLong` when the bytes are not valid UTF-8.
-fn parse_ia5string(bytes: &[u8]) -> Result<String, GooseError> {
-    // IA5String is an ASCII subset, so UTF-8 validation accepts it.
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| GooseError::FieldTooLong(bytes.len()))
-}
-
-/// Decodes an unsigned integer of at most 4 BER content bytes.
-///
-/// # Errors
-///
-/// Returns `LengthMismatch` when the field is empty or wider than 4 bytes.
-fn decode_uint32(bytes: &[u8]) -> Result<u32, GooseError> {
-    if bytes.is_empty() || bytes.len() > 4 {
-        return Err(GooseError::LengthMismatch);
-    }
-    let mut val = 0u32;
-    for &b in bytes {
-        val = (val << 8) | (b as u32);
-    }
-    Ok(val)
-}
-
-/// Decodes the content bytes of the allData member.
-fn decode_all_data(bytes: &[u8]) -> Result<Vec<MmsValue>, GooseError> {
-    decode_data_sequence(bytes)
-}
-
-/// Decodes the SEQUENCE OF Data inside allData.
-fn decode_data_sequence(bytes: &[u8]) -> Result<Vec<MmsValue>, GooseError> {
-    crate::pdu::decode_all_data_bytes(bytes)
 }
 
 /// Decodes a complete Ethernet frame into a `GoosePdu`.
@@ -1045,7 +787,7 @@ mod tests {
         let frame_bytes = buf.to_vec();
 
         // Skip the 14 Ethernet and 8 GOOSE header bytes.
-        let result = parse_goose_payload(&frame_bytes[22..]);
+        let result = GoosePdu::decode_ber(&frame_bytes[22..]);
         assert!(
             result.is_err(),
             "an out-of-bounds element length returns err without panicking"
@@ -1074,7 +816,7 @@ mod tests {
         }
         buf.extend_from_slice(&inner);
 
-        let result = parse_goose_payload(&buf);
+        let result = GoosePdu::decode_ber(&buf);
         assert!(
             matches!(result, Err(GooseError::FieldTooLong(130))),
             "an over-long gocbref returns fieldtoolong, got {:?}",
