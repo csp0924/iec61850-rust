@@ -69,7 +69,7 @@ pub enum AcsiClass {
     Lcb,
     /// Logs, read from the server as domain journals.
     Log,
-    /// Setting group control block, always looked up as `LLN0$SP$SGCB`.
+    /// Setting group control block, found only in LLN0 as `LLN0$SP$SGCB`.
     Sgcb,
     /// GOOSE control blocks (FC = GO).
     GoCb,
@@ -423,8 +423,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
                 }
             }
             AcsiClass::Sgcb => {
-                // The SGCB always lives at `LLN0$SP$SGCB`, whatever the LN asked for.
-                if vars.iter().any(|v| v == "LLN0$SP$SGCB") {
+                // A logical device has at most one SGCB, and it lives in LLN0.
+                if ln_name == "LLN0" && vars.iter().any(|v| v == "LLN0$SP$SGCB") {
                     out.push("SGCB".to_string());
                 }
             }

@@ -10,7 +10,7 @@ mod support;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use iec61850_client::{ClientError, IedConnection};
+use iec61850_client::{AcsiClass, ClientError, IedConnection};
 use iec61850_mms::mms::pdu::get_name_list::{
     decode_confirmed_get_name_list_request, encode_confirmed_get_name_list_response,
     GetNameListResponse, ObjectScope,
@@ -95,6 +95,23 @@ async fn connect(domain: &'static str) -> IedConnection {
     );
     conn.connect("127.0.0.1", port).await.expect("connect");
     conn
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sgcb_is_listed_only_in_lln0() {
+    let conn = connect("MODEL").await;
+    assert_eq!(
+        conn.get_logical_node_directory("MODEL/LLN0", AcsiClass::Sgcb)
+            .await
+            .expect("lln0 directory"),
+        vec!["SGCB".to_string()]
+    );
+    assert_eq!(
+        conn.get_logical_node_directory("MODEL/GGIO1", AcsiClass::Sgcb)
+            .await
+            .expect("ggio1 directory"),
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
