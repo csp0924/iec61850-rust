@@ -371,6 +371,28 @@ impl ReadHandler for Deny {
 
 // ── GetNameList paging ──────────────────────────────────────────────────
 
+/// A continueAfter name that is not in the list resumes at the next name in
+/// order instead of failing the enumeration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_name_list_resumes_after_an_absent_name() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let all = all_names(&mut c).await;
+    let (page, _) = names(&mut c, Some("GGIO1$ST$Ind1$zz")).await;
+    let expected: Vec<String> = all
+        .iter()
+        .filter(|n| n.as_str() > "GGIO1$ST$Ind1$zz")
+        .cloned()
+        .collect();
+    assert_eq!(page.first(), expected.first());
+    assert!(!page.is_empty());
+    let (control, _) = names(&mut c, Some("GGIO1$ST$Ind1$stVal")).await;
+    assert_eq!(control.first(), expected.first());
+    handle.stop().await;
+}
+
 // ── specificationWithResult ─────────────────────────────────────────────
 
 fn read_request(spec: VariableAccessSpecification, with_result: bool) -> ReadRequest {

@@ -5,10 +5,11 @@
 //! named-variable names are sorted alphabetically before paging, so the order a
 //! client sees does not depend on the order the model was built in.
 //!
-//! Paging starts at the name after `continueAfter`, which is itself excluded,
-//! and returns at most `PAGE_SIZE` names; anything left sets `more_follows`. A
-//! `continueAfter` that is not in the list, and a domain that does not exist,
-//! are both answered with object-non-existent.
+//! Paging starts at the first name that sorts after `continueAfter`, and
+//! returns at most `PAGE_SIZE` names; anything left sets `more_follows`. The
+//! `continueAfter` name itself need not be in the list, so a client keeps
+//! paging when the name it stopped at has since been deleted. A domain that
+//! does not exist is answered with object-non-existent.
 
 #[cfg(not(feature = "std"))]
 use alloc::string::{String, ToString};
@@ -30,7 +31,7 @@ const PAGE_SIZE: usize = 100;
 pub enum GetNameListResult {
     /// One page of names, together with the `more_follows` flag.
     Response(GetNameListResponse),
-    /// The named domain does not exist, or `continueAfter` is not in the list.
+    /// The named domain does not exist.
     ///
     /// Maps to the MMS object-non-existent error.
     NotFound,
@@ -83,17 +84,7 @@ pub fn handle_get_name_list_with_extras(
         );
         return GetNameListResult::NotFound;
     };
-    match merged_page(names, extras, req.continue_after.as_deref()) {
-        Some(resp) => GetNameListResult::Response(resp),
-        None => {
-            tracing::warn!(
-                domain = %domain,
-                continue_after = ?req.continue_after,
-                "get-name-list: continueAfter is not in the name list, answering object-non-existent"
-            );
-            GetNameListResult::NotFound
-        }
-    }
+    GetNameListResult::Response(merged_page(names, extras, req.continue_after.as_deref()))
 }
 
 /// Answers a GetNameList request with one page of names.
@@ -107,16 +98,7 @@ pub fn handle_get_name_list(model: &MmsDeviceModel, req: &GetNameListRequest) ->
         // alphabetically per IEC 61850-8-1 §9.2.
         (ObjectClass::Domain, ObjectScope::VmdSpecific) => {
             let domains: Vec<String> = model.list_domains().map(|s| s.to_string()).collect();
-            match merged_page(domains, &[], req.continue_after.as_deref()) {
-                Some(resp) => GetNameListResult::Response(resp),
-                None => {
-                    tracing::warn!(
-                        continue_after = ?req.continue_after,
-                        "get-name-list: continueAfter is not in the domain list, answering object-non-existent"
-                    );
-                    GetNameListResult::NotFound
-                }
-            }
+            GetNameListResult::Response(merged_page(domains, &[], req.continue_after.as_deref()))
         }
 
         // The reply carries every component path of the domain flattened out
@@ -131,17 +113,7 @@ pub fn handle_get_name_list(model: &MmsDeviceModel, req: &GetNameListRequest) ->
                 );
                 return GetNameListResult::NotFound;
             };
-            match merged_page(names, &[], req.continue_after.as_deref()) {
-                Some(resp) => GetNameListResult::Response(resp),
-                None => {
-                    tracing::warn!(
-                        domain = %domain,
-                        continue_after = ?req.continue_after,
-                        "get-name-list: continueAfter is not in the name list, answering object-non-existent"
-                    );
-                    GetNameListResult::NotFound
-                }
-            }
+            GetNameListResult::Response(merged_page(names, &[], req.continue_after.as_deref()))
         }
 
         // An IEC 61850 model holds no VMD-scope named variables.
@@ -233,44 +205,39 @@ pub fn handle_get_name_list(model: &MmsDeviceModel, req: &GetNameListRequest) ->
 ///
 /// A name already in `names` is not repeated, so a control block or data set
 /// that both the model declares and the runtime registers appears once.
-/// `None` means `continue_after` is not in the merged list, which the caller
-/// reports as object-non-existent.
 fn merged_page(
     mut names: Vec<String>,
     extras: &[String],
     continue_after: Option<&str>,
-) -> Option<GetNameListResponse> {
-    for e in extras {
-        if !names.iter().any(|n| n == e) {
-            names.push(e.clone());
-        }
-    }
+) -> GetNameListResponse {
+    names.extend(extras.iter().cloned());
     names.sort_unstable();
-    let (identifiers, more_follows) = paginate(names, continue_after)?;
-    Some(GetNameListResponse {
+    names.dedup();
+    let (identifiers, more_follows) = paginate(names, continue_after);
+    GetNameListResponse {
         identifiers,
         more_follows,
-    })
+    }
 }
 
-/// Takes at most `PAGE_SIZE` names starting after `continue_after`, which is
-/// itself excluded.
+/// Takes at most `PAGE_SIZE` names of a sorted list, starting at the first
+/// name that sorts after `continue_after`.
 ///
 /// Returns the page and whether more names remain. `None` for `continue_after`
-/// starts at the beginning. A `continue_after` that is not in the list yields
-/// `None`, which the caller reports as object-non-existent, rather than
-/// silently restarting from the beginning.
-fn paginate(names: Vec<String>, continue_after: Option<&str>) -> Option<(Vec<String>, bool)> {
+/// starts at the beginning. The cursor need not be in the list: ISO 9506-1
+/// defines it as a position in the ordering, so a name deleted between two
+/// pages does not end the enumeration.
+fn paginate(names: Vec<String>, continue_after: Option<&str>) -> (Vec<String>, bool) {
     let start_idx = match continue_after {
         None => 0,
-        Some(ca) => names.iter().position(|n| n == ca).map(|i| i + 1).or(None)?,
+        Some(ca) => names.partition_point(|n| n.as_str() <= ca),
     };
 
     let remaining = &names[start_idx..];
     if remaining.len() <= PAGE_SIZE {
-        Some((remaining.to_vec(), false))
+        (remaining.to_vec(), false)
     } else {
-        Some((remaining[..PAGE_SIZE].to_vec(), true))
+        (remaining[..PAGE_SIZE].to_vec(), true)
     }
 }
 
@@ -679,8 +646,7 @@ mod tests {
     fn merged_page_continue_after_an_extra_resumes_into_the_model_names() {
         let names = owned(&["LLN0", "MMXU1"]);
         let extras = owned(&["LLN0$RP$urcb1"]);
-        let resp = merged_page(names, &extras, Some("LLN0$RP$urcb1"))
-            .expect("a continueAfter that is in the union must produce a page");
+        let resp = merged_page(names, &extras, Some("LLN0$RP$urcb1"));
         assert_eq!(resp.identifiers, owned(&["MMXU1"]));
         assert!(!resp.more_follows);
     }
@@ -691,8 +657,7 @@ mod tests {
     fn merged_page_continue_after_a_model_name_resumes_into_the_extras() {
         let names = owned(&["LLN0", "MMXU1"]);
         let extras = owned(&["LLN0$RP$urcb1", "MMXU1$BR$brcb1"]);
-        let resp = merged_page(names, &extras, Some("MMXU1"))
-            .expect("a continueAfter that is in the union must produce a page");
+        let resp = merged_page(names, &extras, Some("MMXU1"));
         assert_eq!(resp.identifiers, owned(&["MMXU1$BR$brcb1"]));
         assert!(!resp.more_follows);
     }
@@ -708,7 +673,7 @@ mod tests {
         let extras: Vec<String> = (1..105).step_by(2).map(|i| format!("N{i:03}")).collect();
         assert_eq!(names.len() + extras.len(), PAGE_SIZE + 5);
 
-        let first = merged_page(names.clone(), &extras, None).expect("the first page");
+        let first = merged_page(names.clone(), &extras, None);
         assert_eq!(first.identifiers.len(), PAGE_SIZE);
         assert!(
             first.more_follows,
@@ -716,7 +681,7 @@ mod tests {
         );
 
         let last = first.identifiers.last().unwrap().clone();
-        let second = merged_page(names, &extras, Some(&last)).expect("the second page");
+        let second = merged_page(names, &extras, Some(&last));
         assert_eq!(
             second.identifiers,
             owned(&["N100", "N101", "N102", "N103", "N104"])
@@ -739,7 +704,7 @@ mod tests {
     fn merged_page_sorts_a_log_control_block_name_among_the_model_names() {
         let names = owned(&["LLN0", "MMXU1"]);
         let extras = owned(&["LLN0$LG$evlog"]);
-        let resp = merged_page(names, &extras, None).expect("a page");
+        let resp = merged_page(names, &extras, None);
         assert_eq!(resp.identifiers, owned(&["LLN0", "LLN0$LG$evlog", "MMXU1"]));
         assert!(!resp.more_follows);
     }
@@ -749,7 +714,7 @@ mod tests {
     fn merged_page_does_not_repeat_a_name_present_in_both_sources() {
         let names = owned(&["LLN0", "LLN0$RP$urcb1"]);
         let extras = owned(&["LLN0$RP$urcb1", "LLN0$RP$urcb1"]);
-        let resp = merged_page(names, &extras, None).expect("a page");
+        let resp = merged_page(names, &extras, None);
         assert_eq!(resp.identifiers, owned(&["LLN0", "LLN0$RP$urcb1"]));
     }
 
@@ -843,8 +808,7 @@ mod tests {
     #[test]
     fn paginate_no_continue_after() {
         let names: Vec<String> = (0..5).map(|i| format!("N{}", i)).collect();
-        let result = paginate(names.clone(), None);
-        let (page, more) = result.expect("an absent continueAfter must page from the start");
+        let (page, more) = paginate(names.clone(), None);
         assert_eq!(page, names);
         assert!(!more);
     }
@@ -857,62 +821,64 @@ mod tests {
             "C".to_string(),
             "D".to_string(),
         ];
-        let result = paginate(names, Some("B"));
-        let (page, more) = result.expect("a continueAfter that exists must produce a page");
+        let (page, more) = paginate(names, Some("B"));
         assert_eq!(page, vec!["C".to_string(), "D".to_string()]);
         assert!(!more);
     }
 
-    // ── An unknown continueAfter answers object-non-existent ────────────
+    // ── A continueAfter that is not in the list ─────────────────────────
     //
-    // Paging yields None rather than restarting from the beginning, and the
-    // caller turns that into object-non-existent.
+    // Paging resumes at the first name that sorts after the cursor, whether or
+    // not the cursor itself is still listed.
 
     #[test]
-    fn paginate_continue_after_nonexistent_returns_none() {
-        let names = vec!["A".to_string(), "B".to_string()];
-        let result = paginate(names, Some("NOTEXIST"));
-        assert!(
-            result.is_none(),
-            "an unknown continueAfter must yield None, not a page from the start"
-        );
+    fn paginate_continue_after_absent_name_resumes_at_the_next_in_order() {
+        let names = vec!["A".to_string(), "C".to_string(), "D".to_string()];
+        let (page, more) = paginate(names, Some("B"));
+        assert_eq!(page, vec!["C".to_string(), "D".to_string()]);
+        assert!(!more);
     }
 
     #[test]
-    fn gnl_domain_continue_after_nonexistent_returns_not_found() {
+    fn paginate_continue_after_past_the_end_yields_an_empty_page() {
+        let names = vec!["A".to_string(), "B".to_string()];
+        let (page, more) = paginate(names, Some("Z"));
+        assert!(page.is_empty());
+        assert!(!more);
+    }
+
+    #[test]
+    fn gnl_domain_continue_after_absent_name_answers_a_page() {
         let (_model, mms_model) = build_test_model();
         let req = GetNameListRequest {
             object_class: ObjectClass::NamedVariable,
             object_scope: ObjectScope::DomainSpecific("IED1LD0".to_string()),
-            continue_after: Some("NOTEXIST".to_string()),
+            continue_after: Some("A".to_string()),
         };
-        let result = handle_get_name_list(&mms_model, &req);
-        assert!(
-            matches!(result, GetNameListResult::NotFound),
-            "an unknown continueAfter must answer NotFound"
-        );
+        let GetNameListResult::Response(resp) = handle_get_name_list(&mms_model, &req) else {
+            panic!("a continueAfter that is not listed must still answer a page");
+        };
+        assert_eq!(resp.identifiers.first().map(String::as_str), Some("LLN0"));
     }
 
     #[test]
-    fn gnl_vmd_domain_continue_after_nonexistent_returns_not_found() {
+    fn gnl_vmd_domain_continue_after_absent_name_answers_a_page() {
         let (_model, mms_model) = build_test_model();
         let req = GetNameListRequest {
             object_class: ObjectClass::Domain,
             object_scope: ObjectScope::VmdSpecific,
-            continue_after: Some("NOTEXIST".to_string()),
+            continue_after: Some("A".to_string()),
         };
-        let result = handle_get_name_list(&mms_model, &req);
-        assert!(
-            matches!(result, GetNameListResult::NotFound),
-            "an unknown continueAfter in a vmd-scope list must answer NotFound"
-        );
+        let GetNameListResult::Response(resp) = handle_get_name_list(&mms_model, &req) else {
+            panic!("a continueAfter that is not listed must still answer a page");
+        };
+        assert_eq!(resp.identifiers, vec!["IED1LD0".to_string()]);
     }
 
     #[test]
     fn paginate_more_follows_when_exceeds_page_size() {
         let names: Vec<String> = (0..=PAGE_SIZE).map(|i| format!("N{:03}", i)).collect();
-        let result = paginate(names, None);
-        let (page, more) = result.expect("paging from the start must produce a page");
+        let (page, more) = paginate(names, None);
         assert_eq!(page.len(), PAGE_SIZE);
         assert!(more, "a list longer than one page must set more_follows");
     }

@@ -647,7 +647,7 @@ fn dispatch_get_name_list(
         GetNameListResult::NotFound => {
             tracing::warn!(
                 invoke_id,
-                "get-name-list: unknown domain or continueAfter, answering object-non-existent"
+                "get-name-list: unknown domain, answering object-non-existent"
             );
             make_confirmed_error(invoke_id, ErrorClass::Access(access::OBJECT_NON_EXISTENT))
         }
