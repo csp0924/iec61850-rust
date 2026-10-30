@@ -609,23 +609,34 @@ fn encode_mms_value_to_bytes(v: &MmsValue) -> Bytes {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handles a write to `$CO$<DO>$Cancel`.
+///
+/// A value that does not parse as a Cancel structure is refused with
+/// `InconsistentParameters` and cancels nothing.
 pub fn handle_cancel(obj: &ControlObject, conn_id: u64, raw_value: &MmsValue) -> ServiceResult {
-    // Parameters that do not parse are reported, and the cancel is still attempted.
     if CancelParams::from_mms_value(raw_value).is_none() {
-        tracing::warn!(
-            name = %obj.config.name,
-            "cancel parameters did not parse, attempting the cancel anyway"
-        );
+        tracing::warn!(name = %obj.config.name, "cancel refused: parameters did not parse");
+        return ServiceResult::Failure(ControlAddCause::InconsistentParameters);
     }
+    match cancel(obj, conn_id) {
+        Ok(()) => ServiceResult::Success,
+        Err(cause) => ServiceResult::Failure(cause),
+    }
+}
 
+/// Runs a Cancel whose parameters have been parsed.
+///
+/// # Errors
+///
+/// Returns the add cause of a refusal.
+pub(crate) fn cancel(obj: &ControlObject, conn_id: u64) -> Result<(), ControlAddCause> {
     match obj.try_cancel(conn_id) {
         CancelResult::Accepted => {
             tracing::debug!(name = %obj.config.name, conn_id, "cancel accepted");
-            ServiceResult::Success
+            Ok(())
         }
         CancelResult::Denied(cause) => {
             tracing::warn!(name = %obj.config.name, ?cause, conn_id, "cancel refused");
-            ServiceResult::Failure(cause)
+            Err(cause)
         }
     }
 }

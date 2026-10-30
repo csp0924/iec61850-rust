@@ -392,7 +392,8 @@ impl OperParams {
     /// seven-element form.
     ///
     /// Returns `None` when the value is not a structure of six or seven elements,
-    /// or when a member has the wrong type.
+    /// when a member has the wrong type, when `ctlNum` lies outside the INT8U
+    /// range, or when `Check` carries fewer than two bits.
     pub fn from_mms_value(v: &MmsValue) -> Option<Self> {
         let fields = match v {
             MmsValue::Structure(f) => f,
@@ -418,15 +419,11 @@ impl OperParams {
 
         let origin = OriginValue::from_mms_value(&fields[base + 1])?;
 
-        let ctl_num = match &fields[base + 2] {
-            MmsValue::Unsigned(n) => *n as u8,
-            MmsValue::Integer(n) => *n as u8,
-            _ => return None,
-        };
+        let ctl_num = ctl_num_from_mms_value(&fields[base + 2])?;
 
         let t = match &fields[base + 3] {
             MmsValue::UtcTime(b) => *b,
-            _ => [0u8; 8],
+            _ => return None,
         };
 
         let test = match &fields[base + 4] {
@@ -436,11 +433,13 @@ impl OperParams {
 
         let (synchro_check, interlock_check) = match &fields[base + 5] {
             // Check is a two-bit BIT STRING: bit 0 is synchroCheck, bit 1 interlockCheck.
-            MmsValue::BitString { data, .. } if !data.is_empty() => {
+            MmsValue::BitString { padding, data }
+                if bit_string_len(*padding, data).is_some_and(|bits| bits >= 2) =>
+            {
                 let byte = data[0];
                 (byte & 0x80 != 0, byte & 0x40 != 0)
             }
-            _ => (false, false),
+            _ => return None,
         };
 
         Some(Self {
@@ -456,47 +455,55 @@ impl OperParams {
     }
 }
 
-/// Parameters of a Cancel request, a structure of five or six elements.
+/// Parameters of a Cancel request.
+///
+/// The wire structure has five elements, or six when `operTm` is present as
+/// element 1, which moves every later element up by one.
 #[derive(Debug, Clone)]
 pub struct CancelParams {
     /// Control value, element 0.
     pub ctl_val: Option<MmsValue>,
-    /// Origin, element 1.
+    /// Origin, element 1 or 2.
     pub origin: OriginValue,
-    /// Command sequence number, element 2.
+    /// Command sequence number, element 2 or 3.
     pub ctl_num: u8,
-    /// Timestamp, element 3, as eight UTC_TIME bytes.
+    /// Timestamp, element 3 or 4, as eight UTC_TIME bytes.
     pub t: [u8; 8],
-    /// Test flag, element 4.
+    /// Test flag, element 4 or 5.
     pub test: bool,
 }
 
 impl CancelParams {
-    /// Parses a Cancel from its MMS structure.
+    /// Parses a Cancel from its MMS structure, in either the five- or
+    /// six-element form.
     ///
     /// Returns `None` when the value is not a structure of five or six elements,
-    /// or when a member has the wrong type.
+    /// when a member has the wrong type, or when `ctlNum` lies outside the INT8U
+    /// range.
     pub fn from_mms_value(v: &MmsValue) -> Option<Self> {
         let fields = match v {
             MmsValue::Structure(f) => f,
             _ => return None,
         };
-        if fields.len() < 5 || fields.len() > 6 {
-            return None;
-        }
-
-        let ctl_val = Some(fields[0].clone());
-        let origin = OriginValue::from_mms_value(&fields[1])?;
-        let ctl_num = match &fields[2] {
-            MmsValue::Unsigned(n) => *n as u8,
-            MmsValue::Integer(n) => *n as u8,
+        let base = match fields.len() {
+            5 => 0usize,
+            6 => {
+                if !matches!(fields[1], MmsValue::UtcTime(_)) {
+                    return None;
+                }
+                1usize
+            }
             _ => return None,
         };
-        let t = match &fields[3] {
+
+        let ctl_val = Some(fields[0].clone());
+        let origin = OriginValue::from_mms_value(&fields[base + 1])?;
+        let ctl_num = ctl_num_from_mms_value(&fields[base + 2])?;
+        let t = match &fields[base + 3] {
             MmsValue::UtcTime(b) => *b,
-            _ => [0u8; 8],
+            _ => return None,
         };
-        let test = match &fields[4] {
+        let test = match &fields[base + 4] {
             MmsValue::Boolean(b) => *b,
             _ => return None,
         };
@@ -509,6 +516,24 @@ impl CancelParams {
             test,
         })
     }
+}
+
+/// Reads `ctlNum`, an INT8U, refusing a value outside 0..=255.
+fn ctl_num_from_mms_value(v: &MmsValue) -> Option<u8> {
+    match v {
+        MmsValue::Unsigned(n) => u8::try_from(*n).ok(),
+        MmsValue::Integer(n) => u8::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+/// Returns the number of bits a BIT STRING carries, or `None` when the padding
+/// is not 0..=7 or is set on an empty string.
+pub(crate) fn bit_string_len(padding: u8, data: &[u8]) -> Option<usize> {
+    if padding > 7 || (data.is_empty() && padding != 0) {
+        return None;
+    }
+    Some(data.len() * 8 - padding as usize)
 }
 
 /// Converts a UTC_TIME value to milliseconds.
@@ -761,6 +786,101 @@ mod tests {
         assert_eq!(action.ctl_num(), 2);
         assert!(action.test());
         assert!(action.interlock_check());
+    }
+
+    fn six_element_oper(ctl_num: MmsValue, t: MmsValue, check: MmsValue) -> MmsValue {
+        MmsValue::Structure(vec![
+            MmsValue::Boolean(true),
+            MmsValue::Structure(vec![MmsValue::Integer(0), MmsValue::OctetString(vec![])]),
+            ctl_num,
+            t,
+            MmsValue::Boolean(false),
+            check,
+        ])
+    }
+
+    fn check_bits() -> MmsValue {
+        MmsValue::BitString {
+            padding: 6,
+            data: vec![0x40],
+        }
+    }
+
+    #[test]
+    fn oper_params_refuse_ctl_num_outside_int8u() {
+        let v = six_element_oper(
+            MmsValue::Unsigned(300),
+            MmsValue::UtcTime([0; 8]),
+            check_bits(),
+        );
+        assert!(OperParams::from_mms_value(&v).is_none());
+        let v = six_element_oper(
+            MmsValue::Integer(-1),
+            MmsValue::UtcTime([0; 8]),
+            check_bits(),
+        );
+        assert!(OperParams::from_mms_value(&v).is_none());
+        let v = six_element_oper(
+            MmsValue::Unsigned(255),
+            MmsValue::UtcTime([0; 8]),
+            check_bits(),
+        );
+        assert_eq!(OperParams::from_mms_value(&v).expect("255").ctl_num, 255);
+    }
+
+    #[test]
+    fn oper_params_refuse_t_of_the_wrong_type() {
+        let v = six_element_oper(MmsValue::Unsigned(1), MmsValue::Integer(0), check_bits());
+        assert!(OperParams::from_mms_value(&v).is_none());
+    }
+
+    #[test]
+    fn oper_params_refuse_a_missing_or_short_check() {
+        let v = six_element_oper(
+            MmsValue::Unsigned(1),
+            MmsValue::UtcTime([0; 8]),
+            MmsValue::Boolean(false),
+        );
+        assert!(OperParams::from_mms_value(&v).is_none());
+        let empty = MmsValue::BitString {
+            padding: 0,
+            data: vec![],
+        };
+        let v = six_element_oper(MmsValue::Unsigned(1), MmsValue::UtcTime([0; 8]), empty);
+        assert!(OperParams::from_mms_value(&v).is_none());
+    }
+
+    #[test]
+    fn cancel_params_parse_6_elements_with_oper_tm() {
+        let v = MmsValue::Structure(vec![
+            MmsValue::Boolean(false),
+            MmsValue::UtcTime([0, 0, 0, 60, 0, 0, 0, 0]),
+            MmsValue::Structure(vec![
+                MmsValue::Integer(2),
+                MmsValue::OctetString(vec![0x0a]),
+            ]),
+            MmsValue::Unsigned(4),
+            MmsValue::UtcTime([0u8; 8]),
+            MmsValue::Boolean(true),
+        ]);
+        let p = CancelParams::from_mms_value(&v).expect("six-element cancel");
+        assert_eq!(p.origin.or_cat, 2);
+        assert_eq!(p.ctl_num, 4);
+        assert!(p.test);
+    }
+
+    #[test]
+    fn cancel_params_refuse_a_malformed_structure() {
+        let two = MmsValue::Structure(vec![MmsValue::Integer(1), MmsValue::Boolean(true)]);
+        assert!(CancelParams::from_mms_value(&two).is_none());
+        let bad_t = MmsValue::Structure(vec![
+            MmsValue::Boolean(false),
+            MmsValue::Structure(vec![MmsValue::Integer(0), MmsValue::OctetString(vec![])]),
+            MmsValue::Unsigned(1),
+            MmsValue::Integer(0),
+            MmsValue::Boolean(false),
+        ]);
+        assert!(CancelParams::from_mms_value(&bad_t).is_none());
     }
 
     #[test]
