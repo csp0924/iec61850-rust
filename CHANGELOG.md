@@ -39,6 +39,12 @@ Every crate in the workspace shares one version number.
   `AlternateAccess::decode_with_negotiated_cap` lower the limit to the
   negotiated nesting level when that is smaller. `AlternateAccess::index_component`
   refuses a path of more than 32 segments, so every selector it builds decodes.
+- **`iec61850-mms`** — `parse_message` refuses a confirmed request on a
+  connection whose Initiate has not completed, answering
+  Reject(pdu-error/invalid-pdu) without calling the service dispatcher. An AARQ
+  whose user information carried a Confirmed-RequestPDU in place of the
+  Initiate-RequestPDU was otherwise served before any PDU size or
+  outstanding-request limit had been negotiated.
 
 ## [0.2.0] - 2026-09-06
 

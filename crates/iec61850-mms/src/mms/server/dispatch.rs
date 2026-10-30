@@ -11,6 +11,7 @@
 //!     |
 //!     +-- 0xa8: Initiate request -> MessageOutcome::SendInitiateResponse / SendInitiateError
 //!     +-- 0xa0: Confirmed request -> dispatcher.dispatch() -> SendResponse / SendError / SendReject
+//!     |         (before Initiate completes -> SendReject(invalid PDU))
 //!     +-- 0x8b: Conclude request -> SendConcludeResponse (caller marks concluded)
 //!     +-- 0xa4: Reject received -> ignored, logged at debug level
 //!     +-- 0x00: indefinite-length end tag -> ignored
@@ -28,6 +29,9 @@
 //! - An unrecognized PDU tag is answered with `Reject(unknown PDU type)`.
 //! - A request arriving while the connection blocks requests is answered with
 //!   `Reject(confirmedrequest/other)` and logged at warn level.
+//! - A confirmed request on a connection whose Initiate has not completed is
+//!   answered with `Reject(pdu-error/invalid-pdu)`, logged at warn level, and
+//!   never reaches the dispatcher.
 //! - An incoming `0xa4` Reject is logged at debug level and otherwise ignored:
 //!   answering a reject with a reject would loop between the two peers.
 //!
@@ -96,6 +100,8 @@ pub enum MessageOutcome {
 /// - fewer than 2 bytes, or a length that fails to decode, yields
 ///   Reject(pdu-error / invalid-pdu)
 /// - a blocked or already concluded connection yields Reject(other) and a warning
+/// - a confirmed request before Initiate completes yields
+///   Reject(pdu-error / invalid-pdu) and a warning, without calling `dispatcher`
 pub fn parse_message(
     conn: &MmsServerConnection,
     dispatcher: &dyn MmsServiceDispatcher,
@@ -162,6 +168,17 @@ pub fn parse_message(
 
         // Confirmed request
         0xa0 => {
+            // Before Initiate completes no PDU size or outstanding-request limit is
+            // in force, so a service request is refused rather than executed.
+            if !conn.is_active() {
+                tracing::warn!(
+                    "confirmed request before initiate completed, answering reject(pdu-error/invalid-pdu)"
+                );
+                return MessageOutcome::SendBytes(encode_reject_pdu(
+                    None,
+                    RejectReason::PduError(PduErrorRejectReason::InvalidPdu),
+                ));
+            }
             // extract the invokeID and the service body
             let (invoke_id, service_body) = match parse_confirmed_request(incoming) {
                 Ok(v) => v,
@@ -589,6 +606,60 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // a confirmed request before Initiate completes
+
+    /// Counts the confirmed requests it is handed.
+    #[derive(Default)]
+    struct CountingDispatcher(std::sync::atomic::AtomicUsize);
+
+    impl MmsServiceDispatcher for CountingDispatcher {
+        fn dispatch(
+            &self,
+            _conn: &MmsServerConnection,
+            _req: ConfirmedRequest,
+        ) -> ConfirmedResponse {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ConfirmedResponse::Response(Bytes::new())
+        }
+
+        fn services_supported(&self) -> [u8; 11] {
+            super::super::connection::SERVER_SERVICES_SUPPORTED
+        }
+    }
+
+    /// A confirmed request on a connection whose Initiate has not completed, such
+    /// as one carried as the AARQ user information in place of the Initiate
+    /// request, is answered with Reject(pdu-error/invalid-pdu) and never reaches
+    /// the dispatcher.
+    #[test]
+    fn confirmed_request_before_initiate_rejected() {
+        let pdu: &[u8] = &[0xa0, 0x05, 0x02, 0x01, 0x05, 0xa1, 0x00];
+        let conn = fresh_conn();
+        let dispatcher = CountingDispatcher::default();
+        let outcome = parse_message(&conn, &dispatcher, pdu);
+        assert_eq!(dispatcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        match outcome {
+            MessageOutcome::SendBytes(b) => {
+                let r = RejectPdu::decode(&b).unwrap();
+                assert!(matches!(
+                    r.reason,
+                    RejectReason::PduError(PduErrorRejectReason::InvalidPdu)
+                ));
+            }
+            other => panic!("expected SendBytes(reject), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn confirmed_request_after_initiate_dispatched() {
+        let pdu: &[u8] = &[0xa0, 0x05, 0x02, 0x01, 0x05, 0xa1, 0x00];
+        let conn = negotiated_conn();
+        let dispatcher = CountingDispatcher::default();
+        let outcome = parse_message(&conn, &dispatcher, pdu);
+        assert_eq!(dispatcher.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(outcome, MessageOutcome::SendBytes(_)));
     }
 
     // a malformed PDU is answered with a reject
