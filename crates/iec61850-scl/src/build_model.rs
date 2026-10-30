@@ -822,6 +822,9 @@ fn apply_instances_at_do(
     parent_path: &str,
 ) -> Result<(), SclParseError> {
     for inst in children {
+        if skip_indexed_instance(inst) {
+            continue;
+        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 // Two possibilities: a sub-object, or a constructed attribute.
@@ -927,6 +930,9 @@ fn apply_instances_at_da(
     parent_path: &str,
 ) -> Result<(), SclParseError> {
     for inst in children {
+        if skip_indexed_instance(inst) {
+            continue;
+        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 let bda_def = match dat.bdas.iter().find(|b| b.name == sdi.name) {
@@ -1043,6 +1049,33 @@ fn apply_dai_value(
     let mut guard = da.value.write().expect("MmsValue lock poisoned");
     *guard = parsed;
     Ok(())
+}
+
+/// Reports whether an `<SDI>` or `<DAI>` addresses an array element, through
+/// its `ix` attribute, and warns that it is skipped.
+///
+/// The model holds an array attribute or sub-object as a single element, so an
+/// instance value aimed at one element of it has nowhere to go.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
+    let (kind, name, ix) = match inst {
+        RawDataInstance::Sdi(sdi) => ("SDI", sdi.name.as_str(), sdi.ix),
+        RawDataInstance::Dai(dai) => ("DAI", dai.name.as_str(), dai.ix),
+    };
+    match ix {
+        Some(ix) => {
+            tracing::warn!(
+                "{} name=\"{}\" ix=\"{}\" addresses an array element, which the model does not hold, skipping",
+                kind,
+                name,
+                ix
+            );
+            true
+        }
+        None => false,
+    }
 }
 
 /// Picks the value to apply out of several `<Val>` elements: the one without a

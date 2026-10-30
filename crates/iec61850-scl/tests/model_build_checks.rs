@@ -539,3 +539,31 @@ fn coded_enum_unknown_val_keeps_the_default() {
     ));
     assert_eq!(da(&m, "GGIO1", "C", "pos").snapshot(), two_bits(0));
 }
+
+/// A `<DAI>` or `<SDI>` with an `ix` addresses an array element, which the
+/// model does not hold, so its value is not written into the single element
+/// the model keeps; the same instance without `ix` is applied.
+#[test]
+fn indexed_dai_and_sdi_are_skipped() {
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Lim" type="L_T"/></LNodeType>
+    <DOType id="L_T" cdc="ING">
+      <DA name="v" fc="SP" bType="INT32"/>
+      <DA name="w" fc="SP" bType="INT32"/>
+      <DA name="pulse" fc="CF" bType="Struct" type="P"/>
+    </DOType>
+    <DAType id="P"><BDA name="onDur" bType="INT32U"/></DAType>"#;
+    let ln = r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="Lim">
+            <DAI name="v" ix="2"><Val>7</Val></DAI>
+            <DAI name="w"><Val>9</Val></DAI>
+            <SDI name="pulse" ix="1"><DAI name="onDur"><Val>5</Val></DAI></SDI>
+          </DOI></LN>"#;
+    let m = build(&wrap(t, "", ln));
+    assert_eq!(da(&m, "GGIO1", "Lim", "v").snapshot(), MmsValue::Integer(0));
+    assert_eq!(da(&m, "GGIO1", "Lim", "w").snapshot(), MmsValue::Integer(9));
+    let pulse = da(&m, "GGIO1", "Lim", "pulse");
+    assert_eq!(
+        pulse.child_by_name("onDur").unwrap().snapshot(),
+        MmsValue::Unsigned(0)
+    );
+}

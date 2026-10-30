@@ -28,8 +28,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, template_initial_value,
-    MmsValue,
+    fcda_do_path, parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance,
+    template_initial_value, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -792,6 +792,9 @@ fn emit_instances_at_do(
     out: &mut Vec<TokenStream>,
 ) -> Result<(), CompileError> {
     for inst in children {
+        if skip_indexed_instance(inst) {
+            continue;
+        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 handle_sdi_at_do(sdi, dot, dtt, parent_path, base_path, out)?;
@@ -893,6 +896,9 @@ fn emit_instances_at_da(
     out: &mut Vec<TokenStream>,
 ) -> Result<(), CompileError> {
     for inst in children {
+        if skip_indexed_instance(inst) {
+            continue;
+        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 let bda_def = match dat.bdas.iter().find(|b| b.name == sdi.name) {
