@@ -10,7 +10,8 @@ connection type.
 The verifier wrappers add the profile's stricter certificate rules.
 `AllowOnlyKnownCertsServerVerifier` and its client counterpart reject a peer
 whose leaf certificate is not on the configured list, and reject an empty list
-outright. `IgnoreValidityTimeServerVerifier` and
+outright; on the server the client counterpart also makes a client
+certificate mandatory. `IgnoreValidityTimeServerVerifier` and
 `IgnoreValidityTimeClientVerifier` relax only the validity-time check when it
 is off, and still reject every other chain error.
 `TlsEventHandler` carries the 20 event codes of IEC 62351-3. The constants

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iec61850_tls::{
-    TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsEventCode, TlsEventHandler, TlsEventLevel,
-    TlsVersion, IEC62351_3_TLS12_CIPHERS,
+    TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsError, TlsEventCode, TlsEventHandler,
+    TlsEventLevel, TlsVersion, IEC62351_3_TLS12_CIPHERS,
 };
 use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType,
@@ -122,8 +122,6 @@ struct Leaf {
 fn server_with(leaf: &Leaf) -> TlsConfigBuilder {
     TlsConfigBuilder::new()
         .with_cert_pem(leaf.pem.as_bytes(), leaf.key_pem.as_bytes())
-        .unwrap()
-        .add_ca_pem(Ca::new().pem().as_bytes())
         .unwrap()
 }
 
@@ -472,4 +470,183 @@ async fn server_with_time_validation_off_rejects_an_expired_client_certificate_f
         srv.is_err() && cli.is_err(),
         "server={srv:?} client={cli:?}"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Client authentication
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_without_certificate_is_refused_when_only_known_peers_are_allowed() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let known_client = client_ca.leaf("client.test", 2);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .add_known_peer_der(known_client.der.clone())
+        .allow_only_known_peers(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca).build_client().unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "a client without a certificate got through: server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn known_client_certificate_is_accepted_when_only_known_peers_are_allowed() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let known_client = client_ca.leaf("client.test", 2);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .add_known_peer_der(known_client.der.clone())
+        .allow_only_known_peers(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(known_client.pem.as_bytes(), known_client.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.expect("server side").peer_cert_presented);
+    assert!(cli.is_ok(), "client side: {cli:?}");
+}
+
+#[tokio::test]
+async fn unknown_client_certificate_is_refused_when_only_known_peers_are_allowed() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let known_client = client_ca.leaf("client.test", 2);
+    let other_client = client_ca.leaf("other.test", 3);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .add_known_peer_der(known_client.der.clone())
+        .allow_only_known_peers(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(other_client.pem.as_bytes(), other_client.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn client_without_certificate_is_refused_when_client_auth_is_required() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .require_client_auth(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca).build_client().unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn client_with_certificate_is_accepted_when_client_auth_is_required() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.leaf("client.test", 2);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .require_client_auth(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.expect("server side").peer_cert_presented);
+    assert!(cli.is_ok(), "client side: {cli:?}");
+}
+
+#[tokio::test]
+async fn client_without_certificate_is_accepted_when_client_auth_is_optional() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca).build_client().unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(!srv.expect("server side").peer_cert_presented);
+    assert!(cli.is_ok(), "client side: {cli:?}");
+}
+
+#[tokio::test]
+async fn server_without_trust_anchors_requests_no_client_certificate() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.leaf("client.test", 2);
+    let server = server_with(&server_leaf)
+        .build_server()
+        .expect("a server without trust anchors builds");
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(!srv.expect("server side").peer_cert_presented);
+    assert!(cli.is_ok(), "client side: {cli:?}");
+}
+
+#[test]
+fn mandatory_client_auth_without_trust_anchors_fails_to_build() {
+    let server_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let required = server_with(&server_leaf)
+        .require_client_auth(true)
+        .build_server();
+    let known_only = server_with(&server_leaf)
+        .add_known_peer_der(server_leaf.der.clone())
+        .allow_only_known_peers(true)
+        .build_server();
+    assert!(matches!(required, Err(TlsError::Validation(_))));
+    assert!(matches!(known_only, Err(TlsError::Validation(_))));
 }

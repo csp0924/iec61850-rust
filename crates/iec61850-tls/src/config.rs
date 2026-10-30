@@ -5,8 +5,16 @@
 //! [`TlsServerConfig`].
 //!
 //! Defaults: chain validation on, validity-time validation on,
-//! allow-only-known peers off, session resumption on, and TLS 1.2 as the
-//! minimum version, which IEC 62351-3 mandates.
+//! allow-only-known peers off, client authentication requested but not
+//! required when trust anchors are set, session resumption on, and TLS 1.2
+//! as the minimum version, which IEC 62351-3 mandates.
+//!
+//! Client authentication on the server is mandatory when
+//! [`TlsConfigBuilder::require_client_auth`] or
+//! [`TlsConfigBuilder::allow_only_known_peers`] is set; such a server needs at
+//! least one trust anchor. Otherwise a server with trust anchors requests a
+//! client certificate and validates it when one is presented, and a server
+//! without trust anchors does not request one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +111,8 @@ pub struct TlsConfigBuilder {
     known_peer_certs: Vec<CertificateDer<'static>>,
     /// Restricts peers to `known_peer_certs`. Defaults to false.
     allow_only_known_peers: bool,
+    /// Makes a client certificate mandatory on the server. Defaults to false.
+    require_client_auth: bool,
 
     // Verification settings
     /// Runs chain validation against the trust anchors. Defaults to true.
@@ -158,6 +168,7 @@ impl TlsConfigBuilder {
             ca_certs: Vec::new(),
             known_peer_certs: Vec::new(),
             allow_only_known_peers: false,
+            require_client_auth: false,
             chain_validation: true,
             time_validation: true,
             min_version: TlsVersion::Tls12,
@@ -255,8 +266,24 @@ impl TlsConfigBuilder {
     // Behavior setters
 
     /// Enables or disables allow-only-known-certificates mode. Defaults to false.
+    ///
+    /// When enabled, the peer must present a certificate that passes chain
+    /// validation and appears on the known-peer list. On the server this makes
+    /// client authentication mandatory, so a client presenting no certificate
+    /// is refused.
     pub fn allow_only_known_peers(mut self, v: bool) -> Self {
         self.allow_only_known_peers = v;
+        self
+    }
+
+    /// Makes a client certificate mandatory on the server. Defaults to false.
+    ///
+    /// When enabled, a client presenting no certificate is refused. When
+    /// disabled, a server with trust anchors still requests a certificate and
+    /// validates one when presented, and a server without trust anchors does
+    /// not request one. Has no effect on `build_client`.
+    pub fn require_client_auth(mut self, v: bool) -> Self {
+        self.require_client_auth = v;
         self
     }
 
@@ -443,9 +470,11 @@ impl TlsConfigBuilder {
     /// # Errors
     ///
     /// [`TlsError::Validation`] when `min_version` exceeds `max_version`, when
-    /// no private key or certificate chain was supplied, when the protocol
-    /// version list is rejected, or when the client verifier cannot be built;
-    /// [`TlsError::CertLoad`] when the server certificate is rejected.
+    /// no private key or certificate chain was supplied, when client
+    /// authentication is mandatory but no trust anchor was supplied, when the
+    /// protocol version list is rejected, or when the client verifier cannot
+    /// be built; [`TlsError::CertLoad`] when the server certificate is
+    /// rejected.
     pub fn build_server(self) -> Result<TlsServerConfig, TlsError> {
         if self.min_version > self.max_version {
             return Err(TlsError::Validation(format!(
@@ -462,6 +491,12 @@ impl TlsConfigBuilder {
                 "server requires at least one certificate in chain".into(),
             ));
         }
+        let client_auth_mandatory = self.require_client_auth || self.allow_only_known_peers;
+        if client_auth_mandatory && self.ca_certs.is_empty() {
+            return Err(TlsError::Validation(
+                "mandatory client authentication requires at least one trust anchor".into(),
+            ));
+        }
 
         let versions = build_version_list(self.min_version, self.max_version);
         let provider = Arc::new(rustls::crypto::CryptoProvider {
@@ -469,38 +504,44 @@ impl TlsConfigBuilder {
             ..rustls::crypto::ring::default_provider()
         });
 
-        // Client certificate verifier, for mutual TLS.
-        let root_store = build_root_store(&self.ca_certs)?;
-        let base_client_verifier = WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store),
-            Arc::clone(&provider),
-        )
-        .with_crls(self.crls)
-        .allow_unauthenticated() // clients without a certificate are gated by allow_only_known
-        .build()
-        .map_err(|e| TlsError::Validation(format!("client verifier build: {e}")))?;
+        // Client certificate verifier, outermost first:
+        // IgnoreValidityTime(AllowOnlyKnownCerts(WebPki)).
+        let client_auth_optional = !client_auth_mandatory && !self.ca_certs.is_empty();
+        let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+            if self.ca_certs.is_empty() {
+                WebPkiClientVerifier::no_client_auth()
+            } else {
+                let root_store = build_root_store(&self.ca_certs)?;
+                let mut webpki_builder = WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(root_store),
+                    Arc::clone(&provider),
+                )
+                .with_crls(self.crls);
+                if client_auth_optional {
+                    webpki_builder = webpki_builder.allow_unauthenticated();
+                }
+                let webpki_verifier = webpki_builder
+                    .build()
+                    .map_err(|e| TlsError::Validation(format!("client verifier build: {e}")))?;
 
-        // Allow-only-known wrapper.
-        let known_client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-            Arc::new(AllowOnlyKnownCertsClientVerifier::new(
-                base_client_verifier,
-                self.allow_only_known_peers,
-                self.known_peer_certs,
-                Arc::clone(&self.event_handler),
-            ));
-
-        // Validity-time wrapper.
-        let final_client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-            Arc::new(IgnoreValidityTimeClientVerifier::new(
-                known_client_verifier,
-                !self.time_validation, // time_validation off means ignore_validity_time on
-                Arc::clone(&self.event_handler),
-            ));
+                let known_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+                    Arc::new(AllowOnlyKnownCertsClientVerifier::new(
+                        webpki_verifier,
+                        self.allow_only_known_peers,
+                        self.known_peer_certs,
+                        Arc::clone(&self.event_handler),
+                    ));
+                Arc::new(IgnoreValidityTimeClientVerifier::new(
+                    known_verifier,
+                    !self.time_validation,
+                    Arc::clone(&self.event_handler),
+                ))
+            };
 
         let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(&versions)
             .map_err(|e| TlsError::Validation(format!("protocol versions: {e}")))?
-            .with_client_cert_verifier(final_client_verifier)
+            .with_client_cert_verifier(client_verifier)
             .with_single_cert(self.cert_chain, key)
             .map_err(|e| TlsError::CertLoad(format!("server cert: {e}")))?;
 

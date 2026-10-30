@@ -142,7 +142,10 @@ impl ServerCertVerifier for AllowOnlyKnownCertsServerVerifier {
 
 /// Client-side allow-only-known-certificates wrapper.
 ///
-/// Behaves exactly like the server-side wrapper, on the client certificate.
+/// Behaves like the server-side wrapper, on the client certificate. In
+/// allow-only-known mode it also makes client authentication mandatory,
+/// whatever the inner verifier says, so a client presenting no certificate is
+/// refused.
 pub struct AllowOnlyKnownCertsClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     allow_only_known: bool,
@@ -187,17 +190,17 @@ impl ClientCertVerifier for AllowOnlyKnownCertsClientVerifier {
         self.inner.root_hint_subjects()
     }
 
-    /// Delegates to the inner verifier. When that one was built with
-    /// `allow_unauthenticated()`, client authentication is offered but not
-    /// mandatory, so a peer without a client certificate can still connect.
+    /// True in allow-only-known mode; otherwise delegates to the inner
+    /// verifier.
     fn offer_client_auth(&self) -> bool {
-        self.inner.offer_client_auth()
+        self.allow_only_known || self.inner.offer_client_auth()
     }
 
-    /// Delegates to the inner verifier; `allow_unauthenticated()` makes this
-    /// return false.
+    /// True in allow-only-known mode, so a client presenting no certificate
+    /// is refused; otherwise delegates to the inner verifier, for which
+    /// `allow_unauthenticated()` makes this false.
     fn client_auth_mandatory(&self) -> bool {
-        self.inner.client_auth_mandatory()
+        self.allow_only_known || self.inner.client_auth_mandatory()
     }
 
     fn verify_client_cert(

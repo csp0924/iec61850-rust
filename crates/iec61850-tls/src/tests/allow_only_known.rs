@@ -175,3 +175,130 @@ fn allow_only_known_disabled_passes_chain_only() {
         result
     );
 }
+
+/// Builds a `WebPkiClientVerifier` that trusts `ca_cert` and lets a client
+/// without a certificate through.
+fn make_optional_client_verifier(
+    ca_cert: CertificateDer<'static>,
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut root_store = RootCertStore::empty();
+    root_store.add(ca_cert).unwrap();
+    rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(root_store), provider)
+        .allow_unauthenticated()
+        .build()
+        .unwrap()
+}
+
+/// In allow-only-known mode the client wrapper makes client authentication
+/// mandatory, even over an inner verifier that lets unauthenticated clients
+/// through.
+#[test]
+fn allow_only_known_client_wrapper_makes_client_auth_mandatory() {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let (ca_der, leaf_der, _, _) = make_ca_and_leaf("client.test");
+    let inner = make_optional_client_verifier(ca_der);
+    assert!(!inner.client_auth_mandatory());
+
+    let verifier = crate::verifier::AllowOnlyKnownCertsClientVerifier::new(
+        inner,
+        true,
+        vec![leaf_der],
+        Arc::new(NullEventHandler),
+    );
+
+    assert!(verifier.offer_client_auth());
+    assert!(verifier.client_auth_mandatory());
+}
+
+/// With allow_only_known disabled, the client wrapper keeps the client
+/// authentication policy of the inner verifier.
+#[test]
+fn allow_only_known_client_wrapper_disabled_keeps_the_inner_policy() {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let (ca_der, _, _, _) = make_ca_and_leaf("client.test");
+    let inner = make_optional_client_verifier(ca_der);
+
+    let verifier = crate::verifier::AllowOnlyKnownCertsClientVerifier::new(
+        inner,
+        false,
+        vec![],
+        Arc::new(NullEventHandler),
+    );
+
+    assert!(verifier.offer_client_auth());
+    assert!(!verifier.client_auth_mandatory());
+}
+
+/// Inner verifier that accepts every certificate, so only the known-list
+/// comparison decides.
+#[derive(Debug)]
+struct AcceptAll;
+
+impl ServerCertVerifier for AcceptAll {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::General("unused".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::General("unused".into()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        Vec::new()
+    }
+}
+
+/// The known-list comparison covers every byte of the leaf: a certificate of
+/// the same length that differs in its last byte is not on the list.
+#[test]
+fn allow_only_known_compares_every_byte_of_the_leaf() {
+    let (_, leaf_der, _, _) = make_ca_and_leaf("server.test");
+    let mut altered = leaf_der.as_ref().to_vec();
+    if let Some(last) = altered.last_mut() {
+        *last ^= 0x01;
+    }
+    let altered = CertificateDer::from(altered);
+    assert_eq!(altered.as_ref().len(), leaf_der.as_ref().len());
+
+    let verifier = AllowOnlyKnownCertsServerVerifier::new(
+        Arc::new(AcceptAll),
+        true,
+        vec![leaf_der.clone()],
+        Arc::new(NullEventHandler),
+    );
+    let server_name: ServerName<'static> = "server.test".try_into().unwrap();
+
+    assert!(verifier
+        .verify_server_cert(&leaf_der, &[], &server_name, &[], UnixTime::now())
+        .is_ok());
+    assert!(matches!(
+        verifier.verify_server_cert(&altered, &[], &server_name, &[], UnixTime::now()),
+        Err(RustlsError::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure
+        ))
+    ));
+}
