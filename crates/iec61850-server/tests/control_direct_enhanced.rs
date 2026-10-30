@@ -136,10 +136,11 @@ async fn direct_enhanced_operate_failure_sends_command_termination_negative() {
     );
 }
 
-// A rejecting check handler ends in a negative CommandTermination.
+// A command the check handler refuses is never accepted, so it ends in no
+// CommandTermination; the refusal is reported through LastApplError.
 
 #[tokio::test]
-async fn direct_enhanced_check_rejected_sends_command_termination_negative() {
+async fn direct_enhanced_check_rejected_sends_no_command_termination() {
     use iec61850_server::control::handler::CheckHandler as CheckHandlerTrait;
 
     struct RejectHandler;
@@ -178,15 +179,7 @@ async fn direct_enhanced_check_rejected_sends_command_termination_negative() {
         ServiceResult::Failure(ControlAddCause::BlockedBySynchroCheck)
     );
 
-    let recorded = events.lock().unwrap();
-    assert_eq!(recorded.len(), 1);
-    assert!(matches!(
-        recorded[0],
-        TerminationEvent::Negative {
-            add_cause: ControlAddCause::BlockedBySynchroCheck,
-            ..
-        }
-    ));
+    assert!(events.lock().unwrap().is_empty());
 }
 
 // Direct control with enhanced security sends a CommandTermination for every

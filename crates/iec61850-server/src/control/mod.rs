@@ -9,6 +9,7 @@
 //! - `object`: `ControlObject`, the per-data-object state machine
 //! - `service`: the entry points for Operate, SBO read, SBOw write, and Cancel
 
+pub(crate) mod dispatch;
 pub mod handler;
 pub mod model;
 pub mod object;

@@ -16,6 +16,7 @@ use super::model::{
 };
 use super::state::ControlState;
 use crate::error::ServerError;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +127,9 @@ pub struct ControlObject {
     pub config: Arc<ControlObjectConfig>,
     inner: Arc<Mutex<ControlObjectInner>>,
 
+    /// Time limit of an executing command in milliseconds, 0 for none.
+    oper_timeout_ms: Arc<AtomicU32>,
+
     // Application handlers.
     /// Static check handler stored by `set_check_handler`. The control services
     /// do not consult it; they call the handlers of the `ControlObjectEntry`.
@@ -157,6 +161,7 @@ impl ControlObject {
         Self {
             config: Arc::new(config),
             inner: Arc::new(Mutex::new(ControlObjectInner::new())),
+            oper_timeout_ms: Arc::new(AtomicU32::new(0)),
             check_handler: Arc::new(Mutex::new(None)),
             wait_for_exec_handler: Arc::new(Mutex::new(None)),
             operate_handler: Arc::new(Mutex::new(None)),
@@ -170,6 +175,25 @@ impl ControlObject {
             .lock()
             .map(|g| g.state)
             .unwrap_or(ControlState::Unselected)
+    }
+
+    /// Returns the time limit of an executing command in milliseconds, or 0
+    /// when it is not limited.
+    pub fn oper_timeout_ms(&self) -> u32 {
+        self.oper_timeout_ms.load(Ordering::Relaxed)
+    }
+
+    /// Sets the time limit of an executing command, the `operTimeout` attribute
+    /// of IEC 61850-7-3, in milliseconds; 0, the default, disables it.
+    ///
+    /// The limit covers the control handler, which runs once the Operate has
+    /// been answered positively. When the handler has not finished within it,
+    /// the command ends with the add cause `TimeLimitOver`, reported in a
+    /// negative CommandTermination under enhanced security, and the object
+    /// returns to ready or unselected according to its select class. Every clone
+    /// of this handle shares the setting.
+    pub fn set_oper_timeout_ms(&self, timeout_ms: u32) {
+        self.oper_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 
     /// Stores a check handler on the object, which has no effect.
@@ -566,6 +590,18 @@ impl ControlObject {
     ///
     /// Returns `ServerError::Protocol` when the state mutex is poisoned.
     pub fn try_sbow_select(&self, conn_id: u64, params: &OperParams) -> Result<bool, ServerError> {
+        self.sbow_select(conn_id, params).map(|r| r.is_ok())
+    }
+
+    /// Selects the object with a value, returning the add cause of a refusal.
+    ///
+    /// A selected or executing object refuses with `LockedByOtherClient`, and a
+    /// malformed origin is refused with `InconsistentParameters`.
+    pub(crate) fn sbow_select(
+        &self,
+        conn_id: u64,
+        params: &OperParams,
+    ) -> Result<Result<(), ControlAddCause>, ServerError> {
         let mut g = self.inner.lock().map_err(|_| {
             ServerError::Protocol("ControlObject Mutex poisoned on sbow_select".into())
         })?;
@@ -576,7 +612,7 @@ impl ControlObject {
                 state = ?g.state,
                 "select-with-value refused: the object is already selected or executing"
             );
-            return Ok(false);
+            return Ok(Err(ControlAddCause::LockedByOtherClient));
         }
 
         // The origin field must be well formed.
@@ -585,7 +621,7 @@ impl ControlObject {
                 name = %self.config.name,
                 "select-with-value refused: malformed origin field"
             );
-            return Ok(false);
+            return Ok(Err(ControlAddCause::InconsistentParameters));
         }
 
         g.state = ControlState::Ready;
@@ -593,7 +629,7 @@ impl ControlObject {
         g.select_time = Some(Instant::now());
         g.last_oper_params = Some(params.clone());
         tracing::debug!(name = %self.config.name, conn_id, "select-with-value accepted");
-        Ok(true)
+        Ok(Ok(()))
     }
 
     // ─── Cancel ──────────────────────────────────────────────────────────

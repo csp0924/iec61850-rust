@@ -1,0 +1,705 @@
+//! Control services over the wire: real TCP and the full ISO stack between the
+//! server and the MMS client.
+//!
+//! The model declares four SPC objects, one per control model, so a write is
+//! checked against the declared `Oper`, `SBOw`, and `Cancel` types. Waits are
+//! driven by events; a timeout only bounds a wait whose event never comes.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName};
+use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
+use iec61850_model::cdc::{self, CdcOptions, ControlOptions};
+use iec61850_model::{
+    ControlModel, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue,
+};
+use iec61850_server::control::handler::{OperateFuture, WaitForExecFuture};
+use iec61850_server::control::{
+    AlwaysAcceptCheckHandler, AlwaysFailOperateHandler, AlwaysSuccessOperateHandler, CheckHandler,
+    ControlAction, ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig,
+    ControlObjectEntry, ControlState, SboClass, WaitForExecutionHandler,
+};
+use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
+use tokio::sync::Notify;
+
+const DOMAIN: &str = "simpleIOGenericIO";
+const WAIT: Duration = Duration::from_secs(5);
+
+// ── Model and server ────────────────────────────────────────────────────────
+
+fn build_model() -> Arc<IedModel> {
+    let lln0 = LogicalNodeBuilder::lln0().build().expect("lln0");
+    let mut ggio = LogicalNodeBuilder::new("", "GGIO", "1");
+    for (name, model) in [
+        ("SPCSO1", ControlModel::DirectNormal),
+        ("SPCSO2", ControlModel::SboNormal),
+        ("SPCSO3", ControlModel::DirectEnhanced),
+        ("SPCSO4", ControlModel::SboEnhanced),
+    ] {
+        let opts = ControlOptions::NONE
+            .with_model(model)
+            .union(ControlOptions::HAS_CANCEL);
+        ggio = ggio.add_do(cdc::spc(name, CdcOptions::NONE, opts));
+    }
+    let ld = LogicalDeviceBuilder::new("GenericIO")
+        .add_ln(lln0)
+        .add_ln(ggio.build().expect("ggio"))
+        .build()
+        .expect("ld");
+    Arc::new(
+        IedModelBuilder::new("simpleIO")
+            .add_ld(ld)
+            .expect("add_ld")
+            .build()
+            .expect("model"),
+    )
+}
+
+fn server() -> IedServer {
+    IedServer::builder()
+        .model(build_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .config(IedServerConfig {
+            max_mms_connections: 4,
+            ..Default::default()
+        })
+        .build()
+        .expect("server")
+}
+
+fn object(name: &str, ctl_model: ControlModel) -> ControlObject {
+    ControlObject::new(ControlObjectConfig {
+        name: name.into(),
+        ln_name: "GGIO1".into(),
+        domain: DOMAIN.into(),
+        ctl_model,
+        sbo_timeout_ms: 30_000,
+        sbo_class: SboClass::OperateOnce,
+    })
+}
+
+fn register(server: &IedServer, obj: ControlObject, op: Arc<dyn ControlHandler>) {
+    server.control_objects().register(
+        ControlObjectEntry::new(obj)
+            .with_check(Arc::new(AlwaysAcceptCheckHandler) as Arc<dyn CheckHandler>)
+            .with_operate(op),
+    );
+}
+
+async fn start(server: &IedServer) -> ServerHandle {
+    server.start().await.expect("start")
+}
+
+async fn connect(handle: &ServerHandle) -> MmsClient {
+    let mut c = MmsClientBuilder::new()
+        .connect_timeout_ms(3_000)
+        .request_timeout_ms(3_000)
+        .build();
+    c.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+    c
+}
+
+// ── Values ──────────────────────────────────────────────────────────────────
+
+fn origin() -> MmsData {
+    MmsData::Structure(vec![
+        MmsData::Integer(3),
+        MmsData::OctetString(b"probe".to_vec()),
+    ])
+}
+
+fn check_bits() -> MmsData {
+    MmsData::BitString {
+        padding: 6,
+        data: vec![0],
+    }
+}
+
+fn oper(ctl_val: MmsData, ctl_num: u64) -> MmsData {
+    MmsData::Structure(vec![
+        ctl_val,
+        origin(),
+        MmsData::Unsigned(ctl_num),
+        MmsData::UtcTime([0; 8]),
+        MmsData::Boolean(false),
+        check_bits(),
+    ])
+}
+
+fn cancel(ctl_num: u64) -> MmsData {
+    MmsData::Structure(vec![
+        MmsData::Boolean(true),
+        origin(),
+        MmsData::Unsigned(ctl_num),
+        MmsData::UtcTime([0; 8]),
+        MmsData::Boolean(false),
+    ])
+}
+
+fn on() -> MmsData {
+    MmsData::Boolean(true)
+}
+
+// ── Reports ─────────────────────────────────────────────────────────────────
+
+/// An InformationReport: its variable names and values.
+type Report = (Vec<ObjectName>, Vec<MmsData>);
+
+/// Returns the next InformationReport, waiting at most `wait`.
+async fn next_report(c: &mut MmsClient, wait: Duration) -> Option<Report> {
+    let inner = c.recv_unconfirmed_pdu_with_timeout(wait).await.ok()??;
+    let r = decode_information_report(&inner).expect("information report");
+    let names = match r.variable_access_spec {
+        VariableAccessSpec::ListOfVariable(n) => n,
+        other => panic!("unexpected variable access specification {other:?}"),
+    };
+    Some((names, r.list_of_access_result))
+}
+
+/// Returns the report already queued by the client, without waiting.
+async fn queued_report(c: &mut MmsClient) -> Option<Report> {
+    next_report(c, Duration::ZERO).await
+}
+
+fn is_last_appl_error(name: &ObjectName) -> bool {
+    matches!(name, ObjectName::VmdSpecific(s) if s == "LastApplError")
+}
+
+/// Asserts a report carrying only LastApplError and returns its five members.
+fn last_appl_error_only(report: Option<Report>) -> Vec<MmsData> {
+    let (names, values) = report.expect("a LastApplError report");
+    assert!(
+        names.len() == 1 && is_last_appl_error(&names[0]),
+        "expected a report of LastApplError alone, got {names:?}"
+    );
+    match values.into_iter().next() {
+        Some(MmsData::Structure(members)) => {
+            assert_eq!(members.len(), 5, "LastApplError has five members");
+            members
+        }
+        other => panic!("LastApplError is not a structure: {other:?}"),
+    }
+}
+
+fn assert_last_appl_error(members: &[MmsData], cntrl_obj: &str, ctl_num: u64, add_cause: i64) {
+    assert_eq!(members[0], MmsData::VisibleString(cntrl_obj.to_string()));
+    assert_eq!(members[1], MmsData::Integer(0), "Error is No Error");
+    assert_eq!(members[2], origin(), "origin echoes the command");
+    assert_eq!(
+        members[3],
+        MmsData::Unsigned(ctl_num),
+        "ctlNum echoes the command"
+    );
+    assert_eq!(members[4], MmsData::Integer(add_cause), "AddCause");
+}
+
+fn denied(r: Result<(), ClientError>) -> DataAccessError {
+    match r {
+        Err(ClientError::DataAccessError(e)) => e,
+        other => panic!("expected a data access error, got {other:?}"),
+    }
+}
+
+// ── Handlers ────────────────────────────────────────────────────────────────
+
+/// Control handler that signals entry and finishes when released.
+struct Gate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    result: Result<(), ControlAddCause>,
+}
+
+impl ControlHandler for Gate {
+    fn operate<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        _v: &'a MmsValue,
+        _t: bool,
+    ) -> OperateFuture<'a> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let result = self.result;
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            result
+        })
+    }
+}
+
+/// Dynamic check that signals entry and finishes with `result` when released.
+struct GatedCheck {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    result: Result<(), ControlAddCause>,
+}
+
+impl GatedCheck {
+    /// A check that finishes with `result` as soon as it is entered.
+    fn open(result: Result<(), ControlAddCause>) -> Self {
+        let release = Arc::new(Notify::new());
+        release.notify_one();
+        Self {
+            entered: Arc::new(Notify::new()),
+            release,
+            result,
+        }
+    }
+}
+
+impl WaitForExecutionHandler for GatedCheck {
+    fn wait_for_execution<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        _v: &'a MmsValue,
+        _t: bool,
+        _s: bool,
+    ) -> WaitForExecFuture<'a> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let result = self.result;
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            result
+        })
+    }
+}
+
+/// Control handler that never finishes.
+struct NeverDone;
+
+impl ControlHandler for NeverDone {
+    fn operate<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        _v: &'a MmsValue,
+        _t: bool,
+    ) -> OperateFuture<'a> {
+        Box::pin(std::future::pending())
+    }
+}
+
+// ── LastApplError before a negative response ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_normal_operate_sends_last_appl_error_before_the_response() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO2", ControlModel::SboNormal),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 1)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    // The report arrived ahead of the response, so it is already queued.
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO2$Oper"), 1, 18);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_enhanced_operate_sends_last_appl_error_and_no_command_termination() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO4", ControlModel::SboEnhanced),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO4$Oper", oper(on(), 2)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$Oper"), 2, 18);
+
+    // A command termination would be served ahead of the next request, so by
+    // the time this read is answered it would be queued.
+    a.read(DOMAIN, "GGIO1$ST$SPCSO4$stVal").await.expect("read");
+    assert_eq!(
+        queued_report(&mut a).await,
+        None,
+        "a refused Operate has no CommandTermination"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_sbow_and_cancel_of_another_client_send_last_appl_error() {
+    let s = server();
+    let obj = object("SPCSO4", ControlModel::SboEnhanced);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+    let mut b = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 9))
+        .await
+        .expect("A selects");
+
+    let r = b
+        .write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 10))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut b).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$SBOw"), 10, 27);
+
+    let r = b.write(DOMAIN, "GGIO1$CO$SPCSO4$Cancel", cancel(11)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut b).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO4$Cancel"), 11, 27);
+
+    assert_eq!(
+        obj.state(),
+        ControlState::Ready,
+        "A still holds the selection"
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_requests_send_no_last_appl_error() {
+    let s = server();
+    let obj = object("SPCSO2", ControlModel::SboNormal);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let sel = a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("select");
+    assert_eq!(
+        sel,
+        MmsData::VisibleString(format!("{DOMAIN}/GGIO1$CO$SPCSO2"))
+    );
+    a.write(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 1))
+        .await
+        .expect("operate");
+    assert_eq!(queued_report(&mut a).await, None);
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+// ── Execution off the dispatch path ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_execution_failure_answers_positively_then_terminates_negatively() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO3", ControlModel::DirectEnhanced),
+        Arc::new(AlwaysFailOperateHandler {
+            cause: ControlAddCause::BlockedByProcess,
+        }),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 42))
+        .await;
+    assert!(
+        r.is_ok(),
+        "an accepted command is answered positively, got {r:?}"
+    );
+    let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(
+        names.len(),
+        2,
+        "a negative termination names LastApplError and Oper"
+    );
+    assert!(is_last_appl_error(&names[0]));
+    assert_eq!(
+        names[1],
+        ObjectName::DomainSpecific {
+            domain_id: DOMAIN.into(),
+            item_id: "GGIO1$CO$SPCSO3$Oper".into()
+        }
+    );
+    let MmsData::Structure(lae) = &values[0] else {
+        panic!("LastApplError is not a structure")
+    };
+    assert_eq!(lae[4], MmsData::Integer(9), "AddCause");
+    assert_eq!(values[1], oper(on(), 42), "the termination echoes the Oper");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_operate_is_answered_while_the_command_executes() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let s = server();
+    let obj = object("SPCSO3", ControlModel::DirectEnhanced);
+    register(
+        &s,
+        obj.clone(),
+        Arc::new(Gate {
+            entered: entered.clone(),
+            release: release.clone(),
+            result: Ok(()),
+        }),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    // The handler is not released until after the response, so a response held
+    // until the end of execution never arrives and the request times out.
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 5)).await;
+    if r.is_err() {
+        // Lets a command that held the response finish, so the server can stop.
+        release.notify_one();
+    }
+    assert!(
+        r.is_ok(),
+        "no Operate response while the command executes: {r:?}"
+    );
+    entered.notified().await;
+    assert_eq!(obj.state(), ControlState::Operate);
+
+    // The association keeps serving requests meanwhile; a Cancel cannot stop an
+    // executing command.
+    a.read(DOMAIN, "GGIO1$ST$SPCSO3$stVal").await.expect("read");
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO3$Cancel", cancel(5)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Cancel"), 5, 12);
+
+    release.notify_one();
+    let (names, _) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 1, "a positive termination names Oper alone");
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operate_with_a_dynamic_check_is_answered_by_its_outcome() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let s = server();
+    s.control_objects().register(
+        ControlObjectEntry::new(object("SPCSO1", ControlModel::DirectNormal))
+            .with_wait(Arc::new(GatedCheck {
+                entered: entered.clone(),
+                release: release.clone(),
+                result: Err(ControlAddCause::BlockedBySynchroCheck),
+            }) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    // The check finishes only after it has been entered, so the response cannot
+    // precede it.
+    let releaser = tokio::spawn(async move {
+        entered.notified().await;
+        release.notify_one();
+    });
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 7)).await;
+    releaser.await.expect("releaser");
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO1$Oper"), 7, 11);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_operate_refused_by_the_dynamic_check_has_no_command_termination() {
+    let s = server();
+    let obj = object("SPCSO3", ControlModel::DirectEnhanced);
+    s.control_objects().register(
+        ControlObjectEntry::new(obj.clone())
+            .with_wait(Arc::new(GatedCheck::open(Err(
+                ControlAddCause::BlockedBySynchroCheck,
+            ))) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 8)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"), 8, 11);
+    a.read(DOMAIN, "GGIO1$ST$SPCSO3$stVal").await.expect("read");
+    assert_eq!(
+        queued_report(&mut a).await,
+        None,
+        "a refused Operate has no CommandTermination"
+    );
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_operate_passing_the_dynamic_check_is_answered_then_terminated() {
+    let s = server();
+    s.control_objects().register(
+        ControlObjectEntry::new(object("SPCSO3", ControlModel::DirectEnhanced))
+            .with_wait(Arc::new(GatedCheck::open(Ok(()))) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 9))
+        .await
+        .expect("answered positively");
+    let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 1, "a positive termination names Oper alone");
+    assert_eq!(values[0], oper(on(), 9));
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_operate_failing_after_a_positive_response_is_not_reported() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO1", ControlModel::DirectNormal),
+        Arc::new(AlwaysFailOperateHandler {
+            cause: ControlAddCause::BlockedByProcess,
+        }),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 6))
+        .await
+        .expect("normal security answers when the checks pass");
+    a.read(DOMAIN, "GGIO1$ST$SPCSO1$stVal").await.expect("read");
+    assert_eq!(queued_report(&mut a).await, None);
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn operate_on_a_current_thread_runtime() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO1", ControlModel::DirectNormal),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    register(
+        &s,
+        object("SPCSO3", ControlModel::DirectEnhanced),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 1))
+        .await
+        .expect("direct-normal operate");
+    a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 2))
+        .await
+        .expect("direct-enhanced operate");
+    let (names, _) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oper_timeout_ends_the_command_with_time_limit_over() {
+    let s = server();
+    let obj = object("SPCSO3", ControlModel::DirectEnhanced);
+    obj.set_oper_timeout_ms(20);
+    register(&s, obj.clone(), Arc::new(NeverDone));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 3))
+        .await
+        .expect("accepted");
+    let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 2, "the timeout ends in a negative termination");
+    let MmsData::Structure(lae) = &values[0] else {
+        panic!("LastApplError is not a structure")
+    };
+    assert_eq!(lae[4], MmsData::Integer(16), "AddCause");
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+// ── Type of the written value ───────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_cancel_is_type_inconsistent_and_keeps_the_selection() {
+    let s = server();
+    let obj = object("SPCSO4", ControlModel::SboEnhanced);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 1))
+        .await
+        .expect("select");
+    let bad = MmsData::Structure(vec![MmsData::Integer(1), MmsData::Boolean(true)]);
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO4$Cancel", bad).await;
+    assert_eq!(denied(r), DataAccessError::TypeInconsistent);
+    assert_eq!(
+        obj.state(),
+        ControlState::Ready,
+        "a malformed Cancel cancels nothing"
+    );
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$Cancel", cancel(1))
+        .await
+        .expect("cancel");
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_the_model_does_not_declare_is_checked_against_the_service_structure() {
+    let s = server();
+    let obj = object("SPCSO9", ControlModel::SboEnhanced);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO9$SBOw", oper(on(), 300))
+        .await;
+    assert_eq!(
+        denied(r),
+        DataAccessError::TypeInconsistent,
+        "ctlNum is INT8U"
+    );
+    a.write(DOMAIN, "GGIO1$CO$SPCSO9$SBOw", oper(on(), 1))
+        .await
+        .expect("select");
+    let bad = MmsData::Structure(vec![MmsData::Integer(1), MmsData::Boolean(true)]);
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO9$Cancel", bad).await;
+    assert_eq!(denied(r), DataAccessError::TypeInconsistent);
+    assert_eq!(
+        obj.state(),
+        ControlState::Ready,
+        "a malformed Cancel cancels nothing"
+    );
+    h.stop().await;
+}
+
+// ── Handlers installed on the object ────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_without_a_control_handler_refuses_operate_with_not_supported() {
+    let s = server();
+    let obj = object("SPCSO1", ControlModel::DirectNormal);
+    obj.set_operate_handler(Arc::new(AlwaysSuccessOperateHandler));
+    s.control_objects().register(ControlObjectEntry::new(obj));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 4)).await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessUnsupported);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO1$Oper"), 4, 1);
+    h.stop().await;
+}

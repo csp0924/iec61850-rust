@@ -175,20 +175,12 @@ async fn sbo_enhanced_inconsistent_ctl_val_denied() {
         "a mismatch unselects the object"
     );
 
-    // Per IEC 61850-7-2 clause 20.2.1 every denied Operate under enhanced
-    // security is reported, so a rejection in begin_operate - a parameter
-    // mismatch or an unselected object - still sends a negative
-    // CommandTermination rather than failing silently.
-    let recorded = events.lock().unwrap();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "a denied Operate must send a negative CommandTermination"
+    // A refused Operate was never accepted, so it ends in no
+    // CommandTermination; the refusal is reported through LastApplError.
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a refused Operate sends no CommandTermination"
     );
-    assert!(matches!(
-        recorded[0],
-        iec61850_server::control::TerminationEvent::Negative { .. }
-    ));
 }
 
 // After the select times out an Oper fails with ObjectNotSelected.

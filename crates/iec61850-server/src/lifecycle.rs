@@ -59,9 +59,13 @@ use iec61850_mms::iso::session::{
     encode_abort as sess_encode_abort, encode_accept as sess_encode_accept, encode_data,
     encode_finish, IsoSession, SessionError, SessionIndication,
 };
+use iec61850_mms::mms::pdu::common::WriteOutcome;
 use iec61850_mms::mms::pdu::information_report::{
     encode_command_termination_negative, encode_command_termination_positive, LastApplErrorRef,
     OriginRef,
+};
+use iec61850_mms::mms::pdu::write::{
+    decode_confirmed_write_response, encode_confirmed_write_response, WriteResponse,
 };
 use iec61850_mms::mms::server::{
     parse_message, MessageOutcome, MmsServerConnection, MmsServiceDispatcher,
@@ -358,6 +362,7 @@ impl Drop for AssociationTeardown {
         // The command termination and report senders go first, so nothing new
         // is queued for the association while its state is being released.
         self.server.ct_sink().deregister(conn_id);
+        self.server.control_objects().outbox().deregister(conn_id);
         self.server.report_sink().deregister(conn_id);
         self.server.control_objects().release_connection(conn_id);
         if let Ok(mut engine) = self.server.reporting_engine().lock() {
@@ -584,6 +589,16 @@ where
     let (ct_tx, mut ct_rx) = mpsc::unbounded_channel::<ConnectionTerminationEvent>();
     ct_sink.register(conn_id, ct_tx);
 
+    // ── Control outbox ──────────────────────────────────────────────────
+    //
+    // A refused control request queues its LastApplError report here, which is
+    // sent ahead of the response of that request. An Operate under normal
+    // security defers its write response; the loop holds the invoke id and
+    // answers when the execution task posts the outcome.
+    let control_outbox = server.control_objects().outbox().clone();
+    let mut deferred_rx = control_outbox.register(conn_id);
+    let mut deferred_writes: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+
     // ── Reports ─────────────────────────────────────────────────────────
     //
     // The reporting engine posts an encoded report to the sender registered
@@ -652,9 +667,10 @@ where
             Duration::from_millis(200)
         };
 
-        // The select is biased: a command termination is served first because a
-        // control operation is already waiting on it, then a report, then a new
-        // request from the socket.
+        // The select is biased: the response of a deferred write is served
+        // first, ahead of the command termination its command may already have
+        // posted, then a command termination, then a report, then a new request
+        // from the socket.
         enum Step {
             Payload(Bytes),
             Continue,
@@ -662,6 +678,46 @@ where
         }
         let step = tokio::select! {
             biased;
+            done = deferred_rx.recv() => {
+                match done {
+                    Some(done) => {
+                        if let Some(invoke_id) = deferred_writes.remove(&done.id) {
+                            if let Some(report) = &done.last_appl_error {
+                                send_bounded(
+                                    conn_id,
+                                    send_timeout,
+                                    &mut last_activity,
+                                    send_user_data_mms(&mut cotp, &session, &pres, report),
+                                )
+                                .await?;
+                            }
+                            let mut buf = BytesMut::new();
+                            encode_confirmed_write_response(
+                                invoke_id,
+                                &WriteResponse { outcomes: vec![done.outcome] },
+                                &mut buf,
+                            );
+                            send_bounded(
+                                conn_id,
+                                send_timeout,
+                                &mut last_activity,
+                                send_user_data_mms(&mut cotp, &session, &pres, &buf),
+                            )
+                            .await?;
+                        } else {
+                            tracing::warn!(
+                                conn_id,
+                                "a deferred operate finished after its write was answered, dropping its outcome"
+                            );
+                        }
+                        Step::Continue
+                    }
+                    None => {
+                        tracing::warn!(conn_id, "the control outbox channel has closed");
+                        Step::Continue
+                    }
+                }
+            }
             ev = ct_rx.recv() => {
                 match ev {
                     Some(event) => {
@@ -834,6 +890,36 @@ where
                 let outcome = client_conn
                     .with_mms(|m| parse_message(m, dispatcher.as_ref(), &inner_payload))
                     .unwrap_or(MessageOutcome::Silent);
+
+                // Reports the request produced go ahead of its response.
+                for report in control_outbox.take_before_response(conn_id) {
+                    send_bounded(
+                        conn_id,
+                        send_timeout,
+                        &mut last_activity,
+                        send_user_data_mms(&mut cotp, &session, &pres, &report),
+                    )
+                    .await?;
+                }
+                let deferred = control_outbox.take_deferred(conn_id);
+                let outcome = match outcome {
+                    MessageOutcome::SendBytes(bytes) if !deferred.is_empty() => {
+                        match deferrable_write(&bytes, &deferred) {
+                            Some(invoke_id) => {
+                                deferred_writes.insert(deferred[0], invoke_id);
+                                MessageOutcome::Silent
+                            }
+                            None => {
+                                tracing::warn!(
+                                    conn_id,
+                                    "a write of several variables cannot wait for its operate, answering at acceptance"
+                                );
+                                MessageOutcome::SendBytes(bytes)
+                            }
+                        }
+                    }
+                    other => other,
+                };
 
                 match outcome {
                     MessageOutcome::SendBytes(bytes) => {
@@ -1072,6 +1158,19 @@ fn parse_obj_ref_to_oper(obj_ref: &str) -> (String, String) {
         format!("{}$Oper", path)
     };
     (domain, item)
+}
+
+/// Returns the invoke id of a write response that can wait for the one Operate
+/// it carries: a single deferral, and a positive response of one variable.
+fn deferrable_write(response: &[u8], deferred: &[u64]) -> Option<u32> {
+    if deferred.len() != 1 {
+        return None;
+    }
+    let (invoke_id, resp) = decode_confirmed_write_response(response).ok()?;
+    match resp.outcomes.as_slice() {
+        [WriteOutcome::Success] => Some(invoke_id),
+        _ => None,
+    }
 }
 
 /// Returns the wire value of a control add-cause.

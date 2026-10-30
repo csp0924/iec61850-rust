@@ -8,10 +8,13 @@
 //!
 //! `MmsModelDispatcher::dispatch` is a synchronous trait method while a control
 //! sequence involves asynchronous handlers, so the dispatcher looks the object and
-//! its handlers up here, takes the command-termination sink, and blocks on the
-//! futures. Keeping the lookup in its own module leaves the dispatcher and the MMS
-//! mapping free of control-specific state.
+//! its handlers up here, runs the admission checks inline, and executes an
+//! accepted command on its own task, which reports through the
+//! command-termination sink and the per-connection outbox held here. Keeping the
+//! lookup in its own module leaves the dispatcher and the MMS mapping free of
+//! control-specific state.
 
+use super::dispatch::ControlOutbox;
 use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
 use super::object::ControlObject;
 use super::service::CommandTerminationSink;
@@ -118,6 +121,7 @@ impl ControlObjectEntry {
 pub struct ControlObjectsRegistry {
     inner: Arc<RwLock<HashMap<ControlObjectKey, ControlObjectEntry>>>,
     ct_sink: Arc<dyn CommandTerminationSink>,
+    outbox: Arc<ControlOutbox>,
 }
 
 impl std::fmt::Debug for ControlObjectsRegistry {
@@ -141,6 +145,7 @@ impl ControlObjectsRegistry {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ct_sink: Arc::new(super::service::NoOpCommandTermination),
+            outbox: Arc::default(),
         }
     }
 
@@ -149,6 +154,7 @@ impl ControlObjectsRegistry {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ct_sink,
+            outbox: Arc::default(),
         }
     }
 
@@ -157,10 +163,16 @@ impl ControlObjectsRegistry {
         self.ct_sink = sink;
     }
 
-    /// Returns the current command-termination sink, which the dispatcher passes to
-    /// `handle_operate`.
+    /// Returns the current command-termination sink, through which an executed
+    /// command under enhanced security reports its outcome.
     pub fn ct_sink(&self) -> &Arc<dyn CommandTerminationSink> {
         &self.ct_sink
+    }
+
+    /// Returns the per-connection outbox the control services report through,
+    /// shared by every clone of this registry.
+    pub(crate) fn outbox(&self) -> &Arc<ControlOutbox> {
+        &self.outbox
     }
 
     /// Registers one control object with its handlers.

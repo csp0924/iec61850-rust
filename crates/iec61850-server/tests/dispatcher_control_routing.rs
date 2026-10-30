@@ -114,6 +114,19 @@ fn build_dispatcher_with_recording_sink(
     (dispatcher, events)
 }
 
+/// Waits until the sink has recorded `n` terminations; an accepted command
+/// executes on its own task, which sends its termination when it finishes.
+async fn wait_for_terminations(events: &Arc<std::sync::Mutex<Vec<TerminationEvent>>>, n: usize) {
+    let wait = async {
+        while events.lock().unwrap().len() < n {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("the command termination was never sent");
+}
+
 /// Builds a server connection with connection id 1.
 fn make_conn() -> MmsServerConnection {
     let mut c = MmsServerConnection::new();
@@ -230,6 +243,7 @@ async fn dispatcher_direct_enhanced_oper_sends_command_termination_positive() {
     ));
 
     // Enhanced security sends a positive CommandTermination.
+    wait_for_terminations(&events, 1).await;
     let recorded = events.lock().unwrap();
     assert_eq!(
         recorded.len(),
@@ -349,15 +363,14 @@ async fn dispatcher_sbo_enhanced_sbow_then_oper_succeeds_and_sends_ct() {
     ));
 
     // SBO-enhanced operate → CommandTermination+
+    wait_for_terminations(&events, 1).await;
     let recorded = events.lock().unwrap();
     assert_eq!(recorded.len(), 1);
     assert!(matches!(recorded[0], TerminationEvent::Positive { .. }));
 }
 
-// An Operate without a preceding SBOw fails and still terminates.
-//
-// Per IEC 61850-7-2 clause 20.2.1 every denied Operate under enhanced security
-// is reported with a negative CommandTermination, ObjectNotSelected included.
+// An Operate without a preceding SBOw is refused. It was never accepted, so it
+// ends in no CommandTermination; the refusal is reported through LastApplError.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatcher_sbo_enhanced_oper_without_select_fails() {
@@ -385,14 +398,10 @@ async fn dispatcher_sbo_enhanced_oper_without_select_fails() {
         iec61850_mms::mms::pdu::common::WriteOutcome::Failure(_)
     ));
 
-    // Every denied Operate sends a negative CommandTermination.
-    let recorded = events.lock().unwrap();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "a failed Operate must send a negative CommandTermination"
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a refused Operate sends no CommandTermination"
     );
-    assert!(matches!(recorded[0], TerminationEvent::Negative { .. }));
 }
 
 // A status-only control model refuses the service.

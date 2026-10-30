@@ -164,10 +164,9 @@ impl Default for IdentificationStrings {
 ///
 /// A Read or Write under functional constraint CO is routed to the control
 /// object and handlers found in `control_objects`. `dispatch` is a synchronous
-/// trait method whose signature cannot change, while the control flow involves
-/// asynchronous handlers, so the control path awaits through
-/// `tokio::task::block_in_place` and `Handle::current().block_on`. That
-/// requires the server to run on a multi-threaded runtime.
+/// trait method while the control flow involves asynchronous handlers, so the
+/// control path admits a request inline and executes an accepted command on a
+/// task of the current tokio runtime, of either flavor.
 ///
 /// A Read or Write under RP or BR is routed to `reporting_engine`, which
 /// answers `ObjectNonExistent` for a control block it does not hold.
@@ -2508,9 +2507,9 @@ fn read_path_canonical_from_object_name(
 /// Routes a write: functional constraint CO to the control service, everything
 /// else to the standard write.
 ///
-/// The control service is asynchronous while this path is synchronous, so it
-/// awaits through `tokio::task::block_in_place` and
-/// `Handle::current().block_on`, which requires a multi-threaded runtime.
+/// The control service checks the value and admits the request inline and runs
+/// an accepted command on its own task, so this path never blocks; see the
+/// `control` module for how the outcome reaches the client.
 #[cfg(any(
     feature = "reporting",
     feature = "control",
@@ -2533,7 +2532,8 @@ fn handle_write_with_co_routing(
 ) -> WriteOutcome {
     #[cfg(feature = "control")]
     {
-        use crate::control::{handle_cancel, handle_operate, handle_sbow, CoAttr, ServiceResult};
+        use crate::control::dispatch::{add_cause_to_data_access_error, CoTarget, CoWriteResult};
+        use crate::control::CoAttr;
         use crate::service::convert::mms_data_to_mms_value;
 
         if let Some((domain, ln, do_name, attr)) = extract_co_target(name) {
@@ -2550,42 +2550,36 @@ fn handle_write_with_co_routing(
                 }
             };
 
+            if attr == CoAttr::Sbo {
+                // A select through SBO is issued as a read.
+                tracing::warn!(
+                    domain,
+                    ln,
+                    do_name,
+                    "write: SBO is read, not written, answering object-access-unsupported"
+                );
+                return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
+            }
+
             let value = mms_data_to_mms_value(data);
-
-            let service_result = match attr {
-                CoAttr::Sbo => {
-                    // A select through SBO is issued as a read.
-                    tracing::warn!(
-                        domain,
-                        ln,
-                        do_name,
-                        "write: SBO is read, not written, answering object-access-unsupported"
-                    );
-                    return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
-                }
-                CoAttr::SBOw => block_on_async(async {
-                    handle_sbow(&entry.object, conn_id, &value, entry.check_handler.as_ref()).await
-                }),
-                CoAttr::Oper => block_on_async(async {
-                    handle_operate(
-                        &entry.object,
-                        conn_id,
-                        &value,
-                        entry.check_handler.as_ref(),
-                        entry.wait_handler.as_ref(),
-                        entry.operate_handler.as_ref(),
-                        control_objects.ct_sink().as_ref(),
-                    )
-                    .await
-                }),
-                CoAttr::Cancel => handle_cancel(&entry.object, conn_id, &value),
+            let target = CoTarget {
+                domain,
+                ln_name: ln,
+                do_name,
+                attr: attr.clone(),
             };
-
-            return match service_result {
-                ServiceResult::Success => WriteOutcome::Success,
-                ServiceResult::Failure(cause) => {
-                    // The failure is reported in the WriteResponse; a
-                    // LastApplError report is not pushed from here.
+            return match crate::control::dispatch::write(
+                control_objects,
+                &entry,
+                conn_id,
+                &target,
+                &value,
+            ) {
+                CoWriteResult::Accepted => WriteOutcome::Success,
+                CoWriteResult::TypeInconsistent => {
+                    WriteOutcome::Failure(DataAccessError::TypeInconsistent)
+                }
+                CoWriteResult::Refused(cause) => {
                     tracing::warn!(
                         domain,
                         ln,
@@ -2594,8 +2588,7 @@ fn handle_write_with_co_routing(
                         ?cause,
                         "write: the control service refused the command"
                     );
-                    let err = map_add_cause_to_data_access_error(cause);
-                    WriteOutcome::Failure(err)
+                    WriteOutcome::Failure(add_cause_to_data_access_error(cause))
                 }
             };
         }
@@ -2612,38 +2605,6 @@ fn handle_write_with_co_routing(
         name,
         data,
     )
-}
-
-/// Maps a control add-cause onto the data access error a client receives, per
-/// IEC 61850-7-2 §20.
-#[cfg(feature = "control")]
-fn map_add_cause_to_data_access_error(cause: crate::control::ControlAddCause) -> DataAccessError {
-    use crate::control::ControlAddCause;
-    match cause {
-        ControlAddCause::NotSupported => DataAccessError::ObjectAccessUnsupported,
-        ControlAddCause::ObjectNotSelected => DataAccessError::ObjectAccessDenied,
-        ControlAddCause::ObjectAlreadySelected => DataAccessError::ObjectAccessDenied,
-        ControlAddCause::LockedByOtherClient => DataAccessError::ObjectAccessDenied,
-        ControlAddCause::CommandAlreadyInExecution => DataAccessError::ObjectAccessDenied,
-        ControlAddCause::InconsistentParameters => DataAccessError::ObjectAccessDenied,
-        ControlAddCause::NoAccessAuthority => DataAccessError::ObjectAccessDenied,
-        _ => DataAccessError::ObjectAccessDenied,
-    }
-}
-
-/// Awaits a future from a synchronous call path.
-///
-/// `block_in_place` puts the current worker thread into blocking mode, leaving
-/// the remaining tasks to the other workers, and `block_on` then drives the
-/// future to completion on it.
-///
-/// # Panics
-///
-/// Panics when called outside a multi-threaded tokio runtime. The connection
-/// handler always runs inside one.
-#[cfg(feature = "control")]
-fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

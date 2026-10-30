@@ -22,6 +22,7 @@ use bytes::{Bytes, BytesMut};
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -372,21 +373,15 @@ pub fn handle_read_sbo(
 
 /// Handles a write to `$CO$<DO>$SBOw`, the select of the enhanced-security
 /// select-before-operate model.
+///
+/// A value that does not parse as an SBOw structure is refused with
+/// `InconsistentParameters`.
 pub async fn handle_sbow(
     obj: &ControlObject,
     conn_id: u64,
     raw_value: &MmsValue,
     check_handler: Option<&Arc<dyn CheckHandler>>,
 ) -> ServiceResult {
-    // Expire a stale selection first.
-    obj.check_sbo_timeout();
-
-    // A status-only object never accepts a control request.
-    if obj.config.ctl_model == ControlModel::StatusOnly {
-        tracing::warn!(name = %obj.config.name, "SBOw refused: the object is status-only");
-        return ServiceResult::Failure(ControlAddCause::NotSupported);
-    }
-
     // Parse the SBOw parameters.
     let params = match OperParams::from_mms_value(raw_value) {
         Some(p) => p,
@@ -395,11 +390,36 @@ pub async fn handle_sbow(
             return ServiceResult::Failure(ControlAddCause::InconsistentParameters);
         }
     };
+    match select_with_value(obj, conn_id, &params, check_handler) {
+        Ok(()) => ServiceResult::Success,
+        Err(cause) => ServiceResult::Failure(cause),
+    }
+}
+
+/// Runs a select with value whose parameters have been parsed.
+///
+/// # Errors
+///
+/// Returns the add cause of a refusal.
+pub(crate) fn select_with_value(
+    obj: &ControlObject,
+    conn_id: u64,
+    params: &OperParams,
+    check_handler: Option<&Arc<dyn CheckHandler>>,
+) -> Result<(), ControlAddCause> {
+    // Expire a stale selection first.
+    obj.check_sbo_timeout();
+
+    // A status-only object never accepts a control request.
+    if obj.config.ctl_model == ControlModel::StatusOnly {
+        tracing::warn!(name = %obj.config.name, "SBOw refused: the object is status-only");
+        return Err(ControlAddCause::NotSupported);
+    }
 
     // The origin field must be well formed.
     if !params.origin.is_valid() {
         tracing::warn!(name = %obj.config.name, "SBOw refused: malformed origin field");
-        return ServiceResult::Failure(ControlAddCause::InconsistentParameters);
+        return Err(ControlAddCause::InconsistentParameters);
     }
 
     let action = ControlAction::new(
@@ -427,23 +447,23 @@ pub async fn handle_sbow(
                 ?cause,
                 "SBOw refused by the check handler"
             );
-            return ServiceResult::Failure(cause);
+            return Err(cause);
         }
     }
 
     // Record the SBOw parameters so the Operate can be compared against them.
-    match obj.try_sbow_select(conn_id, &params) {
-        Ok(true) => {
+    match obj.sbow_select(conn_id, params) {
+        Ok(Ok(())) => {
             tracing::debug!(name = %obj.config.name, conn_id, "select-with-value accepted");
-            ServiceResult::Success
+            Ok(())
         }
-        Ok(false) => {
-            tracing::warn!(name = %obj.config.name, "SBOw refused: the object is already selected");
-            ServiceResult::Failure(ControlAddCause::LockedByOtherClient)
+        Ok(Err(cause)) => {
+            tracing::warn!(name = %obj.config.name, ?cause, "SBOw refused by the state machine");
+            Err(cause)
         }
         Err(e) => {
             tracing::warn!(name = %obj.config.name, error = %e, "SBOw failed internally");
-            ServiceResult::Failure(ControlAddCause::Unknown)
+            Err(ControlAddCause::Unknown)
         }
     }
 }
@@ -452,10 +472,15 @@ pub async fn handle_sbow(
 // Operate
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Handles a write to `$CO$<DO>$Oper`, for every control model.
+/// Handles a write to `$CO$<DO>$Oper`, for every control model, and runs the
+/// command to completion.
 ///
-/// With enhanced security a CommandTermination is sent once the command finishes,
-/// whether it succeeded or failed.
+/// An Operate refused by the admission checks or by the dynamic check returns
+/// the cause of the refusal and sends no CommandTermination. An object without a
+/// control handler refuses every Operate with `NotSupported`. Otherwise the
+/// command runs, and with enhanced security it ends with a CommandTermination,
+/// positive or negative, through `ct_sink`; the result is the outcome of the
+/// command.
 pub async fn handle_operate(
     obj: &ControlObject,
     conn_id: u64,
@@ -465,10 +490,6 @@ pub async fn handle_operate(
     operate_handler: Option<&Arc<dyn ControlHandler>>,
     ct_sink: &dyn CommandTerminationSink,
 ) -> ServiceResult {
-    // Expire a stale selection first; a select-before-operate object then reports
-    // that it is not selected.
-    obj.check_sbo_timeout();
-
     // Parse the Oper parameters.
     let params = match OperParams::from_mms_value(raw_value) {
         Some(p) => p,
@@ -478,36 +499,85 @@ pub async fn handle_operate(
         }
     };
 
-    // Keep the client's Oper structure encoded, so a CommandTermination can carry
-    // it back as its second AccessResult.
-    let oper_value_bytes: Bytes = encode_mms_value_to_bytes(raw_value);
-
-    let is_enhanced = matches!(
-        obj.config.ctl_model,
-        ControlModel::DirectEnhanced | ControlModel::SboEnhanced
-    );
-
-    // Admit the request: state machine and parameter checks.
-    let begin = match obj.begin_operate(conn_id, &params) {
-        Ok(Some(r)) => r,
-        Ok(None) => return ServiceResult::Failure(ControlAddCause::Unknown),
-        Err(e) => {
-            tracing::warn!(name = %obj.config.name, error = %e, "operate failed internally");
-            return ServiceResult::Failure(ControlAddCause::Unknown);
-        }
+    let accepted = match admit_operate(
+        obj,
+        conn_id,
+        params,
+        raw_value,
+        check_handler,
+        wait_handler,
+        operate_handler,
+    ) {
+        Ok(a) => a,
+        Err(cause) => return ServiceResult::Failure(cause),
     };
 
-    match begin {
-        OperateBeginResult::Denied(cause) => {
-            // Enhanced security must tell the client about every refused Operate,
-            // including one refused because the object was not selected or its
-            // parameters differed. Normal security and status-only send nothing.
-            if is_enhanced {
-                ct_sink.send_negative(&obj.object_ref(), conn_id, cause, oper_value_bytes.clone());
-            }
-            return ServiceResult::Failure(cause);
+    if let Err(cause) = accepted.dynamic_check().await {
+        return ServiceResult::Failure(cause);
+    }
+    let result = accepted.run().await;
+    accepted.terminate(ct_sink, result);
+    match result {
+        Ok(()) => ServiceResult::Success,
+        Err(cause) => ServiceResult::Failure(cause),
+    }
+}
+
+/// An Operate that passed every admission check and awaits execution.
+///
+/// The object is in `WaitForExecution`. `dynamic_check` decides the Operate
+/// response; after a positive response `run` carries the command out and leaves
+/// the object in ready or unselected.
+pub(crate) struct AcceptedOperate {
+    obj: ControlObject,
+    conn_id: u64,
+    action: ControlAction,
+    params: OperParams,
+    oper_value: Bytes,
+    wait_handler: Option<Arc<dyn WaitForExecutionHandler>>,
+    operate_handler: Arc<dyn ControlHandler>,
+}
+
+/// Admits an Operate whose parameters have been parsed: the state machine, the
+/// parameter checks, and the static check handler.
+///
+/// `raw_value` is the Oper structure as the client sent it, which a
+/// CommandTermination echoes back.
+///
+/// # Errors
+///
+/// Returns the add cause of a refusal; the object is then unchanged, or back in
+/// unselected when the refusal ended its selection.
+pub(crate) fn admit_operate(
+    obj: &ControlObject,
+    conn_id: u64,
+    params: OperParams,
+    raw_value: &MmsValue,
+    check_handler: Option<&Arc<dyn CheckHandler>>,
+    wait_handler: Option<&Arc<dyn WaitForExecutionHandler>>,
+    operate_handler: Option<&Arc<dyn ControlHandler>>,
+) -> Result<AcceptedOperate, ControlAddCause> {
+    // Expire a stale selection first; a select-before-operate object then reports
+    // that it is not selected.
+    obj.check_sbo_timeout();
+
+    let Some(operate_handler) = operate_handler else {
+        tracing::warn!(
+            name = %obj.config.name,
+            "operate refused: no control handler is installed for this object"
+        );
+        return Err(ControlAddCause::NotSupported);
+    };
+
+    // Admit the request: state machine and parameter checks.
+    match obj.begin_operate(conn_id, &params) {
+        Ok(Some(OperateBeginResult::Accepted)) => {}
+        Ok(Some(OperateBeginResult::Denied(cause))) => return Err(cause),
+        Ok(None) => return Err(ControlAddCause::Unknown),
+        Err(e) => {
+            tracing::warn!(name = %obj.config.name, error = %e, "operate failed internally");
+            return Err(ControlAddCause::Unknown);
         }
-        OperateBeginResult::Accepted => {}
     }
 
     let action = ControlAction::new(
@@ -532,63 +602,127 @@ pub async fn handle_operate(
         ) {
             tracing::warn!(name = %obj.config.name, ?cause, "operate refused by the check handler");
             obj.abort_to_unselected();
-            if is_enhanced {
-                ct_sink.send_negative(&obj.object_ref(), conn_id, cause, oper_value_bytes.clone());
-            }
-            return ServiceResult::Failure(cause);
+            return Err(cause);
         }
     }
 
-    // Dynamic check.
-    if let Some(h) = wait_handler {
-        match h
-            .wait_for_execution(&action, &params.ctl_val, params.test, params.synchro_check)
-            .await
-        {
-            Ok(()) => {}
-            Err(cause) => {
-                tracing::warn!(name = %obj.config.name, ?cause, "operate refused by the dynamic check");
-                obj.abort_to_unselected();
-                if is_enhanced {
-                    ct_sink.send_negative(
-                        &obj.object_ref(),
-                        conn_id,
-                        cause,
-                        oper_value_bytes.clone(),
-                    );
+    Ok(AcceptedOperate {
+        obj: obj.clone(),
+        conn_id,
+        action,
+        params,
+        oper_value: encode_mms_value_to_bytes(raw_value),
+        wait_handler: wait_handler.cloned(),
+        operate_handler: operate_handler.clone(),
+    })
+}
+
+impl AcceptedOperate {
+    /// Returns whether the object uses enhanced security, whose result travels
+    /// in a CommandTermination rather than in the Operate response.
+    pub(crate) fn is_enhanced(&self) -> bool {
+        matches!(
+            self.obj.config.ctl_model,
+            ControlModel::DirectEnhanced | ControlModel::SboEnhanced
+        )
+    }
+
+    /// Returns whether a dynamic check is installed, which decides the outcome
+    /// of the Operate response only once it finishes.
+    pub(crate) fn has_dynamic_check(&self) -> bool {
+        self.wait_handler.is_some()
+    }
+
+    /// Runs the dynamic check, the WaitForExecution state of IEC 61850-7-2.
+    ///
+    /// The Operate response follows its outcome: a refusal returns the object to
+    /// unselected and is answered negatively, a pass is answered positively and
+    /// lets the command run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the add cause of the dynamic check.
+    pub(crate) async fn dynamic_check(&self) -> Result<(), ControlAddCause> {
+        let Some(h) = &self.wait_handler else {
+            return Ok(());
+        };
+        let outcome = h
+            .wait_for_execution(
+                &self.action,
+                &self.params.ctl_val,
+                self.params.test,
+                self.params.synchro_check,
+            )
+            .await;
+        if let Err(cause) = outcome {
+            tracing::warn!(name = %self.obj.config.name, ?cause, "operate refused by the dynamic check");
+            self.obj.abort_to_unselected();
+        }
+        outcome
+    }
+
+    /// Runs the command once the Operate has been answered positively, limited
+    /// by the operate timeout of the object.
+    ///
+    /// The object returns to ready or unselected according to the select class
+    /// however the command ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the add cause of the control handler, or `TimeLimitOver` when the
+    /// command outlasts the operate timeout.
+    pub(crate) async fn run(&self) -> Result<(), ControlAddCause> {
+        let name = &self.obj.config.name;
+        self.obj.set_state_operate();
+        let command =
+            self.operate_handler
+                .operate(&self.action, &self.params.ctl_val, self.params.test);
+        let result = match self.obj.oper_timeout_ms() {
+            0 => command.await,
+            timeout_ms => {
+                match tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), command)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!(
+                            name = %name,
+                            timeout_ms,
+                            "operate ended: the command outlasted the operate timeout"
+                        );
+                        Err(ControlAddCause::TimeLimitOver)
+                    }
                 }
-                return ServiceResult::Failure(cause);
+            }
+        };
+        // Return to ready or unselected according to the select class.
+        self.obj.finish_operate();
+
+        match result {
+            Ok(()) => tracing::debug!(name = %name, "operate succeeded"),
+            Err(cause) => {
+                tracing::warn!(name = %name, ?cause, "operate failed in the control handler")
             }
         }
+        result
     }
 
-    obj.set_state_operate();
-
-    // Run the command.
-    let result = if let Some(h) = operate_handler {
-        h.operate(&action, &params.ctl_val, params.test).await
-    } else {
-        // Without a handler the command is treated as successful.
-        Ok(())
-    };
-
-    // Return to ready or unselected according to the select class.
-    obj.finish_operate();
-
-    match result {
-        Ok(()) => {
-            tracing::debug!(name = %obj.config.name, "operate succeeded");
-            if is_enhanced {
-                ct_sink.send_positive(&obj.object_ref(), conn_id, oper_value_bytes.clone());
-            }
-            ServiceResult::Success
+    /// Sends the CommandTermination of a command that ran when the object uses
+    /// enhanced security; does nothing under normal security.
+    pub(crate) fn terminate(
+        &self,
+        ct_sink: &dyn CommandTerminationSink,
+        result: Result<(), ControlAddCause>,
+    ) {
+        if !self.is_enhanced() {
+            return;
         }
-        Err(cause) => {
-            tracing::warn!(name = %obj.config.name, ?cause, "operate failed in the control handler");
-            if is_enhanced {
-                ct_sink.send_negative(&obj.object_ref(), conn_id, cause, oper_value_bytes.clone());
+        let obj_ref = self.obj.object_ref();
+        match result {
+            Ok(()) => ct_sink.send_positive(&obj_ref, self.conn_id, self.oper_value.clone()),
+            Err(cause) => {
+                ct_sink.send_negative(&obj_ref, self.conn_id, cause, self.oper_value.clone())
             }
-            ServiceResult::Failure(cause)
         }
     }
 }
@@ -1056,5 +1190,182 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── An object without a control handler ───────────────────────────────
+
+    #[tokio::test]
+    async fn handle_operate_without_a_control_handler_is_not_supported() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ct = RecordingCommandTermination {
+            events: events.clone(),
+        };
+        let r = handle_operate(&obj, 1, &make_oper_value(), None, None, None, &ct).await;
+        assert_eq!(r, ServiceResult::Failure(ControlAddCause::NotSupported));
+        assert_eq!(obj.state(), ControlState::Unselected);
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    // ── A refused enhanced-security Operate sends no CommandTermination ────
+
+    #[tokio::test]
+    async fn handle_operate_refused_enhanced_sends_no_command_termination() {
+        let obj = make_direct_obj(ControlModel::SboEnhanced);
+        let oper_h: Arc<dyn ControlHandler> = Arc::new(AlwaysSuccessOperateHandler);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ct = RecordingCommandTermination {
+            events: events.clone(),
+        };
+        let r = handle_operate(&obj, 1, &make_oper_value(), None, None, Some(&oper_h), &ct).await;
+        assert_eq!(
+            r,
+            ServiceResult::Failure(ControlAddCause::ObjectNotSelected)
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    // ── The dynamic check decides the response; the timeout limits the command ──
+
+    /// Control handler that finishes after `delay`, or never when `None`.
+    struct DelayedOperate(Option<std::time::Duration>);
+
+    impl ControlHandler for DelayedOperate {
+        fn operate<'a>(
+            &'a self,
+            _action: &'a ControlAction,
+            _ctl_val: &'a MmsValue,
+            _test: bool,
+        ) -> crate::control::handler::OperateFuture<'a> {
+            let delay = self.0;
+            Box::pin(async move {
+                match delay {
+                    Some(d) => {
+                        tokio::time::sleep(d).await;
+                        Ok(())
+                    }
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    /// Dynamic check that refuses with a fixed cause.
+    struct RefusingWait(ControlAddCause);
+
+    impl WaitForExecutionHandler for RefusingWait {
+        fn wait_for_execution<'a>(
+            &'a self,
+            _action: &'a ControlAction,
+            _ctl_val: &'a MmsValue,
+            _test: bool,
+            _synchro_check: bool,
+        ) -> crate::control::handler::WaitForExecFuture<'a> {
+            let cause = self.0;
+            Box::pin(async move { Err(cause) })
+        }
+    }
+
+    fn accept(
+        obj: &ControlObject,
+        wait: Option<Arc<dyn WaitForExecutionHandler>>,
+        operate: DelayedOperate,
+    ) -> AcceptedOperate {
+        let params = OperParams::from_mms_value(&make_oper_value()).expect("oper");
+        let oper_h: Arc<dyn ControlHandler> = Arc::new(operate);
+        admit_operate(
+            obj,
+            1,
+            params,
+            &make_oper_value(),
+            None,
+            wait.as_ref(),
+            Some(&oper_h),
+        )
+        .unwrap_or_else(|cause| panic!("refused: {cause:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_refusing_dynamic_check_ends_the_operate_before_the_command() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let wait: Arc<dyn WaitForExecutionHandler> =
+            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchroCheck));
+        let accepted = accept(&obj, Some(wait), DelayedOperate(None));
+        assert!(accepted.has_dynamic_check());
+        assert_eq!(
+            accepted.dynamic_check().await,
+            Err(ControlAddCause::BlockedBySynchroCheck)
+        );
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[tokio::test]
+    async fn handle_operate_refused_by_the_dynamic_check_sends_no_command_termination() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let wait_h: Arc<dyn WaitForExecutionHandler> =
+            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchroCheck));
+        let oper_h: Arc<dyn ControlHandler> = Arc::new(AlwaysSuccessOperateHandler);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ct = RecordingCommandTermination {
+            events: events.clone(),
+        };
+        let r = handle_operate(
+            &obj,
+            1,
+            &make_oper_value(),
+            None,
+            Some(&wait_h),
+            Some(&oper_h),
+            &ct,
+        )
+        .await;
+        assert_eq!(
+            r,
+            ServiceResult::Failure(ControlAddCause::BlockedBySynchroCheck)
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oper_timeout_ends_the_command_exactly_at_the_limit() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        obj.set_oper_timeout_ms(100);
+        let accepted = accept(&obj, None, DelayedOperate(None));
+        assert_eq!(accepted.dynamic_check().await, Ok(()));
+        let started = tokio::time::Instant::now();
+        // The outer bound only ends a run in which the operate timeout never fires.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3600), accepted.run())
+            .await
+            .expect("the operate timeout never fired");
+        assert_eq!(result, Err(ControlAddCause::TimeLimitOver));
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(100));
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oper_timeout_lets_a_command_within_the_limit_finish() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        obj.set_oper_timeout_ms(100);
+        let accepted = accept(
+            &obj,
+            None,
+            DelayedOperate(Some(std::time::Duration::from_millis(99))),
+        );
+        assert_eq!(accepted.run().await, Ok(()));
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_oper_timeout_waits_for_the_command() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        assert_eq!(obj.oper_timeout_ms(), 0);
+        let accepted = accept(
+            &obj,
+            None,
+            DelayedOperate(Some(std::time::Duration::from_secs(3600))),
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(accepted.run().await, Ok(()));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3600));
     }
 }
