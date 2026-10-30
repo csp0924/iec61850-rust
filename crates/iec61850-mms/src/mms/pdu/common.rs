@@ -763,23 +763,13 @@ impl MmsData {
             }
             0x84 => {
                 // bit-string: the first byte is the padding count, then the data
-                if val.is_empty() {
-                    return Err(MmsError::InvalidLength);
-                }
-                MmsData::BitString {
-                    padding: val[0],
-                    data: val[1..].to_vec(),
-                }
+                let (padding, data) = decode_bit_string(tag, val)?;
+                MmsData::BitString { padding, data }
             }
             0x8e => {
                 // boolean-array, a BIT STRING whose first byte is the padding count
-                if val.is_empty() {
-                    return Err(MmsError::InvalidLength);
-                }
-                MmsData::BooleanArray {
-                    padding: val[0],
-                    data: val[1..].to_vec(),
-                }
+                let (padding, data) = decode_bit_string(tag, val)?;
+                MmsData::BooleanArray { padding, data }
             }
             0x90 => {
                 // mms-string, UTF-8
@@ -1636,6 +1626,32 @@ pub(crate) fn encode_unsigned_int_minimal(val: u64) -> Vec<u8> {
     bytes[start..].to_vec()
 }
 
+/// Decodes the content of a primitive BIT STRING into its padding count and data.
+///
+/// Per ITU-T X.690 the padding count is 0 to 7, and an empty bit string carries a
+/// padding count of 0 and no data byte.
+///
+/// # Errors
+///
+/// `InvalidLength` when the content lacks the padding-count byte, and
+/// `InvalidPdu` when the padding count is above 7 or is non-zero with no data.
+fn decode_bit_string(tag: u8, val: &[u8]) -> Result<(u8, Vec<u8>), MmsError> {
+    let Some((&padding, data)) = val.split_first() else {
+        tracing::warn!("bit string tag 0x{:02X} has no padding-count byte", tag);
+        return Err(MmsError::InvalidLength);
+    };
+    if padding > 7 || (data.is_empty() && padding != 0) {
+        tracing::warn!(
+            "bit string tag 0x{:02X} has padding count {} over {} data bytes, rejecting",
+            tag,
+            padding,
+            data.len()
+        );
+        return Err(MmsError::InvalidPdu);
+    }
+    Ok((padding, data.to_vec()))
+}
+
 /// Decodes a floating point value: the first byte is the exponent width, followed
 /// by an IEEE 754 big-endian value.
 ///
@@ -1952,6 +1968,40 @@ mod tests {
         data.encode(&mut buf);
         let (decoded, _) = MmsData::decode(&buf).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// A bit string or boolean array whose padding count is above 7 is rejected
+    /// with `InvalidPdu`, as is one that pads an empty bit string.
+    #[test]
+    fn bit_string_invalid_padding_rejected() {
+        for tag in [0x84u8, 0x8e] {
+            for bytes in [[tag, 0x02, 0x08, 0xff].as_slice(), &[tag, 0x01, 0x03]] {
+                assert!(
+                    matches!(MmsData::decode(bytes), Err(MmsError::InvalidPdu)),
+                    "{bytes:02x?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bit_string_padding_at_bounds_accepted() {
+        let (seven, _) = MmsData::decode(&[0x84, 0x02, 0x07, 0x80]).unwrap();
+        assert_eq!(
+            seven,
+            MmsData::BitString {
+                padding: 7,
+                data: vec![0x80],
+            }
+        );
+        let (empty, _) = MmsData::decode(&[0x8e, 0x01, 0x00]).unwrap();
+        assert_eq!(
+            empty,
+            MmsData::BooleanArray {
+                padding: 0,
+                data: vec![],
+            }
+        );
     }
 
     // Structure and Array round trips, including nesting

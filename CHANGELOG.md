@@ -45,6 +45,10 @@ Every crate in the workspace shares one version number.
   whose user information carried a Confirmed-RequestPDU in place of the
   Initiate-RequestPDU was otherwise served before any PDU size or
   outstanding-request limit had been negotiated.
+- **`iec61850-mms`** — a `Data` bit-string or boolean-array whose padding
+  count is above 7, or is non-zero on an empty bit string, is rejected with
+  `InvalidPdu` instead of being decoded into a `BitString` or `BooleanArray`
+  that no conforming encoder produces.
 
 ## [0.2.0] - 2026-09-06
 
