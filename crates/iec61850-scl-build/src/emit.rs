@@ -28,7 +28,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, MmsValue,
+    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, template_initial_value, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -420,12 +420,23 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
         });
     }
 
-    // Leaf DA: the type comes from `b_type_to_dat` and the initial value from
-    // the runtime `MmsValue::default_for`.
+    // Leaf DA: the type comes from `b_type_to_dat` and the initial value, the
+    // `<Val>` of the declaration or the zero value, from
+    // `template_initial_value`.
     let dat = iec61850_scl::__build_internals::b_type_to_dat(&da.b_type, da.span, "DA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
-    let initial_tok = emit_mms_value(&MmsValue::default_for(dat));
+    let initial = template_initial_value(
+        dat,
+        &da.b_type,
+        da.type_ref.as_deref(),
+        da.default_value.as_deref(),
+        dtt,
+        da.span,
+        "DA",
+    )
+    .map_err(CompileError::ResolveScl)?;
+    let initial_tok = emit_mms_value(&initial);
 
     Ok(quote! {
         DataAttribute::new(
@@ -479,7 +490,17 @@ fn emit_bda_expr(
     let dat = iec61850_scl::__build_internals::b_type_to_dat(&bda.b_type, bda.span, "BDA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
-    let initial_tok = emit_mms_value(&MmsValue::default_for(dat));
+    let initial = template_initial_value(
+        dat,
+        &bda.b_type,
+        bda.type_ref.as_deref(),
+        bda.default_value.as_deref(),
+        dtt,
+        bda.span,
+        "BDA",
+    )
+    .map_err(CompileError::ResolveScl)?;
+    let initial_tok = emit_mms_value(&initial);
 
     Ok(quote! {
         DataAttribute::new(
@@ -1311,6 +1332,36 @@ mod tests {
   </DataTypeTemplates>
 </SCL>"#;
         assert_leaf_values_match_runtime(xml);
+    }
+
+    /// The generated model starts a leaf with a DataTypeTemplates `<Val>` from
+    /// that value, as the runtime model does.
+    #[test]
+    fn emitted_template_vals_match_runtime() {
+        let xml = r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Pos" type="DPC_T"/></LNodeType>
+    <DOType id="DPC_T" cdc="DPC">
+      <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModels"><Val>sbo-with-normal-security</Val></DA>
+      <DA name="sboTimeout" fc="CF" bType="INT32U"><Val>30000</Val></DA>
+      <DA name="pulseConfig" fc="CF" bType="Struct" type="PulseConfig"/>
+    </DOType>
+    <DAType id="PulseConfig"><BDA name="onDur" bType="INT32U"><Val>500</Val></BDA></DAType>
+    <EnumType id="CtlModels">
+      <EnumVal ord="0">status-only</EnumVal>
+      <EnumVal ord="2">sbo-with-normal-security</EnumVal>
+    </EnumType>
+  </DataTypeTemplates>
+</SCL>"#;
+        assert_leaf_values_match_runtime(xml);
+        let emitted = emit_file(&parse_scl(xml).unwrap().resolve().unwrap(), &cfg())
+            .unwrap()
+            .to_string();
+        let sbo = emit_mms_value(&MmsValue::Unsigned(30000)).to_string();
+        assert!(emitted.contains(&sbo), "sboTimeout is not emitted as 30000");
     }
 
     /// Generated code and the runtime build path must produce the same

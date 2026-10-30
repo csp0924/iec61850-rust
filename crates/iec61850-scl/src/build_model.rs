@@ -8,7 +8,8 @@
 //! is Struct is expanded recursively through its DAType into an
 //! [`iec61850_model::DataAttribute::constructed`].
 //!
-//! Leaf values start at [`iec61850_model::MmsValue::default_for`], and the
+//! Leaf values start at the `<Val>` of their DataTypeTemplates declaration, or
+//! at [`iec61850_model::MmsValue::default_for`] without one, and the
 //! `<DOI>`, `<SDI>` and `<DAI>` overrides are applied afterwards, writing
 //! through the `Arc<RwLock<MmsValue>>` the model already holds. Data sets and
 //! the control blocks are carried over as well.
@@ -300,12 +301,13 @@ fn build_sdo(
 ///
 /// A bType of Struct is expanded recursively through its DAType into a
 /// constructed attribute. Any other bType yields a leaf whose value starts at
-/// the zero value of its type.
+/// the `<Val>` of the declaration, or at the zero value of its type when the
+/// declaration carries none.
 ///
 /// # Errors
 ///
 /// [`SclParseError`] when the bType or the functional constraint is not
-/// recognized.
+/// recognized, or when the `<Val>` does not parse as the bType.
 fn build_da(
     raw_da: &RawDaDef,
     dtt: &DataTypeTemplates,
@@ -341,7 +343,15 @@ fn build_da(
     }
 
     let dat = b_type_to_dat(&raw_da.b_type, raw_da.span, da_path)?;
-    let initial = MmsValue::default_for(dat);
+    let initial = template_initial_value(
+        dat,
+        &raw_da.b_type,
+        raw_da.type_ref.as_deref(),
+        raw_da.default_value.as_deref(),
+        dtt,
+        raw_da.span,
+        da_path,
+    )?;
     Ok(DataAttribute::new(
         raw_da.name.clone(),
         fc,
@@ -352,11 +362,13 @@ fn build_da(
 }
 
 /// Expands a nested attribute. It has no functional constraint of its own and
-/// inherits the one of its parent.
+/// inherits the one of its parent. A leaf starts at the `<Val>` of the
+/// declaration, as in [`build_da`].
 ///
 /// # Errors
 ///
-/// [`SclParseError`] when the bType is not recognized.
+/// [`SclParseError`] when the bType is not recognized, or when the `<Val>`
+/// does not parse as the bType.
 fn build_bda(
     raw_bda: &RawBda,
     parent_fc: FC,
@@ -392,13 +404,58 @@ fn build_bda(
     }
 
     let dat = b_type_to_dat(&raw_bda.b_type, raw_bda.span, bda_path)?;
+    let initial = template_initial_value(
+        dat,
+        &raw_bda.b_type,
+        raw_bda.type_ref.as_deref(),
+        raw_bda.default_value.as_deref(),
+        dtt,
+        raw_bda.span,
+        bda_path,
+    )?;
     Ok(DataAttribute::new(
         raw_bda.name.clone(),
         parent_fc,
         dat,
         TrgOps::NONE,
-        MmsValue::default_for(dat),
+        initial,
     ))
+}
+
+/// Computes the initial value of a leaf `<DA>` or `<BDA>` declared in the
+/// DataTypeTemplates.
+///
+/// A `<Val>` on the declaration is the value every instance starts with, and
+/// a `<DAI>` on an instance overrides it afterwards (IEC 61850-6). Without a
+/// `<Val>`, the value is [`MmsValue::default_for`] of `dat`.
+///
+/// Also used by the build-script path through [`crate::__build_internals`], so
+/// a generated model starts from the same values as one built at run time.
+///
+/// # Errors
+///
+/// Whatever [`parse_val_for_b_type`] reports for the `<Val>` text.
+#[doc(hidden)]
+pub fn template_initial_value(
+    dat: DataAttributeType,
+    b_type: &str,
+    type_ref: Option<&str>,
+    default_value: Option<&str>,
+    dtt: &DataTypeTemplates,
+    span: SourceSpan,
+    path: &str,
+) -> Result<MmsValue, SclParseError> {
+    match default_value {
+        None => Ok(MmsValue::default_for(dat)),
+        Some(text) => {
+            let val = RawVal {
+                s_group: None,
+                raw_text: text.to_string(),
+                span,
+            };
+            parse_val_for_b_type(&val, b_type, type_ref, dtt, span, path)
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -927,7 +984,8 @@ pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
 /// bType.
 ///
 /// The parse is deliberately strict, so a malformed file fails instead of
-/// silently taking a wrong value: a BOOLEAN accepts only `true` and `false`;
+/// silently taking a wrong value: a BOOLEAN accepts the xs:boolean literals
+/// `true`, `false`, `1` and `0`, and `TRUE` and `FALSE` as well;
 /// an integer rejects leading and trailing whitespace; a float rejects a comma
 /// as the decimal separator; a visible string is length-checked against its
 /// declared limit; and an enumeration is looked up by name in its EnumType
@@ -970,14 +1028,11 @@ pub fn parse_val_for_b_type(
 
     match b_type {
         "BOOLEAN" => match raw {
-            "true" => Ok(MmsValue::Boolean(true)),
-            "false" => Ok(MmsValue::Boolean(false)),
+            "true" | "TRUE" | "1" => Ok(MmsValue::Boolean(true)),
+            "false" | "FALSE" | "0" => Ok(MmsValue::Boolean(false)),
             _ => Err(invalid(
-                "BOOLEAN (literal `true` / `false`)",
-                Some(
-                    "IEC 61850-6 §A.10 allows only `true` and `false` as a BOOLEAN literal"
-                        .to_string(),
-                ),
+                "BOOLEAN (`true`, `false`, `1` or `0`)",
+                Some("IEC 61850-6 writes a BOOLEAN as an xs:boolean".to_string()),
             )),
         },
         "INT8" | "INT16" | "INT32" | "INT64" | "INT128" => {

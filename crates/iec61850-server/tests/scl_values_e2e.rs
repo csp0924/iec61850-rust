@@ -20,6 +20,10 @@ const SCL: &str = r#"<SCL>
         <LDevice inst="LD0">
           <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
           <LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>
+          <LN lnClass="CSWI" inst="1" lnType="CSWI_T"/>
+          <LN lnClass="CSWI" inst="2" lnType="CSWI_T">
+            <DOI name="Pos"><DAI name="ctlModel"><Val>direct-with-normal-security</Val></DAI></DOI>
+          </LN>
         </LDevice>
       </Server>
     </AccessPoint>
@@ -31,6 +35,9 @@ const SCL: &str = r#"<SCL>
     <LNodeType id="GGIO_T" lnClass="GGIO">
       <DO name="Rec" type="REC_T"/>
     </LNodeType>
+    <LNodeType id="CSWI_T" lnClass="CSWI">
+      <DO name="Pos" type="DPC_T"/>
+    </LNodeType>
     <DOType id="ENC_T" cdc="ENC">
       <DA name="stVal" fc="ST" bType="BOOLEAN"/>
     </DOType>
@@ -38,6 +45,18 @@ const SCL: &str = r#"<SCL>
       <DA name="entryId" fc="ST" bType="EntryID"/>
       <DA name="octet64" fc="ST" bType="Octet64"/>
     </DOType>
+    <DOType id="DPC_T" cdc="DPC">
+      <DA name="stVal" fc="ST" bType="Dbpos" dchg="true"/>
+      <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModels"><Val>sbo-with-normal-security</Val></DA>
+      <DA name="sboTimeout" fc="CF" bType="INT32U"><Val>30000</Val></DA>
+    </DOType>
+    <EnumType id="CtlModels">
+      <EnumVal ord="0">status-only</EnumVal>
+      <EnumVal ord="1">direct-with-normal-security</EnumVal>
+      <EnumVal ord="2">sbo-with-normal-security</EnumVal>
+      <EnumVal ord="3">direct-with-enhanced-security</EnumVal>
+      <EnumVal ord="4">sbo-with-enhanced-security</EnumVal>
+    </EnumType>
   </DataTypeTemplates>
 </SCL>"#;
 
@@ -99,4 +118,19 @@ async fn entry_id_default_fits_its_fixed_size() {
     );
     assert_eq!(entry_id, MmsValue::OctetString(vec![0u8; 8]));
     assert_eq!(octet64, MmsValue::OctetString(Vec::new()));
+}
+
+/// A client reads the DataTypeTemplates `<Val>` of `ctlModel` and
+/// `sboTimeout`, and the `<DAI>` value where an instance overrides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_defaults_are_served() {
+    let (handle, conn) = serve(SCL).await;
+    let ctl_model = read(&conn, "IED1LD0/CSWI1.Pos.ctlModel", FC::Cf).await;
+    let sbo_timeout = read(&conn, "IED1LD0/CSWI1.Pos.sboTimeout", FC::Cf).await;
+    let overridden = read(&conn, "IED1LD0/CSWI2.Pos.ctlModel", FC::Cf).await;
+    conn.disconnect().await.ok();
+    handle.stop().await;
+    assert_eq!(ctl_model, MmsValue::Integer(2));
+    assert_eq!(sbo_timeout, MmsValue::Unsigned(30000));
+    assert_eq!(overridden, MmsValue::Integer(1));
 }
