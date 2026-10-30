@@ -32,6 +32,10 @@
 //! }
 //! ```
 //!
+//! An UNSIGNED field is an INTEGER on the wire per ISO 9506-2: its content is the
+//! shortest two's-complement encoding, so a value whose top bit is set takes a
+//! leading zero octet.
+//!
 //! ## TimeOfEntry
 //!
 //! TimeOfEntry is a six-octet BinaryTime: four big-endian octets of milliseconds
@@ -542,15 +546,7 @@ fn pdu_len(content: usize) -> usize {
 
 /// Returns the encoded size of an UNSIGNED field holding `v`.
 fn unsigned_tlv_len(v: u64) -> usize {
-    2 + unsigned_content(v).len()
-}
-
-/// Returns the big-endian octets of `v` without leading zero octets; zero is one
-/// zero octet.
-fn unsigned_content(v: u64) -> Vec<u8> {
-    let bytes = v.to_be_bytes();
-    let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
-    bytes[start..].to_vec()
+    iec61850_mms::mms::pdu::common::MmsData::Unsigned(v).estimated_encoded_size()
 }
 
 /// Returns the encoded size of the inclusionField of a data set of `ds_len`
@@ -572,10 +568,11 @@ fn encode_visible_string(s: &str, buf: &mut BytesMut) {
 }
 
 /// Encodes an UNSIGNED (SqNum, ConfRev, subSeqNum), tag 0x86.
+///
+/// The content is the shortest two's-complement INTEGER encoding of ITU-T X.690
+/// §8.3, so a value whose top bit is set takes a leading zero octet.
 fn encode_unsigned(v: u64, buf: &mut BytesMut) {
-    let content = unsigned_content(v);
-    buf.extend_from_slice(&[0x86, content.len() as u8]);
-    buf.extend_from_slice(&content);
+    iec61850_mms::mms::pdu::common::MmsData::Unsigned(v).encode(buf);
 }
 
 /// Encodes a BOOLEAN (moreFollows), tag 0x83.
@@ -1158,19 +1155,25 @@ mod tests {
     }
 
     #[test]
-    fn encode_unsigned_boundary() {
-        let mut buf = BytesMut::new();
-        encode_unsigned(0, &mut buf);
-        assert_eq!(buf[1], 1, "zero must encode in one byte");
-        buf.clear();
-        encode_unsigned(0xff, &mut buf);
-        assert_eq!(buf[1], 1);
-        buf.clear();
-        encode_unsigned(0x100, &mut buf);
-        assert_eq!(buf[1], 2);
-        buf.clear();
-        encode_unsigned(u64::from(u32::MAX), &mut buf);
-        assert_eq!(buf[1], 4);
+    fn encode_unsigned_takes_a_leading_zero_when_the_top_bit_is_set() {
+        let cases: [(u64, &[u8]); 7] = [
+            (0, &[0x86, 0x01, 0x00]),
+            (0x7f, &[0x86, 0x01, 0x7f]),
+            (0x80, &[0x86, 0x02, 0x00, 0x80]),
+            (0xff, &[0x86, 0x02, 0x00, 0xff]),
+            (0x7fff, &[0x86, 0x02, 0x7f, 0xff]),
+            (0x8000, &[0x86, 0x03, 0x00, 0x80, 0x00]),
+            (
+                u64::from(u32::MAX),
+                &[0x86, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for (v, wire) in cases {
+            let mut buf = BytesMut::new();
+            encode_unsigned(v, &mut buf);
+            assert_eq!(&buf[..], wire, "UNSIGNED {v:#x}");
+            assert_eq!(unsigned_tlv_len(v), wire.len(), "size of UNSIGNED {v:#x}");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1404,6 +1407,41 @@ mod tests {
         let dat_set = find(pdu, b"GGIO1$ds1").expect("DatSet");
         let conf_rev = find(pdu, &[0x86, 0x01, 0x55]).expect("ConfRev");
         assert!(dat_set < conf_rev);
+    }
+
+    #[test]
+    fn report_unsigned_fields_take_a_leading_zero_when_the_top_bit_is_set() {
+        let ds = make_dataset(1);
+        let pending = make_pending_data_change(1, 0);
+        let params = ReportEncodeParams {
+            opt_flds: OptFlds::SEQ_NUM | OptFlds::CONF_REV,
+            sq_num: 0x80,
+            conf_rev: 200,
+            ..base_params(&ds, &pending)
+        };
+        let pdu = encode_report_pdus(&params).unwrap().remove(0);
+        assert!(find(&pdu, &[0x86, 0x02, 0x00, 0x80]).is_some(), "SqNum 128");
+        assert!(
+            find(&pdu, &[0x86, 0x02, 0x00, 0xc8]).is_some(),
+            "ConfRev 200"
+        );
+        assert!(find(&pdu, &[0x86, 0x01, 0x80]).is_none());
+        assert!(find(&pdu, &[0x86, 0x01, 0xc8]).is_none());
+
+        let id = EntryId::from_ms(1);
+        let mut brcb = brcb_base_params(&ds, &pending, id, false);
+        brcb.opt_flds = OptFlds::SEQ_NUM | OptFlds::CONF_REV;
+        brcb.sq_num = 0x8000;
+        brcb.conf_rev = 0xff;
+        let pdu = encode_brcb_report_pdus(&brcb).unwrap().remove(0);
+        assert!(
+            find(&pdu, &[0x86, 0x03, 0x00, 0x80, 0x00]).is_some(),
+            "SqNum 32768"
+        );
+        assert!(
+            find(&pdu, &[0x86, 0x02, 0x00, 0xff]).is_some(),
+            "ConfRev 255"
+        );
     }
 
     /// A GI report over `n` members with long data references.
