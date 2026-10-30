@@ -396,13 +396,15 @@ fn decode_binary_time_to_ms(b: &[u8]) -> Result<u64, MmsError> {
             a.copy_from_slice(b);
             Ok(epoch_ms_from_binary_time6(a))
         }
-        4 => {
-            // BinaryTime4 carries only milliseconds within the day, with no date, so
-            // the value is taken as an offset from midnight on 1970-01-01.
-            let ms_of_day = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
-            Ok(ms_of_day)
+        // An EntryTime is a six-octet TimeOfDay (IEC 61850-8-1); the four-octet
+        // form carries no date, so the instant it names is unknown.
+        len => {
+            tracing::warn!(
+                len,
+                "a journal time is not a six-octet TimeOfDay, rejecting the pdu"
+            );
+            Err(MmsError::InvalidLength)
         }
-        _ => Err(MmsError::InvalidLength),
     }
 }
 
@@ -1216,4 +1218,35 @@ mod tests {
         assert_eq!(reason_code_from_wire(0x02), 0x40);
     }
 
+    fn time_range_request_with(start: &[u8]) -> Vec<u8> {
+        // journalName [0] { [1] { "D", "I" } }
+        let mut body = vec![0xa0, 0x08, 0xa1, 0x06, 0x1a, 0x01, b'D', 0x1a, 0x01, b'I'];
+        body.extend_from_slice(&[0xa1, start.len() as u8 + 2, 0x80, start.len() as u8]);
+        body.extend_from_slice(start);
+        let t6 = binary_time6_from_epoch_ms(1_700_000_000_000);
+        body.extend_from_slice(&[0xa2, 0x08, 0x80, 0x06]);
+        body.extend_from_slice(&t6);
+        let mut v = vec![0xbf, 0x41, body.len() as u8];
+        v.extend(body);
+        v
+    }
+
+    #[test]
+    fn four_octet_time_of_day_is_rejected() {
+        let r = ReadJournalRequest::decode(&time_range_request_with(&[0, 0, 0x03, 0xe8]));
+        assert!(matches!(r, Err(MmsError::InvalidLength)), "{r:?}");
+    }
+
+    #[test]
+    fn six_octet_time_of_day_is_accepted() {
+        let t6 = binary_time6_from_epoch_ms(1_600_000_000_000);
+        let r = ReadJournalRequest::decode(&time_range_request_with(&t6)).expect("decodes");
+        assert_eq!(
+            r.range,
+            JournalRange::TimeRange {
+                start_ms: 1_600_000_000_000,
+                end_ms: 1_700_000_000_000,
+            }
+        );
+    }
 }
