@@ -179,9 +179,9 @@ pub enum ControlOutcome {
     /// The command succeeded: the confirmed response in a normal model, or a
     /// positive command termination in an enhanced one.
     Success,
-    /// The command failed, with the additional cause the server reported. In an
-    /// enhanced model this comes from a negative command termination; in a
-    /// normal model the confirmed error carries none and `Unknown` is used.
+    /// The command failed, with the additional cause the server reported: from
+    /// the LastApplError ahead of a negative response, or from a negative
+    /// command termination. `Unknown` when the server reported none.
     Failure(ControlAddCause),
 }
 
@@ -196,9 +196,11 @@ pub struct CommandTerminationParsed {
     pub last_appl_error: Option<LastApplError>,
 }
 
-/// The five-element LastApplError structure of a negative command termination.
+/// The five-element LastApplError structure, reported ahead of the negative
+/// response to a refused command or inside a negative command termination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastApplError {
+    /// Control attribute the command addressed, such as
     /// `<LD>/<LN>$CO$<DO>$Oper`.
     pub ctl_obj: String,
     /// Error the server reported for the command.

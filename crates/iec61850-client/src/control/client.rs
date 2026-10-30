@@ -16,43 +16,46 @@
 //! |                   | writes Oper and awaits CT+ or CT-                |
 //! | any               | `cancel` writes Cancel                           |
 //!
-//! In the enhanced models `operate` reads the following InformationReport
-//! after the confirmed response to the write. A server sends the write
-//! response before the command termination, so the order is deterministic.
+//! A refused command is answered with a negative response, preceded by an
+//! InformationReport carrying only `LastApplError`; its AddCause becomes the
+//! failure cause, and a refused command has no command termination. An
+//! accepted enhanced Operate is concluded by the command termination that
+//! follows the positive response.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-#[cfg(feature = "std")]
 use core::time::Duration;
 
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
 use iec61850_mms::mms::client::MmsClient;
-use iec61850_mms::mms::pdu::common::MmsData;
-// The command termination parser is std-only, and so are its imports.
-#[cfg(feature = "std")]
-use iec61850_mms::mms::pdu::common::ObjectName;
-#[cfg(feature = "std")]
+use iec61850_mms::mms::pdu::common::{MmsData, ObjectName};
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
 use iec61850_mms::ClientError as MmsClientError;
 use iec61850_model::value::MmsValue;
 
 use crate::error::ClientError;
-// Only the command termination parser converts a wire value back into a model
-// value, and that path is std-only.
-#[cfg(feature = "std")]
-use crate::mms_compat::mms_data_to_mms_value;
-use crate::mms_compat::mms_value_to_mms_data;
-use crate::prelude::{format, Arc, String, ToString};
+use crate::mms_compat::{mms_data_to_mms_value, mms_value_to_mms_data};
+use crate::prelude::{format, Arc, String, ToString, Vec};
 use crate::sync::Mutex;
 
 use super::encode::{build_cancel_struct, build_oper_struct, current_utc_time};
 #[cfg(feature = "std")]
-use super::model::{CommandTerminationParsed, ControlLastApplError, LastApplError};
-use super::model::{ControlAddCause, ControlModel, ControlOutcome, OriginValue, SboClass};
+use super::model::CommandTerminationParsed;
+use super::model::{
+    ControlAddCause, ControlLastApplError, ControlModel, ControlOutcome, LastApplError,
+    OriginValue, SboClass,
+};
 
 /// Default wait for a command termination, used by the enhanced models.
 #[cfg(feature = "std")]
 const DEFAULT_CT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Holds the LastApplError of the most recent command. It is locked only to
+/// copy a value in or out, never across an await.
+#[cfg(feature = "std")]
+type LastApplErrorSlot = std::sync::Mutex<Option<LastApplError>>;
+#[cfg(not(feature = "std"))]
+type LastApplErrorSlot = spin::Mutex<Option<LastApplError>>;
 
 // ControlObjectClient
 
@@ -88,6 +91,8 @@ pub struct ControlObjectClient<T = tokio::net::TcpStream, Tm = iec61850_hal::tim
     synchro_check: AtomicBool,
     /// Default `Test` flag.
     test: AtomicBool,
+    /// LastApplError reported for the most recent command.
+    last_appl_error: LastApplErrorSlot,
     /// Shared with the originating connection.
     mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     is_connected: Arc<AtomicBool>,
@@ -106,6 +111,7 @@ pub struct ControlObjectClient<T, Tm> {
     interlock_check: AtomicBool,
     synchro_check: AtomicBool,
     test: AtomicBool,
+    last_appl_error: LastApplErrorSlot,
     mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     is_connected: Arc<AtomicBool>,
 }
@@ -139,6 +145,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             interlock_check: AtomicBool::new(false),
             synchro_check: AtomicBool::new(false),
             test: AtomicBool::new(false),
+            last_appl_error: LastApplErrorSlot::new(None),
             mms_client,
             is_connected,
         })
@@ -191,12 +198,30 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         self.ctl_model
     }
 
+    /// Returns the LastApplError the server reported for the most recent
+    /// Select, SelectWithValue, Operate or Cancel issued through this handle.
+    ///
+    /// A server reports one ahead of the negative response to a refused
+    /// command, and inside a negative command termination. `None` when the
+    /// most recent command drew neither, which includes every success.
+    pub fn last_appl_error(&self) -> Option<LastApplError> {
+        #[cfg(feature = "std")]
+        let slot = self
+            .last_appl_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(not(feature = "std"))]
+        let slot = self.last_appl_error.lock();
+        slot.clone()
+    }
+
     // Services.
 
     /// Selects the object by reading `<LN>$CO$<DO>$SBO` (ACSI Select).
     ///
     /// Returns `true` when the server answers with the object reference and
-    /// `false` when it answers with an empty string, which denies the selection.
+    /// `false` when it answers with an empty string, which denies the selection;
+    /// the cause of a denial is then available from `last_appl_error`.
     ///
     /// # Errors
     ///
@@ -213,18 +238,24 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             )));
         }
         let item = format!("{}$SBO", self.item_base);
-        let resp = {
-            let mut client = self.mms_client.lock().await;
-            client.read(&self.domain, &item).await?
-        };
+        let mut client = self.mms_client.lock().await;
+        self.store_last_appl_error(None);
+        let resp = client.read(&self.domain, &item).await?;
         // A non-empty VisibleString means the selection was granted.
         match resp {
-            MmsData::VisibleString(s) => Ok(!s.is_empty()),
+            MmsData::VisibleString(s) if !s.is_empty() => Ok(true),
+            MmsData::VisibleString(_) => {
+                let last = self.take_last_appl_error(&mut client, None).await;
+                self.store_last_appl_error(last);
+                Ok(false)
+            }
             other => {
                 tracing::warn!(
                     ?other,
                     "select: server answered with a non-string value, treating as denied"
                 );
+                let last = self.take_last_appl_error(&mut client, None).await;
+                self.store_last_appl_error(last);
                 Ok(false)
             }
         }
@@ -234,7 +265,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// `<LN>$CO$<DO>$SBOw` (ACSI SelectWithValue).
     ///
     /// Must precede `operate`, and `ctl_val` must equal the value passed to it;
-    /// otherwise the server answers with InconsistentParameters.
+    /// otherwise the server answers with InconsistentParameters. A refusal is
+    /// `Failure` with the AddCause of the server's LastApplError, or `Unknown`
+    /// when the server sent none.
     ///
     /// # Errors
     ///
@@ -266,15 +299,14 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             self.interlock_check.load(Ordering::Acquire),
         );
         let item = format!("{}$SBOw", self.item_base);
-        let result = {
-            let mut client = self.mms_client.lock().await;
-            client
-                .write(&self.domain, &item, mms_value_to_mms_data(&sbow))
-                .await
-        };
-        match result {
+        let mut client = self.mms_client.lock().await;
+        self.store_last_appl_error(None);
+        match client
+            .write(&self.domain, &item, mms_value_to_mms_data(&sbow))
+            .await
+        {
             Ok(()) => Ok(ControlOutcome::Success),
-            Err(e) => self.write_err_to_outcome(e),
+            Err(e) => self.refused_outcome(&mut client, e, ctl_num).await,
         }
     }
 
@@ -282,10 +314,13 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// `<LN>$CO$<DO>$Oper` (ACSI Operate).
     ///
     /// In the normal models the confirmed response concludes the command. In
-    /// the enhanced models the client then awaits the CommandTermination
-    /// (CT+ or CT-) that follows it. There the write and the wait share one
-    /// lock: releasing it in between would let a background report dispatcher
-    /// consume the command termination and leave this call waiting for it.
+    /// the enhanced models a positive response is followed by the
+    /// CommandTermination (CT+ or CT-) that the call then awaits. There the
+    /// write and the wait share one lock: releasing it in between would let a
+    /// background report dispatcher consume the command termination and leave
+    /// this call waiting for it. A refused command concludes at the negative
+    /// response in every model, as `Failure` with the AddCause of the server's
+    /// LastApplError, or `Unknown` when the server sent none.
     ///
     /// The wait needs a monotonic deadline, so the enhanced models require
     /// `std`; an embedded caller uses the normal models.
@@ -301,6 +336,19 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err(ClientError::NotConnected);
         }
+        let is_enhanced = matches!(
+            self.ctl_model,
+            ControlModel::DirectEnhanced | ControlModel::SboEnhanced
+        );
+        #[cfg(not(feature = "std"))]
+        if is_enhanced {
+            return Err(ClientError::InvalidArgument(
+                "the enhanced control models wait for a command termination, which requires \
+                 the std feature; use direct-normal or sbo-normal on this build"
+                    .to_string(),
+            ));
+        }
+
         // A server requires Oper to match the preceding SBOw exactly, so an
         // sbo-enhanced command reuses the ctlNum the selection carried; the
         // caller aligns it with `set_ctl_num`. The other models increment.
@@ -319,61 +367,39 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         );
         let item = format!("{}$Oper", self.item_base);
 
-        let is_enhanced = matches!(
-            self.ctl_model,
-            ControlModel::DirectEnhanced | ControlModel::SboEnhanced
-        );
-
+        // The lock is held across the write and the wait; see the item doc.
+        let mut client = self.mms_client.lock().await;
+        self.store_last_appl_error(None);
+        let written = client
+            .write(&self.domain, &item, mms_value_to_mms_data(&oper))
+            .await;
+        if let Err(e) = written {
+            return self.refused_outcome(&mut client, e, ctl_num).await;
+        }
         if !is_enhanced {
-            // Normal models: the confirmed response concludes the command.
-            let mut client = self.mms_client.lock().await;
-            return match client
-                .write(&self.domain, &item, mms_value_to_mms_data(&oper))
-                .await
-            {
-                Ok(()) => Ok(ControlOutcome::Success),
-                Err(e) => self.write_err_to_outcome(e),
-            };
+            return Ok(ControlOutcome::Success);
         }
 
-        // The lock is held across the write and the wait; see the item doc.
         #[cfg(feature = "std")]
         {
-            let mut client = self.mms_client.lock().await;
-            let write_res = client
-                .write(&self.domain, &item, mms_value_to_mms_data(&oper))
-                .await;
-            match write_res {
-                Ok(()) => match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT).await? {
-                    Some(ct) => match ct.last_appl_error {
-                        None => Ok(ControlOutcome::Success),
-                        Some(err) => Ok(ControlOutcome::Failure(err.add_cause)),
-                    },
-                    None => Err(ClientError::Mms(format!(
-                        "timed out waiting for a command termination after {:?}",
-                        DEFAULT_CT_TIMEOUT
-                    ))),
-                },
-                Err(e) => {
-                    let refused = self.write_err_to_outcome(e)?;
-                    // A CT- may still follow a rejected write.
-                    match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT).await {
-                        Ok(Some(ct)) => match ct.last_appl_error {
-                            Some(err) => Ok(ControlOutcome::Failure(err.add_cause)),
-                            None => Ok(ControlOutcome::Failure(ControlAddCause::Unknown)),
-                        },
-                        _ => Ok(refused),
+            match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT).await? {
+                Some(ct) => match ct.last_appl_error {
+                    None => Ok(ControlOutcome::Success),
+                    Some(err) => {
+                        let cause = err.add_cause;
+                        self.store_last_appl_error(Some(err));
+                        Ok(ControlOutcome::Failure(cause))
                     }
-                }
+                },
+                None => Err(ClientError::Mms(format!(
+                    "timed out waiting for a command termination after {:?}",
+                    DEFAULT_CT_TIMEOUT
+                ))),
             }
         }
         #[cfg(not(feature = "std"))]
         {
-            Err(ClientError::InvalidArgument(
-                "the enhanced control models wait for a command termination, which requires \
-                 the std feature; use direct-normal or sbo-normal on this build"
-                    .to_string(),
-            ))
+            Ok(ControlOutcome::Success)
         }
     }
 
@@ -381,7 +407,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// `<LN>$CO$<DO>$Cancel` (ACSI Cancel).
     ///
     /// Accepted for every control model; the server checks that the cancel
-    /// comes from the association that holds the selection.
+    /// comes from the association that holds the selection. A refusal is
+    /// `Failure` with the AddCause of the server's LastApplError, or `Unknown`
+    /// when the server sent none.
     ///
     /// # Errors
     ///
@@ -401,15 +429,14 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             self.test.load(Ordering::Acquire),
         );
         let item = format!("{}$Cancel", self.item_base);
-        let result = {
-            let mut client = self.mms_client.lock().await;
-            client
-                .write(&self.domain, &item, mms_value_to_mms_data(&cancel))
-                .await
-        };
-        match result {
+        let mut client = self.mms_client.lock().await;
+        self.store_last_appl_error(None);
+        match client
+            .write(&self.domain, &item, mms_value_to_mms_data(&cancel))
+            .await
+        {
             Ok(()) => Ok(ControlOutcome::Success),
-            Err(e) => self.write_err_to_outcome(e),
+            Err(e) => self.refused_outcome(&mut client, e, ctl_num).await,
         }
     }
 
@@ -421,20 +448,121 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         prev.wrapping_add(1)
     }
 
+    /// Replaces the LastApplError reported by `last_appl_error`.
+    fn store_last_appl_error(&self, value: Option<LastApplError>) {
+        #[cfg(feature = "std")]
+        let mut slot = self
+            .last_appl_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(not(feature = "std"))]
+        let mut slot = self.last_appl_error.lock();
+        *slot = value;
+    }
+
     /// Maps a failed control write onto the result of the command.
     ///
     /// A data access error or a confirmed service error is the server refusing
-    /// the command, a `Failure`; the confirmed error carries no add cause, so
-    /// `Unknown` is reported. Any other error leaves the fate of the command
-    /// unknown and is returned unchanged.
-    fn write_err_to_outcome(&self, e: MmsClientError) -> Result<ControlOutcome, ClientError> {
-        match e {
-            MmsClientError::DataAccessError(_) | MmsClientError::ServiceError { .. } => {
-                tracing::warn!(error = %e, "control write rejected");
-                Ok(ControlOutcome::Failure(ControlAddCause::Unknown))
-            }
-            other => Err(other.into()),
+    /// the command: the outcome is `Failure` with the AddCause of the
+    /// LastApplError report that preceded the response for the command with
+    /// `ctl_num`, or `Unknown` without one. Any other error leaves the fate of
+    /// the command unknown and is returned unchanged.
+    async fn refused_outcome(
+        &self,
+        client: &mut MmsClient<T, Tm>,
+        error: MmsClientError,
+        ctl_num: u8,
+    ) -> Result<ControlOutcome, ClientError> {
+        if !matches!(
+            error,
+            MmsClientError::DataAccessError(_) | MmsClientError::ServiceError { .. }
+        ) {
+            return Err(error.into());
         }
+        let last = self.take_last_appl_error(client, Some(ctl_num)).await;
+        let cause = last
+            .as_ref()
+            .map_or(ControlAddCause::Unknown, |e| e.add_cause);
+        tracing::warn!(
+            object = %self.object_ref,
+            %error,
+            ?cause,
+            "control command refused"
+        );
+        self.store_last_appl_error(last);
+        Ok(ControlOutcome::Failure(cause))
+    }
+
+    /// Takes the LastApplError report of a refused command from the reports
+    /// the client stashed while its last request was outstanding.
+    ///
+    /// `ctl_num` is the ctlNum of a SelectWithValue, Operate or Cancel, and
+    /// `None` for a Select, which carries none; see
+    /// `parse_last_appl_error_report`. A server sends the report ahead of the
+    /// negative response, so it is already stashed. An empty marker queued
+    /// behind the stash bounds the scan, so no further PDU is read from the
+    /// transport. Every other report is put back in arrival order; when
+    /// several match, the latest is returned.
+    async fn take_last_appl_error(
+        &self,
+        client: &mut MmsClient<T, Tm>,
+        ctl_num: Option<u8>,
+    ) -> Option<LastApplError> {
+        client.push_back_unconfirmed(bytes::Bytes::new());
+        let mut kept: Vec<bytes::Bytes> = Vec::new();
+        let mut found = None;
+        loop {
+            match client
+                .recv_unconfirmed_pdu_with_timeout(Duration::ZERO)
+                .await
+            {
+                Ok(Some(inner)) if inner.is_empty() => break,
+                Ok(Some(inner)) => match self.parse_last_appl_error_report(&inner, ctl_num) {
+                    Some(e) => found = Some(e),
+                    None => kept.push(inner),
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot scan the stashed reports for a LastApplError");
+                    break;
+                }
+            }
+        }
+        for inner in kept {
+            client.push_back_unconfirmed(inner);
+        }
+        found
+    }
+
+    /// Reads an InformationReport as the LastApplError of a command on this
+    /// object.
+    ///
+    /// IEC 61850-8-1 reports a refused command with one VMD-specific variable,
+    /// `LastApplError`, whose CntrlObj names the control attribute written,
+    /// such as `<LD>/<LN>$CO$<DO>$Oper`, and whose origin and ctlNum are those
+    /// of the command. With `ctl_num` set, the report must carry that ctlNum
+    /// and the origin of this handle, so a report of an earlier command is not
+    /// taken; without it only CntrlObj is compared.
+    fn parse_last_appl_error_report(
+        &self,
+        inner: &[u8],
+        ctl_num: Option<u8>,
+    ) -> Option<LastApplError> {
+        let report = decode_information_report(inner).ok()?;
+        let VariableAccessSpec::ListOfVariable(names) = &report.variable_access_spec else {
+            return None;
+        };
+        let ([name], [value]) = (names.as_slice(), report.list_of_access_result.as_slice()) else {
+            return None;
+        };
+        if !matches!(name, ObjectName::VmdSpecific(s) if s == "LastApplError") {
+            return None;
+        }
+        let parsed = parse_last_appl_error(value)?;
+        let same_command =
+            ctl_num.is_none_or(|n| parsed.ctl_num == n && parsed.origin == self.origin);
+        (same_command && names_control_object(&parsed.ctl_obj, &self.domain, &self.item_base))
+            .then_some(parsed)
     }
 
     /// Waits for one command termination.
@@ -489,7 +617,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         client: &mut MmsClient<T, Tm>,
         timeout: Duration,
     ) -> Result<Option<CommandTerminationParsed>, ClientError> {
-        use crate::prelude::Vec;
         let deadline = std::time::Instant::now() + timeout;
         let mut deferred: Vec<bytes::Bytes> = Vec::new();
         let result = loop {
@@ -537,6 +664,16 @@ enum CtStep {
     Got(CommandTerminationParsed),
     Timeout,
     PushBackAndRetry(bytes::Bytes),
+}
+
+/// Reports whether a CntrlObj reference names the control object
+/// `<domain>/<item_base>` or one of its control attributes.
+fn names_control_object(ctl_obj: &str, domain: &str, item_base: &str) -> bool {
+    ctl_obj
+        .strip_prefix(domain)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_prefix(item_base))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('$'))
 }
 
 // CommandTermination parser, reached only from the enhanced control path.
@@ -592,7 +729,6 @@ fn parse_command_termination(
 }
 
 /// Parses the five-element LastApplError structure.
-#[cfg(feature = "std")]
 fn parse_last_appl_error(d: &MmsData) -> Option<LastApplError> {
     let v = mms_data_to_mms_value(d);
     let MmsValue::Structure(items) = v else {
@@ -624,8 +760,8 @@ fn parse_last_appl_error(d: &MmsData) -> Option<LastApplError> {
         _ => return None,
     };
     let ctl_num = match &items[3] {
-        MmsValue::Unsigned(n) => *n as u8,
-        MmsValue::Integer(n) => *n as u8,
+        MmsValue::Unsigned(n) => u8::try_from(*n).ok()?,
+        MmsValue::Integer(n) => u8::try_from(*n).ok()?,
         _ => return None,
     };
     let add_cause = match &items[4] {
