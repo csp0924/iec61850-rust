@@ -20,7 +20,7 @@
 //! forever.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -53,9 +53,9 @@ impl SntpClient {
     /// Creates a client aimed at `server`, bound locally to an ephemeral port.
     pub fn new(server: SocketAddr) -> Self {
         let bind_addr = if server.is_ipv6() {
-            "[::]:0".parse().expect("static literal addr")
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         } else {
-            "0.0.0.0:0".parse().expect("static literal addr")
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
         };
         Self { server, bind_addr }
     }
@@ -77,7 +77,8 @@ impl SntpClient {
     /// decode errors of [`SntpPacket::decode`];
     /// [`SntpError::UnexpectedMode`] when the reply is not in server mode;
     /// and [`SntpError::InvalidHeader`] when the reply does not echo the
-    /// originate timestamp, or reports an unsynchronized clock.
+    /// originate timestamp, carries a zero transmit timestamp, or reports an
+    /// unsynchronized clock.
     pub async fn query(&self, recv_timeout: Duration) -> Result<SntpResponse, SntpError> {
         let socket = UdpSocket::bind(self.bind_addr).await?;
         socket.connect(self.server).await?;
@@ -106,6 +107,10 @@ impl SntpClient {
         // anything else is another client's reply, or a replay.
         if reply.originate_ts != t1_ntp {
             return Err(SntpError::InvalidHeader("originate_ts mismatch (replay?)"));
+        }
+        // RFC 4330 section 5: a reply whose transmit timestamp is zero is discarded.
+        if reply.transmit_ts == NtpTimestamp::ZERO {
+            return Err(SntpError::InvalidHeader("transmit_ts is zero"));
         }
         if reply.leap == LeapIndicator::AlarmUnsynchronized || reply.stratum == 0 {
             return Err(SntpError::InvalidHeader(
@@ -170,10 +175,54 @@ fn system_now_unix_s() -> Result<f64, SntpError> {
 /// 2^32 as `f64`: an NTP fraction divided by this is a count of seconds.
 const NTP_FRACTION_PER_SECOND: f64 = 4_294_967_296.0;
 
+/// Seconds in one NTP era, the span of the 32-bit seconds field.
+const NTP_ERA_S: i64 = 1 << 32;
+
+/// Converts an NTP timestamp to Unix epoch seconds with the era rule of
+/// RFC 4330 section 3: a seconds field with its most significant bit set
+/// counts from 1900-01-01 (1968 to 2036), one with it clear counts from
+/// 2036-02-07T06:28:16Z, the start of era 1 (2036 to 2104).
 fn ntp_to_unix_s(ts: NtpTimestamp) -> f64 {
-    // The NTP epoch (1900) precedes the Unix epoch (1970) by 2208988800 s.
-    // Only era 0 is handled; `seconds` is a u32 and wraps into era 1 in 2036.
-    // TODO: handle NTP era rollover.
-    let unix_secs = i64::from(ts.seconds) - NTP_UNIX_OFFSET_S as i64;
+    let era_start_s = if ts.seconds & 0x8000_0000 != 0 {
+        0
+    } else {
+        NTP_ERA_S
+    };
+    let unix_secs = era_start_s + i64::from(ts.seconds) - NTP_UNIX_OFFSET_S as i64;
     unix_secs as f64 + f64::from(ts.fraction) / NTP_FRACTION_PER_SECOND
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn era_0_counts_from_1900() {
+        // 2024-01-01T00:00:00Z.
+        let ts = NtpTimestamp {
+            seconds: 3_913_056_000,
+            fraction: 0,
+        };
+        assert_eq!(ntp_to_unix_s(ts), 1_704_067_200.0);
+    }
+
+    #[test]
+    fn seconds_with_the_top_bit_clear_fall_in_era_1() {
+        // Seconds 0 is 2036-02-07T06:28:16Z.
+        assert_eq!(ntp_to_unix_s(NtpTimestamp::ZERO), 2_085_978_496.0);
+        // 2040-01-01T00:00:00Z.
+        let ts = NtpTimestamp {
+            seconds: 123_010_304,
+            fraction: 0x8000_0000,
+        };
+        assert_eq!(ntp_to_unix_s(ts), 2_208_988_800.5);
+    }
+
+    #[test]
+    fn unspecified_bind_address_follows_the_server_family() {
+        let v4 = SntpClient::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 123)));
+        assert_eq!(v4.bind_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+        let v6 = SntpClient::new(SocketAddr::from((Ipv6Addr::LOCALHOST, 123)));
+        assert_eq!(v6.bind_addr, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)));
+    }
 }

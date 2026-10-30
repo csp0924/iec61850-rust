@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iec61850_sntp::{Mode, NtpTimestamp, SntpClient, SntpPacket, SntpServer};
+use iec61850_sntp::{Mode, NtpTimestamp, SntpClient, SntpError, SntpPacket, SntpServer};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -104,4 +104,44 @@ async fn client_request_gets_a_server_reply_with_its_poll() {
     let reply = exchange(&sock, addr, &req.encode()).await;
     assert_eq!(reply.mode, Mode::Server);
     assert_eq!(reply.poll, 4);
+}
+
+/// Answers one request with `transmit_ts` in place of the server clock.
+async fn spawn_fake_server(transmit_ts: NtpTimestamp) -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let addr = sock.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        let (len, peer) = sock.recv_from(&mut buf).await.expect("recv");
+        let req = SntpPacket::decode(&buf[..len]).expect("decode");
+        let now = NtpTimestamp::now().expect("clock");
+        let reply = SntpPacket {
+            mode: Mode::Server,
+            stratum: 1,
+            reference_ts: now,
+            originate_ts: req.transmit_ts,
+            receive_ts: now,
+            transmit_ts,
+            ..req
+        };
+        sock.send_to(&reply.encode(), peer).await.expect("send");
+    });
+    addr
+}
+
+#[tokio::test]
+async fn client_rejects_a_reply_with_a_zero_transmit_timestamp() {
+    let addr = spawn_fake_server(NtpTimestamp::ZERO).await;
+    let err = SntpClient::new(addr)
+        .query(REPLY_TIMEOUT)
+        .await
+        .expect_err("zero transmit timestamp");
+    assert!(matches!(err, SntpError::InvalidHeader(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn client_accepts_a_reply_with_a_set_transmit_timestamp() {
+    let addr = spawn_fake_server(NtpTimestamp::now().expect("clock")).await;
+    let r = SntpClient::new(addr).query(REPLY_TIMEOUT).await;
+    assert!(r.is_ok(), "{r:?}");
 }
