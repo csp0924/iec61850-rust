@@ -232,16 +232,21 @@ impl GooseSubscriber {
     }
 
     /// Returns whether the last publication is still valid and within its
-    /// timeAllowedToLive.
+    /// timeAllowedToLive. Equivalent to `is_valid_at(Instant::now())`.
     pub fn is_valid(&self) -> bool {
+        self.is_valid_at(Instant::now())
+    }
+
+    /// Returns whether the last publication is valid and its timeAllowedToLive
+    /// has not elapsed at `now`.
+    pub fn is_valid_at(&self, now: Instant) -> bool {
         let Some(state) = &self.last_state else {
             return false;
         };
         if !state.state_valid {
             return false;
         }
-        let elapsed_ms = state.received_at.elapsed().as_millis() as u64;
-        elapsed_ms <= state.time_allowed_to_live_ms as u64
+        elapsed_ms(state, now) <= state.time_allowed_to_live_ms as u64
     }
 
     /// Returns the most recent state snapshot, or `None` before the first
@@ -379,11 +384,11 @@ impl GooseSubscriber {
         }
     }
 
-    /// Raises `Expired` when timeAllowedToLive has elapsed since the last
-    /// publication.
+    /// Raises `Expired` when timeAllowedToLive has elapsed at `now` since the
+    /// last publication.
     ///
     /// The event fires at most once per state; a new publication re-arms it.
-    pub(crate) fn check_expired(&mut self) {
+    pub(crate) fn check_expired_at(&mut self, now: Instant) {
         if self.expired_fired {
             return;
         }
@@ -393,8 +398,7 @@ impl GooseSubscriber {
         if !state.state_valid {
             return;
         }
-        let elapsed_ms = state.received_at.elapsed().as_millis() as u64;
-        if elapsed_ms > state.time_allowed_to_live_ms as u64 {
+        if elapsed_ms(state, now) > state.time_allowed_to_live_ms as u64 {
             self.expired_fired = true;
             let last = state.clone();
             if let Some(cb) = &self.listener {
@@ -402,6 +406,12 @@ impl GooseSubscriber {
             }
         }
     }
+}
+
+/// Milliseconds from the arrival of `state` to `now`, zero when `now` is
+/// earlier.
+fn elapsed_ms(state: &GooseSubscriberState, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(state.received_at).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -694,9 +704,9 @@ mod tests {
         s.received_at = Instant::now() - std::time::Duration::from_millis(10);
         sub.update_and_dispatch(s);
 
-        sub.check_expired();
+        sub.check_expired_at(Instant::now());
         // The second call must not fire again.
-        sub.check_expired();
+        sub.check_expired_at(Instant::now());
 
         let ev = events.lock().unwrap();
         assert_eq!(ev.as_slice(), &["new", "exp"]);

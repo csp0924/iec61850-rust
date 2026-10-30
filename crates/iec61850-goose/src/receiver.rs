@@ -155,28 +155,48 @@ impl GooseReceiver<Running> {
     /// subscriber, then sweeps every subscriber for an expired publication.
     ///
     /// A frame that fails to decode is logged and dropped; the receiver stays
-    /// usable.
+    /// usable. Equivalent to `handle_message_at(buf, Instant::now())`.
     pub fn handle_message(&mut self, buf: &[u8]) {
-        match self.do_handle_message(buf) {
+        self.handle_message_at(buf, Instant::now());
+    }
+
+    /// Handles one Ethernet frame received at `now`, then sweeps every
+    /// subscriber for a publication whose timeAllowedToLive has elapsed by
+    /// `now`.
+    ///
+    /// `now` becomes the arrival time of the publication, so a caller that
+    /// drives the receiver from its own clock gets deterministic expiry.
+    pub fn handle_message_at(&mut self, buf: &[u8], now: Instant) {
+        match self.do_handle_message(buf, now) {
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!("dropped goose frame that failed to decode: {}", e);
             }
         }
-        self.check_all_expired();
+        self.check_all_expired(now);
     }
 
     /// Processes one polling step for a caller-driven receive loop.
     ///
     /// `Some(frame)` is handled like `handle_message`; `None` only sweeps for
     /// expired publications. Returns whether a non-empty frame was supplied.
+    /// Equivalent to `tick_at(frame, Instant::now())`.
     pub fn tick(&mut self, frame: Option<&[u8]>) -> bool {
+        self.tick_at(frame, Instant::now())
+    }
+
+    /// Processes one polling step at `now`.
+    ///
+    /// `Some(frame)` is handled like `handle_message_at`; `None` only sweeps
+    /// for publications expired by `now`. Returns whether a non-empty frame
+    /// was supplied.
+    pub fn tick_at(&mut self, frame: Option<&[u8]>, now: Instant) -> bool {
         if let Some(buf) = frame {
             let had_data = !buf.is_empty();
-            self.handle_message(buf);
+            self.handle_message_at(buf, now);
             return had_data;
         }
-        self.check_all_expired();
+        self.check_all_expired(now);
         false
     }
 
@@ -185,7 +205,7 @@ impl GooseReceiver<Running> {
         self.subscribers.get(idx)?.as_ref()
     }
 
-    fn do_handle_message(&mut self, buf: &[u8]) -> Result<(), GooseError> {
+    fn do_handle_message(&mut self, buf: &[u8], now: Instant) -> Result<(), GooseError> {
         let frame = GooseFrame::decode(buf)?;
         let hdr = &frame.header;
         let app_id = hdr.app_id;
@@ -233,7 +253,7 @@ impl GooseReceiver<Running> {
                     src_mac,
                     dst_mac,
                     vlan,
-                    received_at: Instant::now(),
+                    received_at: now,
                     state_valid: true,
                 };
 
@@ -291,10 +311,10 @@ impl GooseReceiver<Running> {
     }
 
     /// Raises the expiry event on every subscriber whose publication has
-    /// outlived its timeAllowedToLive.
-    fn check_all_expired(&mut self) {
+    /// outlived its timeAllowedToLive at `now`.
+    fn check_all_expired(&mut self, now: Instant) {
         for sub in self.subscribers.iter_mut().flatten() {
-            sub.check_expired();
+            sub.check_expired_at(now);
         }
     }
 }
@@ -337,8 +357,9 @@ impl GooseReceiver<Idle> {
     /// `source` must be an already opened L2 socket; joining the GOOSE
     /// multicast group is the caller's responsibility when opening it. The loop
     /// receives with a 100 ms timeout so that a quiet link still sweeps for
-    /// expired publications and observes the stop flag. A receive error other
-    /// than a timeout is logged and the loop continues.
+    /// expired publications and observes the stop flag; `Expired` is therefore
+    /// raised up to 100 ms after timeAllowedToLive elapses. A receive error
+    /// other than a timeout is logged and the loop continues.
     ///
     /// # Panics
     ///
@@ -712,11 +733,9 @@ mod tests {
         pdu.time_allowed_to_live = 1;
         let frame = encode_frame_with_pdu(&pdu, 0x0001, [0u8; 6]);
 
-        running.handle_message(&frame);
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        running.tick(None);
+        let t0 = Instant::now();
+        running.handle_message_at(&frame, t0);
+        running.tick_at(None, t0 + Duration::from_millis(50));
 
         let ev = events.lock().unwrap();
         assert!(ev.contains(&"new".to_string()), "newstate was raised");

@@ -1,6 +1,7 @@
 //! Receive-path behavior of the GOOSE decoder, receiver, and subscriber.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use iec61850_goose::frame::{GooseFrame, GooseFrameHeader};
@@ -187,4 +188,65 @@ fn frame_missing_only_defaulted_members_is_received() {
         1,
         "simulation and ndscom default to false"
     );
+}
+
+/// Event kinds recorded by `recording`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    New(String, u32, bool),
+    Retx(String, u32, bool),
+    Expired(String),
+}
+
+/// Builds a subscriber that records every event it receives.
+fn recording(builder: GooseSubscriberBuilder) -> (GooseSubscriber, Arc<Mutex<Vec<Seen>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let sub = builder
+        .listener(move |e: GooseEvent| {
+            let item = match e {
+                GooseEvent::NewState { state, .. } => {
+                    Seen::New(state.gocb_ref.clone(), state.st_num, state.state_valid)
+                }
+                GooseEvent::Retransmission { state, .. } => {
+                    Seen::Retx(state.gocb_ref.clone(), state.st_num, state.state_valid)
+                }
+                GooseEvent::Expired { last_state } => Seen::Expired(last_state.gocb_ref.clone()),
+            };
+            s.lock().unwrap().push(item);
+        })
+        .build();
+    (sub, seen)
+}
+
+fn expired_count(seen: &Arc<Mutex<Vec<Seen>>>) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|s| matches!(s, Seen::Expired(_)))
+        .count()
+}
+
+#[test]
+fn expiry_follows_the_injected_clock() {
+    let (sub, seen) = recording(GooseSubscriberBuilder::new().gocb_ref("LD/LLN0$GO$g"));
+    let mut rx = GooseReceiver::new();
+    let idx = rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    rx.handle_message_at(&frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000), t0);
+
+    let at_tal = t0 + Duration::from_millis(2000);
+    rx.tick_at(None, at_tal);
+    assert_eq!(
+        expired_count(&seen),
+        0,
+        "expired before timeallowedtolive elapsed"
+    );
+    assert!(rx.subscriber(idx).unwrap().is_valid_at(at_tal));
+
+    let past_tal = t0 + Duration::from_millis(2001);
+    rx.tick_at(None, past_tal);
+    assert_eq!(expired_count(&seen), 1);
+    assert!(!rx.subscriber(idx).unwrap().is_valid_at(past_tal));
 }
