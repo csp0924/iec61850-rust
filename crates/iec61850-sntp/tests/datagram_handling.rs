@@ -80,3 +80,28 @@ async fn reply_to_a_closed_port_does_not_stop_the_server() {
         assert_still_serving(addr, &task).await;
     }
 }
+
+#[tokio::test]
+async fn symmetric_active_request_gets_a_symmetric_passive_reply() {
+    let (addr, _task) = spawn_server().await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let mut req = SntpPacket::client_request();
+    req.mode = Mode::SymmetricActive;
+    req.poll = 10;
+
+    let reply = exchange(&sock, addr, &req.encode()).await;
+    assert_eq!(reply.mode, Mode::SymmetricPassive);
+    assert_eq!(reply.poll, 10);
+}
+
+#[tokio::test]
+async fn client_request_gets_a_server_reply_with_its_poll() {
+    let (addr, _task) = spawn_server().await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let mut req = SntpPacket::client_request();
+    req.poll = 4;
+
+    let reply = exchange(&sock, addr, &req.encode()).await;
+    assert_eq!(reply.mode, Mode::Server);
+    assert_eq!(reply.poll, 4);
+}

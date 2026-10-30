@@ -21,6 +21,9 @@ pub struct SntpServerConfig {
     /// Stratum, 1 for a primary reference. Defaults to 1.
     pub stratum: u8,
     /// Poll interval as log2 seconds. Defaults to 6, that is 64 seconds.
+    ///
+    /// Has no effect on a reply, which copies the poll field of its request
+    /// (RFC 4330 section 5).
     pub poll: i8,
     /// Precision as log2 seconds. Defaults to -20, roughly microseconds.
     pub precision: i8,
@@ -167,6 +170,10 @@ fn is_per_datagram_error(err: &io::Error) -> bool {
 
 /// Builds the reply for one request packet.
 ///
+/// A client request (mode 3) is answered in server mode (4) and a
+/// symmetric-active request (mode 1) in symmetric-passive mode (2); version
+/// and poll are copied from the request, as RFC 4330 section 5 requires.
+///
 /// Kept free-standing so it can be tested without a socket or an async
 /// runtime.
 ///
@@ -184,18 +191,20 @@ pub fn build_reply(
 
     // Only client (3) and symmetric active (1) are answered; replying to any
     // other mode would confuse a broadcast or control association.
-    if !matches!(req.mode, Mode::Client | Mode::SymmetricActive) {
-        return Err(SntpError::UnexpectedMode(req.mode as u8));
-    }
+    let mode = match req.mode {
+        Mode::Client => Mode::Server,
+        Mode::SymmetricActive => Mode::SymmetricPassive,
+        other => return Err(SntpError::UnexpectedMode(other as u8)),
+    };
 
     let xmit_ts = NtpTimestamp::now()?;
 
     Ok(SntpPacket {
         leap: LeapIndicator::NoWarning,
         version: req.version,
-        mode: Mode::Server,
+        mode,
         stratum: config.stratum,
-        poll: config.poll,
+        poll: req.poll,
         precision: config.precision,
         root_delay: config.root_delay,
         root_dispersion: config.root_dispersion,
@@ -271,11 +280,19 @@ mod tests {
     }
 
     #[test]
-    fn accept_symmetric_active() {
+    fn symmetric_active_is_answered_in_symmetric_passive_mode() {
         let mut req = SntpPacket::client_request();
         req.mode = Mode::SymmetricActive;
         let reply =
             build_reply(&cfg(), &req.encode(), NtpTimestamp::ZERO).expect("symmetric accepted");
-        assert_eq!(reply.mode, Mode::Server);
+        assert_eq!(reply.mode, Mode::SymmetricPassive);
+    }
+
+    #[test]
+    fn reply_copies_the_poll_of_the_request() {
+        let mut req = SntpPacket::client_request();
+        req.poll = 10;
+        let reply = build_reply(&cfg(), &req.encode(), NtpTimestamp::ZERO).expect("valid reply");
+        assert_eq!(reply.poll, 10);
     }
 }
