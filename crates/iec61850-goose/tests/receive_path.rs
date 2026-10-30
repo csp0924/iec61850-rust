@@ -288,3 +288,88 @@ fn out_of_sequence_frame_does_not_expire_early() {
     let (n, _) = expired_after(&[(1, 0), (1, 1), (1, 1)], 2000);
     assert_eq!(n, 0);
 }
+
+/// Adds `subs` in order and returns the event count of each after one frame.
+fn hits_each(subs: Vec<(GooseSubscriber, Arc<Mutex<u32>>)>, frame: &[u8]) -> Vec<u32> {
+    let mut rx = GooseReceiver::new();
+    let mut counters = Vec::new();
+    for (sub, hits) in subs {
+        rx.add_subscriber(sub);
+        counters.push(hits);
+    }
+    let mut rx = rx.start();
+    rx.handle_message(frame);
+    counters.iter().map(|h| *h.lock().unwrap()).collect()
+}
+
+#[test]
+fn observer_added_first_does_not_starve_a_specific_subscriber() {
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let hits = hits_each(
+        vec![counting(None, None), counting(Some("LD/LLN0$GO$g"), None)],
+        &frame,
+    );
+    assert_eq!(hits, vec![1, 1]);
+}
+
+#[test]
+fn specific_subscriber_added_first_does_not_starve_an_observer() {
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let hits = hits_each(
+        vec![counting(Some("LD/LLN0$GO$g"), None), counting(None, None)],
+        &frame,
+    );
+    assert_eq!(hits, vec![1, 1]);
+}
+
+#[test]
+fn appid_filter_is_not_bypassed_by_a_gocb_ref_match() {
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let hits = hits_each(
+        vec![
+            counting(Some("LD/LLN0$GO$other"), Some(0x1000)),
+            counting(Some("LD/LLN0$GO$g"), Some(0x2000)),
+        ],
+        &frame,
+    );
+    assert_eq!(
+        hits,
+        vec![0, 0],
+        "a subscriber on another appid received the frame"
+    );
+}
+
+#[test]
+fn only_subscribers_on_the_frame_gocb_ref_receive_it() {
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let hits = hits_each(
+        vec![
+            counting(Some("LD/LLN0$GO$other"), None),
+            counting(Some("LD/LLN0$GO$g"), Some(0x1000)),
+            counting(Some("LD/LLN0$GO$g"), None),
+        ],
+        &frame,
+    );
+    assert_eq!(hits, vec![0, 1, 1]);
+}
+
+#[test]
+fn dst_mac_filter_holds_alongside_an_observer() {
+    let frame = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let (other_mac, other_hits) = {
+        let hits = Arc::new(Mutex::new(0u32));
+        let h = hits.clone();
+        let sub = GooseSubscriberBuilder::new()
+            .gocb_ref("LD/LLN0$GO$g")
+            .dst_mac([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x02])
+            .listener(move |_e: GooseEvent| *h.lock().unwrap() += 1)
+            .build();
+        (sub, hits)
+    };
+    let hits = hits_each(vec![counting(None, None), (other_mac, other_hits)], &frame);
+    assert_eq!(
+        hits,
+        vec![1, 0],
+        "a subscriber on another destination received the frame"
+    );
+}

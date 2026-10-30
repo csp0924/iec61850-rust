@@ -1,8 +1,10 @@
 //! GOOSE receiver: frame dispatch and subscriber management.
 //!
-//! A receiver owns the subscriptions and routes each frame to at most one of
-//! them: an APPID lookup selects candidates, the frame-level filters narrow
-//! them, and the decoded gocbRef picks the subscriber that is notified.
+//! A receiver owns the subscriptions and routes each frame to every one of
+//! them whose filters accept it: an APPID lookup selects candidates, the
+//! APPID and destination MAC filters narrow them, and the decoded gocbRef
+//! narrows them further. An observer and a subscription on a specific gocbRef
+//! therefore both see a frame they accept, whatever order they were added in.
 //!
 //! The type parameter is a typestate. `GooseReceiver<Idle>` accepts
 //! subscribers; `GooseReceiver<Running>` handles frames. The transition
@@ -151,7 +153,7 @@ impl GooseReceiver<Running> {
         }
     }
 
-    /// Decodes one Ethernet frame and dispatches it to the matching
+    /// Decodes one Ethernet frame and dispatches it to every matching
     /// subscriber, then sweeps every subscriber for an expired publication.
     ///
     /// A frame that fails to decode is logged and dropped; the receiver stays
@@ -213,101 +215,68 @@ impl GooseReceiver<Running> {
         let src_mac = hdr.src_mac;
         let vlan = hdr.vlan;
 
-        // At most one subscriber is notified per frame, the first that matches.
-        let first_match_idx = self.find_first_frame_match(app_id, &dst_mac);
-
-        let Some(first_idx) = first_match_idx else {
-            return Ok(());
+        let Self {
+            subscribers,
+            appid_index,
+            wildcard_indices,
+            ..
+        } = self;
+        let candidates = || {
+            appid_index
+                .get(&app_id)
+                .into_iter()
+                .flatten()
+                .chain(wildcard_indices.iter())
+                .copied()
         };
 
-        let pdu_result = GoosePdu::decode_ber(&frame.pdu_bytes);
+        // The PDU is decoded only when some subscriber accepts the frame.
+        let any_frame_match = candidates().any(|idx| {
+            subscribers
+                .get(idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|sub| sub.matches_frame(app_id, &dst_mac))
+        });
+        if !any_frame_match {
+            return Ok(());
+        }
 
-        match pdu_result {
+        let parsed = match GoosePdu::decode_ber(&frame.pdu_bytes) {
+            Ok(parsed) => parsed,
             Err(e) => {
                 tracing::warn!("goose pdu decode failed for appid 0x{:04x}: {}", app_id, e);
                 return Err(e);
             }
-            Ok(parsed) => {
-                let gocb_ref = &parsed.gocb_ref;
+        };
 
-                // The gocbRef may select a different subscriber than the
-                // frame-level filters did.
-                let pdu_match_idx = self.find_first_pdu_match(first_idx, gocb_ref);
+        let state = GooseSubscriberState {
+            gocb_ref: parsed.gocb_ref,
+            dat_set: parsed.dat_set,
+            go_id: parsed.go_id.unwrap_or_default(),
+            time_allowed_to_live_ms: parsed.time_allowed_to_live,
+            st_num: parsed.st_num,
+            sq_num: parsed.sq_num,
+            conf_rev: parsed.conf_rev,
+            timestamp_raw: parsed.t,
+            simulation: parsed.simulation,
+            nds_com: parsed.nds_com,
+            dataset_values: parsed.all_data,
+            src_mac,
+            dst_mac,
+            vlan,
+            received_at: now,
+            state_valid: true,
+        };
 
-                let Some(match_idx) = pdu_match_idx else {
-                    return Ok(());
-                };
-
-                let state = GooseSubscriberState {
-                    gocb_ref: parsed.gocb_ref.clone(),
-                    dat_set: parsed.dat_set.clone(),
-                    go_id: parsed.go_id.clone().unwrap_or_default(),
-                    time_allowed_to_live_ms: parsed.time_allowed_to_live,
-                    st_num: parsed.st_num,
-                    sq_num: parsed.sq_num,
-                    conf_rev: parsed.conf_rev,
-                    timestamp_raw: parsed.t,
-                    simulation: parsed.simulation,
-                    nds_com: parsed.nds_com,
-                    dataset_values: parsed.all_data,
-                    src_mac,
-                    dst_mac,
-                    vlan,
-                    received_at: now,
-                    state_valid: true,
-                };
-
-                if let Some(Some(sub)) = self.subscribers.get_mut(match_idx) {
-                    sub.update_and_dispatch(state);
+        for idx in candidates() {
+            if let Some(Some(sub)) = subscribers.get_mut(idx) {
+                if sub.matches_frame(app_id, &dst_mac) && sub.matches_gocb_ref(&state.gocb_ref) {
+                    sub.update_and_dispatch(state.clone());
                 }
             }
         }
 
         Ok(())
-    }
-
-    /// Returns the first subscriber index whose frame-level filters accept
-    /// this APPID and destination MAC, checking exact APPID matches before
-    /// subscribers with no APPID filter.
-    fn find_first_frame_match(&self, app_id: u16, dst_mac: &[u8; 6]) -> Option<usize> {
-        if let Some(indices) = self.appid_index.get(&app_id) {
-            for &idx in indices {
-                if let Some(Some(sub)) = self.subscribers.get(idx) {
-                    if sub.matches_frame(app_id, dst_mac) {
-                        return Some(idx);
-                    }
-                }
-            }
-        }
-        for &idx in &self.wildcard_indices {
-            if let Some(Some(sub)) = self.subscribers.get(idx) {
-                if sub.matches_frame(app_id, dst_mac) {
-                    return Some(idx);
-                }
-            }
-        }
-        None
-    }
-
-    /// Returns the first subscriber index accepting `gocb_ref`, trying
-    /// `first_idx` before scanning the rest in order.
-    fn find_first_pdu_match(&self, first_idx: usize, gocb_ref: &str) -> Option<usize> {
-        if let Some(Some(sub)) = self.subscribers.get(first_idx) {
-            if sub.matches_gocb_ref(gocb_ref) {
-                return Some(first_idx);
-            }
-        }
-        for (idx, slot) in self.subscribers.iter().enumerate() {
-            if idx == first_idx {
-                continue;
-            }
-            if let Some(sub) = slot {
-                if sub.matches_gocb_ref(gocb_ref) {
-                    return Some(idx);
-                }
-            }
-        }
-        None
     }
 
     /// Raises the expiry event on every subscriber whose publication has
