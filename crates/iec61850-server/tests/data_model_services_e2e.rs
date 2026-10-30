@@ -440,6 +440,58 @@ async fn data_set_values_of_an_unknown_data_set_fail_the_service() {
 
 // ── Writes below a constructed attribute ────────────────────────────────
 
+/// A leaf below a constructed SP setting is written by its own path, and the
+/// whole setting by a structure with one member per leaf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn constructed_setting_is_writable_leaf_by_leaf_and_whole() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    t!(c.write(DOM, "PTOC1$SP$StrVal$setMag$f", MmsData::Float32(2.5))).expect("leaf");
+    assert_eq!(
+        t!(c.read(DOM, "PTOC1$SP$StrVal$setMag$f")).unwrap(),
+        MmsData::Float32(2.5)
+    );
+    t!(c.write(
+        DOM,
+        "PTOC1$SP$StrVal$setMag",
+        MmsData::Structure(vec![MmsData::Float32(3.5)])
+    ))
+    .expect("whole");
+    assert_eq!(
+        t!(c.read(DOM, "PTOC1$SP$StrVal$setMag")).unwrap(),
+        MmsData::Structure(vec![MmsData::Float32(3.5)])
+    );
+    let mismatched = t!(c.write(
+        DOM,
+        "PTOC1$SP$StrVal$setMag",
+        MmsData::Structure(vec![MmsData::Float32(4.5), MmsData::Float32(5.5)])
+    ));
+    assert!(mismatched.is_err());
+    assert_eq!(
+        t!(c.read(DOM, "PTOC1$SP$StrVal$setMag$f")).unwrap(),
+        MmsData::Float32(3.5)
+    );
+    handle.stop().await;
+}
+
+/// SetEditSGValue reaches a leaf below a constructed SE setting once the
+/// association holds the edit session, and only then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn constructed_edit_setting_is_writable_in_an_edit_session() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut c = mms(&handle).await;
+
+    let item = "PTOC1$SE$OpDlTmms$setMag$f";
+    assert!(t!(c.write(DOM, item, MmsData::Float32(9.0))).is_err());
+    t!(c.write(DOM, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(2))).expect("edit session");
+    t!(c.write(DOM, item, MmsData::Float32(9.0))).expect("leaf in the edit session");
+    assert_eq!(t!(c.read(DOM, item)).unwrap(), MmsData::Float32(9.0));
+    handle.stop().await;
+}
+
 // ── GetNameList paging ──────────────────────────────────────────────────
 
 /// A continueAfter name that is not in the list resumes at the next name in
