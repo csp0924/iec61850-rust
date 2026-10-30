@@ -1936,7 +1936,9 @@ fn build_smv_control(
 /// # Errors
 ///
 /// [`ErrorKind::MissingRequiredAttribute`] when `numOfSGs` is absent, and
-/// [`ErrorKind::AttributeValueInvalid`] for a malformed numeric attribute.
+/// [`ErrorKind::AttributeValueInvalid`] for a malformed numeric attribute, a
+/// `numOfSGs` or `actSG` of 0, or an `actSG` above `numOfSGs`; setting groups
+/// are numbered from 1.
 fn build_setting_control(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -1945,6 +1947,33 @@ fn build_setting_control(
     let num_of_sgs = parse_required::<u32>(start.attributes(), "numOfSGs", span, path)?;
     let act_sg = parse_optional::<u32>(start.attributes(), "actSG", span, path)?.unwrap_or(1);
     let resv_tms = parse_optional::<u32>(start.attributes(), "resvTms", span, path)?;
+    let out_of_range = |name: &str, raw: u32, expected: String| {
+        SclParseError::at(
+            span,
+            path,
+            ErrorKind::AttributeValueInvalid {
+                name: name.to_string(),
+                expected_type: expected,
+                raw_value: raw.to_string(),
+                cause: None,
+            },
+        )
+        .with_attribute(name)
+    };
+    if num_of_sgs == 0 {
+        return Err(out_of_range(
+            "numOfSGs",
+            num_of_sgs,
+            "u32 (at least 1)".to_string(),
+        ));
+    }
+    if act_sg == 0 || act_sg > num_of_sgs {
+        return Err(out_of_range(
+            "actSG",
+            act_sg,
+            format!("u32 (1..={num_of_sgs}, bounded by numOfSGs)"),
+        ));
+    }
     Ok(crate::raw::RawSettingControl {
         num_of_sgs,
         act_sg,

@@ -345,3 +345,31 @@ fn fcda_fc_outside_the_data_constraints_is_rejected() {
         assert!(r.is_err(), "fc={fc} accepted on an FCDA");
     }
 }
+
+/// `numOfSGs` and `actSG` count setting groups from 1, and `actSG` cannot
+/// exceed `numOfSGs`.
+#[test]
+fn setting_control_out_of_range_is_rejected() {
+    for attrs in [
+        r#"numOfSGs="0""#,
+        r#"numOfSGs="0" actSG="0""#,
+        r#"numOfSGs="2" actSG="0""#,
+        r#"numOfSGs="2" actSG="3""#,
+    ] {
+        let ln0 = format!("<SettingControl {attrs}/>");
+        let r = iec61850_scl::parse_scl(&wrap("", &ln0, ""));
+        assert!(r.is_err(), "SettingControl {attrs} accepted");
+    }
+}
+
+/// Control: an active group equal to the group count, and the default
+/// active group of 1, are accepted.
+#[test]
+fn setting_control_in_range_is_accepted() {
+    for (attrs, act) in [(r#"numOfSGs="3" actSG="3""#, 3), (r#"numOfSGs="1""#, 1)] {
+        let ln0 = format!("<SettingControl {attrs}/>");
+        let m = build(&wrap("", &ln0, ""));
+        let ln0 = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
+        assert_eq!(ln0.sgcb.as_ref().unwrap().act_sg, act);
+    }
+}
