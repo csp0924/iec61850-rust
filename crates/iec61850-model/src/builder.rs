@@ -97,7 +97,8 @@ impl IedModelBuilder {
     /// an SGCB is attached outside LLN0; [`ModelError::DuplicateName`] when two
     /// logical devices resolve to the same domain name; and
     /// [`ModelError::DataSetEntryUnresolved`] when a data set entry references a
-    /// node that does not exist.
+    /// node that does not exist, or one that carries no attribute under the
+    /// entry's functional constraint.
     pub fn build(self) -> Result<IedModel> {
         if self.ied_name.is_empty() {
             return Err(ModelError::InvalidObjectRef {
@@ -160,6 +161,16 @@ fn validate_datasets(model: &IedModel) -> Result<()> {
         for ln in &ld.lns {
             for ds in &ln.datasets {
                 for entry in &ds.entries {
+                    let unresolved = || ModelError::DataSetEntryUnresolved {
+                        dataset: ds.name.clone(),
+                        entry: format!(
+                            "{}/{}${}${}",
+                            entry.ld_inst,
+                            entry.ln_name,
+                            entry.fc,
+                            entry.do_path.join("$")
+                        ),
+                    };
                     let target_ld = if entry.ld_inst.is_empty() {
                         ld
                     } else {
@@ -168,60 +179,80 @@ fn validate_datasets(model: &IedModel) -> Result<()> {
                         // what the text says, or the wire-level name
                         // `iedName + inst`. Try the instance first, then the
                         // full name.
-                        match model
+                        model
                             .ld_by_inst(&entry.ld_inst)
                             .or_else(|| model.ld_by_domain(&entry.ld_inst))
-                        {
-                            Some(x) => x,
-                            None => {
-                                return Err(ModelError::DataSetEntryUnresolved {
-                                    dataset: ds.name.clone(),
-                                    entry: format!(
-                                        "{}/{}${}${}",
-                                        entry.ld_inst,
-                                        entry.ln_name,
-                                        entry.fc,
-                                        entry.do_path.join("$")
-                                    ),
-                                })
-                            }
-                        }
+                            .ok_or_else(unresolved)?
                     };
-                    let Some(target_ln) = target_ld.ln_by_name(&entry.ln_name) else {
+                    let target_ln = target_ld
+                        .ln_by_name(&entry.ln_name)
+                        .ok_or_else(unresolved)?;
+                    if entry.do_path.is_empty() {
                         return Err(ModelError::DataSetEntryUnresolved {
-                            dataset: ds.name.clone(),
-                            entry: format!(
-                                "{}/{}${}${}",
-                                entry.ld_inst,
-                                entry.ln_name,
-                                entry.fc,
-                                entry.do_path.join("$")
-                            ),
-                        });
-                    };
-                    let first = entry.do_path.first().ok_or_else(|| {
-                        ModelError::DataSetEntryUnresolved {
                             dataset: ds.name.clone(),
                             entry: "the data object path is empty".into(),
-                        }
-                    })?;
-                    if target_ln.do_by_name(first).is_none() {
-                        return Err(ModelError::DataSetEntryUnresolved {
-                            dataset: ds.name.clone(),
-                            entry: format!(
-                                "{}/{}${}${}",
-                                entry.ld_inst,
-                                entry.ln_name,
-                                entry.fc,
-                                entry.do_path.join("$")
-                            ),
                         });
+                    }
+                    if !entry_resolves(target_ln, &entry.do_path, entry.fc) {
+                        return Err(unresolved());
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// A node reached while walking a data set entry path.
+enum PathNode<'a> {
+    Do(&'a DataObject),
+    Da(&'a DataAttribute),
+}
+
+/// Reports whether `do_path` names a data object or attribute of `ln` that
+/// carries the functional constraint `fc`.
+///
+/// The first name names a data object; each further name names a sub-object
+/// or a data attribute below the previous node. A segment holding several
+/// `.`-joined names is walked name by name. A path ending at a data attribute
+/// resolves when the attribute carries `fc`, and one ending at a data object
+/// when any attribute below it does.
+fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
+    let mut names = do_path.iter().flat_map(|s| s.split('.'));
+    let Some(mut node) = names
+        .next()
+        .and_then(|n| ln.do_by_name(n))
+        .map(PathNode::Do)
+    else {
+        return false;
+    };
+    for seg in names {
+        let next = match node {
+            PathNode::Do(d) => match d.child_by_name(seg) {
+                Some(DoChild::SubDo(s)) => PathNode::Do(s),
+                Some(DoChild::Da(a)) => PathNode::Da(a),
+                None => return false,
+            },
+            PathNode::Da(a) => match a.child_by_name(seg) {
+                Some(c) => PathNode::Da(c),
+                None => return false,
+            },
+        };
+        node = next;
+    }
+    match node {
+        PathNode::Do(d) => do_carries_fc(d, fc),
+        PathNode::Da(a) => a.fc == fc,
+    }
+}
+
+/// Reports whether any data attribute below `d`, through its sub-objects,
+/// carries `fc`.
+fn do_carries_fc(d: &DataObject, fc: FC) -> bool {
+    d.children.iter().any(|c| match c {
+        DoChild::Da(a) => a.fc == fc,
+        DoChild::SubDo(s) => do_carries_fc(s, fc),
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -774,5 +805,150 @@ mod tests {
             .unwrap();
         let r = IedModelBuilder::new("ied1").add_ld(ld).unwrap().build();
         assert!(r.is_ok(), "expected Ok, got {r:?}");
+    }
+
+    /// Builds a model whose LLN0 holds one data set with an entry for `GGIO1`
+    /// at `do_path` under `fc`. GGIO1 has `Ind1.stVal` (ST), `Ind1.q` (ST)
+    /// and `AnIn1.mag.f` (MX), and `Har.phsA.cVal` (MX) through a sub-object.
+    fn model_with_entry(fc: FC, do_path: &[&str]) -> Result<IedModel> {
+        let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(
+                DataObjectBuilder::scalar("Ind1")
+                    .add_da(
+                        "stVal",
+                        FC::St,
+                        DataAttributeType::Boolean,
+                        TrgOps::DCHG,
+                        MmsValue::Boolean(false),
+                    )
+                    .add_da(
+                        "q",
+                        FC::St,
+                        DataAttributeType::Quality,
+                        TrgOps::QCHG,
+                        MmsValue::default_for(DataAttributeType::Quality),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .add_do(
+                DataObjectBuilder::scalar("AnIn1")
+                    .add_da_node(DataAttribute::constructed(
+                        "mag",
+                        FC::Mx,
+                        vec![DataAttribute::new(
+                            "f",
+                            FC::Mx,
+                            DataAttributeType::Float32,
+                            TrgOps::NONE,
+                            MmsValue::Float32(0.0),
+                        )],
+                    ))
+                    .build()
+                    .unwrap(),
+            )
+            .add_do(
+                DataObjectBuilder::scalar("Har")
+                    .add_sub_do(
+                        DataObjectBuilder::scalar("phsA")
+                            .add_da(
+                                "cVal",
+                                FC::Mx,
+                                DataAttributeType::Float32,
+                                TrgOps::NONE,
+                                MmsValue::Float32(0.0),
+                            )
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let lln0 = LogicalNodeBuilder::lln0()
+            .add_dataset(DataSet {
+                name: "DS1".into(),
+                entries: vec![DataSetEntry {
+                    ld_inst: String::new(),
+                    ln_name: "GGIO1".into(),
+                    fc,
+                    do_path: do_path.iter().map(|s| s.to_string()).collect(),
+                    array_index: None,
+                    component: None,
+                }],
+            })
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("WD1")
+            .add_ln(lln0)
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        IedModelBuilder::new("IED1").add_ld(ld).unwrap().build()
+    }
+
+    /// An entry naming an attribute, a component or a sub-object that the data
+    /// object does not have is rejected, not only one whose data object is
+    /// missing.
+    #[test]
+    fn dataset_entry_with_unknown_attribute_rejected() {
+        for path in [
+            &["Ind1", "noSuchDa"][..],
+            &["AnIn1", "mag", "i"][..],
+            &["Har", "phsB", "cVal"][..],
+            &["Ind1", "stVal", "x"][..],
+        ] {
+            let fc = if path[0] == "Ind1" { FC::St } else { FC::Mx };
+            let r = model_with_entry(fc, path);
+            assert!(
+                matches!(r, Err(ModelError::DataSetEntryUnresolved { .. })),
+                "{path:?} accepted"
+            );
+        }
+    }
+
+    /// An entry naming an attribute under another functional constraint than
+    /// its own is rejected, and so is a data object with no attribute under
+    /// the entry's constraint.
+    #[test]
+    fn dataset_entry_with_wrong_fc_rejected() {
+        for (fc, path) in [
+            (FC::Mx, &["Ind1", "stVal"][..]),
+            (FC::St, &["AnIn1", "mag", "f"][..]),
+            (FC::Cf, &["Ind1"][..]),
+            (FC::St, &["Har", "phsA"][..]),
+        ] {
+            let r = model_with_entry(fc, path);
+            assert!(
+                matches!(r, Err(ModelError::DataSetEntryUnresolved { .. })),
+                "{path:?} under {fc} accepted"
+            );
+        }
+    }
+
+    /// A segment holding `.`-joined names, as in `["AnIn1", "mag.f"]`, is
+    /// resolved name by name.
+    #[test]
+    fn dataset_entry_dotted_segment_resolves() {
+        assert!(model_with_entry(FC::Mx, &["AnIn1", "mag.f"]).is_ok());
+        assert!(model_with_entry(FC::Mx, &["AnIn1", "mag.i"]).is_err());
+    }
+
+    /// Control: complete paths to an attribute, a component, a data object
+    /// and a sub-object resolve under their own functional constraint.
+    #[test]
+    fn dataset_entry_full_paths_resolve() {
+        for (fc, path) in [
+            (FC::St, &["Ind1", "stVal"][..]),
+            (FC::St, &["Ind1"][..]),
+            (FC::Mx, &["AnIn1", "mag"][..]),
+            (FC::Mx, &["AnIn1", "mag", "f"][..]),
+            (FC::Mx, &["Har"][..]),
+            (FC::Mx, &["Har", "phsA", "cVal"][..]),
+        ] {
+            let r = model_with_entry(fc, path);
+            assert!(r.is_ok(), "{path:?} under {fc}: {r:?}");
+        }
     }
 }

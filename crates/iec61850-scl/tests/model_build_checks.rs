@@ -453,3 +453,34 @@ fn fcda_malformed_name_is_rejected() {
         );
     }
 }
+
+/// An FCDA naming an attribute the model does not have, or naming one under
+/// another functional constraint than its own, fails the build.
+#[test]
+fn fcda_unresolvable_attribute_fails_the_build() {
+    for (fc, attrs) in [
+        ("MX", r#"doName="TotW" daName="noSuchDa""#),
+        ("MX", r#"doName="TotW" daName="mag.i""#),
+        ("ST", r#"doName="TotW" daName="mag.f""#),
+        ("ST", r#"doName="TotW""#),
+    ] {
+        let ln0 = format!(
+            r#"<DataSet name="DS1"><FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" fc="{fc}" {attrs}/></DataSet>"#
+        );
+        let err = try_build(&wrap(MMXU_MV, &ln0, MMXU1)).expect_err(attrs);
+        assert!(err.contains("DS1"), "{err}");
+    }
+}
+
+/// Control: the same members under their own functional constraint build.
+#[test]
+fn fcda_resolvable_members_build() {
+    for attrs in [
+        r#"doName="TotW" daName="mag.f""#,
+        r#"doName="TotW" daName="q""#,
+        r#"doName="TotW""#,
+        r#"doName="Har" daName="phsAHar(2).cVal""#,
+    ] {
+        build(&wrap(MMXU_MV, &fcda(attrs), MMXU1));
+    }
+}
