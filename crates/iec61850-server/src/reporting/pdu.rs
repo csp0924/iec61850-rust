@@ -18,9 +18,9 @@
 //!       UNSIGNED          SqNum          -- if optFlds bit0 (SEQ_NUM)
 //!       BinaryTime(6)     TimeOfEntry    -- if optFlds bit1 (TIME_STAMP)
 //!       VisibleString     DatSet         -- if optFlds bit3 (DATA_SET)
-//!       UNSIGNED          ConfRev        -- if optFlds bit7 (CONF_REV)
 //!       BOOLEAN           BufOvfl        -- if optFlds bit5 (BUFFER_OVERFLOW), BRCB only
 //!       OCTET STRING(8)   EntryID        -- if optFlds bit6 (ENTRY_ID), BRCB only
+//!       UNSIGNED          ConfRev        -- if optFlds bit7 (CONF_REV)
 //!       UNSIGNED          subSeqNum      -- if optFlds bit8 (SEGMENTATION)
 //!       BOOLEAN           moreFollows    -- if optFlds bit8 (SEGMENTATION)
 //!       BIT_STRING(N)     inclusionField -- N = data set element count
@@ -208,8 +208,8 @@ const EMPTY_VALUE_TLV_LEN: usize = 2;
 
 /// The report fields that precede the segmentation fields.
 ///
-/// They are written in this order: RptID, OptFlds, SqNum, TimeOfEntry, DatSet,
-/// ConfRev, BufOvfl, EntryID. A URCB header has the
+/// They are written in the order of IEC 61850-8-1: RptID, OptFlds, SqNum,
+/// TimeOfEntry, DatSet, BufOvfl, EntryID, ConfRev. A URCB header has the
 /// buffered-only OptFlds bits masked off, so it never carries BufOvfl or
 /// EntryID.
 struct ReportHeader<'a> {
@@ -247,14 +247,14 @@ impl ReportHeader<'_> {
         if f.contains(OptFlds::DATA_SET) {
             n += tlv_len(self.dat_set.len());
         }
-        if f.contains(OptFlds::CONF_REV) {
-            n += unsigned_tlv_len(u64::from(self.conf_rev));
-        }
         if f.contains(OptFlds::BUFFER_OVERFLOW) {
             n += BOOLEAN_TLV_LEN;
         }
         if f.contains(OptFlds::ENTRY_ID) {
             n += ENTRY_ID_TLV_LEN;
+        }
+        if f.contains(OptFlds::CONF_REV) {
+            n += unsigned_tlv_len(u64::from(self.conf_rev));
         }
         n
     }
@@ -283,14 +283,14 @@ impl ReportHeader<'_> {
         if f.contains(OptFlds::DATA_SET) {
             encode_visible_string(self.dat_set, buf);
         }
-        if f.contains(OptFlds::CONF_REV) {
-            encode_unsigned(u64::from(self.conf_rev), buf);
-        }
         if f.contains(OptFlds::BUFFER_OVERFLOW) {
             encode_boolean(self.buf_ovfl, buf);
         }
         if f.contains(OptFlds::ENTRY_ID) {
             encode_octet_string_8(&self.entry_id.0, buf);
+        }
+        if f.contains(OptFlds::CONF_REV) {
+            encode_unsigned(u64::from(self.conf_rev), buf);
         }
         if f.contains(OptFlds::SEGMENTATION) {
             encode_unsigned(u64::from(sub_seq_num), buf);
@@ -714,7 +714,8 @@ pub struct BrcbReportEncodeParams<'a> {
 
 /// Encodes one BRCB report into one or more MMS unconfirmedPDU byte strings.
 ///
-/// Two fields extend the URCB form, both after ConfRev:
+/// Two fields extend the URCB form, both between DatSet and ConfRev in the
+/// IEC 61850-8-1 order:
 /// - `BufOvfl`, a BOOLEAN, when OptFlds requests buffer overflow
 /// - `EntryID`, an OCTET STRING(8), when OptFlds requests the entry identifier
 ///
@@ -1362,6 +1363,48 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // Field order, UNSIGNED encoding, and the PDU limit
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns where `needle` first occurs in `haystack`.
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn brcb_conf_rev_follows_buf_ovfl_and_entry_id() {
+        let ds = make_dataset(1);
+        let pending = make_pending_data_change(1, 0);
+        let id = EntryId([0x11; 8]);
+        let mut params = brcb_base_params(&ds, &pending, id, true);
+        params.opt_flds =
+            OptFlds::DATA_SET | OptFlds::BUFFER_OVERFLOW | OptFlds::ENTRY_ID | OptFlds::CONF_REV;
+        params.conf_rev = 0x55;
+        let pdus = encode_brcb_report_pdus(&params).unwrap();
+        let pdu = pdus[0].as_ref();
+        let dat_set = find(pdu, b"GGIO1$ds1").expect("DatSet");
+        let buf_ovfl = find(pdu, &[0x83, 0x01, 0xff]).expect("BufOvfl");
+        let entry_id = find(pdu, &[0x89, 0x08, 0x11]).expect("EntryID");
+        let conf_rev = find(pdu, &[0x86, 0x01, 0x55]).expect("ConfRev");
+        assert!(
+            dat_set < buf_ovfl && buf_ovfl < entry_id && entry_id < conf_rev,
+            "order DatSet {dat_set}, BufOvfl {buf_ovfl}, EntryID {entry_id}, ConfRev {conf_rev}"
+        );
+    }
+
+    #[test]
+    fn urcb_conf_rev_follows_dat_set() {
+        let ds = make_dataset(1);
+        let pending = make_pending_data_change(1, 0);
+        let params = ReportEncodeParams {
+            opt_flds: OptFlds::DATA_SET | OptFlds::CONF_REV,
+            conf_rev: 0x55,
+            ..base_params(&ds, &pending)
+        };
+        let pdus = encode_report_pdus(&params).unwrap();
+        let pdu = pdus[0].as_ref();
+        let dat_set = find(pdu, b"GGIO1$ds1").expect("DatSet");
+        let conf_rev = find(pdu, &[0x86, 0x01, 0x55]).expect("ConfRev");
+        assert!(dat_set < conf_rev);
+    }
 
     /// A GI report over `n` members with long data references.
     fn large_gi(n: usize) -> (Dataset, PendingReport) {
