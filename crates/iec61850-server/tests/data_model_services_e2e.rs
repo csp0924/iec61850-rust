@@ -18,6 +18,11 @@ use iec61850_mms::mms::pdu::common::{
 };
 use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
 use iec61850_mms::mms::pdu::read::{encode_confirmed_read_request, ReadRequest, ReadResponse};
+use iec61850_mms::mms::pdu::service_error::{
+    decode_confirmed_error_inner,
+    subcode::{access, resource},
+    ErrorClass,
+};
 use iec61850_mms::mms::pdu::type_specification::TypeSpecification;
 use iec61850_mms::mms::pdu::{DefineNamedVariableEntry, MmsPdu};
 use iec61850_mms::mms::MmsData;
@@ -684,7 +689,12 @@ async fn data_set_values_of_an_unknown_data_set_fail_the_service() {
 
     let unknown = t!(c.read_named_variable_list_values(DOM, "LLN0$noSuch"));
     assert!(
-        matches!(unknown, Err(ClientError::ServiceError { .. })),
+        matches!(
+            unknown,
+            Err(ClientError::ServiceError {
+                error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT)
+            })
+        ),
         "{unknown:?}"
     );
     assert_eq!(
@@ -864,6 +874,45 @@ fn ber_header(tlv: &[u8]) -> (usize, usize) {
         .iter()
         .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
     (2 + n, len)
+}
+
+/// Sends one Read over a bare MMS association and returns the answering PDU.
+async fn raw_read_pdu(conn: &mut MmsConnection, invoke_id: u32, req: &ReadRequest) -> MmsPdu {
+    let mut full = BytesMut::new();
+    encode_confirmed_read_request(invoke_id, req, &mut full);
+    let content = Bytes::from(strip_tag_and_length(&full).to_vec());
+    t!(conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(content))).expect("send");
+    t!(conn.recv_mms_pdu_confirmed()).expect("recv")
+}
+
+/// The echoed access specification counts against the negotiated maximum
+/// PDU size: results that fit on their own but not together with the echo
+/// answer resource other instead of an oversized response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn echoed_access_specification_counts_against_the_pdu_size() {
+    let server = server_with(model(false), IedServerConfig::default());
+    let handle = server.start().await.unwrap();
+    let mut conn: MmsConnection = MmsConnection::new();
+    conn.local_max_pdu_size = Some(1024);
+    t!(conn.connect("127.0.0.1", handle.bound_addr.port())).expect("connect");
+
+    // Twenty-seven booleans fit in 1024 bytes, and so does a request naming
+    // them, but not a response carrying both.
+    let VariableAccessSpecification::ListOfVariable(one) =
+        ReadRequest::single_domain(DOM, "GGIO1$ST$Ind1$stVal").variable_access_spec
+    else {
+        unreachable!("single_domain builds a list of variables");
+    };
+    let spec = VariableAccessSpecification::ListOfVariable(vec![one[0].clone(); 27]);
+    let plain = raw_read_pdu(&mut conn, 1, &read_request(spec.clone(), false)).await;
+    assert!(matches!(plain, MmsPdu::ConfirmedResponse(_)), "{plain:?}");
+    let echoed = raw_read_pdu(&mut conn, 2, &read_request(spec, true)).await;
+    let MmsPdu::ConfirmedError(body) = echoed else {
+        panic!("an echo that does not fit must answer an error: {echoed:?}");
+    };
+    let (_, error) = decode_confirmed_error_inner(&body).expect("decode ConfirmedError");
+    assert_eq!(error.error_class, ErrorClass::Resource(resource::OTHER));
+    handle.stop().await;
 }
 
 /// A Read that sets specificationWithResult gets its access specification
