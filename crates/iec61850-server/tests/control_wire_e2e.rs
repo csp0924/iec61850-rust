@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use iec61850_mms::mms::client::connection::MmsConnection;
+use iec61850_mms::mms::client::invoke_id::InvokeIdAllocator;
+use iec61850_mms::mms::client::services::write_variable;
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::common::VariableAccessSpecification;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName};
@@ -941,6 +943,72 @@ async fn failed_test_commands_terminate_with_the_test_error_codes() {
         };
         assert_eq!(lae[1], MmsData::Integer(error), "Error of {item}");
         assert_eq!(lae[4], MmsData::Integer(9), "AddCause");
+    }
+    h.stop().await;
+}
+
+// ── LastApplError ahead of the negative response ───────────────────────────
+
+/// Writes one variable and returns the outcome together with the reports that
+/// arrived before the response; nothing reads the socket after it.
+async fn write_and_take_earlier_reports(
+    conn: &mut MmsConnection,
+    alloc: &mut InvokeIdAllocator,
+    item: &str,
+    value: MmsData,
+) -> (Result<(), ClientError>, Vec<Report>) {
+    let r = write_variable(conn, alloc, DOMAIN, item, value).await;
+    let mut earlier = Vec::new();
+    while let Some(inner) = conn.pop_pending_unconfirmed() {
+        let report = decode_information_report(&inner).expect("information report");
+        let VariableAccessSpec::ListOfVariable(names) = report.variable_access_spec else {
+            panic!("unexpected variable access specification")
+        };
+        earlier.push((names, report.list_of_access_result));
+    }
+    (r, earlier)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_appl_error_arrives_before_the_negative_response() {
+    let s = server();
+    register(
+        &s,
+        object("SPCSO2", ControlModel::SboNormal),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    register(
+        &s,
+        object("SPCSO4", ControlModel::SboEnhanced),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    s.control_objects().register(
+        ControlObjectEntry::new(object("SPCSO1", ControlModel::DirectNormal))
+            .with_wait(Arc::new(GatedCheck::open(Err(
+                ControlAddCause::BlockedBySynchroCheck,
+            ))) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut holder = connect(&h).await;
+    holder
+        .write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 40))
+        .await
+        .expect("select");
+    let mut conn = raw_connect(&h).await;
+    let mut alloc = InvokeIdAllocator::new(8);
+
+    for (item, value, ctl_num, add_cause) in [
+        ("GGIO1$CO$SPCSO2$Oper", oper(on(), 41), 41, 18),
+        ("GGIO1$CO$SPCSO4$SBOw", oper(on(), 42), 42, 19),
+        ("GGIO1$CO$SPCSO4$Cancel", cancel(43), 43, 27),
+        // Refused by the dynamic check, so the response was deferred.
+        ("GGIO1$CO$SPCSO1$Oper", oper(on(), 44), 44, 11),
+    ] {
+        let (r, earlier) = write_and_take_earlier_reports(&mut conn, &mut alloc, item, value).await;
+        assert!(r.is_err(), "{item} is refused, got {r:?}");
+        let lae = last_appl_error_only(earlier.into_iter().next());
+        assert_last_appl_error(&lae, &format!("{DOMAIN}/{item}"), ctl_num, add_cause);
     }
     h.stop().await;
 }
