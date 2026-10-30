@@ -8,6 +8,20 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+- **`iec61850-server`** — `IedServer::update_bit_string` and
+  `IedServer::update_bit_string_from_int` update a BIT STRING data attribute,
+  such as a `Dbpos` or a `Quality`, at run time. `update_bit_string` takes the
+  bytes, most significant bit first, and a padding; the bit count must fit the
+  declared size of the attribute as a remote Write must, and the unused bits of
+  the last byte are stored as zero. `update_bit_string_from_int` takes an
+  unsigned value n bits wide, n the declared size from 1 to 32, and writes it
+  most significant bit first, so bit 0 of the string carries 2^(n-1): a `Dbpos`
+  of 2 is stored as `0x80` with padding 6. A rejected update returns
+  `TypeMismatch` and leaves the attribute unchanged; an accepted one triggers
+  reports as the other typed updates do.
+
 ### Fixed
 
 - **`iec61850-server`** — a typed `update_*` call triggers reports by the

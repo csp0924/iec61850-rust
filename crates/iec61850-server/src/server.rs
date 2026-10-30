@@ -19,7 +19,9 @@ use crate::connection::{ClientConnection, ConnectionId};
 use crate::control::{ChannelCommandTermination, ControlObjectsRegistry};
 use crate::error::{Result, ServerError};
 use crate::handler::{AttributeAccessHandler, HandlerRegistry, ReadHandler};
-use crate::mapping::MmsDeviceModel;
+use crate::mapping::{
+    bit_string_fits, bit_string_len, declared_bit_string_size, MmsDeviceModel, StringSize,
+};
 use crate::policy::WriteAccessPolicies;
 use crate::reporting::{
     BufferedReportControl, ChannelReportSink, DataAttributeRef, Dataset, ReportControl,
@@ -440,37 +442,154 @@ impl IedServer {
         )
     }
 
+    /// Updates a bit-string data attribute from its encoded bytes.
+    ///
+    /// `data` carries the bits most significant first, as on the wire: bit 0 of
+    /// the string is the high-order bit of `data[0]`. `padding` counts the
+    /// unused low-order bits of the last byte, which are stored as zero. The
+    /// bit count `data.len() * 8 - padding` must fit the declared size of the
+    /// attribute, as a remote Write must: exactly N bits for a fixed-size bit
+    /// string such as a `Dbpos`, 1 to N bits for a bounded one such as a
+    /// `Quality`, and the bit count the attribute holds for a type that
+    /// declares no size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeMismatch` when the attribute does not currently hold a bit
+    /// string, when `padding` is 8 or more or nonzero for empty `data`, when
+    /// the bit count does not fit the attribute, or, for a type that declares
+    /// no size, when the bit string it holds is malformed. The attribute is
+    /// left unchanged on error.
+    pub fn update_bit_string(&self, da: &DataAttribute, data: &[u8], padding: u8) -> Result<()> {
+        let new_bits = bit_string_len(data.len(), padding).ok_or_else(|| {
+            let actual = if padding >= 8 {
+                "BitString with padding above 7"
+            } else {
+                "empty BitString with nonzero padding"
+            };
+            bit_string_mismatch(da, "BitString with valid padding", actual)
+        })?;
+        let mut bytes = data.to_vec();
+        if let Some(last) = bytes.last_mut() {
+            *last &= u8::MAX.checked_shl(u32::from(padding)).unwrap_or(0);
+        }
+        let new_value = MmsValue::BitString {
+            padding,
+            data: bytes,
+        };
+        let byte_len = data.len();
+        self.update_with(da, "BitString", |current| {
+            let fits = match declared_bit_string_size(da.ty) {
+                Some(size @ (StringSize::Fixed(_) | StringSize::Max(_))) => {
+                    bit_string_fits(size, byte_len, padding)
+                }
+                _ => held_bit_string_len(da, current)? == new_bits,
+            };
+            if !fits {
+                return Err(bit_string_mismatch(
+                    da,
+                    "BitString of the attribute's length",
+                    "BitString of another length",
+                ));
+            }
+            Ok(new_value)
+        })
+    }
+
+    /// Updates a bit-string data attribute of 1 to 32 bits from an integer.
+    ///
+    /// With `n` the declared size of the attribute, or the bit count it holds
+    /// for a type that declares no size, `value` is taken as an `n`-bit
+    /// unsigned number written most significant bit first: bit 0 of the string
+    /// carries 2^(n-1) and bit n-1 carries 1. A `Dbpos`, a `BIT STRING(2)`,
+    /// therefore stores 2 (on) as data `0x80` with padding 6 and 1 (off) as
+    /// `0x40` with padding 6; a `Quality` is always written as 13 bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeMismatch` when the attribute does not currently hold a bit
+    /// string, when `n` is 0 or above 32, when `value` does not fit in `n`
+    /// bits, or, for a type that declares no size, when the bit string it
+    /// holds is malformed. The attribute is left unchanged on error.
+    pub fn update_bit_string_from_int(&self, da: &DataAttribute, value: u32) -> Result<()> {
+        self.update_with(da, "BitString", |current| {
+            let n = match declared_bit_string_size(da.ty) {
+                Some(StringSize::Fixed(n) | StringSize::Max(n)) => usize::from(n),
+                _ => held_bit_string_len(da, current)?,
+            };
+            if n == 0 || n > 32 {
+                return Err(bit_string_mismatch(
+                    da,
+                    "BitString of 1 to 32 bits",
+                    "BitString of 0 or more than 32 bits",
+                ));
+            }
+            if u64::from(value) >> n != 0 {
+                return Err(bit_string_mismatch(
+                    da,
+                    "integer within the attribute's length",
+                    "integer wider than the attribute",
+                ));
+            }
+            let byte_len = n.div_ceil(8);
+            let padding = byte_len * 8 - n;
+            let aligned = u64::from(value) << padding;
+            Ok(MmsValue::BitString {
+                padding: padding as u8,
+                data: aligned
+                    .to_be_bytes()
+                    .into_iter()
+                    .skip(8 - byte_len)
+                    .collect(),
+            })
+        })
+    }
+
     /// Checks that the attribute currently holds the same variant as the new
     /// value, writes it, and triggers any report that watches the attribute.
-    ///
-    /// The report trigger follows the attribute's trigger options: a quality
-    /// change for an attribute that names `qchg` and not `dchg`, a data change
-    /// for every other attribute.
     fn update_typed(
         &self,
         da: &DataAttribute,
         new_value: MmsValue,
         expected_name: &'static str,
     ) -> Result<()> {
+        self.update_with(da, expected_name, |_| Ok(new_value))
+    }
+
+    /// Checks that the attribute currently holds the `expected_name` variant,
+    /// writes the value `build` derives from the current one, and triggers any
+    /// report that watches the attribute.
+    ///
+    /// The check and the write happen under one write lock, so the attribute is
+    /// unchanged when `build` fails. The report trigger follows the attribute's
+    /// trigger options: a quality change for an attribute that names `qchg` and
+    /// not `dchg`, a data change for every other attribute.
+    fn update_with(
+        &self,
+        da: &DataAttribute,
+        expected_name: &'static str,
+        build: impl FnOnce(&MmsValue) -> Result<MmsValue>,
+    ) -> Result<()> {
         // Taken before the lock, so the write lock is held as briefly as
         // possible.
         let ptr_key = Arc::as_ptr(&da.value) as usize;
 
-        {
+        let new_value = {
             let mut guard = da.value.write().map_err(|_| {
                 ServerError::InvalidModel("DataAttribute value RwLock poisoned".into())
             })?;
             let actual_name = mms_value_variant_name(&guard);
-            let new_name = mms_value_variant_name(&new_value);
-            if actual_name != new_name {
+            if actual_name != expected_name {
                 return Err(ServerError::TypeMismatch {
                     path: da.name.clone(),
                     expected: expected_name,
                     actual: actual_name,
                 });
             }
+            let new_value = build(&guard)?;
             *guard = new_value.clone();
-        }
+            new_value
+        };
         // The write lock is released before the reporting engine is triggered.
         let attr_ref_opt = self
             .inner
@@ -949,6 +1068,28 @@ fn change_flag(da: &DataAttribute) -> crate::reporting::InclusionFlag {
         crate::reporting::InclusionFlag::QUALITY_CHANGED
     } else {
         crate::reporting::InclusionFlag::VALUE_CHANGED
+    }
+}
+
+/// Returns the bit count of the bit string an attribute currently holds.
+fn held_bit_string_len(da: &DataAttribute, current: &MmsValue) -> Result<usize> {
+    let held = match current {
+        MmsValue::BitString { padding, data } => bit_string_len(data.len(), *padding),
+        _ => None,
+    };
+    held.ok_or_else(|| bit_string_mismatch(da, "well-formed BitString", "malformed BitString"))
+}
+
+/// Builds the `TypeMismatch` a rejected bit-string update returns.
+fn bit_string_mismatch(
+    da: &DataAttribute,
+    expected: &'static str,
+    actual: &'static str,
+) -> ServerError {
+    ServerError::TypeMismatch {
+        path: da.name.clone(),
+        expected,
+        actual,
     }
 }
 

@@ -17,15 +17,17 @@ pub enum ServerError {
     #[error("data model is already locked by this thread; reentrant locking is not allowed")]
     AlreadyLocked,
 
-    /// An `update_*` call supplied an `MmsValue` whose type does not match the
-    /// target data attribute.
+    /// An `update_*` call does not fit the target data attribute: the value
+    /// type differs from the one the attribute holds, or a bit string's length,
+    /// padding or integer width does not fit the attribute.
     #[error("data attribute type mismatch: DA `{path}` expects {expected}, got {actual}")]
     TypeMismatch {
         /// Object reference of the data attribute that was written.
         path: String,
-        /// Name of the value variant the attribute currently holds.
+        /// What the update requires.
         expected: &'static str,
-        /// Name of the value variant that was supplied.
+        /// What was found instead: the variant the attribute holds, or a
+        /// description of the rejected value.
         actual: &'static str,
     },
 
