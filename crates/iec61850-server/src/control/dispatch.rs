@@ -29,7 +29,7 @@ use super::model::{CancelParams, ControlAddCause, ControlLastApplError, OperPara
 use super::registry::{ControlObjectEntry, ControlObjectsRegistry};
 use super::service::{
     admit_operate, cancel, select_with_value, AcceptedOperate, CoAttr, CommandTerminationSink,
-    ConnectionTerminationEvent,
+    ConnectionTerminationEvent, Refusal,
 };
 use bytes::Bytes;
 use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName, WriteOutcome};
@@ -272,10 +272,11 @@ pub(crate) fn write(
                 entry.check_handler.as_ref(),
             ) {
                 Ok(()) => CoWriteResult::Accepted,
-                Err(cause) => {
-                    let lae = last_appl_error_report(target, &params.origin, params.ctl_num, cause);
+                Err(refusal) => {
+                    let lae =
+                        last_appl_error_report(target, &params.origin, params.ctl_num, refusal);
                     outbox.push_before_response(conn_id, lae);
-                    CoWriteResult::Refused(cause)
+                    CoWriteResult::Refused(refusal.cause)
                 }
             }
         }
@@ -285,10 +286,11 @@ pub(crate) fn write(
             };
             match cancel(&entry.object, conn_id) {
                 Ok(()) => CoWriteResult::Accepted,
-                Err(cause) => {
-                    let lae = last_appl_error_report(target, &params.origin, params.ctl_num, cause);
+                Err(refusal) => {
+                    let lae =
+                        last_appl_error_report(target, &params.origin, params.ctl_num, refusal);
                     outbox.push_before_response(conn_id, lae);
-                    CoWriteResult::Refused(cause)
+                    CoWriteResult::Refused(refusal.cause)
                 }
             }
         }
@@ -320,12 +322,12 @@ fn operate(
     };
     let origin = params.origin.clone();
     let ctl_num = params.ctl_num;
-    let refuse = |cause: ControlAddCause| {
+    let refuse = |refusal: Refusal| {
         outbox.push_before_response(
             conn_id,
-            last_appl_error_report(target, &origin, ctl_num, cause),
+            last_appl_error_report(target, &origin, ctl_num, refusal),
         );
-        CoWriteResult::Refused(cause)
+        CoWriteResult::Refused(refusal.cause)
     };
 
     let accepted = match admit_operate(
@@ -338,7 +340,7 @@ fn operate(
         entry.operate_handler.as_ref(),
     ) {
         Ok(a) => a,
-        Err(cause) => return refuse(cause),
+        Err(refusal) => return refuse(refusal),
     };
 
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -348,7 +350,7 @@ fn operate(
             "operate refused: no tokio runtime is available to execute the command"
         );
         entry.object.abort_to_unselected();
-        return refuse(ControlAddCause::Unknown);
+        return refuse(Refusal::internal());
     };
 
     let ct_sink = registry.ct_sink().clone();
@@ -372,7 +374,7 @@ fn operate(
                             &cntrl_obj,
                             &origin_ref(&origin),
                             ctl_num,
-                            cause,
+                            Refusal::by_check(cause),
                         )),
                         accepted.negative_termination(cause),
                     ),
@@ -441,9 +443,9 @@ fn last_appl_error_report(
     target: &CoTarget<'_>,
     origin: &OriginValue,
     ctl_num: u8,
-    cause: ControlAddCause,
+    refusal: Refusal,
 ) -> Bytes {
-    encode_last_appl_error(&target.cntrl_obj(), &origin_ref(origin), ctl_num, cause)
+    encode_last_appl_error(&target.cntrl_obj(), &origin_ref(origin), ctl_num, refusal)
 }
 
 /// Encodes an InformationReport carrying only `LastApplError`, with the
@@ -452,14 +454,14 @@ pub(crate) fn encode_last_appl_error(
     cntrl_obj: &str,
     origin: &OriginRef,
     ctl_num: u8,
-    cause: ControlAddCause,
+    refusal: Refusal,
 ) -> Bytes {
     let lae = LastApplErrorRef {
         ctl_obj: cntrl_obj.to_string(),
-        error: last_appl_error_code(cause) as i32,
+        error: last_appl_error_code(refusal) as i32,
         origin: origin.clone(),
         ctl_num,
-        add_cause: cause as i32,
+        add_cause: refusal.cause as i32,
     };
     encode_information_report(&[(
         ObjectName::VmdSpecific("LastApplError".to_string()),
@@ -467,16 +469,16 @@ pub(crate) fn encode_last_appl_error(
     )])
 }
 
-/// Returns the `Error` member of LastApplError for a command that ended with
-/// `cause`.
+/// Returns the `Error` member of LastApplError for a refused request.
 ///
-/// A refusal or failure the control state machine reports through its add
-/// cause carries `No Error`; `Unknown`, which marks an internal failure of the
-/// server, carries `Unknown`.
-pub(crate) fn last_appl_error_code(cause: ControlAddCause) -> ControlLastApplError {
-    match cause {
-        ControlAddCause::Unknown => ControlLastApplError::Unknown,
-        _ => ControlLastApplError::NoError,
+/// A refusal by the checks of the control model carries `No Error` whatever its
+/// add cause, a handler's `Unknown` included; only an internal failure of the
+/// server carries `Unknown`, per IEC 61850-8-1.
+pub(crate) fn last_appl_error_code(refusal: Refusal) -> ControlLastApplError {
+    if refusal.internal {
+        ControlLastApplError::Unknown
+    } else {
+        ControlLastApplError::NoError
     }
 }
 
@@ -486,19 +488,15 @@ pub(crate) fn last_appl_error_code(cause: ControlAddCause) -> ControlLastApplErr
 ///
 /// A failed test command, one whose `Test` is set, carries `Timeout Test Not
 /// OK` when it was time activated and `Operator Test Not OK` otherwise, per
-/// IEC 61850-8-1. Any other command follows `last_appl_error_code`.
+/// IEC 61850-8-1. Any other command carries `No Error`, since its failure is
+/// the outcome its add cause describes.
 // Only the connection loop of the integrated server sends a CommandTermination.
 #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
-pub(crate) fn termination_error_code(
-    cause: ControlAddCause,
-    test: bool,
-    time_activated: bool,
-) -> ControlLastApplError {
-    match (cause, test, time_activated) {
-        (ControlAddCause::Unknown, _, _) => ControlLastApplError::Unknown,
-        (_, true, true) => ControlLastApplError::TimeoutTest,
-        (_, true, false) => ControlLastApplError::OperationFailed,
-        _ => ControlLastApplError::NoError,
+pub(crate) fn termination_error_code(test: bool, time_activated: bool) -> ControlLastApplError {
+    match (test, time_activated) {
+        (true, true) => ControlLastApplError::TimeoutTest,
+        (true, false) => ControlLastApplError::OperationFailed,
+        (false, _) => ControlLastApplError::NoError,
     }
 }
 
@@ -524,39 +522,39 @@ mod tests {
     #[test]
     fn refusals_carry_no_error_and_internal_failures_unknown() {
         assert_eq!(
-            last_appl_error_code(ControlAddCause::ObjectNotSelected),
+            last_appl_error_code(Refusal::by_check(ControlAddCause::ObjectNotSelected)),
             ControlLastApplError::NoError
         );
         assert_eq!(
-            last_appl_error_code(ControlAddCause::Unknown),
+            last_appl_error_code(Refusal::by_check(ControlAddCause::Unknown)),
+            ControlLastApplError::NoError,
+            "a handler's Unknown is a refusal by the checks"
+        );
+        assert_eq!(
+            last_appl_error_code(Refusal::internal()),
             ControlLastApplError::Unknown
         );
     }
 
     #[test]
     fn failed_test_commands_carry_the_test_error_codes() {
-        let cause = ControlAddCause::BlockedByProcess;
         assert_eq!(
-            termination_error_code(cause, false, false),
+            termination_error_code(false, false),
             ControlLastApplError::NoError
         );
         assert_eq!(
-            termination_error_code(cause, false, true),
+            termination_error_code(false, true),
             ControlLastApplError::NoError
         );
         assert_eq!(
-            termination_error_code(cause, true, false) as i32,
+            termination_error_code(true, false) as i32,
             3,
             "Operator Test Not OK"
         );
         assert_eq!(
-            termination_error_code(cause, true, true) as i32,
+            termination_error_code(true, true) as i32,
             2,
             "Timeout Test Not OK"
-        );
-        assert_eq!(
-            termination_error_code(ControlAddCause::Unknown, true, false),
-            ControlLastApplError::Unknown
         );
     }
 }

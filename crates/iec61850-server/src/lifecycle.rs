@@ -1147,7 +1147,6 @@ where
             let last_err = LastApplErrorRef {
                 ctl_obj: format!("{}/{}", domain_id, item_id),
                 error: crate::control::dispatch::termination_error_code(
-                    *add_cause,
                     echoed.test,
                     echoed.time_activated,
                 ) as i32,

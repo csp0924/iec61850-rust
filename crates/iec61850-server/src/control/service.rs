@@ -279,6 +279,35 @@ pub enum ServiceResult {
     Failure(ControlAddCause),
 }
 
+/// Why a control request was refused: the add cause to report, and whether the
+/// refusal stems from an internal failure of the server rather than from the
+/// checks of the control model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// Add cause reported to the client.
+    pub(crate) cause: ControlAddCause,
+    /// Whether the server failed internally.
+    pub(crate) internal: bool,
+}
+
+impl Refusal {
+    /// A refusal by the checks of the control model, a handler included.
+    pub(crate) fn by_check(cause: ControlAddCause) -> Self {
+        Self {
+            cause,
+            internal: false,
+        }
+    }
+
+    /// A refusal caused by an internal failure of the server.
+    pub(crate) fn internal() -> Self {
+        Self {
+            cause: ControlAddCause::Unknown,
+            internal: true,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Select, normal security: Read SBO
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +421,7 @@ pub async fn handle_sbow(
     };
     match select_with_value(obj, conn_id, &params, check_handler) {
         Ok(()) => ServiceResult::Success,
-        Err(cause) => ServiceResult::Failure(cause),
+        Err(refusal) => ServiceResult::Failure(refusal.cause),
     }
 }
 
@@ -400,26 +429,26 @@ pub async fn handle_sbow(
 ///
 /// # Errors
 ///
-/// Returns the add cause of a refusal.
+/// Returns the refusal.
 pub(crate) fn select_with_value(
     obj: &ControlObject,
     conn_id: u64,
     params: &OperParams,
     check_handler: Option<&Arc<dyn CheckHandler>>,
-) -> Result<(), ControlAddCause> {
+) -> Result<(), Refusal> {
     // Expire a stale selection first.
     obj.check_sbo_timeout();
 
     // A status-only object never accepts a control request.
     if obj.config.ctl_model == ControlModel::StatusOnly {
         tracing::warn!(name = %obj.config.name, "SBOw refused: the object is status-only");
-        return Err(ControlAddCause::NotSupported);
+        return Err(Refusal::by_check(ControlAddCause::NotSupported));
     }
 
     // The origin field must be well formed.
     if !params.origin.is_valid() {
         tracing::warn!(name = %obj.config.name, "SBOw refused: malformed origin field");
-        return Err(ControlAddCause::InconsistentParameters);
+        return Err(Refusal::by_check(ControlAddCause::InconsistentParameters));
     }
 
     let action = ControlAction::new(
@@ -447,7 +476,7 @@ pub(crate) fn select_with_value(
                 ?cause,
                 "SBOw refused by the check handler"
             );
-            return Err(cause);
+            return Err(Refusal::by_check(cause));
         }
     }
 
@@ -459,11 +488,11 @@ pub(crate) fn select_with_value(
         }
         Ok(Err(cause)) => {
             tracing::warn!(name = %obj.config.name, ?cause, "SBOw refused by the state machine");
-            Err(cause)
+            Err(Refusal::by_check(cause))
         }
         Err(e) => {
             tracing::warn!(name = %obj.config.name, error = %e, "SBOw failed internally");
-            Err(ControlAddCause::Unknown)
+            Err(Refusal::internal())
         }
     }
 }
@@ -509,7 +538,7 @@ pub async fn handle_operate(
         operate_handler,
     ) {
         Ok(a) => a,
-        Err(cause) => return ServiceResult::Failure(cause),
+        Err(refusal) => return ServiceResult::Failure(refusal.cause),
     };
 
     if let Err(cause) = accepted.dynamic_check().await {
@@ -546,8 +575,8 @@ pub(crate) struct AcceptedOperate {
 ///
 /// # Errors
 ///
-/// Returns the add cause of a refusal; the object is then unchanged, or back in
-/// unselected when the refusal ended its selection.
+/// Returns the refusal; the object is then unchanged, or back in unselected
+/// when the refusal ended its selection.
 pub(crate) fn admit_operate(
     obj: &ControlObject,
     conn_id: u64,
@@ -556,7 +585,7 @@ pub(crate) fn admit_operate(
     check_handler: Option<&Arc<dyn CheckHandler>>,
     wait_handler: Option<&Arc<dyn WaitForExecutionHandler>>,
     operate_handler: Option<&Arc<dyn ControlHandler>>,
-) -> Result<AcceptedOperate, ControlAddCause> {
+) -> Result<AcceptedOperate, Refusal> {
     // Expire a stale selection first; a select-before-operate object then reports
     // that it is not selected.
     obj.check_sbo_timeout();
@@ -566,17 +595,17 @@ pub(crate) fn admit_operate(
             name = %obj.config.name,
             "operate refused: no control handler is installed for this object"
         );
-        return Err(ControlAddCause::NotSupported);
+        return Err(Refusal::by_check(ControlAddCause::NotSupported));
     };
 
     // Admit the request: state machine and parameter checks.
     match obj.begin_operate(conn_id, &params) {
         Ok(Some(OperateBeginResult::Accepted)) => {}
-        Ok(Some(OperateBeginResult::Denied(cause))) => return Err(cause),
-        Ok(None) => return Err(ControlAddCause::Unknown),
+        Ok(Some(OperateBeginResult::Denied(cause))) => return Err(Refusal::by_check(cause)),
+        Ok(None) => return Err(Refusal::internal()),
         Err(e) => {
             tracing::warn!(name = %obj.config.name, error = %e, "operate failed internally");
-            return Err(ControlAddCause::Unknown);
+            return Err(Refusal::internal());
         }
     }
 
@@ -602,7 +631,7 @@ pub(crate) fn admit_operate(
         ) {
             tracing::warn!(name = %obj.config.name, ?cause, "operate refused by the check handler");
             obj.abort_to_unselected();
-            return Err(cause);
+            return Err(Refusal::by_check(cause));
         }
     }
 
@@ -767,7 +796,7 @@ pub fn handle_cancel(obj: &ControlObject, conn_id: u64, raw_value: &MmsValue) ->
     }
     match cancel(obj, conn_id) {
         Ok(()) => ServiceResult::Success,
-        Err(cause) => ServiceResult::Failure(cause),
+        Err(refusal) => ServiceResult::Failure(refusal.cause),
     }
 }
 
@@ -775,16 +804,21 @@ pub fn handle_cancel(obj: &ControlObject, conn_id: u64, raw_value: &MmsValue) ->
 ///
 /// # Errors
 ///
-/// Returns the add cause of a refusal.
-pub(crate) fn cancel(obj: &ControlObject, conn_id: u64) -> Result<(), ControlAddCause> {
+/// Returns the refusal.
+pub(crate) fn cancel(obj: &ControlObject, conn_id: u64) -> Result<(), Refusal> {
     match obj.try_cancel(conn_id) {
         CancelResult::Accepted => {
             tracing::debug!(name = %obj.config.name, conn_id, "cancel accepted");
             Ok(())
         }
+        // The state machine reports an unknown cause only when it failed internally.
+        CancelResult::Denied(ControlAddCause::Unknown) => {
+            tracing::warn!(name = %obj.config.name, conn_id, "cancel failed internally");
+            Err(Refusal::internal())
+        }
         CancelResult::Denied(cause) => {
             tracing::warn!(name = %obj.config.name, ?cause, conn_id, "cancel refused");
-            Err(cause)
+            Err(Refusal::by_check(cause))
         }
     }
 }

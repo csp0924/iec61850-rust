@@ -947,6 +947,44 @@ async fn failed_test_commands_terminate_with_the_test_error_codes() {
     h.stop().await;
 }
 
+// ── Error of a refusal whose cause is unknown ──────────────────────────────
+
+/// Check handler that refuses with a fixed cause.
+struct RefusingCheck(ControlAddCause);
+
+impl CheckHandler for RefusingCheck {
+    fn check(
+        &self,
+        _a: &ControlAction,
+        _v: Option<&MmsValue>,
+        _t: bool,
+        _i: bool,
+    ) -> Result<(), ControlAddCause> {
+        Err(self.0)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handler_refusal_with_an_unknown_cause_carries_no_error() {
+    let s = server();
+    s.control_objects().register(
+        ControlObjectEntry::new(object("SPCSO1", ControlModel::DirectNormal))
+            .with_check(Arc::new(RefusingCheck(ControlAddCause::Unknown)) as Arc<dyn CheckHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 51))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    // Error is No Error: the refusal came from a check, not from the server.
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO1$Oper"), 51, 0);
+    h.stop().await;
+}
+
 // ── LastApplError ahead of the negative response ───────────────────────────
 
 /// Writes one variable and returns the outcome together with the reports that
