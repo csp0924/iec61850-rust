@@ -1,8 +1,14 @@
 //! The TLS event handler trait and its default implementations.
 //!
-//! Carries the 20 event codes defined in IEC 62351-3 §5. Events are
+//! Carries the 19 event codes defined in IEC 62351-3 §5. Events are
 //! informational, such as session establishment or a warning; they do not
 //! replace the `Result<_, TlsError>` error path.
+//!
+//! The verifiers of a configuration built by [`crate::TlsConfigBuilder`]
+//! raise the certificate events; [`crate::TlsAcceptor`] and
+//! [`crate::TlsConnector`] raise the handshake events. Each code's
+//! documentation names where it is raised; codes marked "not raised by this
+//! crate" are defined for callers that detect the condition themselves.
 
 /// Severity of a TLS event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,51 +28,63 @@ pub enum TlsEventLevel {
 #[repr(u32)]
 pub enum TlsEventCode {
     // Informational events
-    /// The TLS session was established.
+    /// The TLS session was established. Raised by the acceptor and the
+    /// connector on every completed handshake.
     SessionEstablished = 1,
-    /// The TLS session closed with a normal close_notify.
+    /// The TLS session closed with a normal close_notify. Not raised by this
+    /// crate: the stream belongs to the caller once the handshake completes.
     SessionClosed = 2,
-    /// A renegotiation or key update was triggered.
+    /// A renegotiation or key update was triggered. Not raised by this crate,
+    /// which never initiates either.
     SessionRenegotiation = 3,
 
     // Warning events
-    /// The certificate has expired, downgraded to a warning because
-    /// validity-time checking is off.
+    /// The certificate has expired, and was accepted because validity-time
+    /// checking is off and every other check passed.
     WrnCertExpired = 100,
-    /// The certificate is not valid yet, downgraded to a warning because
-    /// validity-time checking is off.
+    /// The certificate is not valid yet, and was accepted because
+    /// validity-time checking is off and every other check passed.
     WrnCertNotYetValid = 101,
-    /// The certificate expires within 30 days.
+    /// The certificate expires within 30 days. Not raised by this crate.
     WrnCertExpiringSoon = 102,
-    /// The CRL has expired, downgraded to a warning because validity-time
-    /// checking is off.
+    /// The CRL has expired. Not raised by this crate; an expired CRL is still
+    /// used for the revocation check.
     WrnCrlExpired = 103,
-    /// The peer offered no certificate; a client certificate is optional
-    /// under TLS 1.2.
+    /// The client presented no certificate to a server that requests one
+    /// without requiring it. Raised by the acceptor.
     WrnNoPeerCert = 104,
 
     // Security alarm events
-    /// The peer certificate is not on the configured allow list.
+    /// The peer certificate is not on the configured allow list, or a client
+    /// presented no certificate to a server that requires one.
     AlmCertNotConfigured = 200,
-    /// Chain validation failed: an untrusted CA, a bad signature or similar.
+    /// Chain validation failed: an untrusted CA, a bad signature, a validity
+    /// time outside the certificate's period with validity-time checking on,
+    /// or similar.
     AlmCertChainInvalid = 201,
-    /// The certificate has been revoked.
+    /// The certificate has been revoked, according to a configured CRL.
     AlmCertRevoked = 202,
     /// The certificate common name or SAN does not match.
     AlmCertSanMismatch = 203,
-    /// The connection negotiated a cipher outside the IEC 62351-3 whitelist.
+    /// The peer offered no cipher suite of the IEC 62351-3 whitelist. Raised
+    /// by the acceptor and the connector.
     AlmCipherNotAllowed = 204,
-    /// The TLS version is below the required minimum.
+    /// The peer offered no TLS version this end accepts. Raised by the
+    /// acceptor and the connector.
     AlmVersionTooOld = 205,
-    /// A connection was attempted from an unauthorized address or port.
+    /// A connection was attempted from an unauthorized address or port. Not
+    /// raised by this crate.
     AlmUnauthorizedAccess = 206,
-    /// The TLS handshake timed out.
+    /// The TLS handshake timed out. Not raised by this crate: the acceptor and
+    /// the connector apply no timeout of their own.
     AlmHandshakeTimeout = 207,
-    /// An unexpected TLS alert arrived.
+    /// The peer aborted the handshake with a TLS alert. Raised by the acceptor
+    /// and the connector.
     AlmUnexpectedAlert = 208,
     /// The certificate could not be parsed.
     AlmCertBadEncoding = 209,
     /// The local end closed the connection because a security policy fired.
+    /// Not raised by this crate.
     AlmConnectionAborted = 210,
 }
 
@@ -106,4 +124,52 @@ pub struct NullEventHandler;
 
 impl TlsEventHandler for NullEventHandler {
     fn on_event(&self, _level: TlsEventLevel, _code: TlsEventCode, _message: &str) {}
+}
+
+/// Raises `SessionEstablished` for a completed handshake.
+pub(crate) fn report_established(
+    handler: &dyn TlsEventHandler,
+    side: &str,
+    conn: &rustls::CommonState,
+) {
+    let msg = format!(
+        "{side} TLS session established: version={:?} suite={:?}",
+        conn.protocol_version(),
+        conn.negotiated_cipher_suite().map(|s| s.suite())
+    );
+    handler.on_event(TlsEventLevel::Info, TlsEventCode::SessionEstablished, &msg);
+}
+
+/// Raises the event matching a failed handshake.
+///
+/// Certificate rejections raise nothing here: the verifiers of a built
+/// configuration have already reported them. Failures with no matching code,
+/// such as I/O errors, raise nothing either.
+pub(crate) fn report_handshake_failure(
+    handler: &dyn TlsEventHandler,
+    side: &str,
+    err: &std::io::Error,
+) {
+    use rustls::{Error as E, PeerIncompatible as P};
+    let Some(tls_err) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    else {
+        return;
+    };
+    let code = match tls_err {
+        E::NoCertificatesPresented => TlsEventCode::AlmCertNotConfigured,
+        E::PeerIncompatible(P::NoCipherSuitesInCommon) => TlsEventCode::AlmCipherNotAllowed,
+        E::PeerIncompatible(
+            P::Tls12NotOffered
+            | P::Tls12NotOfferedOrEnabled
+            | P::SupportedVersionsExtensionRequired
+            | P::ServerDoesNotSupportTls12Or13
+            | P::ServerTlsVersionIsDisabledByOurConfig,
+        ) => TlsEventCode::AlmVersionTooOld,
+        E::AlertReceived(_) => TlsEventCode::AlmUnexpectedAlert,
+        _ => return,
+    };
+    let msg = format!("{side} TLS handshake failed: {tls_err}");
+    handler.on_event(TlsEventLevel::Incident, code, &msg);
 }

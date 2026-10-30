@@ -13,8 +13,8 @@ use iec61850_tls::{
     TlsEventLevel, TlsVersion, IEC62351_3_TLS12_CIPHERS,
 };
 use rcgen::{
-    date_time_ymd, BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType,
-    SerialNumber,
+    date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa,
+    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SanType, SerialNumber,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,6 +103,31 @@ impl Ca {
             key_pem: key.serialize_pem(),
             der: CertificateDer::from(cert.der().to_vec()),
         }
+    }
+
+    /// A CRL revoking the given serial numbers, valid until 2099.
+    fn crl(&self, revoked: &[u64]) -> String {
+        let params = CertificateRevocationListParams {
+            this_update: date_time_ymd(2020, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: revoked
+                .iter()
+                .map(|serial| RevokedCertParams {
+                    serial_number: SerialNumber::from(*serial),
+                    revocation_time: date_time_ymd(2020, 1, 1),
+                    reason_code: None,
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+        params
+            .signed_by(&self.cert, &self.key)
+            .unwrap()
+            .pem()
+            .unwrap()
     }
 }
 
@@ -859,5 +884,390 @@ async fn chain_validation_off_still_validates_the_chain() {
     assert!(
         srv.is_err() && cli.is_err(),
         "server={srv:?} client={cli:?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Events
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn completed_handshake_raises_session_established_on_both_sides() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let server_events = Arc::new(Recorder::default());
+    let client_events = Arc::new(Recorder::default());
+    let server = server_with(&leaf)
+        .with_event_handler(server_events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca)
+        .with_event_handler(client_events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+    assert_eq!(
+        server_events.codes(),
+        vec![TlsEventCode::SessionEstablished]
+    );
+    assert_eq!(
+        client_events.codes(),
+        vec![TlsEventCode::SessionEstablished]
+    );
+}
+
+#[tokio::test]
+async fn refused_client_without_certificate_raises_cert_not_configured() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let known_client = client_ca.leaf("client.test", 2);
+    let modes: [fn(TlsConfigBuilder) -> TlsConfigBuilder; 2] = [
+        |b| b.require_client_auth(true),
+        |b| b.allow_only_known_peers(true),
+    ];
+    for mode in modes {
+        let events = Arc::new(Recorder::default());
+        let server = mode(server_with(&server_leaf))
+            .add_ca_pem(client_ca.pem().as_bytes())
+            .unwrap()
+            .add_known_peer_der(known_client.der.clone())
+            .with_event_handler(events.clone())
+            .build_server()
+            .unwrap();
+        let client = client_trusting(&server_ca).build_client().unwrap();
+
+        let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+        assert!(
+            srv.is_err() && cli.is_err(),
+            "server={srv:?} client={cli:?}"
+        );
+        assert!(
+            events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertNotConfigured),
+            "events: {:?}",
+            events.codes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn client_without_certificate_raises_no_peer_cert_when_client_auth_is_optional() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca).build_client().unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+    assert!(
+        events.has(TlsEventLevel::Warning, TlsEventCode::WrnNoPeerCert),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn server_without_trust_anchors_raises_no_missing_certificate_warning() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf)
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca).build_client().unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+    assert_eq!(events.codes(), vec![TlsEventCode::SessionEstablished]);
+}
+
+#[tokio::test]
+async fn untrusted_server_certificate_raises_one_chain_event() {
+    let trusted_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let rogue_leaf = rogue_ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&rogue_leaf).build_server().unwrap();
+    let client = client_trusting(&trusted_ca)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert_eq!(events.codes(), vec![TlsEventCode::AlmCertChainInvalid]);
+}
+
+#[tokio::test]
+async fn expired_server_certificate_from_an_untrusted_ca_raises_a_chain_event() {
+    let trusted_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let rogue_leaf = rogue_ca.issue(SERVER_NAME, 1, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&rogue_leaf).build_server().unwrap();
+    let client = client_trusting(&trusted_ca)
+        .time_validation(false)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert_eq!(events.codes(), vec![TlsEventCode::AlmCertChainInvalid]);
+}
+
+#[tokio::test]
+async fn expired_client_certificate_rejection_raises_a_chain_event() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.issue("client.test", 2, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertChainInvalid),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn name_mismatch_raises_a_san_event() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake_as(
+        TlsAcceptor::new(server),
+        &TlsConnector::new(client),
+        "ied.example",
+    )
+    .await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert_eq!(events.codes(), vec![TlsEventCode::AlmCertSanMismatch]);
+}
+
+#[tokio::test]
+async fn revoked_server_certificate_raises_a_revocation_event() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 41);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .add_crl_pem(ca.crl(&[41]).as_bytes())
+        .unwrap()
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert_eq!(events.codes(), vec![TlsEventCode::AlmCertRevoked]);
+}
+
+#[tokio::test]
+async fn revoked_client_certificate_raises_a_revocation_event() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.leaf("client.test", 42);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .add_crl_pem(client_ca.crl(&[42]).as_bytes())
+        .unwrap()
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertRevoked),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn crl_not_listing_the_peer_lets_the_handshake_through() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 43);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf).build_server().unwrap();
+    let client = client_trusting(&ca)
+        .add_crl_pem(ca.crl(&[44]).as_bytes())
+        .unwrap()
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.is_ok() && cli.is_ok(), "server={srv:?} client={cli:?}");
+    assert_eq!(events.codes(), vec![TlsEventCode::SessionEstablished]);
+}
+
+#[tokio::test]
+async fn no_common_cipher_suite_raises_a_cipher_event() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf)
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+        ..rustls::crypto::ring::default_provider()
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca.cert.der().to_vec()))
+        .unwrap();
+    let foreign = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let (srv, cli) = handshake(
+        TlsAcceptor::new(server),
+        &TlsConnector::from_rustls(Arc::new(foreign)),
+    )
+    .await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmCipherNotAllowed),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn refused_tls12_client_raises_an_alert_event() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_events = Arc::new(Recorder::default());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .require_client_auth(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .max_version(TlsVersion::Tls12)
+        .with_event_handler(client_events.clone())
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        client_events.has(TlsEventLevel::Incident, TlsEventCode::AlmUnexpectedAlert),
+        "events: {:?}",
+        client_events.codes()
+    );
+}
+
+#[tokio::test]
+async fn version_mismatch_raises_a_version_event_on_the_server() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&leaf)
+        .min_version(TlsVersion::Tls13)
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca)
+        .max_version(TlsVersion::Tls12)
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmVersionTooOld),
+        "events: {:?}",
+        events.codes()
     );
 }

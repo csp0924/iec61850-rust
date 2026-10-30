@@ -30,7 +30,8 @@ use crate::event::{DefaultTracingHandler, TlsEventHandler};
 use crate::session::{system_clock, ExpiringSessionStore, SessionClock, SESSION_CACHE_CAPACITY};
 use crate::verifier::{
     AllowOnlyKnownCertsClientVerifier, AllowOnlyKnownCertsServerVerifier,
-    IgnoreValidityTimeClientVerifier, IgnoreValidityTimeServerVerifier,
+    IgnoreValidityTimeClientVerifier, IgnoreValidityTimeServerVerifier, ReportingClientVerifier,
+    ReportingServerVerifier,
 };
 
 // -----------------------------------------------------------------------------
@@ -64,9 +65,11 @@ impl TlsVersion {
 
 /// Client-side TLS configuration. Cloning is cheap; the rustls configuration
 /// sits behind an `Arc`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TlsClientConfig {
     pub(crate) inner: Arc<ClientConfig>,
+    /// Receives the session events raised by [`crate::TlsConnector`].
+    pub(crate) event_handler: Arc<dyn TlsEventHandler>,
 }
 
 impl TlsClientConfig {
@@ -76,17 +79,39 @@ impl TlsClientConfig {
     }
 }
 
+impl std::fmt::Debug for TlsClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsClientConfig")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Server-side TLS configuration. Cloning is cheap; the rustls configuration
 /// sits behind an `Arc`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TlsServerConfig {
     pub(crate) inner: Arc<ServerConfig>,
+    /// Receives the session events raised by [`crate::TlsAcceptor`].
+    pub(crate) event_handler: Arc<dyn TlsEventHandler>,
+    /// Whether the server requests a client certificate without requiring
+    /// one, so that a client presenting none is worth a warning.
+    pub(crate) client_auth_optional: bool,
 }
 
 impl TlsServerConfig {
     /// Returns the underlying `Arc<rustls::ServerConfig>`.
     pub fn inner(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.inner)
+    }
+}
+
+impl std::fmt::Debug for TlsServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsServerConfig")
+            .field("inner", &self.inner)
+            .field("client_auth_optional", &self.client_auth_optional)
+            .finish_non_exhaustive()
     }
 }
 
@@ -284,10 +309,11 @@ impl TlsConfigBuilder {
 
     /// Makes a client certificate mandatory on the server. Defaults to false.
     ///
-    /// When enabled, a client presenting no certificate is refused. When
-    /// disabled, a server with trust anchors still requests a certificate and
-    /// validates one when presented, and a server without trust anchors does
-    /// not request one. Has no effect on `build_client`.
+    /// When enabled, a client presenting no certificate is refused and raises
+    /// `AlmCertNotConfigured`. When disabled, a server with trust anchors
+    /// still requests a certificate and validates one when presented, and a
+    /// server without trust anchors does not request one. Has no effect on
+    /// `build_client`.
     pub fn require_client_auth(mut self, v: bool) -> Self {
         self.require_client_auth = v;
         self
@@ -439,7 +465,7 @@ impl TlsConfigBuilder {
             .map_err(|e| TlsError::Validation(format!("verifier build: {e}")))?;
 
         // Verifier chain, outermost first:
-        // IgnoreValidityTime(AllowOnlyKnownCerts(WebPki or NoSni wrapper)).
+        // Reporting(IgnoreValidityTime(AllowOnlyKnownCerts(WebPki or NoSni wrapper))).
         let base_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             if self.dangerous_no_sni_verify {
                 Arc::new(NoSniServerVerifier::new(webpki_verifier))
@@ -457,12 +483,17 @@ impl TlsConfigBuilder {
             ));
 
         // Validity-time wrapper.
-        let final_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        let timed_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(IgnoreValidityTimeServerVerifier::new(
                 known_verifier,
                 !self.time_validation, // time_validation off means ignore_validity_time on
                 Arc::clone(&self.event_handler),
             ));
+
+        // Event-reporting wrapper.
+        let final_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(
+            ReportingServerVerifier::new(timed_verifier, Arc::clone(&self.event_handler)),
+        );
 
         let cfg_builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(&versions)
@@ -488,6 +519,7 @@ impl TlsConfigBuilder {
 
         Ok(TlsClientConfig {
             inner: Arc::new(cfg),
+            event_handler: self.event_handler,
         })
     }
 
@@ -532,7 +564,7 @@ impl TlsConfigBuilder {
         });
 
         // Client certificate verifier, outermost first:
-        // IgnoreValidityTime(AllowOnlyKnownCerts(WebPki)).
+        // Reporting(IgnoreValidityTime(AllowOnlyKnownCerts(WebPki))).
         let client_auth_optional = !client_auth_mandatory && !self.ca_certs.is_empty();
         let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
             if self.ca_certs.is_empty() {
@@ -558,9 +590,14 @@ impl TlsConfigBuilder {
                         self.known_peer_certs,
                         Arc::clone(&self.event_handler),
                     ));
-                Arc::new(IgnoreValidityTimeClientVerifier::new(
-                    known_verifier,
-                    !self.time_validation,
+                let timed_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+                    Arc::new(IgnoreValidityTimeClientVerifier::new(
+                        known_verifier,
+                        !self.time_validation,
+                        Arc::clone(&self.event_handler),
+                    ));
+                Arc::new(ReportingClientVerifier::new(
+                    timed_verifier,
                     Arc::clone(&self.event_handler),
                 ))
             };
@@ -588,6 +625,8 @@ impl TlsConfigBuilder {
 
         Ok(TlsServerConfig {
             inner: Arc::new(cfg),
+            event_handler: self.event_handler,
+            client_auth_optional,
         })
     }
 

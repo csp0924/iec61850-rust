@@ -528,6 +528,166 @@ impl ClientCertVerifier for IgnoreValidityTimeClientVerifier {
 }
 
 // -----------------------------------------------------------------------------
+// Rejection events
+// -----------------------------------------------------------------------------
+
+/// Raises the alarm event matching a certificate rejection.
+///
+/// `ApplicationVerificationFailure` raises nothing: the allow-only-known
+/// wrappers return it after raising `AlmCertNotConfigured` themselves.
+fn report_certificate_rejection(handler: &dyn TlsEventHandler, peer: &str, err: &RustlsError) {
+    use rustls::CertificateError as E;
+    let code = match err {
+        RustlsError::InvalidCertificate(E::ApplicationVerificationFailure) => return,
+        RustlsError::InvalidCertificate(E::Revoked) => TlsEventCode::AlmCertRevoked,
+        RustlsError::InvalidCertificate(E::NotValidForName | E::NotValidForNameContext { .. }) => {
+            TlsEventCode::AlmCertSanMismatch
+        }
+        RustlsError::InvalidCertificate(E::BadEncoding) => TlsEventCode::AlmCertBadEncoding,
+        _ => TlsEventCode::AlmCertChainInvalid,
+    };
+    let msg = format!("{peer} cert rejected: {err}");
+    handler.on_event(TlsEventLevel::Incident, code, &msg);
+    tracing::warn!("{}", msg);
+}
+
+/// Outermost server verifier of a built client configuration; raises an
+/// alarm event for every rejection of the server certificate.
+pub(crate) struct ReportingServerVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    event_handler: Arc<dyn TlsEventHandler>,
+}
+
+impl ReportingServerVerifier {
+    pub(crate) fn new(
+        inner: Arc<dyn ServerCertVerifier>,
+        event_handler: Arc<dyn TlsEventHandler>,
+    ) -> Self {
+        Self {
+            inner,
+            event_handler,
+        }
+    }
+}
+
+impl std::fmt::Debug for ReportingServerVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReportingServerVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerCertVerifier for ReportingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .inspect_err(|e| report_certificate_rejection(self.event_handler.as_ref(), "server", e))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Outermost client verifier of a built server configuration; raises an
+/// alarm event for every rejection of the client certificate.
+pub(crate) struct ReportingClientVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    event_handler: Arc<dyn TlsEventHandler>,
+}
+
+impl ReportingClientVerifier {
+    pub(crate) fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        event_handler: Arc<dyn TlsEventHandler>,
+    ) -> Self {
+        Self {
+            inner,
+            event_handler,
+        }
+    }
+}
+
+impl std::fmt::Debug for ReportingClientVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReportingClientVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientCertVerifier for ReportingClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)
+            .inspect_err(|e| report_certificate_rejection(self.event_handler.as_ref(), "client", e))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Constant-time byte comparison
 // -----------------------------------------------------------------------------
 

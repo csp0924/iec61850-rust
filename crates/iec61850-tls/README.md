@@ -14,7 +14,7 @@ outright; on the server the client counterpart also makes a client
 certificate mandatory. `IgnoreValidityTimeServerVerifier` and
 `IgnoreValidityTimeClientVerifier` relax only the validity-time check when it
 is off, and still reject every other chain error.
-`TlsEventHandler` carries the 20 event codes of IEC 62351-3. The constants
+`TlsEventHandler` carries the 19 event codes of IEC 62351-3. The constants
 `IEC62351_3_TLS12_CIPHERS` and `IEC62351_3_TLS13_CIPHERS` are the whitelist
 itself; its TLS 1.2 part contains ECDHE_RSA and ECDHE_ECDSA with AES-GCM,
 because the rustls ring provider implements no finite-field DHE suite. Library
