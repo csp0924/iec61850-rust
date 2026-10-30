@@ -64,6 +64,10 @@ async fn datagram_longer_than_the_buffer_does_not_stop_the_server() {
     assert_still_serving(addr, &task).await;
 }
 
+/// Smoke test only: whether a reply to a closed port makes the next receive
+/// fail depends on the platform and on when the ICMP port unreachable
+/// arrives, so this test does not guard the error handling. The unit test
+/// `receive_loop_decision_follows_the_raw_os_error` does.
 #[tokio::test]
 async fn reply_to_a_closed_port_does_not_stop_the_server() {
     let (addr, task) = spawn_server().await;

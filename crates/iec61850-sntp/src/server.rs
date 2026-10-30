@@ -102,11 +102,10 @@ impl SntpServer {
         loop {
             let (len, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(received) => received,
-                Err(err) if is_per_datagram_error(&err) => {
-                    tracing::warn!(?err, "dropped an SNTP datagram that failed to receive");
+                Err(err) => {
+                    on_receive_error(err)?;
                     continue;
                 }
-                Err(err) => return Err(err),
             };
             // Stamp the receive time at once, so reply processing does not bias it.
             let recv_ts = match NtpTimestamp::now() {
@@ -168,6 +167,18 @@ fn is_per_datagram_error(err: &io::Error) -> bool {
     false
 }
 
+/// Decides what the receive loop does after a failed receive: `Ok(())` drops
+/// the datagram, after a warning, and the loop goes on; `Err` hands back an
+/// error of the socket itself, which ends the loop.
+fn on_receive_error(err: io::Error) -> io::Result<()> {
+    if is_per_datagram_error(&err) {
+        tracing::warn!(?err, "dropped an SNTP datagram that failed to receive");
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// Builds the reply for one request packet.
 ///
 /// A client request (mode 3) is answered in server mode (4) and a
@@ -223,6 +234,48 @@ mod tests {
 
     fn cfg() -> SntpServerConfig {
         SntpServerConfig::default()
+    }
+
+    /// The receive loop goes on after each OS error that concerns one datagram
+    /// and ends on one that concerns the socket, decided from the raw error
+    /// code the platform reports.
+    #[test]
+    fn receive_loop_decision_follows_the_raw_os_error() {
+        #[cfg(windows)]
+        let (per_datagram, fatal): (&[i32], &[i32]) = (
+            // WSAECONNRESET, WSAEMSGSIZE, WSAECONNREFUSED.
+            &[10054, 10040, 10061],
+            // WSAENOTSOCK, WSAENOTCONN, WSAENETDOWN.
+            &[10038, 10057, 10050],
+        );
+        #[cfg(target_os = "linux")]
+        let (per_datagram, fatal): (&[i32], &[i32]) = (
+            // ECONNRESET, ECONNREFUSED, EINTR, EAGAIN.
+            &[104, 111, 4, 11],
+            // EBADF, ENOTSOCK, ENOTCONN.
+            &[9, 88, 107],
+        );
+        #[cfg(target_os = "macos")]
+        let (per_datagram, fatal): (&[i32], &[i32]) = (
+            // ECONNRESET, ECONNREFUSED, EINTR, EAGAIN.
+            &[54, 61, 4, 35],
+            // EBADF, ENOTSOCK, ENOTCONN.
+            &[9, 38, 57],
+        );
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        {
+            for &code in per_datagram {
+                assert!(
+                    on_receive_error(io::Error::from_raw_os_error(code)).is_ok(),
+                    "OS error {code} must drop the datagram and keep serving"
+                );
+            }
+            for &code in fatal {
+                let err = on_receive_error(io::Error::from_raw_os_error(code))
+                    .expect_err("a socket failure must end the loop");
+                assert_eq!(err.raw_os_error(), Some(code));
+            }
+        }
     }
 
     #[test]
