@@ -9,10 +9,11 @@
 //! While another association holds the session, `EditSG` answers
 //! `TemporarilyUnavailable` and `CnfEdit` answers `ObjectAccessDenied`.
 //!
-//! A session also carries a reservation deadline. Every `EditSG` and `CnfEdit`
-//! checks it first, so an expired session counts as no session at all;
-//! [`SettingGroupRegistry::tick_reservations`] releases expired sessions in the
-//! background as well.
+//! A session also carries a reservation deadline on the monotonic clock, so a
+//! step of the wall clock neither shortens nor extends it. Every `EditSG` and
+//! `CnfEdit` checks it first, so an expired session counts as no session at
+//! all; [`SettingGroupRegistry::tick_reservations`] releases expired sessions in
+//! the background as well.
 //!
 //! This module implements the control protocol only. The values of a setting
 //! group are stored by the application, which receives the commit through
@@ -26,7 +27,7 @@ use iec61850_mms::mms::pdu::common::{
 use iec61850_model::IedModel;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SettingGroupHandler trait
@@ -87,9 +88,8 @@ struct State {
     last_act_tm_ms: u64,
     /// The association holding the edit session, if any.
     editing_conn: Option<ConnectionId>,
-    /// When the edit session expires, in milliseconds since the epoch;
-    /// meaningless while no session is open.
-    reservation_expiry_ms: u64,
+    /// When the edit session expires; `None` while no session is open.
+    reservation_deadline: Option<Instant>,
 }
 
 /// Values a read of the setting group control block reports.
@@ -123,7 +123,7 @@ impl SettingGroupRuntime {
                 edit_sg: 0,
                 last_act_tm_ms: now_ms,
                 editing_conn: None,
-                reservation_expiry_ms: 0,
+                reservation_deadline: None,
             }),
             handler: RwLock::new(Arc::new(DefaultSettingGroupHandler)),
         }
@@ -272,12 +272,12 @@ impl SettingGroupRuntime {
             })?;
             g.edit_sg = new_edit_sg;
             g.editing_conn = Some(conn_id);
-            g.reservation_expiry_ms =
-                now_ms().saturating_add(self.default_resv_tms_s as u64 * 1000);
+            let lifetime = Duration::from_secs(u64::from(self.default_resv_tms_s));
+            g.reservation_deadline = Instant::now().checked_add(lifetime);
         } else {
             g.edit_sg = 0;
             g.editing_conn = None;
-            g.reservation_expiry_ms = 0;
+            g.reservation_deadline = None;
         }
         Ok(())
     }
@@ -343,7 +343,7 @@ impl SettingGroupRuntime {
         })?;
         g.edit_sg = 0;
         g.editing_conn = None;
-        g.reservation_expiry_ms = 0;
+        g.reservation_deadline = None;
         Ok(())
     }
 
@@ -366,21 +366,21 @@ impl SettingGroupRuntime {
     /// association that held it so the caller can log or notify. `None` means
     /// no session was open or it has not expired.
     pub fn tick_reservation(&self) -> Option<ConnectionId> {
-        self.tick_reservation_at(now_ms())
+        self.tick_reservation_at(Instant::now())
     }
 
-    /// [`SettingGroupRuntime::tick_reservation`] against a supplied clock.
-    pub(crate) fn tick_reservation_at(&self, now: u64) -> Option<ConnectionId> {
+    /// [`SettingGroupRuntime::tick_reservation`] against a supplied instant of
+    /// the monotonic clock.
+    pub(crate) fn tick_reservation_at(&self, now: Instant) -> Option<ConnectionId> {
         let mut g = match self.state.write() {
             Ok(g) => g,
             Err(_) => return None,
         };
-        if g.editing_conn.is_some() && g.reservation_expiry_ms > 0 && now >= g.reservation_expiry_ms
-        {
+        if g.editing_conn.is_some() && g.reservation_deadline.is_some_and(|d| now >= d) {
             let owner = g.editing_conn;
             g.edit_sg = 0;
             g.editing_conn = None;
-            g.reservation_expiry_ms = 0;
+            g.reservation_deadline = None;
             owner
         } else {
             None
@@ -403,7 +403,7 @@ impl SettingGroupRuntime {
             );
             g.edit_sg = 0;
             g.editing_conn = None;
-            g.reservation_expiry_ms = 0;
+            g.reservation_deadline = None;
         }
     }
 
@@ -439,21 +439,11 @@ impl SettingGroupRuntime {
 
     /// Clears the edit session if its reservation deadline has passed.
     fn expire_stale_session_if_any(&self) {
-        let now = now_ms();
-        let mut g = match self.state.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if g.editing_conn.is_some() && g.reservation_expiry_ms > 0 && now >= g.reservation_expiry_ms
-        {
+        if let Some(owner) = self.tick_reservation_at(Instant::now()) {
             tracing::info!(
-                "setting group edit session reservation expired at {} (deadline {}), releasing it",
-                now,
-                g.reservation_expiry_ms
+                owner,
+                "setting group edit session reservation expired, releasing it"
             );
-            g.edit_sg = 0;
-            g.editing_conn = None;
-            g.reservation_expiry_ms = 0;
         }
     }
 }
@@ -566,11 +556,12 @@ impl SettingGroupRegistry {
     ///
     /// The server calls this from its periodic timer.
     pub fn tick_reservations(&self) -> Vec<(String, ConnectionId)> {
-        self.tick_reservations_at(now_ms())
+        self.tick_reservations_at(Instant::now())
     }
 
-    /// [`SettingGroupRegistry::tick_reservations`] against a supplied clock.
-    pub(crate) fn tick_reservations_at(&self, now: u64) -> Vec<(String, ConnectionId)> {
+    /// [`SettingGroupRegistry::tick_reservations`] against a supplied instant of
+    /// the monotonic clock.
+    pub(crate) fn tick_reservations_at(&self, now: Instant) -> Vec<(String, ConnectionId)> {
         let g = match self.inner.read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
@@ -989,7 +980,10 @@ mod tests {
         let rt = rt_three_sg(); // 60-second reservation
         rt.try_edit_sg(2, 100).expect("start");
         // One millisecond later the reservation still stands.
-        assert_eq!(rt.tick_reservation_at(now_ms() + 1), None);
+        assert_eq!(
+            rt.tick_reservation_at(Instant::now() + Duration::from_millis(1)),
+            None
+        );
         assert_eq!(rt.snapshot().edit_sg, 2);
     }
 
@@ -998,7 +992,7 @@ mod tests {
         let rt = rt_three_sg();
         rt.try_edit_sg(2, 100).expect("start");
         // One millisecond past the 60-second reservation.
-        let future = now_ms() + 60_001;
+        let future = Instant::now() + Duration::from_millis(60_001);
         assert_eq!(rt.tick_reservation_at(future), Some(100));
         // The session is gone, so a second pass releases nothing.
         assert_eq!(rt.tick_reservation_at(future), None);
@@ -1009,7 +1003,10 @@ mod tests {
     #[test]
     fn tick_reservation_no_op_without_session() {
         let rt = rt_three_sg();
-        assert_eq!(rt.tick_reservation_at(now_ms() + 1_000_000), None);
+        assert_eq!(
+            rt.tick_reservation_at(Instant::now() + Duration::from_secs(1_000)),
+            None
+        );
     }
 
     #[test]
@@ -1023,7 +1020,8 @@ mod tests {
         reg.inner.write().unwrap().insert("LDB".into(), rt_b);
 
         // Past the reservation of both devices.
-        let mut released = reg.tick_reservations_at(now_ms() + 60_001);
+        let later = Instant::now() + Duration::from_millis(60_001);
+        let mut released = reg.tick_reservations_at(later);
         released.sort();
         assert_eq!(
             released,
@@ -1031,7 +1029,9 @@ mod tests {
             "both sessions must be released at the same deadline"
         );
         // Both sessions are gone, so a second pass releases nothing.
-        assert!(reg.tick_reservations_at(now_ms() + 60_002).is_empty());
+        assert!(reg
+            .tick_reservations_at(later + Duration::from_millis(1))
+            .is_empty());
     }
 
     #[test]
@@ -1041,7 +1041,7 @@ mod tests {
         rt.try_edit_sg(2, 111).expect("start");
         reg.inner.write().unwrap().insert("LDA".into(), rt);
         // One millisecond later the reservation still stands.
-        let released = reg.tick_reservations_at(now_ms() + 1);
+        let released = reg.tick_reservations_at(Instant::now() + Duration::from_millis(1));
         assert!(released.is_empty());
     }
 
