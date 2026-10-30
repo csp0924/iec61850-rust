@@ -143,6 +143,13 @@ async fn read_all(c: &mut MmsClient, item: &str) -> ReadJournalResponse {
         .expect("read journal")
 }
 
+fn members(v: MmsData) -> Vec<MmsData> {
+    match v {
+        MmsData::Structure(m) => m,
+        other => panic!("expected a structure, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enabled_lcb_logs_each_data_change_of_a_data_set_member() {
     let m = model();
@@ -256,6 +263,78 @@ async fn an_lcb_with_an_unregistered_data_set_logs_nothing() {
 
     srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
     assert_eq!(storage.count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whole_lcb_read_carries_the_nine_components() {
+    let m = model();
+    let srv = server(m.clone());
+    register_data_set(&srv, &m);
+    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+    register_lcb(
+        &srv,
+        lcb(TriggerOptions::DATA_CHANGED),
+        storage.clone(),
+        true,
+    );
+    let h = srv.start().await.unwrap();
+    let mut c = client(h.bound_addr.port()).await;
+
+    // An empty log reports a zero time and an all-zero EntryID.
+    let empty = members(c.read(DOM, LCB_ITEM).await.expect("read LCB"));
+    assert_eq!(empty.len(), 9);
+    assert_eq!(empty[0], MmsData::Boolean(true));
+    assert_eq!(
+        empty[1],
+        MmsData::VisibleString(format!("{DOM}/{EVENT_LOG}"))
+    );
+    assert_eq!(empty[2], MmsData::VisibleString(DATA_SET.into()));
+    assert_eq!(empty[3], MmsData::BinaryTime(vec![0; 6]));
+    assert_eq!(empty[4], MmsData::BinaryTime(vec![0; 6]));
+    assert_eq!(empty[5], MmsData::OctetString(vec![0; 8]));
+    assert_eq!(empty[6], MmsData::OctetString(vec![0; 8]));
+    assert!(matches!(empty[7], MmsData::BitString { .. }), "TrgOps");
+    assert_eq!(empty[8], MmsData::Unsigned(2_000));
+
+    srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
+    srv.update_boolean(ggio_da(&m, 0, 0), false).unwrap();
+    let journal = read_all(&mut c, LCB_ITEM).await;
+    let (oldest, newest) = (&journal.entries[0], &journal.entries[1]);
+
+    let full = members(c.read(DOM, LCB_ITEM).await.expect("read LCB"));
+    let time = |ms| {
+        MmsData::BinaryTime(iec61850_mms::mms::binary_time::binary_time6_from_epoch_ms(ms).to_vec())
+    };
+    assert_eq!(full[3], time(oldest.occurence_time_ms));
+    assert_eq!(full[4], time(newest.occurence_time_ms));
+    assert_eq!(full[5], MmsData::OctetString(oldest.entry_id.to_vec()));
+    assert_eq!(full[6], MmsData::OctetString(newest.entry_id.to_vec()));
+
+    // Each component reads alone by its component name, and OldEnt and
+    // NewEnt also by the attribute names OldEntr and NewEntr.
+    for (name, expected) in [
+        ("OldEntrTm", &full[3]),
+        ("NewEntrTm", &full[4]),
+        ("OldEnt", &full[5]),
+        ("NewEnt", &full[6]),
+        ("OldEntr", &full[5]),
+        ("NewEntr", &full[6]),
+        ("IntgPd", &full[8]),
+    ] {
+        let v = c
+            .read(DOM, &format!("{LCB_ITEM}${name}"))
+            .await
+            .unwrap_or_else(|e| panic!("read {name}: {e:?}"));
+        assert_eq!(&v, expected, "{name}");
+    }
+    assert!(
+        c.read(DOM, &format!("{LCB_ITEM}$NoSuchAttr"))
+            .await
+            .is_err(),
+        "an unknown attribute is absent"
+    );
+    c.disconnect().await.ok();
+    h.stop().await;
 }
 
 /// Serves a journal of fresh entries on 0.0.0.0:18103 for thirty seconds, for

@@ -2029,23 +2029,23 @@ fn read_brcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> 
     AccessResult::Success(MmsData::Structure(members))
 }
 
-/// The log control block attributes this server serves on a Read, in the order
-/// IEC 61850-7-2 declares them.
+/// The MMS components of a log control block, in the order of its MMS
+/// structure (IEC 61850-8-1 log control block definition).
 ///
-/// The nine attributes of a log control block are LogEna, LogRef, DatSet,
-/// OldEntrTm, NewEntrTm, OldEntr, NewEntr, TrgOps and IntgPd. The four omitted
-/// here are properties of the journal behind the control block, and the
-/// `LogStorage` trait exposes no accessor for them, so they answer
-/// object-access-unsupported the way the unserved buffered report control block
-/// fields do.
+/// OldEntrTm, NewEntrTm, OldEnt and NewEnt report the oldest and newest entry
+/// of the log behind the control block.
 #[cfg(feature = "logging")]
-const LCB_SERVED_FIELDS: [&str; 5] = ["LogEna", "LogRef", "DatSet", "TrgOps", "IntgPd"];
-
-/// The log control block attributes IEC 61850-7-2 declares that this server
-/// does not serve. They exist, so they answer object-access-unsupported rather
-/// than object-non-existent.
-#[cfg(feature = "logging")]
-const LCB_UNSERVED_FIELDS: [&str; 4] = ["OldEntrTm", "NewEntrTm", "OldEntr", "NewEntr"];
+const LCB_SERVED_FIELDS: [&str; 9] = [
+    "LogEna",
+    "LogRef",
+    "DatSet",
+    "OldEntrTm",
+    "NewEntrTm",
+    "OldEnt",
+    "NewEnt",
+    "TrgOps",
+    "IntgPd",
+];
 
 /// Splits a Read object name into the log control registry key and the optional
 /// attribute name, for an item id of `<LN>$LG$<name>` or `<LN>$LG$<name>$<attr>`.
@@ -2074,30 +2074,66 @@ fn extract_lcb_target(
     Some((domain_id.as_str(), item, parts.get(3).copied()))
 }
 
-/// Reads one attribute out of the state of a log control block.
+/// The oldest and the newest entry of a log, as OldEntrTm, NewEntrTm, OldEnt
+/// and NewEnt report them; `None` for an empty log or a control block with no
+/// storage bound.
+#[cfg(feature = "logging")]
+type LogBounds = Option<(
+    crate::logging::storage::EntryMeta,
+    crate::logging::storage::EntryMeta,
+)>;
+
+/// The LogRef a log control block reports: the configured one, or the
+/// default `<LD>/<LN>$GeneralLog` when none is configured.
 ///
-/// `domain` and `ln` supply the default LogRef, `<LD>/<LN>$GeneralLog`, which
-/// applies when the control block configures none. The logical device is part
-/// of it because a LogRef is an MMS path a client hands straight to ReadJournal,
-/// which resolves it by domain and item. `None` means the attribute is not one
-/// of [`LCB_SERVED_FIELDS`].
+/// The logical device is part of it because a LogRef is the reference a client
+/// hands to ReadJournal, which resolves it by domain and item.
+#[cfg(feature = "logging")]
+fn effective_log_ref(
+    state: &crate::logging::lcb::LogControlState,
+    domain: &str,
+    ln: &str,
+) -> String {
+    state
+        .log_ref
+        .clone()
+        .unwrap_or_else(|| format!("{domain}/{ln}$GeneralLog"))
+}
+
+/// Reads one MMS component out of a log control block.
+///
+/// `domain` and `ln` supply the default LogRef. `bounds` supplies the four
+/// components that describe the log: an EntryTime is a six-octet TimeOfDay,
+/// and an EntryID eight octets; an empty log reports a zero time and an
+/// all-zero EntryID for both its oldest and its newest entry. `None` means
+/// `field` is not one of [`LCB_SERVED_FIELDS`].
 #[cfg(feature = "logging")]
 fn lcb_field_value(
     state: &crate::logging::lcb::LogControlState,
+    bounds: LogBounds,
     domain: &str,
     ln: &str,
     field: &str,
 ) -> Option<iec61850_mms::mms::pdu::common::MmsData> {
+    use iec61850_mms::mms::binary_time::binary_time6_from_epoch_ms;
     use iec61850_mms::mms::pdu::common::MmsData;
+    let entry_time = |meta: Option<crate::logging::storage::EntryMeta>| {
+        MmsData::BinaryTime(match meta {
+            Some((_, time_ms)) => binary_time6_from_epoch_ms(time_ms).to_vec(),
+            None => vec![0; 6],
+        })
+    };
+    let entry_id = |meta: Option<crate::logging::storage::EntryMeta>| {
+        MmsData::OctetString(meta.map_or([0; 8], |(id, _)| id.to_be_bytes()).to_vec())
+    };
     Some(match field {
         "LogEna" => MmsData::Boolean(matches!(state.log_ena, crate::logging::LogState::Enabled)),
-        "LogRef" => MmsData::VisibleString(
-            state
-                .log_ref
-                .clone()
-                .unwrap_or_else(|| format!("{domain}/{ln}$GeneralLog")),
-        ),
+        "LogRef" => MmsData::VisibleString(effective_log_ref(state, domain, ln)),
         "DatSet" => MmsData::VisibleString(state.data_set.clone().unwrap_or_default()),
+        "OldEntrTm" => entry_time(bounds.map(|(oldest, _)| oldest)),
+        "NewEntrTm" => entry_time(bounds.map(|(_, newest)| newest)),
+        "OldEnt" => entry_id(bounds.map(|(oldest, _)| oldest)),
+        "NewEnt" => entry_id(bounds.map(|(_, newest)| newest)),
         "TrgOps" => {
             let wire = state.trg_ops.to_ber_bit_string();
             MmsData::BitString {
@@ -2328,6 +2364,28 @@ fn handle_read_with_routing(
                     DataAccessError::ObjectNonExistent,
                 ));
             };
+            let field = field.map(crate::mapping::lcb_member_name);
+            let describes_log = match field {
+                None => true,
+                Some(f) => matches!(f, "OldEntrTm" | "NewEntrTm" | "OldEnt" | "NewEnt"),
+            };
+            let bounds: LogBounds = match lc.storage.as_ref() {
+                Some(storage) if describes_log => match storage.oldest_and_newest() {
+                    Ok(bounds) => bounds,
+                    Err(e) => {
+                        tracing::warn!(
+                            domain,
+                            item,
+                            error = %e,
+                            "read: the log storage backend failed, answering hardware-fault"
+                        );
+                        return ReadRoutingOutcome::Result(AccessResult::Failure(
+                            DataAccessError::HardwareFault,
+                        ));
+                    }
+                },
+                _ => None,
+            };
             let Ok(state) = lc.state.lock() else {
                 tracing::warn!(
                     domain,
@@ -2340,25 +2398,15 @@ fn handle_read_with_routing(
             };
             let ln = item.split('$').next().unwrap_or_default();
             let r = match field {
-                // A whole-block read answers the served attributes in declared
-                // order, mirroring the report control block structure read.
+                // A whole-block read answers every component in structure order.
                 None => AccessResult::Success(iec61850_mms::mms::pdu::common::MmsData::Structure(
                     LCB_SERVED_FIELDS
                         .iter()
-                        .filter_map(|f| lcb_field_value(&state, domain, ln, f))
+                        .filter_map(|f| lcb_field_value(&state, bounds, domain, ln, f))
                         .collect(),
                 )),
-                Some(f) => match lcb_field_value(&state, domain, ln, f) {
+                Some(f) => match lcb_field_value(&state, bounds, domain, ln, f) {
                     Some(d) => AccessResult::Success(d),
-                    None if LCB_UNSERVED_FIELDS.contains(&f) => {
-                        tracing::warn!(
-                            domain,
-                            item,
-                            field = f,
-                            "read: this log control block attribute is not served, answering object-access-unsupported"
-                        );
-                        AccessResult::Failure(DataAccessError::ObjectAccessUnsupported)
-                    }
                     None => {
                         tracing::warn!(
                             domain,
@@ -4948,7 +4996,7 @@ mod tests {
 
 #[cfg(all(test, feature = "logging"))]
 mod log_control_name_tests {
-    use super::{extract_lcb_target, is_lcb_path, LCB_SERVED_FIELDS, LCB_UNSERVED_FIELDS};
+    use super::{extract_lcb_target, is_lcb_path, LCB_SERVED_FIELDS};
     use iec61850_mms::mms::pdu::common::ObjectName;
 
     fn domain_specific(item: &str) -> ObjectName {
@@ -4991,17 +5039,23 @@ mod log_control_name_tests {
         assert!(extract_lcb_target(&ObjectName::VmdSpecific("LLN0$LG$evlog".into())).is_none());
     }
 
-    /// The served and unserved attribute lists together are the nine attributes
-    /// of a log control block, and they do not overlap.
+    /// A log control block carries its nine MMS components in structure order.
     #[test]
-    fn served_and_unserved_lcb_fields_are_disjoint_and_complete() {
-        assert_eq!(LCB_SERVED_FIELDS.len() + LCB_UNSERVED_FIELDS.len(), 9);
-        for f in LCB_SERVED_FIELDS {
-            assert!(
-                !LCB_UNSERVED_FIELDS.contains(&f),
-                "{f} cannot be both served and unserved"
-            );
-        }
+    fn lcb_components_follow_the_mms_structure() {
+        assert_eq!(
+            LCB_SERVED_FIELDS,
+            [
+                "LogEna",
+                "LogRef",
+                "DatSet",
+                "OldEntrTm",
+                "NewEntrTm",
+                "OldEnt",
+                "NewEnt",
+                "TrgOps",
+                "IntgPd"
+            ]
+        );
     }
 
     /// Only a three-segment `<LN>$LG$<name>` item names a log control block; a

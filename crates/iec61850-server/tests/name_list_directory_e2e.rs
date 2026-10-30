@@ -295,9 +295,8 @@ async fn a_registered_log_control_block_is_listed_under_the_lcb_class() {
 }
 
 /// Every name GetNameList reports must be readable, so the `$LG$` name the
-/// directory now advertises is read back here: the whole control block, each
-/// served attribute, and the two error classes that separate an attribute this
-/// server does not serve from a name that does not exist.
+/// directory now advertises is read back here: the whole control block, its
+/// attributes, and a control block that does not exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listed_log_control_block_is_readable() {
     let server = build_server();
@@ -306,7 +305,7 @@ async fn a_listed_log_control_block_is_readable() {
     let handle = server.start().await.expect("start the server");
     let conn = connect(&handle).await;
 
-    // The whole control block answers a structure of the served attributes.
+    // The whole control block answers a structure of its nine components.
     let whole = conn
         .read_object(LCB_REF, FC::Lg)
         .await
@@ -314,8 +313,8 @@ async fn a_listed_log_control_block_is_readable() {
     match whole {
         MmsValue::Structure(members) => assert_eq!(
             members.len(),
-            5,
-            "the structure must carry LogEna, LogRef, DatSet, TrgOps and IntgPd, got {members:?}"
+            9,
+            "the structure must carry the nine log control block components, got {members:?}"
         ),
         other => panic!("expected a structure, got {other:?}"),
     }
@@ -366,18 +365,12 @@ async fn a_listed_log_control_block_is_readable() {
         "TrgOps must be a bit string, got {trg_ops:?}"
     );
 
-    // An attribute the standard declares but this server does not serve is
-    // reported as unsupported, not as absent: the name exists.
-    let unserved = conn
+    // The log is empty, so its newest entry time is the zero TimeOfDay.
+    let new_entr_tm = conn
         .read_object(&format!("{LCB_REF}.NewEntrTm"), FC::Lg)
         .await
-        .expect_err("an unserved attribute must fail");
-    let unserved = unserved.to_string();
-    assert!(
-        unserved.contains("object-access-unsupported")
-            || unserved.contains("ObjectAccessUnsupported"),
-        "an unserved attribute must answer object-access-unsupported, got `{unserved}`"
-    );
+        .expect("NewEntrTm must be readable");
+    assert_eq!(new_entr_tm, MmsValue::BinaryTime(vec![0; 6]));
 
     // A control block that was never registered is absent, not unsupported.
     let missing = conn
