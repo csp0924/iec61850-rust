@@ -1489,7 +1489,8 @@ fn build_sdo_def(
 ///
 /// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent,
 /// [`ErrorKind::AttributeValueInvalid`] for a malformed value, and
-/// [`ErrorKind::EnumValueUnknown`] when `fc` is not a functional constraint.
+/// [`ErrorKind::EnumValueUnknown`] when `fc` is not a data functional
+/// constraint.
 fn build_da_def(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -1498,7 +1499,7 @@ fn build_da_def(
     let name = required(start.attributes(), "name", span, path)?;
     let fc_str = required(start.attributes(), "fc", span, path)?;
     // Validate the functional constraint token, then keep the raw string.
-    let _ = crate::enums::parse_fc(&fc_str, span, path)?;
+    let _ = crate::enums::parse_data_fc(&fc_str, span, path)?;
     let b_type = required(start.attributes(), "bType", span, path)?;
     let type_ref = optional(start.attributes(), "type");
     let count = parse_optional::<u32>(start.attributes(), "count", span, path)?;
@@ -1740,7 +1741,8 @@ fn build_data_set(
 ///
 /// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent,
 /// [`ErrorKind::AttributeValueInvalid`] when `ix` is not a `u32`, and
-/// [`ErrorKind::EnumValueUnknown`] when `fc` is not a functional constraint.
+/// [`ErrorKind::EnumValueUnknown`] when `fc` is not a data functional
+/// constraint.
 fn build_fcda(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -1750,7 +1752,7 @@ fn build_fcda(
     let ln_class = required(start.attributes(), "lnClass", span, path)?;
     let fc_str = required(start.attributes(), "fc", span, path)?;
     // Validate the functional constraint token, then keep the raw string.
-    let _ = crate::enums::parse_fc(&fc_str, span, path)?;
+    let _ = crate::enums::parse_data_fc(&fc_str, span, path)?;
     let prefix = optional(start.attributes(), "prefix");
     let ln_inst = optional(start.attributes(), "lnInst");
     let do_name = optional(start.attributes(), "doName");

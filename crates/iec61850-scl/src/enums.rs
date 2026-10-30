@@ -3,8 +3,8 @@
 //! A failure reports [`ErrorKind::EnumValueUnknown`] together with the list of
 //! permitted values, so the message says what to write instead.
 //!
-//! Covered here: `parse_smp_mod`, `parse_gse_type` and `parse_fc` for plain
-//! attribute values, and `parse_trg_ops`, `parse_opt_fields` and
+//! Covered here: `parse_smp_mod`, `parse_gse_type`, `parse_fc` and its
+//! data-attribute form `parse_data_fc` for plain attribute values, and `parse_trg_ops`, `parse_opt_fields` and
 //! `parse_smv_opts`, which read an element's attributes into a bit struct.
 //!
 //! A coded enumeration inside `<Val>` is not handled here: the basic type has
@@ -108,6 +108,44 @@ pub fn parse_fc(
         )
         .with_attribute("fc")
     })
+}
+
+/// The functional constraints a `<DA>` or an `<FCDA>` may carry: the data
+/// constraints of the IEC 61850-6 schema, without the `ALL` and `NONE`
+/// selectors and the control block constraints BR, RP, LG, GO, MS and US.
+const DATA_FCS: [&str; 13] = [
+    "ST", "MX", "CO", "SP", "SG", "SE", "SV", "CF", "DC", "EX", "SR", "BL", "OR",
+];
+
+/// Parses the functional constraint of a `<DA>` or an `<FCDA>`.
+///
+/// Accepts only a data functional constraint, so an attribute cannot be placed
+/// under a selector or a control block constraint where no MMS view lists it.
+///
+/// # Errors
+///
+/// [`ErrorKind::AttributeValueInvalid`] when the token is not a functional
+/// constraint at all, and [`ErrorKind::EnumValueUnknown`] when it is one that
+/// a data attribute cannot carry.
+pub(crate) fn parse_data_fc(
+    s: &str,
+    span: SourceSpan,
+    path: &str,
+) -> Result<iec61850_model::fc::FC, SclParseError> {
+    let fc = parse_fc(s, span, path)?;
+    if !DATA_FCS.contains(&s) {
+        return Err(SclParseError::at(
+            span,
+            path,
+            ErrorKind::EnumValueUnknown {
+                name: "fc".to_string(),
+                raw_value: s.to_string(),
+                allowed: DATA_FCS.to_vec(),
+            },
+        )
+        .with_attribute("fc"));
+    }
+    Ok(fc)
 }
 
 // ------------------------------------------------------------------------

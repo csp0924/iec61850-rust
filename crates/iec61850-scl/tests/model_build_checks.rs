@@ -304,3 +304,44 @@ fn template_integer_out_of_range_is_rejected() {
     ))
     .is_err());
 }
+
+fn da_with_fc(fc: &str) -> String {
+    let t = format!(
+        r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="X" type="X_T"/></LNodeType>
+    <DOType id="X_T" cdc="SPS"><DA name="v" fc="{fc}" bType="BOOLEAN"/></DOType>"#
+    );
+    wrap(&t, "", GGIO1)
+}
+
+/// A `<DA>` whose `fc` is the ALL or NONE selector or a control block
+/// constraint is rejected, since no MMS view of the logical node lists it.
+#[test]
+fn da_fc_outside_the_data_constraints_is_rejected() {
+    for fc in ["ALL", "NONE", "BR", "RP", "LG", "GO", "MS", "US"] {
+        let r = iec61850_scl::parse_scl(&da_with_fc(fc));
+        assert!(r.is_err(), "fc={fc} accepted on a DA");
+    }
+}
+
+/// Control: every data functional constraint is accepted on a `<DA>`.
+#[test]
+fn da_fc_data_constraints_are_accepted() {
+    for fc in [
+        "ST", "MX", "CO", "SP", "SG", "SE", "SV", "CF", "DC", "EX", "SR", "BL", "OR",
+    ] {
+        build(&da_with_fc(fc));
+    }
+}
+
+/// The same restriction holds for an `<FCDA>`.
+#[test]
+fn fcda_fc_outside_the_data_constraints_is_rejected() {
+    for fc in ["ALL", "BR", "GO"] {
+        let ln0 = format!(
+            r#"<DataSet name="DS1"><FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Ind1" fc="{fc}"/></DataSet>"#
+        );
+        let r = iec61850_scl::parse_scl(&wrap(GGIO_SPS, &ln0, GGIO1));
+        assert!(r.is_err(), "fc={fc} accepted on an FCDA");
+    }
+}
