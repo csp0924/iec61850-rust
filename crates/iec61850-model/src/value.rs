@@ -70,6 +70,10 @@ impl MmsValue {
             T::Float32 => MmsValue::Float32(0.0),
             T::Float64 => MmsValue::Float64(0.0),
             T::Enumerated => MmsValue::Integer(0),
+            // An 8-octet string is the fixed-size EntryID of IEC 61850-8-1,
+            // which the MMS mapping declares as octet-string(8); a shorter
+            // value would contradict that declaration.
+            T::OctetString(8) => MmsValue::OctetString(vec![0u8; 8]),
             T::OctetString(_) => MmsValue::OctetString(Vec::new()),
             T::VisibleString(_) | T::Currency => MmsValue::VisibleString(String::new()),
             T::UnicodeString255 => MmsValue::MmsString(String::new()),
@@ -160,6 +164,20 @@ mod tests {
         for v in cases {
             assert!(!v.type_name().is_empty());
         }
+    }
+
+    #[test]
+    fn default_entry_id_is_eight_zero_octets() {
+        use crate::types::DataAttributeType;
+        assert_eq!(
+            MmsValue::default_for(DataAttributeType::OctetString(8)),
+            MmsValue::OctetString(vec![0u8; 8])
+        );
+        // Control: a variable-length octet string still starts empty.
+        assert_eq!(
+            MmsValue::default_for(DataAttributeType::OctetString(64)),
+            MmsValue::OctetString(Vec::new())
+        );
     }
 
     #[test]
