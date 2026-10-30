@@ -331,13 +331,25 @@ fn read_tlv_header(data: &[u8], pos: usize, end: usize) -> Result<(u8, usize, us
     Ok((tag, value_start, value_end))
 }
 
-/// Decodes a `u32` from a BER signed integer of at most 5 content bytes.
+/// Decodes a `u32` from a BER integer of at most 5 content bytes.
+///
+/// A 5-byte form is only the sign octet `0x00` in front of a value with bit
+/// 31 set; any other leading octet encodes a value wider than `u32`.
 fn decode_u32_from_bytes(bytes: &[u8]) -> Result<u32, GooseError> {
-    if bytes.is_empty() || bytes.len() > 5 {
-        return Err(GooseError::LengthMismatch);
-    }
+    let payload = match bytes {
+        [] => return Err(GooseError::LengthMismatch),
+        [0x00, rest @ ..] if rest.len() == 4 => rest,
+        _ if bytes.len() > 4 => {
+            tracing::warn!(
+                "goose integer of {} content bytes does not fit 32 bits",
+                bytes.len()
+            );
+            return Err(GooseError::LengthMismatch);
+        }
+        _ => bytes,
+    };
     let mut result = 0u32;
-    for &b in bytes {
+    for &b in payload {
         result = result << 8 | b as u32;
     }
     Ok(result)
