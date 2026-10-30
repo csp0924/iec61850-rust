@@ -671,7 +671,7 @@ fn dispatch_get_name_list(
 /// nothing registered has no Read handler, and listing it would advertise a
 /// name that answers object-non-existent.
 ///
-/// Only two combinations have members. Domain-scope named variables gain the
+/// Only three combinations have members. Domain-scope named variables gain the
 /// GOOSE control blocks of the domain and, flattened the way the model's own
 /// names are, every report and log control block of
 /// [`domain_control_blocks`]: the `<LN>$RP`, `<LN>$BR` or `<LN>$LG` group, the
@@ -679,6 +679,7 @@ fn dispatch_get_name_list(
 /// describes them. Domain-scope named variable lists gain the data sets of the
 /// registry, which covers both those the application registered and those a
 /// client created with DefineNamedVariableList.
+/// Domain-scope journals gain the journals of the log control registry.
 ///
 /// A poisoned registry lock yields the names it can still contribute rather
 /// than failing the request: an incomplete directory is more useful to a
@@ -714,6 +715,10 @@ fn runtime_extras(
                 out.push(group);
             }
             out
+        }
+        #[cfg(feature = "logging")]
+        (ObjectClass::Journal, ObjectScope::DomainSpecific(domain)) => {
+            journal_names_in_domain(log_controls, domain)
         }
         #[cfg(feature = "reporting")]
         (ObjectClass::NamedVariableList, ObjectScope::DomainSpecific(domain)) => {
@@ -3084,6 +3089,38 @@ fn log_ref_of(lc: &LogControl, domain: &str, item: &str) -> Option<String> {
         .lock()
         .ok()
         .map(|state| effective_log_ref(&state, domain, ln))
+}
+
+/// Names of the journals of `domain`, as GetNameList reports them for the
+/// Journal object class: the log each control block's LogRef names within
+/// the domain, and each registry key that is a log instance name rather than
+/// a control block path. Sorted, without duplicates.
+///
+/// A poisoned registry lock yields no name.
+#[cfg(feature = "logging")]
+fn journal_names_in_domain(log_controls: &LogControlRegistry, domain: &str) -> Vec<String> {
+    let Ok(registry) = log_controls.read() else {
+        tracing::warn!(
+            domain = %domain,
+            "get-name-list: the log control registry lock is poisoned, no journal is listed"
+        );
+        return Vec::new();
+    };
+    let mut names: Vec<String> = registry
+        .iter()
+        .filter_map(|((d, item), lc)| {
+            if is_lcb_path(item) {
+                let log_ref = log_ref_of(lc, d, item)?;
+                let (log_domain, log_item) = log_ref.split_once('/')?;
+                (log_domain == domain && !log_item.is_empty()).then(|| log_item.to_string())
+            } else {
+                (d == domain).then(|| item.clone())
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Dispatches a ReadJournal request (`0xbf 0x41`).

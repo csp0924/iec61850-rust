@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
 use iec61850_mms::mms::pdu::{ReadJournalRequest, ReadJournalResponse};
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{
@@ -380,6 +381,53 @@ async fn the_journal_a_logref_names_is_readable() {
         .read_journal(&ReadJournalRequest::time_range(DOM, "LLN0$NoLog", 0, 1))
         .await;
     assert!(missing.is_err(), "a journal no LogRef names is absent");
+    c.disconnect().await.ok();
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_name_list_lists_the_journals_of_a_domain() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+    register_lcb(
+        &srv,
+        lcb(TriggerOptions::DATA_CHANGED),
+        storage.clone(),
+        true,
+    );
+    // No LogRef configured: the default `<LD>/<LN>$GeneralLog` applies.
+    let general = LogControl::new(
+        format!("{DOM}/GGIO1$LG$gen"),
+        LogControlBlock::new("gen").with_dataset(DATA_SET),
+    );
+    srv.register_log_control(DOM, "GGIO1$LG$gen", Arc::new(general));
+    // A second control block writing to the same log adds no name.
+    let shared = LogControl::new(
+        format!("{DOM}/LLN0$LG$second"),
+        lcb(TriggerOptions::DATA_CHANGED),
+    );
+    srv.register_log_control(DOM, "LLN0$LG$second", Arc::new(shared));
+    let h = srv.start().await.unwrap();
+
+    let mut c = client(h.bound_addr.port()).await;
+    let (journals, more) = c
+        .get_name_list(ObjectClass::Journal, Some(DOM), None)
+        .await
+        .expect("journal names");
+    assert_eq!(
+        journals,
+        vec!["GGIO1$GeneralLog".to_string(), EVENT_LOG.to_string()]
+    );
+    assert!(!more);
+    let (variables, _) = c
+        .get_name_list(ObjectClass::NamedVariable, Some(DOM), None)
+        .await
+        .expect("variable names");
+    assert!(
+        !variables.iter().any(|n| n == EVENT_LOG),
+        "a journal is not a named variable"
+    );
     c.disconnect().await.ok();
     h.stop().await;
 }
