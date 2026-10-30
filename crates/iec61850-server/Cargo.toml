@@ -105,7 +105,7 @@ tls = ["dep:iec61850-tls"]
 sqlite-backend = ["dep:rusqlite", "reporting"]
 
 [dev-dependencies]
-tokio          = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "macros", "time", "signal"] }
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "macros", "time", "signal", "test-util"] }
 rcgen          = { workspace = true }
 rustls         = { workspace = true }
 iec61850-tls   = { workspace = true }

@@ -23,6 +23,10 @@
 //!   disconnect.
 //! - An abort sends an ACSE A-ABORT, wrapped in a Session abort and a COTP data
 //!   TPDU, before the socket closes.
+//! - An association that neither receives nor sends a PDU for
+//!   `association_idle_timeout_ms`, 300 000 ms by default, is aborted.
+//! - A PDU the peer does not accept within `association_send_timeout_ms`,
+//!   10 000 ms by default, ends the connection without a further write.
 //! - After answering a Conclude the server waits for the Session finish for a
 //!   bounded time, 10 seconds by default, and then closes the socket itself.
 //! - An AARQ that fails authentication is answered with an AARE carrying a
@@ -294,6 +298,8 @@ enum ConnError {
     UnexpectedSessionIndication(SessionIndication),
     #[error("association setup did not complete within the setup timeout")]
     SetupTimedOut,
+    #[error("a PDU could not be written within the send timeout")]
+    SendTimedOut,
 }
 
 /// Runs one association from accept to close.
@@ -578,6 +584,12 @@ where
     let conclude_timeout = client_conn
         .with_mms(|m| m.conclude_timeout_ms())
         .unwrap_or(10_000);
+    let idle_timeout = server
+        .config()
+        .association_idle_timeout_ms
+        .map(Duration::from_millis);
+    let send_timeout = Duration::from_millis(server.config().association_send_timeout_ms);
+    let mut last_activity = tokio::time::Instant::now();
 
     loop {
         // Polled rather than awaited, so no future is built per iteration.
@@ -586,11 +598,36 @@ where
                 conn_id,
                 "association marked for abort, sending an abort and closing the socket"
             );
-            send_acse_abort(&mut cotp, &mut session, &mut pres).await?;
+            send_bounded(
+                conn_id,
+                send_timeout,
+                &mut last_activity,
+                send_acse_abort(&mut cotp, &mut session, &mut pres),
+            )
+            .await?;
             break;
         }
 
         let concluded = client_conn.with_mms(|m| m.is_concluded()).unwrap_or(false);
+        // Checked here rather than on the receive timeout, which a steady
+        // stream of reports or command terminations would never let expire.
+        if let Some(idle) = idle_timeout {
+            if !concluded && last_activity.elapsed() >= idle {
+                tracing::warn!(
+                    conn_id,
+                    idle_timeout_ms = idle.as_millis() as u64,
+                    "no PDU received or sent within the idle timeout, sending an abort and closing the socket"
+                );
+                send_bounded(
+                    conn_id,
+                    send_timeout,
+                    &mut last_activity,
+                    send_acse_abort(&mut cotp, &mut session, &mut pres),
+                )
+                .await?;
+                break;
+            }
+        }
         let tick = if concluded {
             Duration::from_millis(conclude_timeout)
         } else {
@@ -610,8 +647,11 @@ where
             ev = ct_rx.recv() => {
                 match ev {
                     Some(event) => {
-                        if let Err(e) = send_command_termination(
-                            &mut cotp, &session, &pres, &event,
+                        if let Err(e) = send_bounded(
+                            conn_id,
+                            send_timeout,
+                            &mut last_activity,
+                            send_command_termination(&mut cotp, &session, &pres, &event),
                         ).await {
                             tracing::warn!(conn_id, error = %e, "failed to send a command termination");
                             return Err(e);
@@ -627,7 +667,12 @@ where
             ev = rpt_rx.recv() => {
                 match ev {
                     Some(pdu) => {
-                        if let Err(e) = send_user_data_mms(&mut cotp, &session, &pres, &pdu).await {
+                        if let Err(e) = send_bounded(
+                            conn_id,
+                            send_timeout,
+                            &mut last_activity,
+                            send_user_data_mms(&mut cotp, &session, &pres, &pdu),
+                        ).await {
                             tracing::warn!(conn_id, error = %e, "failed to send a report");
                             return Err(e);
                         }
@@ -659,7 +704,10 @@ where
             }
         };
         let payload = match step {
-            Step::Payload(p) => p,
+            Step::Payload(p) => {
+                last_activity = tokio::time::Instant::now();
+                p
+            }
             Step::Continue => continue,
             Step::Break => break,
         };
@@ -685,7 +733,10 @@ where
                 let mut dn = BytesMut::new();
                 use iec61850_mms::iso::session::encode_disconnect;
                 encode_disconnect(&[], &mut dn)?;
-                cotp.send_data(&dn).await?;
+                send_bounded(conn_id, send_timeout, &mut last_activity, async {
+                    cotp.send_data(&dn).await.map_err(ConnError::from)
+                })
+                .await?;
                 break;
             }
             SessionIndication::Abort => {
@@ -739,7 +790,13 @@ where
                         );
                         let mut rlre = [0u8; 2];
                         encode_rlre(&mut rlre);
-                        send_user_data_acse(&mut cotp, &session, &pres, &rlre).await?;
+                        send_bounded(
+                            conn_id,
+                            send_timeout,
+                            &mut last_activity,
+                            send_user_data_acse(&mut cotp, &session, &pres, &rlre),
+                        )
+                        .await?;
                     }
                     AcseIndication::Abort => {
                         tracing::debug!(conn_id, "acse abort received, closing the socket");
@@ -762,16 +819,31 @@ where
 
                 match outcome {
                     MessageOutcome::SendBytes(bytes) => {
-                        send_user_data_mms(&mut cotp, &session, &pres, &bytes).await?;
+                        send_bounded(
+                            conn_id,
+                            send_timeout,
+                            &mut last_activity,
+                            send_user_data_mms(&mut cotp, &session, &pres, &bytes),
+                        )
+                        .await?;
                     }
                     MessageOutcome::SendConcludeResponse { response_bytes } => {
-                        send_user_data_mms(&mut cotp, &session, &pres, &response_bytes).await?;
+                        send_bounded(
+                            conn_id,
+                            send_timeout,
+                            &mut last_activity,
+                            send_user_data_mms(&mut cotp, &session, &pres, &response_bytes),
+                        )
+                        .await?;
                         // Starts the bounded wait for the session finish.
                         client_conn.with_mms_mut(|m| m.mark_concluded());
                         // The session finish tells the peer to close as well.
                         let mut fn_bytes = BytesMut::new();
                         encode_finish(&[], &mut fn_bytes)?;
-                        cotp.send_data(&fn_bytes).await?;
+                        send_bounded(conn_id, send_timeout, &mut last_activity, async {
+                            cotp.send_data(&fn_bytes).await.map_err(ConnError::from)
+                        })
+                        .await?;
                     }
                     MessageOutcome::SendInitiateErrorAndClose { error_bytes: _ } => {
                         tracing::warn!(conn_id, "a second initiate arrived on an established association, closing the socket");
@@ -805,6 +877,40 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 // Writing a PDU down through the stack
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Runs one write of an established association within `send_timeout`, and
+/// records its completion as activity for the idle timeout.
+///
+/// # Errors
+///
+/// Returns the write's own error, or `ConnError::SendTimedOut` when the peer
+/// has stopped reading and the write does not complete in time; the caller then
+/// ends the connection without attempting any further write.
+async fn send_bounded<F>(
+    conn_id: ConnectionId,
+    send_timeout: Duration,
+    last_activity: &mut tokio::time::Instant,
+    send: F,
+) -> std::result::Result<(), ConnError>
+where
+    F: core::future::Future<Output = std::result::Result<(), ConnError>>,
+{
+    match tokio::time::timeout(send_timeout, send).await {
+        Ok(Ok(())) => {
+            *last_activity = tokio::time::Instant::now();
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            tracing::warn!(
+                conn_id,
+                send_timeout_ms = send_timeout.as_millis() as u64,
+                "the peer did not accept a PDU within the send timeout, closing the socket"
+            );
+            Err(ConnError::SendTimedOut)
+        }
+    }
+}
 
 /// Encodes an ACSE PDU with the supplied callback and wraps it outwards through
 /// Presentation CPA, Session accept, and a COTP data TPDU.
@@ -976,4 +1082,237 @@ where
 
     cotp.send_data(&sess_buf).await?;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The association timers, run against an in-memory stream on a paused clock:
+/// the runtime advances time only when every task is waiting, so each
+/// assertion about a timeout holds regardless of machine load.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::IedServerConfig;
+    use crate::reporting::rcb::Rcb;
+    use crate::reporting::{Dataset, ReportControl};
+    use iec61850_mms::iso::acse::encode_aarq;
+    use iec61850_mms::iso::presentation::{encode_connect, PresentationConnectionParameters};
+    use iec61850_mms::iso::session::{encode_connect as sess_encode_connect, IsoParameters};
+    use iec61850_mms::mms::pdu::initiate::InitiateRequestPdu;
+    use iec61850_mms::AarqAddressing;
+    use iec61850_model::{IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
+    use std::sync::Arc;
+    use tokio::io::DuplexStream;
+    use tokio::task::JoinHandle;
+    use tokio::time::Instant;
+
+    const URCB_PATH: &str = "TESTLD0/LLN0$RP$urcb01";
+
+    fn build_server(cfg: IedServerConfig) -> IedServer {
+        let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(lln0)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("TEST")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let server = IedServer::builder()
+            .model(Arc::new(model))
+            .bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .config(cfg)
+            .build()
+            .unwrap();
+        server
+            .register_urcb(
+                ReportControl::new(URCB_PATH, Rcb::new("urcb01", "LLN0$ds1")),
+                Dataset::new("LLN0$ds1"),
+            )
+            .unwrap();
+        server
+    }
+
+    /// Runs one connection task, holding a connection slot as the accept loop
+    /// does, over an in-memory stream that buffers `buf` bytes per direction.
+    fn spawn_connection(server: &IedServer, buf: usize) -> (DuplexStream, JoinHandle<()>) {
+        let (client, server_end) = tokio::io::duplex(buf);
+        let slot = server.try_acquire_connection_slot().expect("a free slot");
+        let server = server.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            handle_connection_inner(
+                server,
+                server_end,
+                "127.0.0.1:102".parse().unwrap(),
+                deadline,
+            )
+            .await;
+        });
+        (client, task)
+    }
+
+    /// Completes the association and waits for the Initiate response.
+    async fn associate(client: DuplexStream) -> CotpConnection<DuplexStream> {
+        let mut initiate = BytesMut::new();
+        InitiateRequestPdu::default().encode(&mut initiate);
+        let mut aarq = BytesMut::new();
+        encode_aarq(&initiate, None, 3, &AarqAddressing::default(), &mut aarq);
+        let mut cp = BytesMut::new();
+        encode_connect(&PresentationConnectionParameters::default(), &aarq, &mut cp);
+        let mut cn = BytesMut::new();
+        sess_encode_connect(&IsoParameters::default(), &IsoSession::new(), &cp, &mut cn).unwrap();
+
+        let mut cotp = CotpConnection::connect(client, CotpOptions::default())
+            .await
+            .unwrap();
+        cotp.send_data(&cn).await.unwrap();
+        cotp.recv_data().await.expect("the initiate response");
+        cotp
+    }
+
+    /// Reads and discards everything the server sends until it closes.
+    fn drain(mut cotp: CotpConnection<DuplexStream>) -> JoinHandle<()> {
+        tokio::spawn(async move { while cotp.recv_data().await.is_ok() {} })
+    }
+
+    /// Posts one report-sized PDU to connection 1, the first id a server hands out.
+    fn post_report(server: &IedServer) {
+        let _ = server
+            .report_sink()
+            .try_send_pdu(1, Bytes::from(vec![0xa3; 200]));
+    }
+
+    fn urcb_reserved(server: &IedServer) -> bool {
+        let engine = server.reporting_engine();
+        let engine = engine.lock().unwrap();
+        let rc = engine.get_rcb(URCB_PATH).unwrap();
+        let rc = rc.lock().unwrap();
+        let reserved = rc.state.lock().unwrap().resv;
+        reserved
+    }
+
+    fn reserve_urcb_for_connection_1(server: &IedServer) {
+        let engine = server.reporting_engine();
+        let engine = engine.lock().unwrap();
+        let rc = engine.get_rcb(URCB_PATH).unwrap();
+        let rc = rc.lock().unwrap();
+        let mut state = rc.state.lock().unwrap();
+        state.resv = true;
+        state.client_conn_id = Some(1);
+    }
+
+    /// A peer that stops reading while the server has reports to send has its
+    /// connection closed once a write exceeds the send timeout; the slot and
+    /// the URCB reservation are released with it.
+    #[tokio::test(start_paused = true)]
+    async fn peer_that_stops_reading_is_closed_after_the_send_timeout() {
+        let server = build_server(IedServerConfig {
+            association_send_timeout_ms: 1_000,
+            association_idle_timeout_ms: None,
+            ..Default::default()
+        });
+        let (client, task) = spawn_connection(&server, 512);
+        let _stalled = associate(client).await;
+        reserve_urcb_for_connection_1(&server);
+
+        let start = Instant::now();
+        for _ in 0..8 {
+            post_report(&server);
+        }
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the connection must end once a write exceeds the send timeout")
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.open_socket_count(), 0);
+        assert!(!urcb_reserved(&server));
+    }
+
+    /// A peer that keeps reading receives reports for well past the send
+    /// timeout and stays connected.
+    #[tokio::test(start_paused = true)]
+    async fn reading_peer_outlasts_the_send_timeout() {
+        let server = build_server(IedServerConfig {
+            association_send_timeout_ms: 1_000,
+            association_idle_timeout_ms: None,
+            ..Default::default()
+        });
+        let (client, task) = spawn_connection(&server, 512);
+        let _reader = drain(associate(client).await);
+
+        for _ in 0..20 {
+            for _ in 0..8 {
+                post_report(&server);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(!task.is_finished());
+        assert_eq!(server.connection_count(), 1);
+    }
+
+    /// A client that only receives reports, never sending a request, stays
+    /// open through three idle timeouts, because each completed send counts as
+    /// activity.
+    #[tokio::test(start_paused = true)]
+    async fn report_only_client_outlives_the_idle_timeout() {
+        let server = build_server(IedServerConfig::default());
+        let (client, task) = spawn_connection(&server, 4096);
+        let _reader = drain(associate(client).await);
+
+        for _ in 0..15 {
+            post_report(&server);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "a report-only client must not be aborted"
+        );
+        assert_eq!(server.connection_count(), 1);
+    }
+
+    /// A client that neither sends nor receives anything is aborted once the
+    /// default idle timeout of 300 s has passed, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_is_aborted_at_the_idle_timeout() {
+        let server = build_server(IedServerConfig::default());
+        let (client, task) = spawn_connection(&server, 4096);
+        let _silent = associate(client).await;
+
+        let start = Instant::now();
+        tokio::time::timeout(Duration::from_secs(301), task)
+            .await
+            .expect("a silent association must be aborted at the idle timeout")
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(300));
+        assert_eq!(server.connection_count(), 0);
+    }
+
+    /// A client that sends a request every 100 s stays open through three
+    /// idle timeouts.
+    #[tokio::test(start_paused = true)]
+    async fn requesting_client_outlives_the_idle_timeout() {
+        use iec61850_mms::mms::client::MmsClient;
+        use iec61850_mms::mms::pdu::ObjectClass;
+
+        let server = build_server(IedServerConfig::default());
+        let (client, task) = spawn_connection(&server, 4096);
+        let mut client = MmsClient::<DuplexStream>::from_transport(client)
+            .await
+            .expect("associate");
+        for _ in 0..9 {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            client
+                .get_name_list(ObjectClass::Domain, None, None)
+                .await
+                .expect("an active association keeps serving");
+        }
+        assert!(!task.is_finished());
+        assert_eq!(server.connection_count(), 1);
+    }
 }

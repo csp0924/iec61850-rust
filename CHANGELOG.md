@@ -23,9 +23,21 @@ Every crate in the workspace shares one version number.
   the data set the stream publishes, and an ASDU of any other length is dropped;
   a subscriber built without it delivers every ASDU whatever its sample length.
   `SvSubscriber::expected_sample_size` returns the configured length, or 0.
-- **`iec61850-server`** — `IedServerConfig` has a new public field,
-  `association_setup_timeout_ms`. A configuration written as a struct literal
-  without `..Default::default()` no longer compiles and needs the field added.
+- **`iec61850-server`** — `IedServerConfig` has new public fields,
+  `association_setup_timeout_ms`, `association_idle_timeout_ms` and
+  `association_send_timeout_ms`. A configuration written as a struct literal
+  without `..Default::default()` no longer compiles and needs the fields added.
+- **`iec61850-server`** — an established association that neither receives a
+  PDU nor completes the send of one for
+  `IedServerConfig::association_idle_timeout_ms`, 300 000 ms by default, is
+  aborted with an ACSE A-ABORT. A report or command termination the peer
+  accepts counts as activity, so a client that only receives reports stays
+  open. `None` disables the timeout.
+- **`iec61850-server`** — every PDU the server sends on an established
+  association, including an A-ABORT, must be accepted by the peer within
+  `IedServerConfig::association_send_timeout_ms`, 10 000 ms by default. A peer
+  that stops reading has its connection closed without a further write, and
+  what its association holds is released.
 
 ### Added
 

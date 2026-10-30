@@ -5,7 +5,8 @@
 //! that ends on a transport error, whose URCB reservation and setting group
 //! edit session must be released at once; and sockets that never associate,
 //! which count against the connection limit from accept and are closed once
-//! the association setup timeout runs out.
+//! the association setup timeout runs out. The idle and send timeouts are
+//! covered on a paused clock in the `lifecycle` unit tests.
 //!
 //! Every test binds 127.0.0.1:0 so concurrent tests cannot collide on a port.
 

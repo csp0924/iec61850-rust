@@ -26,6 +26,16 @@ pub struct IedServerConfig {
     /// 10 000 ms.
     pub association_setup_timeout_ms: u64,
 
+    /// Time an established association may go without receiving a PDU or
+    /// completing the send of one before the server aborts it, so a client
+    /// that only receives reports stays open. `None` keeps an idle association
+    /// open indefinitely. Defaults to 300 000 ms.
+    pub association_idle_timeout_ms: Option<u64>,
+
+    /// Time the peer has to accept each PDU the server sends on an established
+    /// association; a peer that stops reading has its connection closed once a
+    /// write exceeds it. Defaults to 10 000 ms.
+    pub association_send_timeout_ms: u64,
     /// IEC 61850 edition the server presents. Defaults to `Ed2`.
     pub edition: Edition,
 
@@ -52,6 +62,8 @@ impl Default for IedServerConfig {
         Self {
             max_mms_connections: 5,
             association_setup_timeout_ms: 10_000,
+            association_idle_timeout_ms: Some(300_000),
+            association_send_timeout_ms: 10_000,
             edition: Edition::Ed2,
             write_access_policies: WriteAccessPolicies::default(),
             time_quality: TimeQuality::default(),
