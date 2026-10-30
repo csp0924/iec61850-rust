@@ -161,7 +161,7 @@ pub(crate) fn handle_get_named_variable_list_attributes(
 /// Splits `"<domain>/<item>"` into its two parts.
 ///
 /// Returns `None` when the separator is missing or either part is empty.
-fn split_attr_ref(attr_ref: &str) -> Option<(String, String)> {
+pub(crate) fn split_attr_ref(attr_ref: &str) -> Option<(String, String)> {
     let (domain, item) = attr_ref.split_once('/')?;
     if domain.is_empty() || item.is_empty() {
         return None;

@@ -1341,20 +1341,42 @@ fn dispatch_write(
                     return ConfirmedResponse::Response(buf.freeze());
                 }
 
-                use crate::service::convert::mms_data_to_mms_value;
+                // Each member is written exactly as if the client had named it
+                // in a list of variables, so the functional constraint, the
+                // write access policy, the handlers and the type check all apply
+                // per member and one refused member leaves the others unaffected.
                 let outcomes: Vec<WriteOutcome> = dataset
                     .entries
                     .iter()
                     .zip(req.list_of_data.iter())
                     .map(|(entry, data)| {
-                        let value = mms_data_to_mms_value(data);
-                        match entry.value.write() {
-                            Ok(mut g) => {
-                                *g = value;
-                                WriteOutcome::Success
-                            }
-                            Err(_) => WriteOutcome::Failure(DataAccessError::HardwareFault),
-                        }
+                        let Some((domain_id, item_id)) =
+                            get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref)
+                        else {
+                            tracing::warn!(
+                                invoke_id,
+                                attr_ref = %entry.attr_ref,
+                                "write: data set member reference carries no domain separator, answering object-non-existent"
+                            );
+                            return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
+                        };
+                        let member = iec61850_mms::ObjectName::DomainSpecific { domain_id, item_id };
+                        handle_write_with_routing(
+                            ied_model,
+                            mms_model,
+                            policies,
+                            #[cfg(feature = "control")]
+                            control_objects,
+                            reporting_engine,
+                            handler_registry,
+                            #[cfg(feature = "setting-groups")]
+                            setting_groups,
+                            #[cfg(feature = "goose-mapping")]
+                            gocb_registry,
+                            conn_id,
+                            &member,
+                            data,
+                        )
                     })
                     .collect();
                 let resp = WriteResponse { outcomes };
@@ -3343,6 +3365,137 @@ mod tests {
             }
             other => panic!("write must answer with a response, got {:?}", other),
         }
+    }
+
+    // ── SetDataSetValues ─────────────────────────────────────────────
+
+    /// Sends a Write and decodes its per-entry outcomes.
+    #[cfg(feature = "reporting")]
+    fn write_outcomes(
+        dispatcher: &MmsModelDispatcher,
+        req: &iec61850_mms::mms::pdu::write::WriteRequest,
+    ) -> Vec<WriteOutcome> {
+        use iec61850_mms::mms::pdu::write::encode_confirmed_write_request;
+
+        let mut full_buf = BytesMut::new();
+        encode_confirmed_write_request(11, req, &mut full_buf);
+        let req = ConfirmedRequest {
+            invoke_id: 11,
+            service_body: extract_service_body_from_confirmed_request(&full_buf),
+        };
+        match dispatcher.dispatch(&make_conn(), req) {
+            ConfirmedResponse::Response(bytes) => {
+                let body = extract_service_body_from_confirmed_request(&BytesMut::from(&bytes[..]));
+                WriteResponse::decode(&body)
+                    .expect("the write response must decode")
+                    .outcomes
+            }
+            other => panic!("write must answer with a response, got {:?}", other),
+        }
+    }
+
+    /// Registers `IED1LD0/GGIO1$dsw` over the model's read-only `TotW.mag`
+    /// (MX) and writable `Mod.ctlModel` (CF), sharing their value locks.
+    #[cfg(feature = "reporting")]
+    fn register_mixed_dataset(dispatcher: &MmsModelDispatcher) {
+        crate::reporting::DynamicDatasetOps::add_dynamic(
+            &dispatcher.dataset_registry,
+            &dispatcher.model,
+            "IED1LD0",
+            "GGIO1$dsw",
+            vec![
+                ("IED1LD0".into(), "MMXU1$MX$TotW$mag".into()),
+                ("IED1LD0".into(), "GGIO1$CF$Mod$ctlModel".into()),
+            ],
+        )
+        .expect("the data set must resolve against the model");
+    }
+
+    #[cfg(feature = "reporting")]
+    fn dataset_values(dispatcher: &MmsModelDispatcher) -> Vec<MmsValue> {
+        let registry = dispatcher.dataset_registry.read().unwrap();
+        registry
+            .get(&("IED1LD0".to_string(), "GGIO1$dsw".to_string()))
+            .expect("the data set is registered")
+            .entries
+            .iter()
+            .map(|e| e.read_value().expect("the value lock is usable"))
+            .collect()
+    }
+
+    #[cfg(feature = "reporting")]
+    fn set_data_set_values(values: Vec<MmsData>) -> iec61850_mms::mms::pdu::write::WriteRequest {
+        use iec61850_mms::mms::pdu::common::VariableAccessSpecification;
+        iec61850_mms::mms::pdu::write::WriteRequest {
+            variable_access_spec: VariableAccessSpecification::VariableListName(
+                iec61850_mms::ObjectName::DomainSpecific {
+                    domain_id: "IED1LD0".into(),
+                    item_id: "GGIO1$dsw".into(),
+                },
+            ),
+            list_of_data: values,
+        }
+    }
+
+    /// SetDataSetValues writes each member through the single-write checks: a
+    /// member under a functional constraint the write access policy refuses
+    /// keeps its value and is answered as a Write naming it alone would be,
+    /// while a writable member in the same request is updated.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn set_data_set_values_applies_member_write_access() {
+        use iec61850_mms::mms::pdu::write::WriteRequest;
+
+        let dispatcher = build_dispatcher();
+        register_mixed_dataset(&dispatcher);
+
+        let outcomes = write_outcomes(
+            &dispatcher,
+            &set_data_set_values(vec![MmsData::Float32(9.5), MmsData::Integer(2)]),
+        );
+        let single = write_outcomes(
+            &dispatcher,
+            &WriteRequest::single_domain("IED1LD0", "MMXU1$MX$TotW$mag", MmsData::Float32(9.5)),
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(
+            outcomes[0], single[0],
+            "a read-only member must be answered as a single write of it is"
+        );
+        assert!(matches!(outcomes[0], WriteOutcome::Failure(_)));
+        assert_eq!(outcomes[1], WriteOutcome::Success);
+        assert_eq!(
+            dataset_values(&dispatcher),
+            vec![MmsValue::Float32(1.23), MmsValue::Integer(2)],
+            "only the writable member changes"
+        );
+    }
+
+    /// A SetDataSetValues value whose type does not match its member is
+    /// refused for that member and leaves the model untouched.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn set_data_set_values_refuses_a_mistyped_member() {
+        let dispatcher = build_dispatcher();
+        register_mixed_dataset(&dispatcher);
+
+        let outcomes = write_outcomes(
+            &dispatcher,
+            &set_data_set_values(vec![
+                MmsData::Float32(1.23),
+                MmsData::VisibleString("x".into()),
+            ]),
+        );
+        assert!(
+            matches!(outcomes[1], WriteOutcome::Failure(_)),
+            "a string written to an integer member must fail, got {:?}",
+            outcomes[1]
+        );
+        assert_eq!(
+            dataset_values(&dispatcher)[1],
+            MmsValue::Integer(0),
+            "a refused member keeps its value"
+        );
     }
 
     // ── GetVarAccessAttrs → Response ─────────────────────────────────

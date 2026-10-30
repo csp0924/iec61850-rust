@@ -73,6 +73,13 @@ Every crate in the workspace shares one version number.
   an authenticator could not check a password. A failed authentication is
   logged with the mechanism name, never the credentials, and the `Debug`
   output of `AcseAuth::Password` gives the password's length, not its content.
+- **`iec61850-server`** — a Write that names a data set, the ACSI
+  SetDataSetValues service, writes each member through the same checks as a
+  Write that names the member alone: the functional constraint, the write
+  access policy, the installed handlers and the value type. A member the
+  checks refuse keeps its value and is answered with the same failure, and the
+  other members of the request are written independently. The values used to
+  be stored into the model without any of these checks.
 
 ## [0.2.0] - 2026-09-06
 
