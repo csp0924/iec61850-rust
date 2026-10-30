@@ -59,8 +59,8 @@ impl ResolvedScl {
     /// [`ErrorKind::UnresolvedTypeReference`] when a reference does not
     /// resolve; the element path names the full logical node, data object and
     /// data attribute path of the reference, and the span is that of the
-    /// referencing element. [`ErrorKind::SemanticConflict`] when structure
-    /// references form a cycle.
+    /// referencing element. [`ErrorKind::SemanticConflict`] when structure or
+    /// sub-object references form a cycle, or nest deeper than 32 levels.
     pub fn from_raw(raw: RawScl) -> Result<Self, SclParseError> {
         // The four tables are already in raw.data_type_templates, and stage 1
         // has rejected any duplicate identifier.
@@ -201,30 +201,61 @@ impl ResolvedScl {
     }
 }
 
-/// Rejects a cycle among DOTypes formed by their `<SDO>` references.
+/// The deepest nesting of DOTypes through `<SDO>`, and of DATypes through
+/// `<BDA>`, that stage 2 accepts. The model builder expands both by
+/// recursion, so the bound keeps a deep but acyclic chain from exhausting the
+/// stack.
+pub(crate) const MAX_TYPE_NESTING: usize = 32;
+
+/// Rejects a cycle among DOTypes formed by their `<SDO>` references, and a
+/// chain of them deeper than [`MAX_TYPE_NESTING`].
 ///
 /// Runs a depth-first walk over the sub-object graph, visiting each DOType
 /// once. A reference back to a DOType still on the walk stack is a cycle and
 /// yields [`ErrorKind::SemanticConflict`] naming the chain, at the span of the
-/// `<SDO>` that closes it. Every `do_type_ref` must already be known to exist.
+/// `<SDO>` that closes it; a DOType whose sub-object chain is too deep yields
+/// the same kind at its own span. Every `do_type_ref` must already be known to
+/// exist.
 fn check_do_type_cycles(dtt: &crate::raw::DataTypeTemplates) -> Result<(), SclParseError> {
-    // Each frame is a DOType identifier and the index of its next SDO to visit.
-    let mut done: BTreeMap<&str, ()> = BTreeMap::new();
+    // The number of DOType levels from each finished DOType down to its
+    // deepest sub-object, itself included.
+    let mut height: BTreeMap<&str, usize> = BTreeMap::new();
+    let too_deep = |id: &str, span| {
+        SclParseError::at(
+            span,
+            format!("SCL/DataTypeTemplates/DOType[id=\"{id}\"]"),
+            ErrorKind::SemanticConflict {
+                detail: format!(
+                    "the sub-object chain below DOType `{id}` is deeper than {MAX_TYPE_NESTING} levels"
+                ),
+            },
+        )
+    };
     for root in dtt.do_types.keys() {
-        if done.contains_key(root.as_str()) {
+        if height.contains_key(root.as_str()) {
             continue;
         }
+        // Each frame is a DOType identifier and the index of its next SDO to visit.
         let mut stack: Vec<(&str, usize)> = vec![(root.as_str(), 0)];
         while let Some(top) = stack.last_mut() {
             let (id, index) = *top;
             top.1 += 1;
-            let sdos = dtt
-                .do_types
-                .get(id)
-                .map(|t| t.sdos.as_slice())
-                .unwrap_or(&[]);
+            let Some(dot) = dtt.do_types.get(id) else {
+                stack.pop();
+                continue;
+            };
+            let sdos = dot.sdos.as_slice();
             let Some(sdo) = sdos.get(index) else {
-                done.insert(id, ());
+                let below = sdos
+                    .iter()
+                    .filter_map(|s| height.get(s.do_type_ref.as_str()))
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                if below + 1 > MAX_TYPE_NESTING {
+                    return Err(too_deep(id, dot.span));
+                }
+                height.insert(id, below + 1);
                 stack.pop();
                 continue;
             };
@@ -244,7 +275,11 @@ fn check_do_type_cycles(dtt: &crate::raw::DataTypeTemplates) -> Result<(), SclPa
                 )
                 .with_attribute("type"));
             }
-            if !done.contains_key(target) && dtt.do_types.contains_key(target) {
+            if !height.contains_key(target) && dtt.do_types.contains_key(target) {
+                if stack.len() >= MAX_TYPE_NESTING {
+                    let root_id = stack.first().map_or(id, |frame| frame.0);
+                    return Err(too_deep(root_id, sdo.span));
+                }
                 stack.push((target, 0));
             }
         }
@@ -326,11 +361,13 @@ fn check_attr_type_ref(
 ///
 /// `visited` is a stack of DAType identifiers: one is pushed each time a
 /// `bType=Struct` reference is followed, and popped on the way out. A reference
-/// to an identifier already on the stack is a cycle and yields
+/// to an identifier already on the stack is a cycle, and a stack reaching
+/// [`MAX_TYPE_NESTING`] is too deep; either yields
 /// [`ErrorKind::SemanticConflict`].
 ///
-/// The recursion follows the same path the model builder takes, so a cycle is
-/// caught here and cannot overflow the stack later.
+/// The recursion follows the same path the model builder takes, so a cycle or
+/// a runaway nesting is caught here, within the bound, and cannot overflow the
+/// stack later.
 fn check_bda_recursive(
     bda: &RawBda,
     path: &str,
@@ -352,6 +389,18 @@ fn check_bda_recursive(
                     path,
                     ErrorKind::SemanticConflict {
                         detail: format!("DAType cycle: {cycle}"),
+                    },
+                ));
+            }
+            if visited.len() >= MAX_TYPE_NESTING {
+                return Err(SclParseError::at(
+                    bda.span,
+                    path,
+                    ErrorKind::SemanticConflict {
+                        detail: format!(
+                            "the DAType nesting below `{}` is deeper than {MAX_TYPE_NESTING} levels",
+                            visited.first().map_or(type_id, |s| s.as_str())
+                        ),
                     },
                 ));
             }
