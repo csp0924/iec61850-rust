@@ -3,6 +3,9 @@
 use iec61850_sv::pdu::{Asdu, SmpMod, SmpSynch};
 use iec61850_sv::subscriber::{SvSubscriber, SvSubscriberAsdu, SvSubscriberBuilder};
 
+mod log_capture;
+use log_capture::warnings_containing;
+
 fn asdu(sv_id: &str, cnt: u16) -> Asdu {
     Asdu {
         sv_id: sv_id.into(),
@@ -86,6 +89,48 @@ fn ordinary_gap_is_counted() {
 }
 
 #[test]
+fn interleaved_streams_keep_their_own_continuity() {
+    let sub = SvSubscriber::builder().build();
+    for c in 100..110 {
+        feed(&sub, [asdu("MU01", c), asdu("MU02", c + 2000)]);
+    }
+    assert_eq!(sub.missed_count(), 0);
+}
+
+#[test]
+fn gap_in_one_of_interleaved_streams_is_counted() {
+    let sub = SvSubscriber::builder().build();
+    feed(
+        &sub,
+        [
+            asdu("MU01", 1),
+            asdu("MU02", 50),
+            asdu("MU01", 2),
+            asdu("MU02", 53),
+            asdu("MU01", 3),
+        ],
+    );
+    assert_eq!(sub.missed_count(), 2);
+}
+
+#[test]
+fn least_recent_stream_is_forgotten_when_full() {
+    let sub = SvSubscriber::builder().max_streams(2).build();
+    feed(
+        &sub,
+        [
+            asdu("MU01", 1),
+            asdu("MU02", 1),
+            asdu("MU03", 1),
+            // MU01 was forgotten and starts a new baseline; MU03 is followed.
+            asdu("MU01", 500),
+            asdu("MU03", 2),
+        ],
+    );
+    assert_eq!(sub.missed_count(), 0);
+}
+
+#[test]
 fn lost_reset_sample_without_a_limit_counts_only_the_samples_after_zero() {
     let sub = SvSubscriber::builder().sv_id("MU01").build();
     // Sample 0 of the next second is missing.
@@ -123,4 +168,33 @@ fn counter_beyond_the_limit_falls_back_to_plain_counting() {
         .build();
     counts(&sub, [5000, 5001, 5003]);
     assert_eq!(sub.missed_count(), 1);
+}
+
+#[test]
+fn least_recently_heard_stream_is_forgotten_rather_than_the_oldest() {
+    let sub = SvSubscriber::builder().max_streams(2).build();
+    feed(
+        &sub,
+        [
+            asdu("MU01", 1),
+            asdu("MU02", 1),
+            asdu("MU01", 2),
+            // MU02 is the least recently heard and makes room for MU03.
+            asdu("MU03", 1),
+            // MU01 is still followed, so the skipped 3 and 4 count.
+            asdu("MU01", 5),
+        ],
+    );
+    assert_eq!(sub.missed_count(), 2);
+}
+
+#[test]
+fn evictions_are_logged_once() {
+    let sub = SvSubscriber::builder().max_streams(1).build();
+    let logged = warnings_containing("forgetting svid", || {
+        for c in 0..20u16 {
+            feed(&sub, [asdu(&format!("MU{:02}", c % 5), c)]);
+        }
+    });
+    assert_eq!(logged, 1);
 }

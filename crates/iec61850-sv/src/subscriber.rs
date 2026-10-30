@@ -17,18 +17,24 @@
 //! without either, a smpCnt below its predecessor is taken as the
 //! once-a-second reset of a synchronized stream, and only the samples from 0
 //! up to it count as missed.
+//! Continuity is followed per svID, so a subscriber without an svID filter
+//! checks each stream against its own predecessor; the number of streams it
+//! follows is bounded.
 //!
 //! The state a subscriber accumulates is atomic, so one `Arc<SvSubscriber>`
 //! can be shared across threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use iec61850_model::Quality;
 
 use crate::error::SvError;
 use crate::nine_two_le::{NineTwoLE, SAMPLE_SIZE};
 use crate::pdu::{Asdu, SmpMod, SmpSynch};
+
+/// Default number of streams a subscriber follows for smpCnt continuity.
+pub const DEFAULT_MAX_STREAMS: usize = 64;
 
 /// Listener invoked once per matching ASDU.
 pub type SvListener = Arc<dyn Fn(&SvSubscriberAsdu<'_>) + Send + Sync>;
@@ -163,6 +169,7 @@ pub struct SvSubscriberBuilder {
     dst_mac_filter: Option<[u8; 6]>,
     sample_size: Option<usize>,
     smp_cnt_limit: Option<u16>,
+    max_streams: Option<usize>,
     listener: Option<SvListener>,
 }
 
@@ -176,6 +183,7 @@ impl Default for SvSubscriberBuilder {
             dst_mac_filter: None,
             sample_size: None,
             smp_cnt_limit: None,
+            max_streams: None,
             listener: None,
         }
     }
@@ -229,6 +237,18 @@ impl SvSubscriberBuilder {
         self
     }
 
+    /// Sets how many svIDs the subscriber follows for smpCnt continuity; the
+    /// default is [`DEFAULT_MAX_STREAMS`] and the minimum 1.
+    ///
+    /// When an ASDU of a new svID arrives with every slot taken, the stream
+    /// heard from least recently is forgotten, and its next ASDU starts a new
+    /// baseline; the first eviction is logged. A subscriber with an svID filter
+    /// follows one stream.
+    pub fn max_streams(mut self, n: usize) -> Self {
+        self.max_streams = Some(n);
+        self
+    }
+
     /// Sets the listener invoked for each matching ASDU.
     pub fn listener(mut self, cb: impl Fn(&SvSubscriberAsdu<'_>) + Send + Sync + 'static) -> Self {
         self.listener = Some(Arc::new(cb));
@@ -244,9 +264,9 @@ impl SvSubscriberBuilder {
             listener: self.listener,
             expected_sample_size: self.sample_size,
             smp_cnt_limit: self.smp_cnt_limit,
-            last_smp_cnt: AtomicU16::new(u16::MAX),
+            max_streams: self.max_streams.unwrap_or(DEFAULT_MAX_STREAMS).max(1),
+            streams: Mutex::new(StreamTable::default()),
             missed_count: AtomicU64::new(0),
-            first_received: AtomicBool::new(false),
         }
     }
 }
@@ -269,12 +289,70 @@ pub struct SvSubscriber {
     expected_sample_size: Option<usize>,
     /// smpCnt value at which the stream wraps to 0, when configured.
     smp_cnt_limit: Option<u16>,
-    /// smpCnt of the most recent ASDU.
-    last_smp_cnt: AtomicU16,
+    /// Upper bound on the streams followed.
+    max_streams: usize,
+    /// Last smpCnt per svID.
+    streams: Mutex<StreamTable>,
     /// Number of samples missed, summed over every detected gap.
     missed_count: AtomicU64,
-    /// Whether an ASDU has been delivered yet.
-    first_received: AtomicBool,
+}
+
+/// Last smpCnt of each followed stream.
+#[derive(Default)]
+struct StreamTable {
+    /// One entry per svID.
+    entries: Vec<StreamEntry>,
+    /// Dispatch counter, the recency stamp of `StreamEntry::last_seen`.
+    clock: u64,
+    /// Whether an eviction has been logged; later ones are not, so a peer
+    /// cycling through svIDs cannot flood the log.
+    eviction_reported: bool,
+}
+
+/// Continuity state of one svID.
+struct StreamEntry {
+    sv_id: String,
+    last_smp_cnt: u16,
+    last_seen: u64,
+}
+
+impl StreamTable {
+    /// Records `cnt` for `sv_id` and returns the previous smpCnt of that
+    /// stream, or `None` when the stream is new; at `max` entries the least
+    /// recent one makes room.
+    fn swap(&mut self, sv_id: &str, cnt: u16, max: usize) -> Option<u16> {
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+        if let Some(e) = self.entries.iter_mut().find(|e| e.sv_id == sv_id) {
+            e.last_seen = clock;
+            return Some(std::mem::replace(&mut e.last_smp_cnt, cnt));
+        }
+        if self.entries.len() >= max {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_seen)
+                .map(|(i, _)| i);
+            if let Some(i) = oldest {
+                let gone = self.entries.swap_remove(i);
+                if !self.eviction_reported {
+                    self.eviction_reported = true;
+                    tracing::warn!(
+                        "sv subscriber follows {} streams, forgetting svid={:?}; later evictions are not logged",
+                        max,
+                        gone.sv_id
+                    );
+                }
+            }
+        }
+        self.entries.push(StreamEntry {
+            sv_id: sv_id.to_owned(),
+            last_smp_cnt: cnt,
+            last_seen: clock,
+        });
+        None
+    }
 }
 
 impl std::fmt::Debug for SvSubscriber {
@@ -375,12 +453,12 @@ impl SvSubscriber {
         }
 
         let cur_cnt = asdu_view.smp_cnt;
-        let is_first = !self.first_received.load(Ordering::Acquire);
-        if is_first {
-            self.last_smp_cnt.store(cur_cnt, Ordering::Release);
-            self.first_received.store(true, Ordering::Release);
-        } else {
-            let prev = self.last_smp_cnt.load(Ordering::Acquire);
+        let prev = self
+            .streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .swap(asdu_view.sv_id, cur_cnt, self.max_streams);
+        if let Some(prev) = prev {
             let limit = self.smp_cnt_limit.or_else(|| announced_limit(asdu_view));
             let diff = smp_cnt_gap(prev, cur_cnt, limit);
             if diff != 0 {
@@ -393,7 +471,6 @@ impl SvSubscriber {
                 );
                 self.missed_count.fetch_add(diff, Ordering::Relaxed);
             }
-            self.last_smp_cnt.store(cur_cnt, Ordering::Release);
         }
 
         if let Some(ref cb) = self.listener {
