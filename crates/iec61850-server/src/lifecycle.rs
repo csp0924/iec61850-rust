@@ -23,6 +23,8 @@
 //!   disconnect.
 //! - An abort sends an ACSE A-ABORT, wrapped in a Session abort and a COTP data
 //!   TPDU, before the socket closes.
+//! - Once the Initiate exchange completes, a TSDU larger than the negotiated
+//!   maximum PDU size plus 8192 bytes of envelope closes the connection.
 //! - An association that neither receives nor sends a PDU for
 //!   `association_idle_timeout_ms`, 300 000 ms by default, is aborted.
 //! - A PDU the peer does not accept within `association_send_timeout_ms`,
@@ -46,7 +48,7 @@ use iec61850_mms::iso::acse::{
     encode_aare, encode_abrt, encode_associate_failed, encode_rlre, AcseConnection, AcseError,
     AcseIndication,
 };
-use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions};
+use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions, DEFAULT_MAX_TSDU_SIZE};
 use iec61850_mms::iso::presentation::{
     encode_abort as pres_encode_abort, encode_cpa, encode_user_data, encode_user_data_acse,
     parse_connect as pres_parse_connect, parse_user_data, IsoPresentation, PresentationError,
@@ -72,6 +74,12 @@ use crate::connection::ClientConnection;
 
 /// Tag of the MMS Initiate-RequestPDU, the only PDU an AARQ may carry.
 const MMS_INITIATE_REQUEST_TAG: u8 = 0xa8;
+
+/// Room a TSDU leaves around one MMS PDU for its Session, Presentation and
+/// ACSE envelope: the margin `DEFAULT_MAX_TSDU_SIZE` adds to the default
+/// maximum PDU size.
+const TSDU_ENVELOPE_SIZE: usize =
+    DEFAULT_MAX_TSDU_SIZE - iec61850_mms::DEFAULT_MAX_PDU_SIZE as usize;
 
 /// Handle to a running server, returned by `IedServer::start`.
 #[derive(Debug)]
@@ -486,6 +494,11 @@ where
             response_bytes,
             params,
         } => {
+            // From here on a TSDU carries at most one MMS PDU of the
+            // negotiated size inside its Session and Presentation envelope.
+            cotp.set_max_tsdu_size(Some(
+                (params.max_pdu_size as usize).saturating_add(TSDU_ENVELOPE_SIZE),
+            ));
             mms_conn.set_negotiated(params);
             mms_conn.set_block_requests(server.connection_block_requests_default());
             // The dispatcher routes command terminations by this id.
@@ -1291,6 +1304,83 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_secs(300));
         assert_eq!(server.connection_count(), 0);
+    }
+
+    /// Completes the association offering `max_pdu_size` and waits for the
+    /// Initiate response.
+    async fn associate_with_max_pdu(
+        client: DuplexStream,
+        max_pdu_size: u32,
+    ) -> CotpConnection<DuplexStream> {
+        let mut initiate = BytesMut::new();
+        InitiateRequestPdu {
+            local_detail_calling: Some(max_pdu_size),
+            ..InitiateRequestPdu::default()
+        }
+        .encode(&mut initiate);
+        let mut aarq = BytesMut::new();
+        encode_aarq(&initiate, None, 3, &AarqAddressing::default(), &mut aarq);
+        let mut cp = BytesMut::new();
+        encode_connect(&PresentationConnectionParameters::default(), &aarq, &mut cp);
+        let mut cn = BytesMut::new();
+        sess_encode_connect(&IsoParameters::default(), &IsoSession::new(), &cp, &mut cn).unwrap();
+
+        let mut cotp = CotpConnection::connect(client, CotpOptions::default())
+            .await
+            .unwrap();
+        cotp.send_data(&cn).await.unwrap();
+        cotp.recv_data().await.expect("the initiate response");
+        cotp
+    }
+
+    /// Sends a GetNameList request padded to about `size` bytes by its
+    /// continue-after name, wrapped in Presentation and Session user data, and
+    /// returns whether any answer arrives before the server closes.
+    async fn oversized_request_is_answered(
+        cotp: &mut CotpConnection<DuplexStream>,
+        size: usize,
+    ) -> bool {
+        use iec61850_mms::mms::pdu::get_name_list::{
+            encode_confirmed_get_name_list_request, GetNameListRequest, ObjectScope,
+        };
+        use iec61850_mms::mms::pdu::ObjectClass;
+
+        let req = GetNameListRequest {
+            object_class: ObjectClass::Domain,
+            object_scope: ObjectScope::VmdSpecific,
+            continue_after: Some("x".repeat(size)),
+        };
+        let mut mms = BytesMut::new();
+        encode_confirmed_get_name_list_request(41, &req, &mut mms);
+        let mut ppdu = BytesMut::new();
+        encode_user_data(&IsoPresentation::new(), &mms, &mut ppdu);
+        let mut spdu = BytesMut::new();
+        encode_data(&ppdu, &mut spdu);
+        if cotp.send_data(&spdu).await.is_err() {
+            return false;
+        }
+        cotp.recv_data().await.is_ok()
+    }
+
+    /// Once an association has negotiated a 1000-byte maximum PDU, a TSDU
+    /// larger than that plus the 8192-byte envelope closes the connection
+    /// unanswered; the same request is answered on an association that kept
+    /// the default maximum.
+    #[tokio::test(start_paused = true)]
+    async fn tsdu_is_bounded_by_the_negotiated_pdu_size() {
+        let server = build_server(IedServerConfig::default());
+        let (client, task) = spawn_connection(&server, 64 * 1024);
+        let mut small = associate_with_max_pdu(client, 1_000).await;
+        assert!(!oversized_request_is_answered(&mut small, 12_000).await);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the connection must end on an oversized TSDU")
+            .unwrap();
+
+        let (client, task) = spawn_connection(&server, 64 * 1024);
+        let mut default = associate(client).await;
+        assert!(oversized_request_is_answered(&mut default, 12_000).await);
+        assert!(!task.is_finished());
     }
 
     /// A client that sends a request every 100 s stays open through three

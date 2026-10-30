@@ -137,6 +137,11 @@ Every crate in the workspace shares one version number.
   smaller than the local limit of 32, so data or an alternate access nested
   deeper than the association allows is answered with a confirmed error
   instead of being decoded.
+- **`iec61850-server`** — once the Initiate exchange completes, a connection
+  bounds each reassembled COTP TSDU at the negotiated maximum PDU size plus
+  8192 bytes of Session, Presentation and ACSE envelope, instead of the
+  default bound sized for a 65 000-byte PDU. A TSDU past it closes the
+  connection.
 
 ## [0.2.0] - 2026-09-06
 
