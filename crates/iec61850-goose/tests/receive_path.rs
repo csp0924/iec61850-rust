@@ -250,3 +250,41 @@ fn expiry_follows_the_injected_clock() {
     assert_eq!(expired_count(&seen), 1);
     assert!(!rx.subscriber(idx).unwrap().is_valid_at(past_tal));
 }
+
+/// Delivers `frames` at 10 ms steps from `t0` to one subscriber on
+/// `LD/LLN0$GO$g`, then sweeps at `sweep_after_ms` past the last frame.
+fn expired_after(frames: &[(u32, u32)], sweep_after_ms: u64) -> (usize, Vec<Seen>) {
+    let (sub, seen) = recording(GooseSubscriberBuilder::new().gocb_ref("LD/LLN0$GO$g"));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    let mut last = t0;
+    for (i, (st, sq)) in frames.iter().enumerate() {
+        last = t0 + Duration::from_millis(10 * i as u64);
+        rx.handle_message_at(&frame_of(&pdu("LD/LLN0$GO$g", *st, *sq), 0x1000), last);
+    }
+    rx.tick_at(None, last + Duration::from_millis(sweep_after_ms));
+    let all = seen.lock().unwrap().clone();
+    (expired_count(&seen), all)
+}
+
+#[test]
+fn expired_is_raised_after_a_duplicate_frame() {
+    let (n, seen) = expired_after(&[(1, 0), (1, 1), (1, 1)], 2001);
+    assert!(seen.contains(&Seen::Retx("LD/LLN0$GO$g".into(), 1, false)));
+    assert_eq!(n, 1, "no expiry after a repeated sqnum: {seen:?}");
+}
+
+#[test]
+fn expired_is_raised_after_an_st_num_rollback() {
+    let (n, seen) = expired_after(&[(5, 0), (1, 0)], 2001);
+    assert!(seen.contains(&Seen::New("LD/LLN0$GO$g".into(), 1, false)));
+    assert_eq!(n, 1, "no expiry after stnum went backwards: {seen:?}");
+}
+
+#[test]
+fn out_of_sequence_frame_does_not_expire_early() {
+    let (n, _) = expired_after(&[(1, 0), (1, 1), (1, 1)], 2000);
+    assert_eq!(n, 0);
+}

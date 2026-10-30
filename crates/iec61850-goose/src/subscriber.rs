@@ -388,6 +388,9 @@ impl GooseSubscriber {
     /// last publication.
     ///
     /// The event fires at most once per state; a new publication re-arms it.
+    /// An out-of-sequence last publication expires like any other, since the
+    /// timeAllowedToLive supervision of IEC 61850-8-1 depends only on when the
+    /// last message arrived.
     pub(crate) fn check_expired_at(&mut self, now: Instant) {
         if self.expired_fired {
             return;
@@ -395,9 +398,6 @@ impl GooseSubscriber {
         let Some(state) = &self.last_state else {
             return;
         };
-        if !state.state_valid {
-            return;
-        }
         if elapsed_ms(state, now) > state.time_allowed_to_live_ms as u64 {
             self.expired_fired = true;
             let last = state.clone();
