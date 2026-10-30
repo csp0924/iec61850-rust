@@ -6,10 +6,11 @@
 //! inside its validity period, so a bad signature, a revoked certificate or an
 //! unknown CA still rejects.
 //!
-//! Covered here: expiry rejects with validity-time checking on; expiry is
-//! allowed with it off; an unknown CA still rejects with it off, also when
-//! the certificate has expired; a certificate not valid yet is allowed with
-//! it off; and an expiry error without a validity period rejects.
+//! Covered here, for the server and the client certificate: expiry rejects
+//! with validity-time checking on; expiry is allowed with it off; an unknown
+//! CA still rejects with it off, also when the certificate has expired; a
+//! certificate not valid yet is allowed with it off; and an expiry error
+//! without a validity period rejects.
 
 use std::sync::Arc;
 
@@ -330,6 +331,75 @@ fn expiry_without_context_with_time_validation_off_rejects() {
 
     let server_name: ServerName<'static> = "server.test".try_into().unwrap();
     let result = verifier.verify_server_cert(&leaf_der, &[], &server_name, &[], UnixTime::now());
+
+    assert!(result.is_err());
+}
+
+/// Builds a `WebPkiClientVerifier` that trusts `ca_cert` and requires a
+/// client certificate.
+fn make_client_verifier(
+    ca_cert: CertificateDer<'static>,
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut root_store = RootCertStore::empty();
+    root_store.add(ca_cert).unwrap();
+    rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(root_store), provider)
+        .build()
+        .unwrap()
+}
+
+/// The client-certificate counterpart accepts an expired certificate from a
+/// trusted CA with validity-time checking off.
+#[test]
+fn expired_client_cert_with_time_validation_off_passes() {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let (ca_der, leaf_der) = make_expired_ca_and_leaf("client.test");
+    let verifier = crate::verifier::IgnoreValidityTimeClientVerifier::new(
+        make_client_verifier(ca_der),
+        true,
+        Arc::new(NullEventHandler),
+    );
+
+    let result = verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+
+    assert!(result.is_ok(), "got {:?}", result);
+    assert!(verifier.client_auth_mandatory());
+}
+
+/// The client-certificate counterpart still rejects an expired certificate
+/// from an untrusted CA with validity-time checking off.
+#[test]
+fn expired_client_cert_from_an_untrusted_ca_with_time_validation_off_rejects() {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let (_, rogue_leaf_der) = make_expired_ca_and_leaf("client.test");
+    let (trusted_ca_der, _) = make_valid_ca_and_leaf("client.test");
+    let verifier = crate::verifier::IgnoreValidityTimeClientVerifier::new(
+        make_client_verifier(trusted_ca_der),
+        true,
+        Arc::new(NullEventHandler),
+    );
+
+    let result = verifier.verify_client_cert(&rogue_leaf_der, &[], UnixTime::now());
+
+    assert!(result.is_err());
+}
+
+/// The client-certificate counterpart rejects an expired certificate with
+/// validity-time checking on.
+#[test]
+fn expired_client_cert_with_time_validation_on_rejects() {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let (ca_der, leaf_der) = make_expired_ca_and_leaf("client.test");
+    let verifier = crate::verifier::IgnoreValidityTimeClientVerifier::new(
+        make_client_verifier(ca_der),
+        false,
+        Arc::new(NullEventHandler),
+    );
+
+    let result = verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
 
     assert!(result.is_err());
 }

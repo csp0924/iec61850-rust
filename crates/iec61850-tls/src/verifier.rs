@@ -433,6 +433,98 @@ impl ServerCertVerifier for IgnoreValidityTimeServerVerifier {
 }
 
 // -----------------------------------------------------------------------------
+// IgnoreValidityTimeClientVerifier
+// -----------------------------------------------------------------------------
+
+/// Client verifier that can ignore certificate validity time.
+///
+/// Behaves like [`IgnoreValidityTimeServerVerifier`], on the client
+/// certificate. Whether client authentication is offered or mandatory is
+/// left to the inner verifier.
+pub struct IgnoreValidityTimeClientVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    ignore_validity_time: bool,
+    event_handler: Arc<dyn TlsEventHandler>,
+}
+
+impl IgnoreValidityTimeClientVerifier {
+    /// Wraps `inner` with the validity-time override.
+    pub fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        ignore_validity_time: bool,
+        event_handler: Arc<dyn TlsEventHandler>,
+    ) -> Self {
+        Self {
+            inner,
+            ignore_validity_time,
+            event_handler,
+        }
+    }
+}
+
+impl std::fmt::Debug for IgnoreValidityTimeClientVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IgnoreValidityTimeClientVerifier")
+            .field("ignore_validity_time", &self.ignore_validity_time)
+            .finish()
+    }
+}
+
+impl ClientCertVerifier for IgnoreValidityTimeClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        if !self.ignore_validity_time {
+            return self
+                .inner
+                .verify_client_cert(end_entity, intermediates, now);
+        }
+        let (verified, findings) = verify_ignoring_validity_time(now, |at| {
+            self.inner.verify_client_cert(end_entity, intermediates, at)
+        })?;
+        report_validity_time_findings(self.event_handler.as_ref(), "client", findings);
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Constant-time byte comparison
 // -----------------------------------------------------------------------------
 

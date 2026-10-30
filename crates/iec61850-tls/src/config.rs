@@ -21,7 +21,7 @@ use crate::error::TlsError;
 use crate::event::{DefaultTracingHandler, TlsEventHandler};
 use crate::verifier::{
     AllowOnlyKnownCertsClientVerifier, AllowOnlyKnownCertsServerVerifier,
-    IgnoreValidityTimeServerVerifier,
+    IgnoreValidityTimeClientVerifier, IgnoreValidityTimeServerVerifier,
 };
 
 // -----------------------------------------------------------------------------
@@ -267,8 +267,8 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Enables or disables certificate validity-time checking. Defaults to
-    /// true.
+    /// Enables or disables certificate validity-time checking on both sides.
+    /// Defaults to true.
     ///
     /// When disabled, an expired or not yet valid peer certificate is
     /// accepted, with a `WrnCertExpired` or `WrnCertNotYetValid` event, only if
@@ -481,11 +481,19 @@ impl TlsConfigBuilder {
         .map_err(|e| TlsError::Validation(format!("client verifier build: {e}")))?;
 
         // Allow-only-known wrapper.
-        let final_client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        let known_client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
             Arc::new(AllowOnlyKnownCertsClientVerifier::new(
                 base_client_verifier,
                 self.allow_only_known_peers,
                 self.known_peer_certs,
+                Arc::clone(&self.event_handler),
+            ));
+
+        // Validity-time wrapper.
+        let final_client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+            Arc::new(IgnoreValidityTimeClientVerifier::new(
+                known_client_verifier,
+                !self.time_validation, // time_validation off means ignore_validity_time on
                 Arc::clone(&self.event_handler),
             ));
 

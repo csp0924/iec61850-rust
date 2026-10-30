@@ -7,11 +7,12 @@ cipher suite whitelist. `TlsConnector` and `TlsAcceptor` wrap `tokio-rustls`
 and hand back a `TlsStream<TcpStream>` that plugs straight into the COTP
 connection type.
 
-Two verifier wrappers add the profile's stricter certificate rules.
+The verifier wrappers add the profile's stricter certificate rules.
 `AllowOnlyKnownCertsServerVerifier` and its client counterpart reject a peer
 whose leaf certificate is not on the configured list, and reject an empty list
-outright. `IgnoreValidityTimeServerVerifier` downgrades only expiry errors when
-validity-time checking is off, and still rejects every other chain error.
+outright. `IgnoreValidityTimeServerVerifier` and
+`IgnoreValidityTimeClientVerifier` relax only the validity-time check when it
+is off, and still reject every other chain error.
 `TlsEventHandler` carries the 20 event codes of IEC 62351-3. The constants
 `IEC62351_3_TLS12_CIPHERS` and `IEC62351_3_TLS13_CIPHERS` are the whitelist
 itself; its TLS 1.2 part contains ECDHE_RSA and ECDHE_ECDSA with AES-GCM,

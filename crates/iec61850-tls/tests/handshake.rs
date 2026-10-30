@@ -182,7 +182,9 @@ impl Recorder {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct ServerSide {}
+struct ServerSide {
+    peer_cert_presented: bool,
+}
 
 #[derive(Debug)]
 struct ClientSide {
@@ -201,6 +203,7 @@ async fn handshake_as(
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut stream = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
+        let peer_cert_presented = stream.get_ref().1.peer_certificates().is_some();
         let mut byte = [0u8; 1];
         stream
             .read_exact(&mut byte)
@@ -208,7 +211,9 @@ async fn handshake_as(
             .map_err(|e| e.to_string())?;
         stream.write_all(&byte).await.map_err(|e| e.to_string())?;
         stream.flush().await.map_err(|e| e.to_string())?;
-        Ok(ServerSide {})
+        Ok(ServerSide {
+            peer_cert_presented,
+        })
     });
     let tcp = TcpStream::connect(addr).await.unwrap();
     let name = ServerName::try_from(name.to_string()).unwrap();
@@ -382,5 +387,89 @@ async fn expired_unknown_server_is_refused_in_allow_only_known_mode_with_time_va
         events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertNotConfigured),
         "events: {:?}",
         events.codes()
+    );
+}
+
+#[tokio::test]
+async fn server_with_time_validation_off_accepts_an_expired_client_certificate() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.issue("client.test", 2, expired());
+    let events = Arc::new(Recorder::default());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .time_validation(false)
+        .with_event_handler(events.clone())
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(srv.expect("server side").peer_cert_presented);
+    assert!(cli.is_ok(), "client side: {cli:?}");
+    assert!(
+        events.has(TlsEventLevel::Warning, TlsEventCode::WrnCertExpired),
+        "events: {:?}",
+        events.codes()
+    );
+}
+
+#[tokio::test]
+async fn server_with_time_validation_on_rejects_an_expired_client_certificate() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let client_leaf = client_ca.issue("client.test", 2, expired());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(client_leaf.pem.as_bytes(), client_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn server_with_time_validation_off_rejects_an_expired_client_certificate_from_an_untrusted_ca(
+) {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let rogue_ca = Ca::new();
+    let server_leaf = server_ca.leaf(SERVER_NAME, 1);
+    let rogue_leaf = rogue_ca.issue("client.test", 2, expired());
+    let server = server_with(&server_leaf)
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .time_validation(false)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca)
+        .with_cert_pem(rogue_leaf.pem.as_bytes(), rogue_leaf.key_pem.as_bytes())
+        .unwrap()
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        srv.is_err() && cli.is_err(),
+        "server={srv:?} client={cli:?}"
     );
 }
