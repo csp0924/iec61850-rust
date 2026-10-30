@@ -38,8 +38,7 @@ use iec61850_scl::raw::{
 use iec61850_scl::ResolvedScl;
 
 use crate::tokens::{
-    emit_dat_value, emit_default_mms_value, emit_fc_value, emit_mms_value, emit_opt_flds,
-    emit_report_trg_ops, emit_trg_ops,
+    emit_dat_value, emit_fc_value, emit_mms_value, emit_opt_flds, emit_report_trg_ops, emit_trg_ops,
 };
 use crate::{CompileBuilder, CompileError};
 
@@ -422,11 +421,11 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
     }
 
     // Leaf DA: the type comes from `b_type_to_dat` and the initial value from
-    // `emit_default_mms_value`.
+    // the runtime `MmsValue::default_for`.
     let dat = iec61850_scl::__build_internals::b_type_to_dat(&da.b_type, da.span, "DA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
-    let initial_tok = emit_default_mms_value(dat);
+    let initial_tok = emit_mms_value(&MmsValue::default_for(dat));
 
     Ok(quote! {
         DataAttribute::new(
@@ -480,7 +479,7 @@ fn emit_bda_expr(
     let dat = iec61850_scl::__build_internals::b_type_to_dat(&bda.b_type, bda.span, "BDA")
         .map_err(CompileError::ResolveScl)?;
     let dat_tok = emit_dat_value(dat);
-    let initial_tok = emit_default_mms_value(dat);
+    let initial_tok = emit_mms_value(&MmsValue::default_for(dat));
 
     Ok(quote! {
         DataAttribute::new(
@@ -1222,6 +1221,96 @@ mod tests {
             pretty.contains("MmsValue :: Integer") || pretty.contains("MmsValue::Integer"),
             "expected DOI override MmsValue::Integer, pretty=\n{pretty}"
         );
+    }
+
+    /// Asserts that every leaf attribute of the runtime model of `IED1` is
+    /// emitted as a `DataAttribute::new` carrying the same initial value.
+    fn assert_leaf_values_match_runtime(xml: &str) {
+        use crate::tokens::emit_trg_ops_value;
+        use iec61850_scl::__rt::{DataAttribute, DataObject, DoChild};
+
+        fn leaf_exprs(da: &DataAttribute, top: bool, out: &mut Vec<(String, String)>) {
+            if !da.children.is_empty() {
+                for c in &da.children {
+                    leaf_exprs(c, false, out);
+                }
+                return;
+            }
+            let name = da.name.as_str();
+            let fc = emit_fc_value(da.fc);
+            let dat = emit_dat_value(da.ty);
+            let trg = if top {
+                emit_trg_ops_value(da.trg_ops)
+            } else {
+                quote! { TrgOps::NONE }
+            };
+            let init = emit_mms_value(&da.snapshot());
+            let expr = quote! {
+                DataAttribute::new(::std::string::String::from(#name), #fc, #dat, #trg, #init,)
+            };
+            out.push((name.to_string(), expr.to_string()));
+        }
+        fn walk(d: &DataObject, out: &mut Vec<(String, String)>) {
+            for c in &d.children {
+                match c {
+                    DoChild::Da(da) => leaf_exprs(da, true, out),
+                    DoChild::SubDo(s) => walk(s, out),
+                }
+            }
+        }
+
+        let resolved = parse_scl(xml).expect("parse").resolve().expect("resolve");
+        let model = resolved.build_model("IED1").expect("build_model");
+        let emitted = emit_file(&resolved, &cfg()).expect("emit_file").to_string();
+        let mut expected = Vec::new();
+        for ld in &model.lds {
+            for ln in &ld.lns {
+                for d in &ln.dos {
+                    walk(d, &mut expected);
+                }
+            }
+        }
+        assert!(!expected.is_empty());
+        for (name, expr) in expected {
+            assert!(
+                emitted.contains(&expr),
+                "the generated model starts `{name}` from another value than the runtime model; expected `{expr}`"
+            );
+        }
+    }
+
+    /// The generated model starts every leaf from the value the runtime model
+    /// starts it from, for each basic type whose default is not a plain zero.
+    #[test]
+    fn emitted_leaf_defaults_match_runtime() {
+        let xml = r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="All" type="ALL_T"/></LNodeType>
+    <DOType id="ALL_T" cdc="SPS">
+      <DA name="dbpos" fc="ST" bType="Dbpos"/>
+      <DA name="tcmd" fc="ST" bType="Tcmd"/>
+      <DA name="check" fc="ST" bType="Check"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="entryTime" fc="ST" bType="EntryTime"/>
+      <DA name="optFlds" fc="ST" bType="OptFlds"/>
+      <DA name="trgOps" fc="ST" bType="TrgOps"/>
+      <DA name="currency" fc="ST" bType="Currency"/>
+      <DA name="entryId" fc="ST" bType="EntryID"/>
+      <DA name="octet64" fc="ST" bType="Octet64"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+      <DA name="int8" fc="ST" bType="INT8"/>
+      <DA name="cfg" fc="CF" bType="Struct" type="CFG_T"/>
+    </DOType>
+    <DAType id="CFG_T">
+      <BDA name="pos" bType="Dbpos"/>
+      <BDA name="opts" bType="OptFlds"/>
+    </DAType>
+  </DataTypeTemplates>
+</SCL>"#;
+        assert_leaf_values_match_runtime(xml);
     }
 
     /// Generated code and the runtime build path must produce the same
