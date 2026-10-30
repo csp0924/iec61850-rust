@@ -472,6 +472,8 @@ fn now_ms() -> u64 {
 /// Setting group runtimes, keyed by MMS domain name.
 pub struct SettingGroupRegistry {
     inner: RwLock<HashMap<String, Arc<SettingGroupRuntime>>>,
+    /// Time quality octet of every timestamp the control blocks report.
+    time_quality: u8,
 }
 
 impl std::fmt::Debug for SettingGroupRegistry {
@@ -502,11 +504,21 @@ impl Default for SettingGroupRegistry {
 }
 
 impl SettingGroupRegistry {
-    /// Returns an empty registry.
+    /// Returns an empty registry whose timestamps carry the default time
+    /// quality of [`TimeQuality`](crate::TimeQuality).
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            time_quality: crate::TimeQuality::default().to_byte(),
         }
+    }
+
+    /// Sets the time quality every timestamp of the control blocks reports,
+    /// such as `LActTm`.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn with_time_quality(mut self, quality: crate::TimeQuality) -> Self {
+        self.time_quality = quality.to_byte();
+        self
     }
 
     /// Builds a registry from a model, with one runtime per logical device
@@ -649,11 +661,9 @@ pub fn extract_sgcb_target(name: &ObjectName) -> Option<(&str, &str, SgcbField)>
 }
 
 /// Encodes milliseconds since the epoch as an IEC 61850 UTC timestamp: four
-/// octets of whole seconds, three of fraction, and one of time quality.
-///
-/// The quality octet reports an accuracy of 10 bits, that is millisecond
-/// resolution (IEC 61850-7-2 §6.2.3.4).
-fn ms_to_utc_time(ms: u64) -> [u8; 8] {
+/// octets of whole seconds, three of fraction, and the time quality octet
+/// `quality` (IEC 61850-7-2 §6.2.3.4).
+fn ms_to_utc_time(ms: u64, quality: u8) -> [u8; 8] {
     let secs = (ms / 1000) as u32;
     // The fraction is a 24-bit fixed-point value.
     let frac24 = ((ms % 1000) * (1u64 << 24) / 1000) as u32;
@@ -662,7 +672,7 @@ fn ms_to_utc_time(ms: u64) -> [u8; 8] {
     out[4] = ((frac24 >> 16) & 0xff) as u8;
     out[5] = ((frac24 >> 8) & 0xff) as u8;
     out[6] = (frac24 & 0xff) as u8;
-    out[7] = 0x0a; // accuracy = 10 (1 ms)
+    out[7] = quality;
     out
 }
 
@@ -670,13 +680,13 @@ fn ms_to_utc_time(ms: u64) -> [u8; 8] {
 ///
 /// The members follow the order of the type specification: `NumOfSG`, `ActSG`,
 /// `EditSG`, `CnfEdit`, `LActTm`, and `ResvTms` where it is exposed.
-fn snapshot_to_struct(snap: &SgcbSnapshot) -> MmsData {
+fn snapshot_to_struct(snap: &SgcbSnapshot, time_quality: u8) -> MmsData {
     let mut fields = vec![
         MmsData::Unsigned(snap.num_of_sg as u64),
         MmsData::Unsigned(snap.act_sg as u64),
         MmsData::Unsigned(snap.edit_sg as u64),
         MmsData::Boolean(snap.cnf_edit),
-        MmsData::UtcTime(ms_to_utc_time(snap.last_act_tm_ms)),
+        MmsData::UtcTime(ms_to_utc_time(snap.last_act_tm_ms, time_quality)),
     ];
     if let Some(resv) = snap.resv_tms_s {
         fields.push(MmsData::Unsigned(resv as u64));
@@ -708,12 +718,14 @@ pub fn handle_sgcb_read(
     };
     let snap = rt.snapshot();
     let data = match field {
-        SgcbField::Whole => snapshot_to_struct(&snap),
+        SgcbField::Whole => snapshot_to_struct(&snap, registry.time_quality),
         SgcbField::NumOfSg => MmsData::Unsigned(snap.num_of_sg as u64),
         SgcbField::ActSg => MmsData::Unsigned(snap.act_sg as u64),
         SgcbField::EditSg => MmsData::Unsigned(snap.edit_sg as u64),
         SgcbField::CnfEdit => MmsData::Boolean(snap.cnf_edit),
-        SgcbField::LActTm => MmsData::UtcTime(ms_to_utc_time(snap.last_act_tm_ms)),
+        SgcbField::LActTm => {
+            MmsData::UtcTime(ms_to_utc_time(snap.last_act_tm_ms, registry.time_quality))
+        }
         SgcbField::ResvTms => match snap.resv_tms_s {
             Some(v) => MmsData::Unsigned(v as u64),
             None => return AccessResult::Failure(DataAccessError::ObjectNonExistent),
@@ -1318,10 +1330,51 @@ mod tests {
 
     #[test]
     fn ms_to_utc_time_first_4_bytes_are_seconds() {
-        let bytes = ms_to_utc_time(1_700_000_000_500);
+        let bytes = ms_to_utc_time(1_700_000_000_500, 0x8a);
         let secs = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(secs, 1_700_000_000);
-        // The eighth octet is the time quality; accuracy 10 encodes as 0x0a.
-        assert_eq!(bytes[7], 0x0a);
+        // The eighth octet is the time quality, passed through unchanged.
+        assert_eq!(bytes[7], 0x8a);
+    }
+
+    #[test]
+    fn last_act_tm_carries_the_configured_time_quality() {
+        let quality = crate::TimeQuality {
+            leap_seconds_known: false,
+            clock_failure: false,
+            clock_not_synchronized: true,
+            time_accuracy: 7,
+        };
+        let reg = registry_with_one(3, false).with_time_quality(quality);
+        let AccessResult::Success(MmsData::UtcTime(t)) =
+            handle_sgcb_read(&reg, "IED1LD0", "LLN0", SgcbField::LActTm)
+        else {
+            panic!("LActTm reads as a UTC time");
+        };
+        assert_eq!(t[7], quality.to_byte());
+        let AccessResult::Success(MmsData::Structure(members)) =
+            handle_sgcb_read(&reg, "IED1LD0", "LLN0", SgcbField::Whole)
+        else {
+            panic!("the whole block reads as a structure");
+        };
+        assert_eq!(members[4], MmsData::UtcTime(t));
+    }
+
+    #[test]
+    fn last_act_tm_defaults_to_the_default_time_quality() {
+        let reg = registry_with_one(3, false);
+        let AccessResult::Success(MmsData::UtcTime(t)) =
+            handle_sgcb_read(&reg, "IED1LD0", "LLN0", SgcbField::LActTm)
+        else {
+            panic!("LActTm reads as a UTC time");
+        };
+        assert_eq!(t[7], crate::TimeQuality::default().to_byte());
+    }
+
+    #[test]
+    fn extract_target_only_routes_lln0() {
+        assert_eq!(extract_sgcb_target(&dom("GGIO1$SP$SGCB")), None);
+        assert_eq!(extract_sgcb_target(&dom("GGIO1$SP$SGCB$ActSG")), None);
+        assert_eq!(extract_sgcb_target(&dom("$SP$SGCB$ActSG")), None);
     }
 }

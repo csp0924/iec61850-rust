@@ -1294,7 +1294,8 @@ impl IedServerBuilder<Bound> {
 
         // Projected from the setting group control blocks the model declares.
         let setting_groups: Arc<crate::setting_groups::SettingGroupRegistry> = Arc::new(
-            crate::setting_groups::SettingGroupRegistry::from_model(&model),
+            crate::setting_groups::SettingGroupRegistry::from_model(&model)
+                .with_time_quality(self.config.time_quality),
         );
 
         let dynamic_dataset_keys: crate::service::define_named_variable_list::DynamicDatasetKeys =

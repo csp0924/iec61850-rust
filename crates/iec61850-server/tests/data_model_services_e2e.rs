@@ -389,6 +389,36 @@ async fn setting_group_control_block_is_only_in_lln0() {
     handle.stop().await;
 }
 
+/// LActTm carries the time quality the server is configured with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_activation_time_carries_the_configured_time_quality() {
+    let quality = TimeQuality {
+        leap_seconds_known: false,
+        clock_failure: true,
+        clock_not_synchronized: true,
+        time_accuracy: 3,
+    };
+    for (config, expected) in [
+        (IedServerConfig::default(), TimeQuality::default().to_byte()),
+        (
+            IedServerConfig {
+                time_quality: quality,
+                ..IedServerConfig::default()
+            },
+            quality.to_byte(),
+        ),
+    ] {
+        let server = server_with(model(false), config);
+        let handle = server.start().await.unwrap();
+        let mut c = mms(&handle).await;
+        let MmsData::UtcTime(t) = t!(c.read(DOM, "LLN0$SP$SGCB$LActTm")).unwrap() else {
+            panic!("LActTm is a UTC time");
+        };
+        assert_eq!(t[7], expected);
+        handle.stop().await;
+    }
+}
+
 // ── Data set members ────────────────────────────────────────────────────
 
 /// A constructed attribute holds no value of its own, so a data set member
