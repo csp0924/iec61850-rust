@@ -132,10 +132,11 @@ pub struct ReportingEngine {
 /// Buffer-time accumulation state for one BRCB.
 ///
 /// Follows the URCB `RcbState.report_due` timing model: the first trigger sets
-/// `due_at = now + buf_tm_ms`, and later triggers inside the same window only
-/// update the inclusion bitmap and the value snapshot. When the buffer time
-/// expires, the accumulated inclusion flags and snapshot are frozen into one
-/// buffer entry, which is then flushed.
+/// `due_at = now + buf_tm_ms`, and triggers of other members inside the same
+/// window only update the inclusion bitmap and the value snapshot. When the
+/// buffer time expires, or a member already in the window triggers again, the
+/// accumulated inclusion flags and snapshot are frozen into one buffer entry,
+/// which is then flushed.
 #[derive(Debug)]
 struct BrcbBufTmPending {
     /// Millisecond timestamp of the first trigger, used as the entry time.
@@ -426,6 +427,10 @@ impl ReportingEngine {
     /// watching it, so the cost is proportional to the number of watchers rather
     /// than to the number of registered control blocks.
     ///
+    /// A member that triggers again while it is already part of the pending report
+    /// sends that report immediately, and the new trigger opens the next buffer
+    /// time, so no value is overwritten before it is reported.
+    ///
     /// `attr_ref` has the form `"<domain>/<LN>$<FC>$<DO>$<DA>"`. `new_value` is
     /// cloned into the pending snapshot. `flag` selects the trigger class (data
     /// change, quality change, or data update). `now_ms` is the current time in
@@ -441,6 +446,8 @@ impl ReportingEngine {
             return;
         };
 
+        // Connections whose send failed are dropped once every lock is released.
+        let mut to_drop: Vec<ConnectionId> = Vec::new();
         for weak in weak_list {
             let Some(rc_arc) = weak.upgrade() else {
                 continue;
@@ -488,9 +495,9 @@ impl ReportingEngine {
                 }
             };
 
-            // Buffer-time bypass: if this entry already carries a trigger flag, the
-            // pending report is sent at once instead of absorbing a second change,
-            // per IEC 61850-7-2.
+            // Buffer-time bypass, per the BufTm rules of IEC 61850-7-2: a second
+            // trigger of a member already in the pending report sends that report
+            // at once, and the new trigger starts the next buffer time.
             let already_triggered = state
                 .pending
                 .as_ref()
@@ -498,17 +505,35 @@ impl ReportingEngine {
                 .map(|f| f.has_trigger())
                 .unwrap_or(false);
 
-            if already_triggered {
-                state.report_due = Some(Instant::now());
-                rc_guard
-                    .metrics
-                    .coalesced_buftm
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    attr_ref = %attr_ref,
-                    idx,
-                    "buffer-time bypass: entry retriggered inside the buffer window, sending the pending report now"
-                );
+            if let (true, Some(conn_id)) = (already_triggered, state.client_conn_id) {
+                if let Some(pending) = state.pending.take() {
+                    state.triggered = false;
+                    state.report_due = None;
+                    rc_guard
+                        .metrics
+                        .coalesced_buftm
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        attr_ref = %attr_ref,
+                        idx,
+                        "buffer-time bypass: member retriggered inside the buffer window, sending the pending report now"
+                    );
+                    // flush_pending takes the state lock itself.
+                    drop(state);
+                    if let Some(c) = self.flush_pending(&rc_guard, conn_id, pending, now_ms) {
+                        to_drop.push(c);
+                    }
+                    state = match rc_guard.state.lock() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            tracing::warn!(attr_ref = %attr_ref, "rcb state mutex poisoned, skipping");
+                            continue;
+                        }
+                    };
+                    if !state.rpt_ena {
+                        continue;
+                    }
+                }
             }
 
             let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -532,6 +557,9 @@ impl ReportingEngine {
                 }
             }
         }
+        for c in to_drop {
+            self.on_connection_dropped(c);
+        }
     }
 
     // ─── BRCB trigger path ────────────────────────────────────────────────────
@@ -547,7 +575,8 @@ impl ReportingEngine {
     ///    difference between a BRCB and a URCB;
     /// 4. coalesce by buffer time: `buf_tm_ms == 0` enqueues an entry immediately,
     ///    otherwise the trigger accumulates in `brcb_buftm_pending` until `tick`
-    ///    finds it due;
+    ///    finds it due; a member that triggers again inside the window enqueues
+    ///    the accumulated entry at once and opens the next window;
     /// 5. enqueue through `enqueue_entry_with_snapshot`, which freezes the data set
     ///    values and inclusion flags into the entry, so the send path never reads
     ///    live values.
@@ -645,24 +674,58 @@ impl ReportingEngine {
             }
 
             // Buffer time set: accumulate until tick finds the window expired.
-            let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
-                tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
-                continue;
-            };
-            let entry = pending
-                .entry(mms_path.clone())
-                .or_insert_with(|| BrcbBufTmPending {
-                    first_trigger_ms: now_ms,
-                    due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
-                    snapshot: EnqueuedSnapshot::new(ds_len),
+            let completed = {
+                let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
+                    tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
+                    continue;
+                };
+                // A member that triggers again inside the window closes it: the
+                // accumulated entry is buffered at once and the new trigger opens
+                // the next window, per the BufTm rules of IEC 61850-7-2.
+                let retriggered = pending.get(&mms_path).is_some_and(|p| {
+                    p.snapshot
+                        .inclusion_flags
+                        .get(idx)
+                        .is_some_and(|f| f.has_trigger())
                 });
-            // A later trigger in the same window merges its inclusion flag and
-            // overwrites the value with the newest one.
-            if let Some(slot) = entry.snapshot.inclusion_flags.get_mut(idx) {
-                *slot = flag;
-            }
-            if let Some(slot) = entry.snapshot.values.get_mut(idx) {
-                *slot = Some(new_value.clone());
+                let completed = if retriggered {
+                    pending.remove(&mms_path)
+                } else {
+                    None
+                };
+                let entry = pending
+                    .entry(mms_path.clone())
+                    .or_insert_with(|| BrcbBufTmPending {
+                        first_trigger_ms: now_ms,
+                        due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
+                        snapshot: EnqueuedSnapshot::new(ds_len),
+                    });
+                if let Some(slot) = entry.snapshot.inclusion_flags.get_mut(idx) {
+                    *slot = flag;
+                }
+                if let Some(slot) = entry.snapshot.values.get_mut(idx) {
+                    *slot = Some(new_value.clone());
+                }
+                completed
+            };
+            if let Some(p) = completed {
+                tracing::debug!(
+                    mms_path = %mms_path,
+                    attr_ref = %attr_ref,
+                    "buffer-time bypass: member retriggered inside the buffer window, buffering the entry now"
+                );
+                if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(
+                    p.first_trigger_ms,
+                    false,
+                    false,
+                    p.snapshot,
+                ) {
+                    tracing::warn!(
+                        mms_path = %mms_path,
+                        error = ?e,
+                        "brcb buffer-time enqueue failed"
+                    );
+                }
             }
         }
     }
@@ -2673,5 +2736,147 @@ mod tests {
             1,
             "tick_brcb must enqueue one entry once the buffer time has elapsed"
         );
+    }
+
+    // ── Buffer time, reasons, and TimeOfEntry on the send path ────────────────
+
+    /// Returns whether `pdu` contains `needle`.
+    fn contains(pdu: &[u8], needle: &[u8]) -> bool {
+        pdu.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// An INTEGER value as the report encoder writes it.
+    const INT_2: [u8; 3] = [0x85, 0x01, 0x02];
+    const INT_1: [u8; 3] = [0x85, 0x01, 0x01];
+
+    #[test]
+    fn urcb_retrigger_inside_buf_tm_sends_the_first_value_at_once() {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let (rc, ds) = make_rcb_and_ds("urcb01", &attr, TriggerOptions::DATA_CHANGED);
+        let path = rc.mms_path.clone();
+        engine.register_rcb(rc, ds).unwrap();
+        let rc_arc = engine.get_rcb(&path).unwrap();
+        enable_rcb(&rc_arc, 7);
+        rc_arc.lock().unwrap().state.lock().unwrap().buf_tm_ms = 10_000;
+
+        let flag = InclusionFlag::VALUE_CHANGED;
+        engine.on_value_updated(&attr, MmsValue::Integer(2), flag, 1_000);
+        assert!(
+            sink.pdus.lock().unwrap().is_empty(),
+            "the first trigger waits"
+        );
+        engine.on_value_updated(&attr, MmsValue::Integer(1), flag, 1_010);
+        {
+            let pdus = sink.pdus.lock().unwrap();
+            assert_eq!(pdus.len(), 1, "the retrigger sends the pending report");
+            assert!(contains(&pdus[0].1, &INT_2), "with the first value");
+            assert!(!contains(&pdus[0].1, &INT_1));
+        }
+
+        // The second value waits for its own buffer time.
+        engine.tick_at(Instant::now(), 1_020);
+        assert_eq!(sink.pdus.lock().unwrap().len(), 1);
+        engine.tick_at(Instant::now() + Duration::from_secs(11), 11_010);
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(
+            pdus.len(),
+            2,
+            "the second value follows after its buffer time"
+        );
+        assert!(contains(&pdus[1].1, &INT_1));
+    }
+
+    #[test]
+    fn urcb_trigger_of_another_member_inside_buf_tm_is_merged() {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let a = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let b = "IED1LD0/GGIO1$ST$Ind2$stVal".to_string();
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM)
+            .with_buf_tm_ms(10_000);
+        let ds = make_ds(vec![
+            (a.as_str(), MmsValue::Integer(0)),
+            (b.as_str(), MmsValue::Integer(0)),
+        ]);
+        engine
+            .register_rcb(ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb), ds)
+            .unwrap();
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 7);
+
+        let flag = InclusionFlag::VALUE_CHANGED;
+        engine.on_value_updated(&a, MmsValue::Integer(2), flag, 1_000);
+        engine.on_value_updated(&b, MmsValue::Integer(1), flag, 1_010);
+        assert!(sink.pdus.lock().unwrap().is_empty());
+        engine.tick_at(Instant::now() + Duration::from_secs(11), 11_000);
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(pdus.len(), 1, "one report for both members");
+        assert!(contains(&pdus[0].1, &INT_2) && contains(&pdus[0].1, &INT_1));
+    }
+
+    /// A BRCB over one INTEGER member, with the given buffer time and options.
+    fn brcb_engine(
+        buf_tm_ms: u32,
+        trg_ops: TriggerOptions,
+        opt_flds: OptFlds,
+    ) -> (
+        ReportingEngine,
+        Arc<CollectReportSink>,
+        Arc<crate::reporting::brcb::BufferedReportControl>,
+        String,
+    ) {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let sink = Arc::new(CollectReportSink::default());
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let ds = make_ds(vec![(attr.as_str(), MmsValue::Integer(0))]);
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(trg_ops)
+            .with_opt_flds(opt_flds)
+            .with_buf_tm_ms(buf_tm_ms);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), ds)
+            .unwrap();
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        (eng, sink, brcb_arc, attr)
+    }
+
+    #[test]
+    fn brcb_retrigger_inside_buf_tm_buffers_the_first_value_at_once() {
+        let (eng, _sink, brcb, attr) =
+            brcb_engine(10_000, TriggerOptions::DATA_CHANGED, OptFlds::SEQ_NUM);
+        let flag = InclusionFlag::VALUE_CHANGED;
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(2), flag, 1_000);
+        assert_eq!(
+            brcb.lock_buffer().unwrap().len(),
+            0,
+            "the first trigger waits"
+        );
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(1), flag, 1_010);
+        {
+            let entries = brcb.lock_buffer().unwrap().iter_entries();
+            assert_eq!(entries.len(), 1, "the retrigger buffers the open window");
+            let snap = entries[0].snapshot.as_ref().expect("snapshot");
+            assert_eq!(snap.values[0], Some(MmsValue::Integer(2)));
+            assert_eq!(entries[0].time_of_entry_ms, 1_000);
+        }
+        eng.tick_brcb(Instant::now(), 1_020);
+        assert_eq!(brcb.lock_buffer().unwrap().len(), 1);
+        eng.tick_brcb(Instant::now() + Duration::from_secs(11), 11_010);
+        let entries = brcb.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 2, "the second value gets its own entry");
+        let snap = entries[1].snapshot.as_ref().expect("snapshot");
+        assert_eq!(snap.values[0], Some(MmsValue::Integer(1)));
+        assert_eq!(entries[1].time_of_entry_ms, 1_010);
     }
 }
