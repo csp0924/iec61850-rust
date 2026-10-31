@@ -656,21 +656,9 @@ mod tests {
             MmsValue::Boolean(false),
         );
 
-        let totw_do = DataObject {
-            name: "TotW".into(),
-            array_count: None,
-            children: vec![DoChild::Da(mag_da)],
-        };
-        let mod_do = DataObject {
-            name: "Mod".into(),
-            array_count: None,
-            children: vec![DoChild::Da(ctl_model_da)],
-        };
-        let spcso_do = DataObject {
-            name: "SPCSO1".into(),
-            array_count: None,
-            children: vec![DoChild::Da(ctl_val_da)],
-        };
+        let totw_do = DataObject::new("TotW", vec![DoChild::Da(mag_da)]);
+        let mod_do = DataObject::new("Mod", vec![DoChild::Da(ctl_model_da)]);
+        let spcso_do = DataObject::new("SPCSO1", vec![DoChild::Da(ctl_val_da)]);
         // GGIO1.SetPt.setMag, SP and constructed.
         let set_mag_da = DataAttribute::constructed(
             "setMag",
@@ -683,36 +671,15 @@ mod tests {
                 MmsValue::Float32(0.0),
             )],
         );
-        let setpt_do = DataObject {
-            name: "SetPt".into(),
-            array_count: None,
-            children: vec![DoChild::Da(set_mag_da)],
-        };
+        let setpt_do = DataObject::new("SetPt", vec![DoChild::Da(set_mag_da)]);
 
-        let mmxu_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![totw_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
-        let ggio_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "GGIO".into(),
-            inst: "1".into(),
-            dos: vec![mod_do, spcso_do, setpt_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![totw_do]);
+        let ggio_ln = iec61850_model::LogicalNode::new(
+            String::new(),
+            "GGIO",
+            "1",
+            vec![mod_do, spcso_do, setpt_do],
+        );
 
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
@@ -1104,44 +1071,20 @@ mod tests {
                 MmsValue::Float32(0.0),
             )],
         );
-        let phs_a = DataObject {
-            name: "phsA".into(),
-            array_count: None,
-            children: vec![DoChild::Da(set_mag), DoChild::Da(set_cplx)],
-        };
-        let deep = DataObject {
-            name: "cmv".into(),
-            array_count: None,
-            children: vec![DoChild::Da(DataAttribute::new(
+        let phs_a = DataObject::new("phsA", vec![DoChild::Da(set_mag), DoChild::Da(set_cplx)]);
+        let deep = DataObject::new(
+            "cmv",
+            vec![DoChild::Da(DataAttribute::new(
                 "setDeep",
                 FC::Sp,
                 DataAttributeType::Float32,
                 TrgOps::default(),
                 MmsValue::Float32(0.0),
             ))],
-        };
-        let phs_b = DataObject {
-            name: "phsB".into(),
-            array_count: None,
-            children: vec![DoChild::SubDo(deep)],
-        };
-        let phset_do = DataObject {
-            name: "PhSet".into(),
-            array_count: None,
-            children: vec![DoChild::SubDo(phs_a), DoChild::SubDo(phs_b)],
-        };
-        let ggio_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "GGIO".into(),
-            inst: "1".into(),
-            dos: vec![phset_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        );
+        let phs_b = DataObject::new("phsB", vec![DoChild::SubDo(deep)]);
+        let phset_do = DataObject::new("PhSet", vec![DoChild::SubDo(phs_a), DoChild::SubDo(phs_b)]);
+        let ggio_ln = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![phset_do]);
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
             .add_ln(lln0)
@@ -1428,30 +1371,21 @@ mod tests {
             TrgOps::default(),
             MmsValue::Integer(0),
         );
-        let setpoint_do = DataObject {
-            name: "Setpoint".into(),
-            array_count: None,
-            children: vec![DoChild::Da(set_val_da), DoChild::Da(cur_val_da)],
-        };
+        let setpoint_do = DataObject::new(
+            "Setpoint",
+            vec![DoChild::Da(set_val_da), DoChild::Da(cur_val_da)],
+        );
 
-        let ggio_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "GGIO".into(),
-            inst: "1".into(),
-            dos: vec![setpoint_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let ggio_ln =
+            iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![setpoint_do]);
         let lln0 = LogicalNodeBuilder::lln0()
-            .set_sgcb(SettingGroupControlBlock {
-                num_of_sg: 3,
-                act_sg: 1,
-                has_resv_tms: false,
-                default_resv_tms_s: 60,
+            .set_sgcb({
+                let mut sgcb = SettingGroupControlBlock::default();
+                sgcb.num_of_sg = 3;
+                sgcb.act_sg = 1;
+                sgcb.has_resv_tms = false;
+                sgcb.default_resv_tms_s = 60;
+                sgcb
             })
             .build()
             .unwrap();
@@ -1724,11 +1658,7 @@ mod tests {
             },
         );
         let value = Arc::clone(&pos.value);
-        let cfg_do = DataObject {
-            name: "Cfg".into(),
-            array_count: None,
-            children: vec![DoChild::Da(pos)],
-        };
+        let cfg_do = DataObject::new("Cfg", vec![DoChild::Da(pos)]);
         let ggio_ln = LogicalNodeBuilder::new("", "GGIO", "1")
             .add_do(cfg_do)
             .build()

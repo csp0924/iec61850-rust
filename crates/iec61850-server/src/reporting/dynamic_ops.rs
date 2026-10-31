@@ -297,23 +297,8 @@ mod tests {
             TrgOps::default(),
             MmsValue::Boolean(false),
         );
-        let ind1 = DataObject {
-            name: "Ind1".into(),
-            array_count: None,
-            children: vec![DoChild::Da(stval)],
-        };
-        let ggio1 = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "GGIO".into(),
-            inst: "1".into(),
-            dos: vec![ind1],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let ind1 = DataObject::new("Ind1", vec![DoChild::Da(stval)]);
+        let ggio1 = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![ind1]);
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
             .add_ln(lln0)

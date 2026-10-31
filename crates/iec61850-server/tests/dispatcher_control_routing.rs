@@ -41,23 +41,8 @@ fn build_min_model() -> iec61850_model::IedModel {
         TrgOps::default(),
         MmsValue::Integer(1),
     );
-    let mod_do = DataObject {
-        name: "Mod".into(),
-        array_count: None,
-        children: vec![DoChild::Da(mod_da)],
-    };
-    let ggio_ln = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![mod_do],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let mod_do = DataObject::new("Mod", vec![DoChild::Da(mod_da)]);
+    let ggio_ln = LogicalNode::new(String::new(), "GGIO", "1", vec![mod_do]);
     let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
     let ld = LogicalDeviceBuilder::new("LD0")
         .add_ln(lln0)

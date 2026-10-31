@@ -54,14 +54,13 @@ fn build_server() -> IedServer {
 fn resolve_da(model: &IedModel, path: &str) -> DataAttribute {
     let r = ObjectRef::parse_iec(path).expect("parse_iec");
     match model.node_by_object_ref(&r).expect("node lookup") {
-        NodeRef::Da(da) => DataAttribute {
-            name: da.name.clone(),
-            fc: da.fc,
-            ty: da.ty,
-            trg_ops: da.trg_ops,
-            value: Arc::clone(&da.value),
-            children: Vec::new(),
-        },
+        NodeRef::Da(da) => DataAttribute::with_shared_value(
+            da.name.clone(),
+            da.fc,
+            da.ty,
+            da.trg_ops,
+            Arc::clone(&da.value),
+        ),
         _ => panic!("expected a data attribute at {path}"),
     }
 }

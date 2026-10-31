@@ -549,10 +549,10 @@ fn emit_dataset_expr(
         .map(|f| emit_fcda_expr(f, ld_inst, ln))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(quote! {
-        DataSet {
-            name: ::std::string::String::from(#name_lit),
-            entries: ::std::vec![ #( #entries ),* ],
-        }
+        DataSet::new(
+            ::std::string::String::from(#name_lit),
+            ::std::vec![ #( #entries ),* ],
+        )
     })
 }
 
@@ -593,13 +593,15 @@ fn emit_fcda_expr(
     };
 
     Ok(quote! {
-        DataSetEntry {
-            ld_inst: ::std::string::String::from(#ld_inst_lit),
-            ln_name: ::std::string::String::from(#ln_name),
-            fc: #fc_tok,
-            do_path: ::std::vec![ #( ::std::string::String::from(#do_path_lits) ),* ],
-            array_index: #array_index_tok,
-            component: ::std::option::Option::None,
+        {
+            let mut __entry = DataSetEntry::new(
+                ::std::string::String::from(#ln_name),
+                #fc_tok,
+                ::std::vec![ #( ::std::string::String::from(#do_path_lits) ),* ],
+            );
+            __entry.ld_inst = ::std::string::String::from(#ld_inst_lit);
+            __entry.array_index = #array_index_tok;
+            __entry
         }
     })
 }
@@ -619,16 +621,19 @@ fn emit_rcb_expr(r: &RawReportControlBlock) -> TokenStream {
     let buf_tm_ms = r.buf_time;
     let intg_pd_ms = r.intg_pd;
     quote! {
-        ReportControlBlock {
-            name: ::std::string::String::from(#name),
-            is_buffered: #is_buffered,
-            dataset_ref: ::std::string::String::from(#dataset_ref),
-            conf_rev: #conf_rev,
-            rpt_id: ::std::string::String::from(#rpt_id),
-            trg_ops: #trg_ops_tok,
-            opt_flds: #opt_flds_tok,
-            buf_tm_ms: #buf_tm_ms,
-            intg_pd_ms: #intg_pd_ms,
+        {
+            let mut __rcb = ReportControlBlock::new(
+                ::std::string::String::from(#name),
+                ::std::string::String::from(#dataset_ref),
+            );
+            __rcb.is_buffered = #is_buffered;
+            __rcb.conf_rev = #conf_rev;
+            __rcb.rpt_id = ::std::string::String::from(#rpt_id);
+            __rcb.trg_ops = #trg_ops_tok;
+            __rcb.opt_flds = #opt_flds_tok;
+            __rcb.buf_tm_ms = #buf_tm_ms;
+            __rcb.intg_pd_ms = #intg_pd_ms;
+            __rcb
         }
     }
 }
@@ -641,11 +646,14 @@ fn emit_gocb_expr(g: &RawGseControl, domain: &str) -> TokenStream {
     // is empty.
     let go_id = gse_control_go_id(g, domain);
     quote! {
-        GooseControlBlock {
-            name: ::std::string::String::from(#name),
-            dataset_ref: ::std::string::String::from(#dataset_ref),
-            conf_rev: #conf_rev,
-            go_id: ::std::string::String::from(#go_id),
+        {
+            let mut __gocb = GooseControlBlock::new(
+                ::std::string::String::from(#name),
+                ::std::string::String::from(#dataset_ref),
+                ::std::string::String::from(#go_id),
+            );
+            __gocb.conf_rev = #conf_rev;
+            __gocb
         }
     }
 }
@@ -657,12 +665,15 @@ fn emit_svcb_expr(s: &RawSampledValueControl) -> TokenStream {
     let sv_id = s.smv_id.as_str();
     let is_multicast = s.multicast;
     quote! {
-        SvControlBlock {
-            name: ::std::string::String::from(#name),
-            dataset_ref: ::std::string::String::from(#dataset_ref),
-            conf_rev: #conf_rev,
-            sv_id: ::std::string::String::from(#sv_id),
-            is_multicast: #is_multicast,
+        {
+            let mut __svcb = SvControlBlock::new(
+                ::std::string::String::from(#name),
+                ::std::string::String::from(#dataset_ref),
+                ::std::string::String::from(#sv_id),
+            );
+            __svcb.conf_rev = #conf_rev;
+            __svcb.is_multicast = #is_multicast;
+            __svcb
         }
     }
 }
@@ -672,10 +683,13 @@ fn emit_lcb_expr(l: &RawLogControl) -> TokenStream {
     let dataset_ref = l.data_set.clone().unwrap_or_default();
     let log_ref = l.log_name.clone().unwrap_or_default();
     quote! {
-        LogControlBlock {
-            name: ::std::string::String::from(#name),
-            dataset_ref: ::std::string::String::from(#dataset_ref),
-            log_ref: ::std::string::String::from(#log_ref),
+        {
+            let mut __lcb = LogControlBlock::new(
+                ::std::string::String::from(#name),
+                ::std::string::String::from(#log_ref),
+            );
+            __lcb.dataset_ref = ::std::string::String::from(#dataset_ref);
+            __lcb
         }
     }
 }
@@ -717,11 +731,13 @@ fn emit_sgcb_expr(
         .unwrap_or(60);
 
     Ok(quote! {
-        SettingGroupControlBlock {
-            num_of_sg: #num_of_sg,
-            act_sg: #act_sg,
-            has_resv_tms: #has_resv_tms,
-            default_resv_tms_s: #default_resv_tms_s,
+        {
+            let mut __sgcb = SettingGroupControlBlock::default();
+            __sgcb.num_of_sg = #num_of_sg;
+            __sgcb.act_sg = #act_sg;
+            __sgcb.has_resv_tms = #has_resv_tms;
+            __sgcb.default_resv_tms_s = #default_resv_tms_s;
+            __sgcb
         }
     })
 }
@@ -1390,7 +1406,7 @@ mod tests {
         assert_eq!(go_ids, vec!["events", "IED1LD0/LLN0$GO$gcbBare"]);
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         for go_id in go_ids {
-            let expected = quote! { go_id: ::std::string::String::from(#go_id) }.to_string();
+            let expected = format!("{} ,", quote! { ::std::string::String::from(#go_id) });
             assert!(emitted.contains(&expected), "{emitted}");
         }
     }
@@ -1417,13 +1433,17 @@ mod tests {
         assert_eq!(entry.do_path, vec!["W", "mag", "f"]);
         assert_eq!(entry.array_index, Some(2));
         let segs = entry.do_path.iter().map(|s| s.as_str());
-        let expected = quote! {
-            do_path: ::std::vec![ #( ::std::string::String::from(#segs) ),* ],
-            array_index: ::std::option::Option::Some(2u32),
+        let expected_path = format!(
+            "{} ,",
+            quote! { ::std::vec![ #( ::std::string::String::from(#segs) ),* ] }
+        );
+        let expected_index = quote! {
+            __entry.array_index = ::std::option::Option::Some(2u32);
         }
         .to_string();
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
-        assert!(emitted.contains(&expected), "{emitted}");
+        assert!(emitted.contains(&expected_path), "{emitted}");
+        assert!(emitted.contains(&expected_index), "{emitted}");
     }
 
     /// Every DAI value is emitted, including those under a constructed

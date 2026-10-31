@@ -33,17 +33,16 @@ use tokio::sync::mpsc;
 const DOMAIN: &str = "IED1LD0";
 
 fn bool_do(name: &str, v: bool) -> DataObject {
-    DataObject {
-        name: name.into(),
-        array_count: None,
-        children: vec![DoChild::Da(DataAttribute::new(
+    DataObject::new(
+        name,
+        vec![DoChild::Da(DataAttribute::new(
             "stVal",
             FC::St,
             DataAttributeType::Boolean,
             TrgOps::DCHG,
             MmsValue::Boolean(v),
         ))],
-    }
+    )
 }
 
 fn build_model() -> Arc<IedModel> {

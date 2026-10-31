@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// An error raised by a model operation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModelError {
     /// The object reference exceeds the 128-byte limit.
     ///

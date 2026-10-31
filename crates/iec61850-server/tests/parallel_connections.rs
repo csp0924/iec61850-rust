@@ -36,23 +36,8 @@ fn model_with_single_sps() -> Arc<IedModel> {
         TrgOps::default(),
         MmsValue::Boolean(true),
     );
-    let ind1_do = DataObject {
-        name: "Ind1".into(),
-        array_count: None,
-        children: vec![DoChild::Da(ind1_st_val)],
-    };
-    let ggio = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![ind1_do],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let ind1_do = DataObject::new("Ind1", vec![DoChild::Da(ind1_st_val)]);
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![ind1_do]);
     let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
     let ld = LogicalDeviceBuilder::new("LD0")
         .add_ln(lln0)

@@ -209,7 +209,15 @@ pub fn emit_dat_value(dat: DataAttributeType) -> TokenStream {
         T::OptFlds => quote! { ::iec61850_scl::__rt::DataAttributeType::OptFlds },
         T::TrgOpsBits => quote! { ::iec61850_scl::__rt::DataAttributeType::TrgOpsBits },
         T::Currency => quote! { ::iec61850_scl::__rt::DataAttributeType::Currency },
+        other => unsupported_dat(other),
     }
+}
+
+/// Emits a `compile_error!` naming a data attribute type the generator has
+/// no token for.
+fn unsupported_dat(dat: DataAttributeType) -> TokenStream {
+    let msg = format!("iec61850-scl-build: unsupported data attribute type {dat:?}");
+    quote! { ::core::compile_error!(#msg) }
 }
 
 /// Emits the zero value of a data attribute type as an expression.
@@ -272,6 +280,9 @@ pub fn emit_default_mms_value(dat: DataAttributeType) -> TokenStream {
         | T::Currency
         | T::Constructed
         | T::GenericBitString(_) => {
+            quote! { ::iec61850_scl::__rt::MmsValue::OctetString(::std::vec::Vec::new()) }
+        }
+        _ => {
             quote! { ::iec61850_scl::__rt::MmsValue::OctetString(::std::vec::Vec::new()) }
         }
     }

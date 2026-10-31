@@ -83,11 +83,7 @@ fn build_rich_model() -> Arc<IedModel> {
         TrgOps::default(),
         MmsValue::Boolean(false),
     );
-    let ind1 = DataObject {
-        name: "Ind1".into(),
-        array_count: None,
-        children: vec![DoChild::Da(ind1_st)],
-    };
+    let ind1 = DataObject::new("Ind1", vec![DoChild::Da(ind1_st)]);
 
     // Enumerated-like setpoint carried as Int32.
     let sp_mod_st = DataAttribute::new(
@@ -97,24 +93,9 @@ fn build_rich_model() -> Arc<IedModel> {
         TrgOps::default(),
         MmsValue::Integer(1),
     );
-    let sp_mod = DataObject {
-        name: "Mod".into(),
-        array_count: None,
-        children: vec![DoChild::Da(sp_mod_st)],
-    };
+    let sp_mod = DataObject::new("Mod", vec![DoChild::Da(sp_mod_st)]);
 
-    let ggio1 = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![ind1, sp_mod],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let ggio1 = LogicalNode::new(String::new(), "GGIO", "1", vec![ind1, sp_mod]);
 
     let ld: LogicalDevice = LogicalDeviceBuilder::new("LD0")
         .add_ln(lln0)

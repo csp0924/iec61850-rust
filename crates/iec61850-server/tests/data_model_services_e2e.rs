@@ -120,11 +120,13 @@ fn model(resv_tms: bool) -> Arc<IedModel> {
                 .build()
                 .unwrap(),
         )
-        .set_sgcb(SettingGroupControlBlock {
-            num_of_sg: 3,
-            act_sg: 1,
-            has_resv_tms: resv_tms,
-            default_resv_tms_s: 30,
+        .set_sgcb({
+            let mut sgcb = SettingGroupControlBlock::default();
+            sgcb.num_of_sg = 3;
+            sgcb.act_sg = 1;
+            sgcb.has_resv_tms = resv_tms;
+            sgcb.default_resv_tms_s = 30;
+            sgcb
         })
         .build()
         .unwrap();

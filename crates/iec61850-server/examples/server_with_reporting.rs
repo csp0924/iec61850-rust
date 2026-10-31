@@ -292,14 +292,13 @@ async fn run_value_updater(server: IedServer, handles: UpdaterHandles) {
 fn resolve_da(model: &IedModel, iec_path: &str) -> Option<DataAttribute> {
     let r = ObjectRef::parse_iec(iec_path).ok()?;
     match model.node_by_object_ref(&r)? {
-        NodeRef::Da(da) => Some(DataAttribute {
-            name: da.name.clone(),
-            fc: da.fc,
-            ty: da.ty,
-            trg_ops: da.trg_ops,
-            value: da.value.clone(),
-            children: Vec::new(),
-        }),
+        NodeRef::Da(da) => Some(DataAttribute::with_shared_value(
+            da.name.clone(),
+            da.fc,
+            da.ty,
+            da.trg_ops,
+            da.value.clone(),
+        )),
         _ => None,
     }
 }

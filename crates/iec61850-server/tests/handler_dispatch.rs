@@ -57,41 +57,11 @@ fn build_test_model() -> IedModel {
         MmsValue::Integer(0),
     );
 
-    let totw_do = DataObject {
-        name: "TotW".into(),
-        array_count: None,
-        children: vec![DoChild::Da(mag_da)],
-    };
-    let mod_do = DataObject {
-        name: "Mod".into(),
-        array_count: None,
-        children: vec![DoChild::Da(ctl_model_da)],
-    };
+    let totw_do = DataObject::new("TotW", vec![DoChild::Da(mag_da)]);
+    let mod_do = DataObject::new("Mod", vec![DoChild::Da(ctl_model_da)]);
 
-    let mmxu_ln = iec61850_model::LogicalNode {
-        prefix: String::new(),
-        class: "MMXU".into(),
-        inst: "1".into(),
-        dos: vec![totw_do],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
-    let ggio_ln = iec61850_model::LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![mod_do],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![totw_do]);
+    let ggio_ln = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![mod_do]);
 
     let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
     let ld = LogicalDeviceBuilder::new("LD0")

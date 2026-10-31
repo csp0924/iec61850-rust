@@ -556,10 +556,7 @@ fn build_dataset(
         .iter()
         .map(|fcda| build_fcda(fcda, ld_inst, raw_ln, &raw_ds.name))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(DataSet {
-        name: raw_ds.name.clone(),
-        entries,
-    })
+    Ok(DataSet::new(raw_ds.name.clone(), entries))
 }
 
 fn build_fcda(
@@ -592,14 +589,10 @@ fn build_fcda(
         &path,
     )?;
 
-    Ok(DataSetEntry {
-        ld_inst: fcda.ld_inst.clone(),
-        ln_name,
-        fc,
-        do_path,
-        array_index,
-        component: None,
-    })
+    let mut entry = DataSetEntry::new(ln_name, fc, do_path);
+    entry.ld_inst = fcda.ld_inst.clone();
+    entry.array_index = array_index;
+    Ok(entry)
 }
 
 /// Splits the `doName` and `daName` of an `<FCDA>` into the segments of
@@ -694,28 +687,30 @@ pub fn fcda_do_path(
 /// configuration. The report instance limit stays a server runtime setting and
 /// is not carried here.
 fn build_rcb(raw_rcb: &RawReportControlBlock) -> ReportControlBlock {
-    ReportControlBlock {
-        name: raw_rcb.name.clone(),
-        is_buffered: raw_rcb.buffered,
-        dataset_ref: raw_rcb.dat_set.clone().unwrap_or_default(),
-        conf_rev: raw_rcb.conf_rev,
-        rpt_id: raw_rcb.rpt_id.clone().unwrap_or_default(),
-        trg_ops: report_trg_ops_to_model(raw_rcb.trg_ops),
-        opt_flds: opt_fields_to_model(raw_rcb.opt_fields),
-        buf_tm_ms: raw_rcb.buf_time,
-        intg_pd_ms: raw_rcb.intg_pd,
-    }
+    let mut rcb = ReportControlBlock::new(
+        raw_rcb.name.clone(),
+        raw_rcb.dat_set.clone().unwrap_or_default(),
+    );
+    rcb.is_buffered = raw_rcb.buffered;
+    rcb.conf_rev = raw_rcb.conf_rev;
+    rcb.rpt_id = raw_rcb.rpt_id.clone().unwrap_or_default();
+    rcb.trg_ops = report_trg_ops_to_model(raw_rcb.trg_ops);
+    rcb.opt_flds = opt_fields_to_model(raw_rcb.opt_fields);
+    rcb.buf_tm_ms = raw_rcb.buf_time;
+    rcb.intg_pd_ms = raw_rcb.intg_pd;
+    rcb
 }
 
 /// Converts a `<GSEControl>` into a [`GooseControlBlock`], whose GoID comes
 /// from [`gse_control_go_id`].
 fn build_gocb(raw_gcb: &RawGseControl, domain: &str) -> GooseControlBlock {
-    GooseControlBlock {
-        name: raw_gcb.name.clone(),
-        dataset_ref: raw_gcb.data_set.clone(),
-        conf_rev: raw_gcb.conf_rev,
-        go_id: gse_control_go_id(raw_gcb, domain),
-    }
+    let mut gocb = GooseControlBlock::new(
+        raw_gcb.name.clone(),
+        raw_gcb.data_set.clone(),
+        gse_control_go_id(raw_gcb, domain),
+    );
+    gocb.conf_rev = raw_gcb.conf_rev;
+    gocb
 }
 
 /// Returns the GoID of a `<GSEControl>` in the logical device whose MMS
@@ -752,13 +747,14 @@ pub fn ld_domain_name(raw_ld: &RawLogicalDevice, ied_name: &str) -> String {
 /// The sample rate, ASDU count, sample mode and options are server settings and
 /// are not part of the model schema.
 fn build_svcb(raw_svcb: &RawSampledValueControl) -> SvControlBlock {
-    SvControlBlock {
-        name: raw_svcb.name.clone(),
-        dataset_ref: raw_svcb.data_set.clone(),
-        conf_rev: raw_svcb.conf_rev,
-        sv_id: raw_svcb.smv_id.clone(),
-        is_multicast: raw_svcb.multicast,
-    }
+    let mut svcb = SvControlBlock::new(
+        raw_svcb.name.clone(),
+        raw_svcb.data_set.clone(),
+        raw_svcb.smv_id.clone(),
+    );
+    svcb.conf_rev = raw_svcb.conf_rev;
+    svcb.is_multicast = raw_svcb.multicast;
+    svcb
 }
 
 /// Converts a `<LogControl>` into a [`LogControlBlock`].
@@ -766,11 +762,12 @@ fn build_svcb(raw_svcb: &RawSampledValueControl) -> SvControlBlock {
 /// SCL defaults `logName` to `LN$Log`; when the raw element carries no value,
 /// the field is left empty for the caller to fill in.
 fn build_lcb(raw_lcb: &RawLogControl) -> LogControlBlock {
-    LogControlBlock {
-        name: raw_lcb.name.clone(),
-        dataset_ref: raw_lcb.data_set.clone().unwrap_or_default(),
-        log_ref: raw_lcb.log_name.clone().unwrap_or_default(),
-    }
+    let mut lcb = LogControlBlock::new(
+        raw_lcb.name.clone(),
+        raw_lcb.log_name.clone().unwrap_or_default(),
+    );
+    lcb.dataset_ref = raw_lcb.data_set.clone().unwrap_or_default();
+    lcb
 }
 
 /// Converts a `<SettingControl>` into a [`SettingGroupControlBlock`].
@@ -830,12 +827,12 @@ fn build_sgcb(
             }
         })
         .unwrap_or(60);
-    Ok(SettingGroupControlBlock {
-        num_of_sg,
-        act_sg,
-        has_resv_tms: raw_sgcb.resv_tms.is_some(),
-        default_resv_tms_s,
-    })
+    let mut sgcb = SettingGroupControlBlock::default();
+    sgcb.num_of_sg = num_of_sg;
+    sgcb.act_sg = act_sg;
+    sgcb.has_resv_tms = raw_sgcb.resv_tms.is_some();
+    sgcb.default_resv_tms_s = default_resv_tms_s;
+    Ok(sgcb)
 }
 
 // -----------------------------------------------------------------------------

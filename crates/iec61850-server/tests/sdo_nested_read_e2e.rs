@@ -232,33 +232,22 @@ const SET_MAG: &str = "IED1LD0/GGIO1.PhSet.phsA.setMag";
 /// shape a WYE of setpoints takes. `demo.cid` nests nothing writable, so the
 /// write path needs a model of its own.
 fn build_setpoint_model() -> Arc<IedModel> {
-    let phs_a = DataObject {
-        name: "phsA".into(),
-        array_count: None,
-        children: vec![DoChild::Da(DataAttribute::new(
+    let phs_a = DataObject::new(
+        "phsA",
+        vec![DoChild::Da(DataAttribute::new(
             "setMag",
             FC::Sp,
             DataAttributeType::Float32,
             TrgOps::default(),
             MmsValue::Float32(0.0),
         ))],
-    };
-    let ggio = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![DataObject {
-            name: "PhSet".into(),
-            array_count: None,
-            children: vec![DoChild::SubDo(phs_a)],
-        }],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    );
+    let ggio = LogicalNode::new(
+        String::new(),
+        "GGIO",
+        "1",
+        vec![DataObject::new("PhSet", vec![DoChild::SubDo(phs_a)])],
+    );
     let ld = LogicalDeviceBuilder::new("LD0")
         .add_ln(LogicalNodeBuilder::lln0().build().expect("build LLN0"))
         .add_ln(ggio)

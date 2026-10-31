@@ -46,11 +46,7 @@ fn data_object(
 ) -> (DataObject, Arc<RwLock<MmsValue>>) {
     let da = DataAttribute::new(da_name, fc, ty, TrgOps::DCHG, value);
     let handle = Arc::clone(&da.value);
-    let dobj = DataObject {
-        name: name.into(),
-        array_count: None,
-        children: vec![DoChild::Da(da)],
-    };
+    let dobj = DataObject::new(name, vec![DoChild::Da(da)]);
     (dobj, handle)
 }
 
@@ -109,18 +105,7 @@ fn build_model() -> (Arc<IedModel>, Members) {
         handles.push(handle);
     }
     let setting = handles.split_off(3);
-    let ggio = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos,
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", dos);
     let lln0 = LogicalNodeBuilder::lln0().build().expect("lln0");
     let ld = LogicalDeviceBuilder::new("LD0")
         .add_ln(lln0)

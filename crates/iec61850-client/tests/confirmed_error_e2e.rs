@@ -33,11 +33,7 @@ fn build_model() -> Arc<IedModel> {
         TrgOps::DCHG,
         MmsValue::Boolean(true),
     );
-    let ind = DataObject {
-        name: "Ind1".into(),
-        array_count: None,
-        children: vec![DoChild::Da(da)],
-    };
+    let ind = DataObject::new("Ind1", vec![DoChild::Da(da)]);
     let lln0 = LogicalNodeBuilder::lln0().build().expect("lln0");
     let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
         .add_do(ind)

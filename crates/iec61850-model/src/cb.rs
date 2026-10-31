@@ -23,6 +23,7 @@ use crate::types::TrgOps;
 /// the current entry identifier - stays in the server crate and is not mixed
 /// into this structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReportControlBlock {
     /// Block name, without the `LN$RP$` or `LN$BR$` prefix; the MMS mapping
     /// adds the wire name.
@@ -54,8 +55,33 @@ pub struct ReportControlBlock {
     pub intg_pd_ms: u32,
 }
 
+impl ReportControlBlock {
+    /// Creates an unbuffered report control block named `name` that reports
+    /// the data set `dataset_ref`.
+    ///
+    /// The other fields take the values an SCL `<ReportControl>` gets when the
+    /// corresponding attribute or child element is absent: `is_buffered` is
+    /// `false`, `conf_rev` is 0, `rpt_id` is empty, `trg_ops` is
+    /// [`TrgOps::NONE`], `opt_flds` is [`OptFlds::BUFFER_OVERFLOW`], and
+    /// `buf_tm_ms` and `intg_pd_ms` are 0.
+    pub fn new(name: impl Into<String>, dataset_ref: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            is_buffered: false,
+            dataset_ref: dataset_ref.into(),
+            conf_rev: 0,
+            rpt_id: String::new(),
+            trg_ops: TrgOps::NONE,
+            opt_flds: OptFlds::BUFFER_OVERFLOW,
+            buf_tm_ms: 0,
+            intg_pd_ms: 0,
+        }
+    }
+}
+
 /// A GOOSE control block.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GooseControlBlock {
     /// Control block name.
     pub name: String,
@@ -67,8 +93,29 @@ pub struct GooseControlBlock {
     pub go_id: String,
 }
 
+impl GooseControlBlock {
+    /// Creates a GOOSE control block named `name` that publishes the data set
+    /// `dataset_ref` under the identifier `go_id`.
+    ///
+    /// `conf_rev` is 0, the value an SCL `<GSEControl>` without `confRev`
+    /// gets.
+    pub fn new(
+        name: impl Into<String>,
+        dataset_ref: impl Into<String>,
+        go_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            dataset_ref: dataset_ref.into(),
+            conf_rev: 0,
+            go_id: go_id.into(),
+        }
+    }
+}
+
 /// A sampled values control block.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SvControlBlock {
     /// Control block name.
     pub name: String,
@@ -82,8 +129,31 @@ pub struct SvControlBlock {
     pub is_multicast: bool,
 }
 
+impl SvControlBlock {
+    /// Creates a sampled values control block named `name` that publishes the
+    /// data set `dataset_ref` under the identifier `sv_id`.
+    ///
+    /// The other fields take the values an SCL `<SampledValueControl>` gets
+    /// when the attribute is absent: `conf_rev` is 0 and `is_multicast` is
+    /// `true`.
+    pub fn new(
+        name: impl Into<String>,
+        dataset_ref: impl Into<String>,
+        sv_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            dataset_ref: dataset_ref.into(),
+            conf_rev: 0,
+            sv_id: sv_id.into(),
+            is_multicast: true,
+        }
+    }
+}
+
 /// A log control block.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LogControlBlock {
     /// Control block name.
     pub name: String,
@@ -91,6 +161,21 @@ pub struct LogControlBlock {
     pub dataset_ref: String,
     /// The referenced log, as `LN$logName`.
     pub log_ref: String,
+}
+
+impl LogControlBlock {
+    /// Creates a log control block named `name` that writes to the log
+    /// `log_ref`.
+    ///
+    /// `dataset_ref` is empty, the value an SCL `<LogControl>` without
+    /// `datSet` gets.
+    pub fn new(name: impl Into<String>, log_ref: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            dataset_ref: String::new(),
+            log_ref: log_ref.into(),
+        }
+    }
 }
 
 /// The static configuration of a setting group control block, of which a
@@ -105,6 +190,7 @@ pub struct LogControlBlock {
 /// crate, one instance per logical device, so that a model stays immutable
 /// after `build`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SettingGroupControlBlock {
     /// The `numOfSG` attribute: the total number of setting groups, at least 1.
     pub num_of_sg: u8,

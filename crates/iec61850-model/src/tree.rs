@@ -212,6 +212,7 @@ fn walk_da<'a, F: FnMut(ModelNode<'a>)>(da: &'a DataAttribute, f: &mut F) {
 
 /// One logical device of an IED, and the MMS domain it maps to.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LogicalDevice {
     /// The SCL `inst` attribute, such as `WD1` or `GenericIO`.
     pub inst: String,
@@ -223,6 +224,17 @@ pub struct LogicalDevice {
 }
 
 impl LogicalDevice {
+    /// Creates a logical device with instance name `inst` holding `lns`;
+    /// `ld_name` is `None`, so the domain name is the IED name followed by
+    /// `inst`.
+    pub fn new(inst: impl Into<String>, lns: Vec<LogicalNode>) -> Self {
+        Self {
+            inst: inst.into(),
+            ld_name: None,
+            lns,
+        }
+    }
+
     /// Returns the MMS domain name: `ld_name` when set, otherwise
     /// `ied_name + inst`.
     pub fn domain_name(&self, ied_name: &str) -> String {
@@ -249,6 +261,7 @@ impl LogicalDevice {
 
 /// One logical node, holding its data objects, data sets and control blocks.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LogicalNode {
     /// Logical node prefix; empty when the node has none.
     pub prefix: String,
@@ -275,6 +288,29 @@ pub struct LogicalNode {
 }
 
 impl LogicalNode {
+    /// Creates a logical node `prefix` + `class` + `inst` holding the data
+    /// objects `dos`, with no data set, control block or setting group
+    /// control block.
+    pub fn new(
+        prefix: impl Into<String>,
+        class: impl Into<String>,
+        inst: impl Into<String>,
+        dos: Vec<DataObject>,
+    ) -> Self {
+        Self {
+            prefix: prefix.into(),
+            class: class.into(),
+            inst: inst.into(),
+            dos,
+            datasets: Vec::new(),
+            rcbs: Vec::new(),
+            gocbs: Vec::new(),
+            svcbs: Vec::new(),
+            lcbs: Vec::new(),
+            sgcb: None,
+        }
+    }
+
     /// Returns the full logical node name, `prefix + class + inst`.
     pub fn full_name(&self) -> String {
         let mut s = String::with_capacity(self.prefix.len() + self.class.len() + self.inst.len());
@@ -309,6 +345,7 @@ impl LogicalNode {
 
 /// One data object, holding data attributes and nested sub-objects.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DataObject {
     /// Data object name.
     pub name: String,
@@ -323,6 +360,16 @@ pub struct DataObject {
 }
 
 impl DataObject {
+    /// Creates a scalar data object named `name` with the given children;
+    /// `array_count` is `None`.
+    pub fn new(name: impl Into<String>, children: Vec<DoChild>) -> Self {
+        Self {
+            name: name.into(),
+            array_count: None,
+            children,
+        }
+    }
+
     /// Finds a direct child by name, one level only.
     ///
     /// Of the FC=SE and FC=SG data attributes of one setting, which share a
@@ -369,6 +416,7 @@ pub enum DoChild {
 
 /// One data attribute, leaf or constructed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DataAttribute {
     /// Data attribute name.
     pub name: String,
@@ -412,6 +460,28 @@ impl DataAttribute {
             ty,
             trg_ops,
             value: Arc::new(RwLock::new(initial)),
+            children: Vec::new(),
+        }
+    }
+
+    /// Creates a leaf data attribute whose runtime value is the lock `value`,
+    /// shared with every other holder of the same `Arc`.
+    ///
+    /// A store through either holder is seen by the other, which is how a
+    /// handle on an attribute of a served model is made.
+    pub fn with_shared_value(
+        name: impl Into<String>,
+        fc: FC,
+        ty: DataAttributeType,
+        trg_ops: TrgOps,
+        value: Arc<RwLock<MmsValue>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            fc,
+            ty,
+            trg_ops,
+            value,
             children: Vec::new(),
         }
     }
@@ -478,6 +548,7 @@ impl DataAttribute {
 
 /// One data set, per IEC 61850-7-2 §22.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DataSet {
     /// The data set name, without the `LN$` prefix; the MMS mapping adds the
     /// wire name.
@@ -486,8 +557,19 @@ pub struct DataSet {
     pub entries: Vec<DataSetEntry>,
 }
 
+impl DataSet {
+    /// Creates a data set named `name` with the given entries.
+    pub fn new(name: impl Into<String>, entries: Vec<DataSetEntry>) -> Self {
+        Self {
+            name: name.into(),
+            entries,
+        }
+    }
+}
+
 /// One data set entry, addressing a data attribute or one of its components.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DataSetEntry {
     /// The logical device instance of the referenced node. Left empty for the
     /// same device, in which case the builder fills it in.
@@ -503,6 +585,24 @@ pub struct DataSetEntry {
     pub array_index: Option<u32>,
     /// Component below the addressed attribute, if the entry names one.
     pub component: Option<String>,
+}
+
+impl DataSetEntry {
+    /// Creates an entry addressing `do_path` under the logical node `ln_name`
+    /// and the functional constraint `fc`.
+    ///
+    /// `ld_inst` is empty, which the builder fills in with the device that
+    /// owns the data set; `array_index` and `component` are `None`.
+    pub fn new(ln_name: impl Into<String>, fc: FC, do_path: Vec<String>) -> Self {
+        Self {
+            ld_inst: String::new(),
+            ln_name: ln_name.into(),
+            fc,
+            do_path,
+            array_index: None,
+            component: None,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

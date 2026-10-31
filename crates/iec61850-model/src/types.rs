@@ -13,6 +13,7 @@ use core::fmt;
 /// A variable-length string or bit string carries its limit as a parameter,
 /// rather than having one variant per length.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DataAttributeType {
     /// BOOLEAN.
     Boolean,

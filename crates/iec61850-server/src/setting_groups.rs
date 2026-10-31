@@ -1134,11 +1134,13 @@ mod tests {
         };
 
         let lln0 = LogicalNodeBuilder::lln0()
-            .set_sgcb(SettingGroupControlBlock {
-                num_of_sg: 4,
-                act_sg: 1,
-                has_resv_tms: true,
-                default_resv_tms_s: 45,
+            .set_sgcb({
+                let mut sgcb = SettingGroupControlBlock::default();
+                sgcb.num_of_sg = 4;
+                sgcb.act_sg = 1;
+                sgcb.has_resv_tms = true;
+                sgcb.default_resv_tms_s = 45;
+                sgcb
             })
             .build()
             .unwrap();

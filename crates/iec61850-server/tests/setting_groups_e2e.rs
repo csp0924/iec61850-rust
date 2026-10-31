@@ -43,29 +43,16 @@ fn build_sg_demo_model() -> Arc<IedModel> {
         TrgOps::default(),
         MmsValue::Integer(0),
     );
-    let setpoint = DataObject {
-        name: "Setpoint".into(),
-        array_count: None,
-        children: vec![DoChild::Da(set_val), DoChild::Da(cur_val)],
-    };
-    let ggio = LogicalNode {
-        prefix: String::new(),
-        class: "GGIO".into(),
-        inst: "1".into(),
-        dos: vec![setpoint],
-        datasets: vec![],
-        rcbs: vec![],
-        gocbs: vec![],
-        svcbs: vec![],
-        lcbs: vec![],
-        sgcb: None,
-    };
+    let setpoint = DataObject::new("Setpoint", vec![DoChild::Da(set_val), DoChild::Da(cur_val)]);
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![setpoint]);
     let lln0 = LogicalNodeBuilder::lln0()
-        .set_sgcb(SettingGroupControlBlock {
-            num_of_sg: 3,
-            act_sg: 1,
-            has_resv_tms: false,
-            default_resv_tms_s: 60,
+        .set_sgcb({
+            let mut sgcb = SettingGroupControlBlock::default();
+            sgcb.num_of_sg = 3;
+            sgcb.act_sg = 1;
+            sgcb.has_resv_tms = false;
+            sgcb.default_resv_tms_s = 60;
+            sgcb
         })
         .build()
         .unwrap();

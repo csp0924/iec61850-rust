@@ -58,11 +58,13 @@ fn model_with_writable_vendor() -> (Arc<IedModel>, Arc<RwLock<MmsValue>>) {
         .unwrap();
     let lln0 = LogicalNodeBuilder::lln0()
         .add_do(nam_plt)
-        .set_sgcb(SettingGroupControlBlock {
-            num_of_sg: 3,
-            act_sg: 1,
-            has_resv_tms: false,
-            default_resv_tms_s: 60,
+        .set_sgcb({
+            let mut sgcb = SettingGroupControlBlock::default();
+            sgcb.num_of_sg = 3;
+            sgcb.act_sg = 1;
+            sgcb.has_resv_tms = false;
+            sgcb.default_resv_tms_s = 60;
+            sgcb
         })
         .build()
         .unwrap();

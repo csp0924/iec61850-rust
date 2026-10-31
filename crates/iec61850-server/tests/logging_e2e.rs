@@ -50,16 +50,8 @@ fn model() -> Arc<IedModel> {
         TrgOps::DCHG,
         MmsValue::Boolean(false),
     );
-    let ind1 = DataObject {
-        name: "Ind1".into(),
-        array_count: None,
-        children: vec![DoChild::Da(st_val), DoChild::Da(q)],
-    };
-    let ind2 = DataObject {
-        name: "Ind2".into(),
-        array_count: None,
-        children: vec![DoChild::Da(other)],
-    };
+    let ind1 = DataObject::new("Ind1", vec![DoChild::Da(st_val), DoChild::Da(q)]);
+    let ind2 = DataObject::new("Ind2", vec![DoChild::Da(other)]);
     let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
         .add_do(ind1)
         .add_do(ind2)

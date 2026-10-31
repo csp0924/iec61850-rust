@@ -537,6 +537,12 @@ fn leaf_from_da_type(ty: DataAttributeType) -> Result<MmsLeafType> {
                 ty
             )));
         }
+        _ => {
+            return Err(ServerError::InvalidModel(format!(
+                "data attribute type {:?} has no MMS mapping",
+                ty
+            )));
+        }
     };
     Ok(leaf)
 }
@@ -932,11 +938,8 @@ mod tests {
             TrgOps::default(),
             MmsValue::Boolean(false),
         );
-        let do_node = DataObject {
-            name: "Ind".to_string(),
-            array_count: Some(3),
-            children: vec![DoChild::Da(inner_da)],
-        };
+        let mut do_node = DataObject::new("Ind".to_string(), vec![DoChild::Da(inner_da)]);
+        do_node.array_count = Some(3);
         let spec = build_do_type_spec(&do_node, FC::St).unwrap();
         match spec {
             MmsTypeSpec::Array { count, inner } => {
@@ -953,14 +956,13 @@ mod tests {
     fn ln_fc_order_mx_st_cf() {
         // The node is built directly: the model builder admits only LLN0
         // outside a logical device.
-        let ln = LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![DataObject {
-                name: "TotW".into(),
-                array_count: None,
-                children: vec![
+        let ln = LogicalNode::new(
+            String::new(),
+            "MMXU",
+            "1",
+            vec![DataObject::new(
+                "TotW",
+                vec![
                     DoChild::Da(DataAttribute::new(
                         "mag",
                         FC::Mx,
@@ -983,14 +985,8 @@ mod tests {
                         MmsValue::VisibleString(String::new()),
                     )),
                 ],
-            }],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+            )],
+        );
         let spec = build_ln_structure(&ln).unwrap();
         match spec {
             MmsTypeSpec::Structure(comps) => {
@@ -1003,28 +999,21 @@ mod tests {
 
     #[test]
     fn ln_only_existing_fc_groups_present() {
-        let ln = LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![DataObject {
-                name: "TotW".into(),
-                array_count: None,
-                children: vec![DoChild::Da(DataAttribute::new(
+        let ln = LogicalNode::new(
+            String::new(),
+            "MMXU",
+            "1",
+            vec![DataObject::new(
+                "TotW",
+                vec![DoChild::Da(DataAttribute::new(
                     "mag",
                     FC::Mx,
                     DataAttributeType::Float32,
                     TrgOps::default(),
                     MmsValue::Float32(0.0),
                 ))],
-            }],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+            )],
+        );
         let spec = build_ln_structure(&ln).unwrap();
         match spec {
             MmsTypeSpec::Structure(comps) => {
@@ -1040,27 +1029,23 @@ mod tests {
     #[test]
     fn sgcb_inserted_first_in_sp_structure() {
         use iec61850_model::SettingGroupControlBlock;
-        let ln = LogicalNode {
-            prefix: String::new(),
-            class: "LLN0".into(),
-            inst: String::new(),
-            dos: vec![DataObject {
-                name: "Mod".into(),
-                array_count: None,
-                children: ln_with_sp_da().into_iter().map(DoChild::Da).collect(),
-            }],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: Some(SettingGroupControlBlock {
-                num_of_sg: 1,
-                act_sg: 1,
-                has_resv_tms: false,
-                default_resv_tms_s: 60,
-            }),
-        };
+        let mut ln = LogicalNode::new(
+            String::new(),
+            "LLN0",
+            String::new(),
+            vec![DataObject::new(
+                "Mod",
+                ln_with_sp_da().into_iter().map(DoChild::Da).collect(),
+            )],
+        );
+        ln.sgcb = Some({
+            let mut sgcb = SettingGroupControlBlock::default();
+            sgcb.num_of_sg = 1;
+            sgcb.act_sg = 1;
+            sgcb.has_resv_tms = false;
+            sgcb.default_resv_tms_s = 60;
+            sgcb
+        });
         let spec = build_ln_structure(&ln).unwrap();
         match spec {
             MmsTypeSpec::Structure(comps) => {
@@ -1101,28 +1086,21 @@ mod tests {
         let long_do = "D".repeat(80);
         let long_da = "A".repeat(80);
 
-        let ln = LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![DataObject {
-                name: long_do.clone(),
-                array_count: None,
-                children: vec![DoChild::Da(DataAttribute::new(
+        let ln = LogicalNode::new(
+            String::new(),
+            "MMXU",
+            "1",
+            vec![DataObject::new(
+                long_do.clone(),
+                vec![DoChild::Da(DataAttribute::new(
                     long_da.clone(),
                     FC::Mx,
                     DataAttributeType::Float32,
                     TrgOps::default(),
                     MmsValue::Float32(0.0),
                 ))],
-            }],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+            )],
+        );
 
         let spec = build_ln_structure(&ln).expect("a long name path must build");
         match spec {

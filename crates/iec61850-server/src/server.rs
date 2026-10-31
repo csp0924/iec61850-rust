@@ -1577,11 +1577,13 @@ mod tests {
     fn model_with_sgcb() -> Arc<IedModel> {
         use iec61850_model::SettingGroupControlBlock;
         let lln0 = LogicalNodeBuilder::lln0()
-            .set_sgcb(SettingGroupControlBlock {
-                num_of_sg: 3,
-                act_sg: 1,
-                has_resv_tms: true,
-                default_resv_tms_s: 30,
+            .set_sgcb({
+                let mut sgcb = SettingGroupControlBlock::default();
+                sgcb.num_of_sg = 3;
+                sgcb.act_sg = 1;
+                sgcb.has_resv_tms = true;
+                sgcb.default_resv_tms_s = 30;
+                sgcb
             })
             .build()
             .unwrap();

@@ -860,23 +860,8 @@ mod tests {
             TrgOps::default(),
             MmsValue::Float32(1.23),
         );
-        let totw_do = DataObject {
-            name: "TotW".into(),
-            array_count: None,
-            children: vec![DoChild::Da(mag_da)],
-        };
-        let mmxu_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![totw_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let totw_do = DataObject::new("TotW", vec![DoChild::Da(mag_da)]);
+        let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![totw_do]);
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
             .add_ln(lln0)
@@ -943,23 +928,8 @@ mod tests {
             MmsValue::Float32(3.5),
         );
         let mag_da = DataAttribute::constructed("mag", FC::Mx, vec![f_da]);
-        let totw_do = DataObject {
-            name: "TotW".into(),
-            array_count: None,
-            children: vec![DoChild::Da(mag_da)],
-        };
-        let mmxu_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![totw_do],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let totw_do = DataObject::new("TotW", vec![DoChild::Da(mag_da)]);
+        let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![totw_do]);
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
             .add_ln(lln0)
@@ -1024,18 +994,7 @@ mod tests {
     /// Wraps one data object into `IED1LD0/MMXU1` and maps the result, so a
     /// test only has to describe the object tree it cares about.
     fn build_model_around(do_node: DataObject) -> (iec61850_model::IedModel, MmsDeviceModel) {
-        let mmxu_ln = iec61850_model::LogicalNode {
-            prefix: String::new(),
-            class: "MMXU".into(),
-            inst: "1".into(),
-            dos: vec![do_node],
-            datasets: vec![],
-            rcbs: vec![],
-            gocbs: vec![],
-            svcbs: vec![],
-            lcbs: vec![],
-            sgcb: None,
-        };
+        let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![do_node]);
         let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
         let ld = LogicalDeviceBuilder::new("LD0")
             .add_ln(lln0)
@@ -1078,20 +1037,15 @@ mod tests {
                 MmsValue::Float32(-1.5),
             )],
         );
-        let phs_a = DataObject {
-            name: "phsA".into(),
-            array_count: None,
-            children: vec![DoChild::Da(DataAttribute::constructed(
+        let phs_a = DataObject::new(
+            "phsA",
+            vec![DoChild::Da(DataAttribute::constructed(
                 "cVal",
                 FC::Mx,
                 vec![mag, ang],
             ))],
-        };
-        let phv = DataObject {
-            name: "PhV".into(),
-            array_count: None,
-            children: vec![DoChild::SubDo(phs_a)],
-        };
+        );
+        let phv = DataObject::new("PhV", vec![DoChild::SubDo(phs_a)]);
         build_model_around(phv)
     }
 
@@ -1253,23 +1207,18 @@ mod tests {
 
     /// Builds a sub-object chain `S0.S1....Sdepth.v` whose only leaf is a float.
     fn build_sdo_chain(depth: usize) -> (iec61850_model::IedModel, MmsDeviceModel) {
-        let mut node = DataObject {
-            name: format!("S{depth}"),
-            array_count: None,
-            children: vec![DoChild::Da(DataAttribute::new(
+        let mut node = DataObject::new(
+            format!("S{depth}"),
+            vec![DoChild::Da(DataAttribute::new(
                 "v",
                 FC::Mx,
                 DataAttributeType::Float32,
                 TrgOps::default(),
                 MmsValue::Float32(9.0),
             ))],
-        };
+        );
         for level in (0..depth).rev() {
-            node = DataObject {
-                name: format!("S{level}"),
-                array_count: None,
-                children: vec![DoChild::SubDo(node)],
-            };
+            node = DataObject::new(format!("S{level}"), vec![DoChild::SubDo(node)]);
         }
         build_model_around(node)
     }

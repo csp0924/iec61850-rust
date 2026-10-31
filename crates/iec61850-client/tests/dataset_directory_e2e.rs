@@ -34,11 +34,7 @@ fn build_model() -> Arc<IedModel> {
             TrgOps::DCHG,
             MmsValue::Boolean(init),
         );
-        DataObject {
-            name: name.into(),
-            array_count: None,
-            children: vec![DoChild::Da(da)],
-        }
+        DataObject::new(name, vec![DoChild::Da(da)])
     }
     let analog_do = {
         let da = DataAttribute::new(
@@ -48,11 +44,7 @@ fn build_model() -> Arc<IedModel> {
             TrgOps::DCHG,
             MmsValue::Float32(1.5),
         );
-        DataObject {
-            name: "AnIn1".into(),
-            array_count: None,
-            children: vec![DoChild::Da(da)],
-        }
+        DataObject::new("AnIn1", vec![DoChild::Da(da)])
     };
 
     let lln0 = LogicalNodeBuilder::lln0().build().expect("lln0");
