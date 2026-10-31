@@ -13,8 +13,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::build_model::{doi_children, instance_children};
 use crate::error::{ErrorKind, SclParseError, SourceSpan, TypeKind};
-use crate::raw::{DataTypeTemplates, RawBda, RawCount, RawDoTypeChild, RawScl};
+use crate::raw::{
+    DataTypeTemplates, RawBda, RawCount, RawDataInstance, RawDoTypeChild, RawLogicalNode, RawScl,
+};
 
 /// The default of [`ResolveOptions::max_expanded_nodes`].
 pub const DEFAULT_MAX_EXPANDED_NODES: u64 = 1_000_000;
@@ -653,8 +656,11 @@ fn check_bda_recursive(
 /// nested attribute the model builder would create, a type being counted once
 /// per reference to it and an array once per element, plus once for the array
 /// itself. Each type's count is computed once and shared, so the check is
-/// linear in the size of the templates. Every chain must already be known to
-/// be acyclic.
+/// linear in the size of the templates. An IED counts the arrays whose element
+/// count its instances give with those counts, read as the model builder
+/// reads them; a type alone counts them as scalars. An IED is rejected at the
+/// logical node whose nodes take the running total past the limit, with that
+/// total. Every chain must already be known to be acyclic.
 fn check_expanded_nodes(raw: &RawScl, max: u64) -> Result<(), SclParseError> {
     let dtt = &raw.data_type_templates;
     let mut counts = ExpansionCounts::default();
@@ -713,19 +719,25 @@ fn check_expanded_nodes(raw: &RawScl, max: u64) -> Result<(), SclParseError> {
             };
             for ld in &server.logical_devices {
                 for ln in &ld.logical_nodes {
-                    let ln_count = 1 + counts.ln_node_type(dtt, &ln.ln_type_ref);
+                    let ln_count = 1u64.saturating_add(counts.ln_node_type_in(dtt, ln));
                     total = total.saturating_add(ln_count);
+                    // The logical nodes after the one that crosses the limit
+                    // are not walked, so the walk stays within about twice
+                    // the limit whatever the number of logical nodes.
+                    if total > max {
+                        return Err(SclParseError::at(
+                            ied.span,
+                            format!("SCL/IED[name=\"{}\"]", ied.name),
+                            ErrorKind::SemanticConflict {
+                                detail: format!(
+                                    "IED `{}` expands to at least {total} model nodes, more than the limit of {max}",
+                                    ied.name
+                                ),
+                            },
+                        ));
+                    }
                 }
             }
-        }
-        if total > max {
-            return Err(over(
-                "IED",
-                &ied.name,
-                total,
-                ied.span,
-                format!("SCL/IED[name=\"{}\"]", ied.name),
-            ));
         }
     }
     Ok(())
@@ -738,9 +750,158 @@ struct ExpansionCounts {
     da_types: BTreeMap<String, u64>,
     do_types: BTreeMap<String, u64>,
     ln_node_types: BTreeMap<String, u64>,
+    /// Whether a DAType, at any depth, holds a count its instances give.
+    instance_da_types: BTreeMap<String, bool>,
+    /// Whether a DOType, at any depth, holds a count its instances give.
+    instance_do_types: BTreeMap<String, bool>,
 }
 
 impl ExpansionCounts {
+    /// The node count of a logical node instance, its data objects counted
+    /// with the element counts the instance gives.
+    fn ln_node_type_in(&mut self, dtt: &DataTypeTemplates, ln: &RawLogicalNode) -> u64 {
+        let Some(lnt) = dtt.ln_node_types.get(&ln.ln_type_ref) else {
+            return 0;
+        };
+        lnt.dos.iter().fold(0u64, |n, do_def| {
+            let values = doi_children(ln, &do_def.name);
+            n.saturating_add(1u64.saturating_add(self.do_type_in(dtt, &do_def.do_type_ref, values)))
+        })
+    }
+
+    /// The node count of DOType `id` in an instance whose values at its level
+    /// are `values`; the memoized type count when the type holds no count its
+    /// instances give.
+    fn do_type_in(
+        &mut self,
+        dtt: &DataTypeTemplates,
+        id: &str,
+        values: Option<&[RawDataInstance]>,
+    ) -> u64 {
+        if !self.do_type_has_instance_count(dtt, id) {
+            return self.do_type(dtt, id);
+        }
+        let Some(dot) = dtt.do_types.get(id) else {
+            return 0;
+        };
+        let mut n: u64 = 0;
+        for child in &dot.children {
+            let child_count = match child {
+                RawDoTypeChild::Da(da) => {
+                    let element = match (da.b_type.as_str(), da.type_ref.as_deref()) {
+                        ("Struct", Some(type_id)) => 1u64.saturating_add(self.da_type_in(
+                            dtt,
+                            type_id,
+                            instance_children(values, &da.name),
+                        )),
+                        _ => 1,
+                    };
+                    with_count(element, instance_count(da.count.as_ref(), values))
+                }
+                RawDoTypeChild::Sdo(sdo) => with_count(
+                    1u64.saturating_add(self.do_type_in(
+                        dtt,
+                        &sdo.do_type_ref,
+                        instance_children(values, &sdo.name),
+                    )),
+                    instance_count(sdo.count.as_ref(), values),
+                ),
+            };
+            n = n.saturating_add(child_count);
+        }
+        n
+    }
+
+    /// The node count of DAType `id` in an instance, as [`Self::do_type_in`].
+    fn da_type_in(
+        &mut self,
+        dtt: &DataTypeTemplates,
+        id: &str,
+        values: Option<&[RawDataInstance]>,
+    ) -> u64 {
+        if !self.da_type_has_instance_count(dtt, id) {
+            return self.da_type(dtt, id);
+        }
+        match dtt.da_types.get(id) {
+            Some(dat) => dat.bdas.iter().fold(0u64, |acc, bda| {
+                acc.saturating_add(self.bda_in(dtt, bda, values))
+            }),
+            None => 0,
+        }
+    }
+
+    fn bda_in(
+        &mut self,
+        dtt: &DataTypeTemplates,
+        bda: &RawBda,
+        values: Option<&[RawDataInstance]>,
+    ) -> u64 {
+        let inner = instance_children(values, &bda.name);
+        let mut n: u64 = 1;
+        if bda.b_type == "Struct" {
+            if let Some(id) = bda.type_ref.as_deref() {
+                n = n.saturating_add(self.da_type_in(dtt, id, inner));
+            }
+        }
+        for child in &bda.bda {
+            n = n.saturating_add(self.bda_in(dtt, child, inner));
+        }
+        with_count(n, instance_count(bda.count.as_ref(), values))
+    }
+
+    fn do_type_has_instance_count(&mut self, dtt: &DataTypeTemplates, id: &str) -> bool {
+        if let Some(&b) = self.instance_do_types.get(id) {
+            return b;
+        }
+        let mut found = false;
+        if let Some(dot) = dtt.do_types.get(id) {
+            for child in &dot.children {
+                found |= match child {
+                    RawDoTypeChild::Da(da) => {
+                        matches!(da.count, Some(RawCount::Attribute(_)))
+                            || match (da.b_type.as_str(), da.type_ref.as_deref()) {
+                                ("Struct", Some(type_id)) => {
+                                    self.da_type_has_instance_count(dtt, type_id)
+                                }
+                                _ => false,
+                            }
+                    }
+                    RawDoTypeChild::Sdo(sdo) => {
+                        matches!(sdo.count, Some(RawCount::Attribute(_)))
+                            || self.do_type_has_instance_count(dtt, &sdo.do_type_ref)
+                    }
+                };
+            }
+        }
+        self.instance_do_types.insert(id.to_string(), found);
+        found
+    }
+
+    fn da_type_has_instance_count(&mut self, dtt: &DataTypeTemplates, id: &str) -> bool {
+        if let Some(&b) = self.instance_da_types.get(id) {
+            return b;
+        }
+        let found = match dtt.da_types.get(id) {
+            Some(dat) => dat
+                .bdas
+                .iter()
+                .any(|bda| self.bda_has_instance_count(dtt, bda)),
+            None => false,
+        };
+        self.instance_da_types.insert(id.to_string(), found);
+        found
+    }
+
+    fn bda_has_instance_count(&mut self, dtt: &DataTypeTemplates, bda: &RawBda) -> bool {
+        matches!(bda.count, Some(RawCount::Attribute(_)))
+            || (bda.b_type == "Struct"
+                && bda
+                    .type_ref
+                    .as_deref()
+                    .is_some_and(|id| self.da_type_has_instance_count(dtt, id)))
+            || bda.bda.iter().any(|c| self.bda_has_instance_count(dtt, c))
+    }
+
     fn da_type(&mut self, dtt: &DataTypeTemplates, id: &str) -> u64 {
         if let Some(&n) = self.da_types.get(id) {
             return n;
@@ -817,10 +978,37 @@ impl ExpansionCounts {
 /// a scalar, and one node for the array plus `element` per element for an
 /// array.
 fn with_elements(element: u64, count: Option<&RawCount>) -> u64 {
-    match count.and_then(RawCount::elements) {
+    with_count(element, count.and_then(RawCount::elements))
+}
+
+/// The node count of an attribute or sub-object of `element` nodes and
+/// `count` elements, `None` for a scalar.
+fn with_count(element: u64, count: Option<u32>) -> u64 {
+    match count {
         Some(n) => 1u64.saturating_add(element.saturating_mul(u64::from(n))),
         None => element,
     }
+}
+
+/// The element count of `count` in an instance whose values at the same level
+/// are `values`: the count itself, or for a count naming an attribute the
+/// value of the `<DAI>` of that name, as the model builder reads it; `None`
+/// for a scalar, including a value the model builder rejects.
+fn instance_count(count: Option<&RawCount>, values: Option<&[RawDataInstance]>) -> Option<u32> {
+    let attr = match count? {
+        RawCount::Attribute(attr) => attr,
+        other => return other.elements(),
+    };
+    let dai = values?.iter().find_map(|v| match v {
+        RawDataInstance::Dai(dai) if &dai.name == attr && dai.ix.is_none() => Some(dai),
+        _ => None,
+    })?;
+    let val = dai
+        .values
+        .iter()
+        .find(|v| v.s_group.is_none())
+        .or_else(|| dai.values.first())?;
+    val.raw_text.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
 #[cfg(test)]

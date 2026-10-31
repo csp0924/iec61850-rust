@@ -197,7 +197,64 @@ fn array_elements_count_against_the_limit() {
         .resolve_with(&options(32))
         .expect_err("33 nodes exceed a limit of 32");
     assert!(
-        err.to_string().contains("expands to 33 model nodes"),
+        err.to_string()
+            .contains("expands to at least 33 model nodes"),
         "{err}"
     );
+}
+
+/// An IED of LLN0 and three GGIO logical nodes, each with the data object `D`
+/// whose array `a` takes its element count from the instance value of `n`,
+/// which every instance sets to `count`.
+fn instance_counts(count: u32) -> String {
+    let doi = format!(r#"<DOI name="D"><DAI name="n"><Val>{count}</Val></DAI></DOI>"#);
+    let lns: String = (1..=3)
+        .map(|i| format!(r#"<LN lnClass="GGIO" inst="{i}" lnType="T_T">{doi}</LN>"#))
+        .collect();
+    format!(
+        r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="T_T">{doi}</LN0>
+    {lns}
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="T_T" lnClass="GGIO"><DO name="D" type="D_T"/></LNodeType>
+    <DOType id="D_T" cdc="HST">
+      <DA name="a" fc="ST" bType="INT32" count="n"/>
+      <DA name="n" fc="CF" bType="INT16U"/>
+    </DOType>
+  </DataTypeTemplates>
+</SCL>"#
+    )
+}
+
+/// The node count of an IED takes the element counts its instances give: four
+/// logical nodes each within the limit on their own, whose sum is above it,
+/// are rejected in stage 2. The walk stops at the logical node that takes the
+/// running total past the limit, which the error reports.
+#[test]
+fn instance_counts_add_up_against_the_limit_of_the_ied() {
+    // Each logical node: itself, D, the array a of 300 elements and n.
+    // 1 + 1 + (1 + 300) + 1 = 304; the running totals are 304, 608, 912 and
+    // 1216.
+    let xml = instance_counts(300);
+    let resolve = |max| {
+        iec61850_scl::parse_scl(&xml)
+            .expect("parse")
+            .resolve_with(&options(max))
+    };
+    for (max, total) in [(1000, 1216), (500, 608), (100, 304)] {
+        let err = resolve(max).expect_err("the IED exceeds the limit");
+        assert!(
+            err.to_string().contains(&format!(
+                "IED `IED1` expands to at least {total} model nodes, more than the limit of {max}"
+            )),
+            "limit {max}: {err}"
+        );
+    }
+    // Control: the same file within a limit of 1216 resolves and builds.
+    resolve(1216)
+        .expect("1216 nodes fit a limit of 1216")
+        .build_model("IED1")
+        .expect("build");
 }
