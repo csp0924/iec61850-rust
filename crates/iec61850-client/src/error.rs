@@ -105,6 +105,14 @@ pub enum ClientError {
     #[error("connection is not established")]
     NotConnected,
 
+    /// A GetNameList walk of the directory services reported more names than
+    /// the connection's limit; see `IedConnection::with_max_name_list_names`.
+    #[error("getnamelist returned more than {limit} names")]
+    NameListLimit {
+        /// The limit that was exceeded.
+        limit: usize,
+    },
+
     /// An error from the MMS or ISO layer below that no other variant
     /// describes, rendered through its `Display`: a PDU or SPDU that does not
     /// decode, an exhausted invokeID space, or another protocol failure.

@@ -88,21 +88,23 @@ pub enum AcsiClass {
 
 // Name list retrieval, following the GetNameList continuation.
 
-/// Most names one GetNameList walk collects across its pages.
-const MAX_NAME_LIST_NAMES: usize = 1_000_000;
+/// Default for the most names one GetNameList walk collects across its pages;
+/// see [`IedConnection::with_max_name_list_names`].
+pub const DEFAULT_MAX_NAME_LIST_NAMES: usize = 1_000_000;
 
 /// Calls GetNameList repeatedly until the server reports no more names.
 ///
 /// `domain` selects the scope: `Some(name)` is domain-specific, `None` is
 /// VMD-specific. Each continuation must move past the previous one, and the
-/// walk stops at `MAX_NAME_LIST_NAMES` names, so a server that keeps reporting
-/// more cannot hold the client in the loop.
+/// walk stops at the connection's name limit, so a server that keeps
+/// reporting more cannot hold the client in the loop.
 ///
 /// # Errors
 ///
 /// `NotConnected` if the association is not established, `Mms` if a page that
-/// reports more names ends on the name the previous page ended on, or the walk
-/// exceeds `MAX_NAME_LIST_NAMES` names, and the error the MMS layer reports.
+/// reports more names ends on the name the previous page ended on,
+/// `NameListLimit` if the walk exceeds the connection's name limit, and the
+/// error the MMS layer reports.
 async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     conn: &IedConnection<T, Tm>,
     object_class: ObjectClass,
@@ -111,6 +113,7 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     if !conn.is_connected() {
         return Err(ClientError::NotConnected);
     }
+    let limit = conn.max_name_list_names;
     let mut all: Vec<String> = Vec::new();
     let mut continue_after: Option<String> = None;
     loop {
@@ -119,16 +122,14 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
             .get_name_list(object_class, domain, continue_after.as_deref())
             .await?;
         drop(client);
-        if all.len().saturating_add(page.len()) > MAX_NAME_LIST_NAMES {
+        if all.len().saturating_add(page.len()) > limit {
             tracing::warn!(
                 ?object_class,
                 domain,
-                limit = MAX_NAME_LIST_NAMES,
+                limit,
                 "getnamelist walk exceeds the name limit, abandoning it"
             );
-            return Err(ClientError::Mms(format!(
-                "getnamelist returned more than {MAX_NAME_LIST_NAMES} names"
-            )));
+            return Err(ClientError::NameListLimit { limit });
         }
         if let Some(last) = page.last().cloned() {
             all.extend(page);

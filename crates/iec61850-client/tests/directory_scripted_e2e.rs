@@ -10,6 +10,7 @@ mod support;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use iec61850_client::directory::DEFAULT_MAX_NAME_LIST_NAMES;
 use iec61850_client::{AcsiClass, ClientError, IedConnection};
 use iec61850_mms::mms::pdu::get_name_list::{
     decode_confirmed_get_name_list_request, encode_confirmed_get_name_list_response,
@@ -136,6 +137,45 @@ async fn name_list_walk_that_does_not_advance_is_an_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn name_list_walk_past_the_name_limit_is_an_error() {
     let conn = connect("ENDLESS").await;
+    assert_eq!(conn.max_name_list_names(), DEFAULT_MAX_NAME_LIST_NAMES);
     let r = conn.get_server_directory(false).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert_eq!(
+        r,
+        Err(ClientError::NameListLimit {
+            limit: DEFAULT_MAX_NAME_LIST_NAMES
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_past_a_configured_limit_is_an_error() {
+    let port = support::start(script_for("ENDLESS")).await;
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    )
+    .with_max_name_list_names(3_000);
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    let r = conn.get_server_directory(false).await;
+    assert_eq!(r, Err(ClientError::NameListLimit { limit: 3_000 }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_within_a_configured_limit_completes() {
+    let port = support::start(script_for("MODEL")).await;
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    )
+    .with_max_name_list_names(6);
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    let lns = conn
+        .get_logical_device_directory("MODEL")
+        .await
+        .expect("ld directory");
+    assert_eq!(lns, vec!["GGIO1".to_string(), "LLN0".to_string()]);
 }

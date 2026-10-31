@@ -60,6 +60,8 @@ pub struct IedConnection<T = TcpStream, Tm = TokioTimer> {
     /// Device model cache, keyed by logical device name. Populated lazily on
     /// the first directory call and reused afterwards.
     pub(crate) device_model: Arc<Mutex<Option<crate::directory::DeviceModel>>>,
+    /// Most names one GetNameList walk may collect.
+    pub(crate) max_name_list_names: usize,
 }
 
 /// `IedConnection` without type-parameter defaults, for a `no_std` build.
@@ -70,6 +72,7 @@ pub struct IedConnection<T, Tm> {
     pub(crate) mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     pub(crate) is_connected: Arc<AtomicBool>,
     pub(crate) device_model: Arc<Mutex<Option<crate::directory::DeviceModel>>>,
+    pub(crate) max_name_list_names: usize,
 }
 
 // Accessors independent of transport and timer, shared by the submodules.
@@ -120,7 +123,25 @@ impl<T, Tm> IedConnection<T, Tm> {
             mms_client: Arc::new(Mutex::new(mms_client)),
             is_connected,
             device_model: Arc::new(Mutex::new(None)),
+            max_name_list_names: crate::directory::DEFAULT_MAX_NAME_LIST_NAMES,
         }
+    }
+
+    /// Sets the most names one GetNameList walk of the directory services may
+    /// collect across its pages; a walk past it fails with
+    /// [`ClientError::NameListLimit`].
+    ///
+    /// The limit keeps a server that keeps reporting more names from holding
+    /// the client in the walk. Defaults to
+    /// [`DEFAULT_MAX_NAME_LIST_NAMES`](crate::directory::DEFAULT_MAX_NAME_LIST_NAMES).
+    pub fn with_max_name_list_names(mut self, max_names: usize) -> Self {
+        self.max_name_list_names = max_names;
+        self
+    }
+
+    /// Returns the most names one GetNameList walk may collect.
+    pub fn max_name_list_names(&self) -> usize {
+        self.max_name_list_names
     }
 }
 
