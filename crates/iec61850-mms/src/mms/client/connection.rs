@@ -417,8 +417,12 @@ impl MmsConnection<TcpStream, TokioTimer> {
     ///
     /// - `ConnectTimeout` when the TCP connection and the COTP handshake do not
     ///   complete within `connect_timeout_ms`.
-    /// - `IsoError` when the name does not resolve or every address refuses.
-    /// - The errors of [`Self::connect_via`] for the rest of the association.
+    /// - `Transport` when the name does not resolve or every address refuses.
+    /// - `ServiceTimeout` when the Initiate response does not arrive within
+    ///   `request_timeout_ms`.
+    /// - `SessionRefused`, `AssociateFailed` or `InitiateFailed` when the peer
+    ///   refuses at the Session, ACSE or MMS level.
+    /// - `IsoError` or `PduParse` for a malformed answer.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         self.reset_association_state();
         self.set_state(ConnectionState::Connecting);
@@ -656,9 +660,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// embedded IP stack for instance. Only the COTP handshake and the
     /// Session, Presentation, ACSE and MMS Initiate negotiation happen here.
     ///
-    /// `connect` performs the TCP connection and then calls this; the TLS path uses
-    /// `connect_tls`, which drives its own COTP connection instead. On failure the
-    /// connection is left `Closed`.
+    /// `connect` and `connect_tls` establish their own transport and COTP
+    /// connection under one deadline and then run the same negotiation. On
+    /// failure the connection is left `Closed`.
     ///
     /// The COTP CR and CC are bounded by `connect_timeout_ms`.
     ///
@@ -1661,8 +1665,6 @@ fn check_session_accept(raw: &[u8], indication: SessionIndication) -> Result<(),
 
 // Unit tests
 
-// The connect request is built on the std transport and timer, so these run on
-// a std build only.
 #[cfg(all(test, feature = "tls"))]
 mod tls_failure_tests {
     use super::*;
@@ -1720,6 +1722,36 @@ mod tls_failure_tests {
     }
 }
 
+#[cfg(all(test, feature = "std"))]
+mod connect_deadline_tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+
+    /// A peer that never answers the COTP connection request ends
+    /// `connect_via` at `connect_timeout_ms`, and not before, with
+    /// `ConnectTimeout` and the connection closed. On the paused clock only
+    /// the deadline can end the wait.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_cotp_request_ends_connect_via_at_the_connect_timeout() {
+        let (transport, _peer) = tokio::io::duplex(4096);
+        let mut conn = MmsConnection::<DuplexStream, TokioTimer>::new();
+        conn.connect_timeout_ms = 2_000;
+        let start = tokio::time::Instant::now();
+        let result = conn.connect_via(transport).await;
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::ConnectTimeout { timeout_ms: 2_000 })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(2_000));
+        assert_eq!(conn.state, ConnectionState::Closed);
+    }
+}
+
+// The connect request is built on the std transport and timer, so these run on
+// a std build only.
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;

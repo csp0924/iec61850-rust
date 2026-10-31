@@ -83,7 +83,8 @@ tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros
 rustls         = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time", "sync"] }
+# `test-util` runs the connection deadline tests on a paused clock.
+tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time", "sync", "test-util"] }
 iec61850-tls   = { workspace = true }
 rcgen          = { workspace = true }
 criterion      = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
