@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn unknown_tag_returns_err() {
-        // tag [5], 0xa5, is cancel-request and is not implemented
+        // 0xa5 is a constructed [5], which the MMSpdu CHOICE does not define
         let data = &[0xa5u8, 0x01, 0x00];
         let result = MmsPdu::decode(data);
         assert!(matches!(result, Err(MmsError::UnknownMmsPduTag(0xa5))));
@@ -442,7 +442,9 @@ mod tests {
 
     #[test]
     fn cancel_tags_56_7_all_unknown() {
-        for tag in [0xa5u8, 0xa6, 0xa7] {
+        // cancel-RequestPDU [5] and cancel-ResponsePDU [6] are primitive
+        // Unsigned32, cancel-ErrorPDU [7] is a constructed SEQUENCE
+        for tag in [0x85u8, 0x86, 0xa7, 0xa5, 0xa6] {
             let data = &[tag, 0x01, 0x00];
             let result = MmsPdu::decode(data);
             assert!(
