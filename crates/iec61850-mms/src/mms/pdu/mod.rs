@@ -31,6 +31,7 @@ pub mod delete_named_variable_list;
 pub mod get_name_list;
 pub mod get_named_variable_list_attrs;
 pub mod get_var_access_attrs;
+pub mod identify;
 pub mod information_report;
 pub mod initiate;
 pub mod read;
@@ -79,6 +80,11 @@ pub use get_var_access_attrs::{
     encode_confirmed_get_var_access_attrs_request, encode_confirmed_get_var_access_attrs_response,
     GetVariableAccessAttributesRequest, GetVariableAccessAttributesResponse,
     SERVICE_TAG_GET_VAR_ACCESS_ATTRS,
+};
+pub use identify::{
+    decode_confirmed_identify_request, decode_confirmed_identify_response,
+    encode_confirmed_identify_request, encode_confirmed_identify_response, IdentifyResponse,
+    SERVICE_TAG_IDENTIFY_REQUEST, SERVICE_TAG_IDENTIFY_RESPONSE,
 };
 pub use information_report::{
     encode_command_termination_negative, encode_command_termination_positive,
