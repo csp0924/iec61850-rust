@@ -14,20 +14,36 @@
 //! client.disconnect().unwrap();
 //! ```
 //!
+//! ## Coverage
+//!
+//! Every service of [`MmsClient`] has a blocking counterpart of the same name and
+//! arguments, as do the association and state accessors. The one exception is
+//! the transport-generic entry point, `MmsClient::from_transport` and its
+//! variants: a caller with its own transport is async already and uses
+//! `MmsClient` directly.
+//!
 //! ## Not for use inside a runtime
 //!
-//! A caller already inside a tokio runtime must not construct a `BlockingMmsClient`:
-//! blocking on a current-thread runtime from within a runtime panics. Await the
-//! `MmsClient` methods directly instead.
+//! A caller already inside a tokio runtime must not use a `BlockingMmsClient`:
+//! blocking on a current-thread runtime from within a runtime panics, and so does
+//! dropping one there. Await the `MmsClient` methods directly instead.
 
 use super::error::ClientError;
 use super::{ConnectionState, MmsClient, MmsClientBuilder, MmsValue};
+use crate::compat::Arc;
 use crate::mms::pdu::{
-    GetNamedVariableListAttributesResponse, IdentifyResponse, ObjectClass, StatusResponse,
-    TypeSpecification,
+    AccessResult, DefineNamedVariableEntry, GetNamedVariableListAttributesResponse,
+    IdentifyResponse, ListOfVariableEntry, ObjectClass, ReadJournalRequest, ReadJournalResponse,
+    StatusResponse, TypeSpecification, WriteOutcome,
 };
+use bytes::Bytes;
+use core::sync::atomic::AtomicBool;
+use core::time::Duration;
 
 /// Synchronous wrapper over [`MmsClient`], owning a private current-thread runtime.
+///
+/// The runtime is dropped with the client, which panics inside an async
+/// runtime; see the module documentation.
 pub struct BlockingMmsClient {
     inner: MmsClient,
     rt: tokio::runtime::Runtime,
@@ -61,11 +77,21 @@ impl BlockingMmsClient {
     // Association management
 
     /// Establishes an ISO and MMS association with the given host and port.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         self.rt.block_on(self.inner.connect(host, port))
     }
 
     /// Establishes an association over TLS, synchronously.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     #[cfg(feature = "tls")]
     pub fn connect_tls(
         &mut self,
@@ -78,8 +104,24 @@ impl BlockingMmsClient {
     }
 
     /// Runs the MMS Conclude sequence and closes the connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn disconnect(&mut self) -> Result<(), ClientError> {
         self.rt.block_on(self.inner.disconnect())
+    }
+
+    /// Aborts the association: sends an ACSE ABRT inside a Session AB and
+    /// closes the transport without waiting for an answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn abort(&mut self) -> Result<(), ClientError> {
+        self.rt.block_on(self.inner.abort())
     }
 
     /// Closes the transport immediately, without any release handshake.
@@ -97,29 +139,214 @@ impl BlockingMmsClient {
         self.inner.negotiated_max_pdu_size()
     }
 
+    /// Returns a flag that is `true` exactly while the association is
+    /// established.
+    pub fn connected_flag(&mut self) -> Arc<AtomicBool> {
+        self.inner.connected_flag()
+    }
+
     // Service API
 
     /// Reads one MMS variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn read(&mut self, domain: &str, item: &str) -> Result<MmsValue, ClientError> {
         self.rt.block_on(self.inner.read(domain, item))
     }
 
     /// Writes one MMS variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn write(&mut self, domain: &str, item: &str, value: MmsValue) -> Result<(), ClientError> {
         self.rt.block_on(self.inner.write(domain, item, value))
     }
 
+    /// Reads one array element, or a component of it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn read_single_array_element(
+        &mut self,
+        domain: &str,
+        item: &str,
+        index: u32,
+        component: Option<&str>,
+    ) -> Result<MmsValue, ClientError> {
+        self.rt.block_on(
+            self.inner
+                .read_single_array_element(domain, item, index, component),
+        )
+    }
+
+    /// Writes one array element, or a component of it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn write_single_array_element(
+        &mut self,
+        domain: &str,
+        item: &str,
+        index: u32,
+        component: Option<&str>,
+        value: MmsValue,
+    ) -> Result<(), ClientError> {
+        self.rt.block_on(
+            self.inner
+                .write_single_array_element(domain, item, index, component, value),
+        )
+    }
+
+    /// Reads several MMS variables with one Read service.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn read_list(
+        &mut self,
+        entries: Vec<ListOfVariableEntry>,
+    ) -> Result<Vec<AccessResult>, ClientError> {
+        self.rt.block_on(self.inner.read_list(entries))
+    }
+
+    /// Reads every value of a named variable list.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn read_named_variable_list_values(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+    ) -> Result<Vec<AccessResult>, ClientError> {
+        self.rt.block_on(
+            self.inner
+                .read_named_variable_list_values(domain, list_name),
+        )
+    }
+
+    /// Writes every value of a named variable list.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn write_named_variable_list_values(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+        values: Vec<MmsValue>,
+    ) -> Result<Vec<WriteOutcome>, ClientError> {
+        self.rt.block_on(
+            self.inner
+                .write_named_variable_list_values(domain, list_name, values),
+        )
+    }
+
+    /// Creates a named variable list.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn define_named_variable_list(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+        entries: Vec<DefineNamedVariableEntry>,
+    ) -> Result<(), ClientError> {
+        self.rt.block_on(
+            self.inner
+                .define_named_variable_list(domain, list_name, entries),
+        )
+    }
+
+    /// Deletes a named variable list and returns the numbers matched and
+    /// deleted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn delete_named_variable_list(
+        &mut self,
+        domain: &str,
+        list_name: &str,
+    ) -> Result<(u32, u32), ClientError> {
+        self.rt
+            .block_on(self.inner.delete_named_variable_list(domain, list_name))
+    }
+
+    /// Reads journal entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn read_journal(
+        &mut self,
+        req: &ReadJournalRequest,
+    ) -> Result<ReadJournalResponse, ClientError> {
+        self.rt.block_on(self.inner.read_journal(req))
+    }
+
+    /// Receives the next Unconfirmed PDU, such as an InformationReport, within
+    /// `timeout_dur`; `Ok(None)` when none arrives in time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
+    pub fn recv_unconfirmed_pdu_with_timeout(
+        &mut self,
+        timeout_dur: Duration,
+    ) -> Result<Option<Bytes>, ClientError> {
+        self.rt
+            .block_on(self.inner.recv_unconfirmed_pdu_with_timeout(timeout_dur))
+    }
+
+    /// Returns a set of Unconfirmed PDU content bytes to the back of the stash.
+    pub fn push_back_unconfirmed(&mut self, inner: Bytes) {
+        self.inner.push_back_unconfirmed(inner);
+    }
+
     /// Asks the server to identify itself with the MMS Identify service.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn identify(&mut self) -> Result<IdentifyResponse, ClientError> {
         self.rt.block_on(self.inner.identify())
     }
 
     /// Asks the server for the status of its VMD with the MMS Status service.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn status(&mut self, extended_derivation: bool) -> Result<StatusResponse, ClientError> {
         self.rt.block_on(self.inner.status(extended_derivation))
     }
 
     /// Retrieves a list of object names.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn get_name_list(
         &mut self,
         object_class: ObjectClass,
@@ -133,6 +360,11 @@ impl BlockingMmsClient {
     }
 
     /// Retrieves the access attributes of a variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn get_variable_access_attributes(
         &mut self,
         domain: &str,
@@ -144,6 +376,11 @@ impl BlockingMmsClient {
 
     /// Retrieves the attributes of a named variable list: its members, in
     /// order, and whether it may be deleted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from within an async runtime; see the module
+    /// documentation.
     pub fn get_named_variable_list_attributes(
         &mut self,
         domain: &str,

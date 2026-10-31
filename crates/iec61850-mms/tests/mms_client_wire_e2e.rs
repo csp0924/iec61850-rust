@@ -689,3 +689,50 @@ async fn initiate_request_proposes_the_configured_outstanding_limit() {
     let (_, init) = tokio::join!(c.connect("127.0.0.1", port), probe);
     assert_eq!(init.proposed_max_serv_outstanding_calling, 3);
 }
+
+fn list_entry(item: &str) -> iec61850_mms::mms::pdu::ListOfVariableEntry {
+    iec61850_mms::mms::pdu::ObjectName::DomainSpecific {
+        domain_id: "LD0".to_string(),
+        item_id: item.to_string(),
+    }
+    .into()
+}
+
+#[test]
+fn blocking_client_covers_list_reads_reports_and_abort() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (l, port) = rt.block_on(listener());
+    let peer = rt.spawn(async move {
+        let mut peer = accept(&l, Aare::Accept).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(true), boolean(false)])
+            .await;
+        peer.send_mms(&[0xa3, 0x03, 0xa0, 0x01, 0x07]).await;
+        let (ind, _) = peer.recv_spdu().await.expect("abort");
+        ind
+    });
+
+    let mut c = iec61850_mms::mms::client::BlockingMmsClient::from_builder(
+        MmsClientBuilder::new().request_timeout_ms(3_000),
+    )
+    .unwrap();
+    c.connect("127.0.0.1", port).unwrap();
+    let results = c
+        .read_list(vec![
+            list_entry("GGIO1$ST$Ind1$stVal"),
+            list_entry("GGIO1$ST$Ind2$stVal"),
+        ])
+        .unwrap();
+    assert_eq!(results, vec![boolean(true), boolean(false)]);
+    let report = c
+        .recv_unconfirmed_pdu_with_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(report.as_deref(), Some(&[0xa0, 0x01, 0x07][..]));
+    c.abort().unwrap();
+    assert_eq!(c.state(), ConnectionState::Closed);
+    assert_eq!(rt.block_on(peer).unwrap(), SessionIndication::Abort);
+}
