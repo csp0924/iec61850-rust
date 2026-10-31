@@ -55,10 +55,12 @@ pub struct GooseSubscriberState {
     pub sq_num: u32,
     /// Configuration revision.
     pub conf_rev: u32,
-    /// Raw 8-byte UTC time from the PDU.
+    /// Raw 8-byte UTC time from the `t` member of the PDU.
     ///
-    /// A publication that carries no `t` field leaves this zero and is logged,
-    /// so a zero value is not a trustworthy timestamp.
+    /// `t` is mandatory (IEC 61850-8-1 Annex A): a frame without it, or with
+    /// one that is not 8 bytes, fails to decode and is dropped before any
+    /// state is built, so every delivered state carries the time the
+    /// publisher sent.
     pub timestamp_raw: [u8; 8],
     /// `simulation` member of the PDU, the Simulation parameter of SendGOOSE.
     pub simulation: bool,
@@ -547,6 +549,13 @@ impl GooseSubscriber {
     /// An out-of-sequence last publication expires like any other, since the
     /// timeAllowedToLive supervision of IEC 61850-8-1 depends only on when the
     /// last message arrived.
+    ///
+    /// Every frame of the publication restarts the measurement, including one
+    /// that repeats the last sqNum, so a publisher stuck resending one frame
+    /// never expires here; it is reported through `state_valid` instead. Such
+    /// a frame does not re-arm an `Expired` that already fired. How a
+    /// subscriber treats out-of-sequence messages is a local matter in IEC
+    /// 61850-8-1 §18.1.2.5.1.
     pub(crate) fn check_expired_at(&mut self, now: Instant) {
         for track in &mut self.streams {
             if track.expired_fired {
