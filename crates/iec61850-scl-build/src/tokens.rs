@@ -183,6 +183,7 @@ pub fn emit_dat_value(dat: DataAttributeType) -> TokenStream {
         T::Boolean => quote! { ::iec61850_scl::__rt::DataAttributeType::Boolean },
         T::Int8 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int8 },
         T::Int16 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int16 },
+        T::Int24 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int24 },
         T::Int32 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int32 },
         T::Int64 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int64 },
         T::Int128 => quote! { ::iec61850_scl::__rt::DataAttributeType::Int128 },
@@ -214,6 +215,8 @@ pub fn emit_dat_value(dat: DataAttributeType) -> TokenStream {
         T::PhyComAddr => quote! { ::iec61850_scl::__rt::DataAttributeType::PhyComAddr },
         T::OptFlds => quote! { ::iec61850_scl::__rt::DataAttributeType::OptFlds },
         T::TrgOpsBits => quote! { ::iec61850_scl::__rt::DataAttributeType::TrgOpsBits },
+        T::SvOptFlds => quote! { ::iec61850_scl::__rt::DataAttributeType::SvOptFlds },
+        T::LogOptFlds => quote! { ::iec61850_scl::__rt::DataAttributeType::LogOptFlds },
         T::Currency => quote! { ::iec61850_scl::__rt::DataAttributeType::Currency },
         other => unsupported_dat(other),
     }

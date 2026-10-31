@@ -1349,11 +1349,13 @@ pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
 /// A Dbpos takes the IEC 61850-7-3 value names `intermediate-state`, `off`,
 /// `on` and `bad-state`, and a Tcmd `stop`, `lower`, `higher` and `reserved`;
 /// either becomes the two-bit string of its ordinal, and any other text on
-/// them keeps the default with a warning. An Octet64 is written as
-/// base64Binary and a Timestamp as an xs:dateTime such as
+/// them keeps the default with a warning. An Octet6, Octet16 or Octet64 is
+/// written as base64Binary and a Timestamp as an xs:dateTime such as
 /// `2007-12-31T21:01:12.345`, taken as UTC when it carries no time zone
-/// (IEC 61850-6). A value on Quality, Check, EntryTime, EntryID, OptFlds,
-/// TrgOps or PhyComAddr is warned about and the attribute keeps its default.
+/// (IEC 61850-6 §9.5.4.1 Table 45). IEC 61850-6 gives Quality, Check,
+/// EntryTime, EntryID, OptFlds, SvOptFlds, LogOptFlds, TrgOps and PhyComAddr
+/// no value representation (§9.5.4.1 Table 45 and its note, §9.5.4.2), so a
+/// value on one is warned about and the attribute keeps its default.
 ///
 /// Also used by the build-script path through [`crate::__build_internals`], so
 /// the value is parsed once while the build script runs and emitted as a
@@ -1395,7 +1397,7 @@ pub fn parse_val_for_b_type(
                 Some("IEC 61850-6 writes a BOOLEAN as an xs:boolean".to_string()),
             )),
         },
-        "INT8" | "INT16" | "INT32" | "INT64" | "INT128" => {
+        "INT8" | "INT16" | "INT24" | "INT32" | "INT64" | "INT128" => {
             if raw.trim() != raw {
                 return Err(invalid(
                     b_type,
@@ -1408,6 +1410,7 @@ pub fn parse_val_for_b_type(
             let (min, max) = match b_type {
                 "INT8" => (i64::from(i8::MIN), i64::from(i8::MAX)),
                 "INT16" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                "INT24" => (-(1 << 23), (1 << 23) - 1),
                 "INT32" => (i64::from(i32::MIN), i64::from(i32::MAX)),
                 _ => (i64::MIN, i64::MAX),
             };
@@ -1547,13 +1550,18 @@ pub fn parse_val_for_b_type(
                 }
             }
         }
-        "Octet64" => {
-            let bytes = decode_base64(raw)
-                .map_err(|cause| invalid("Octet64 (base64Binary)", Some(cause)))?;
-            if bytes.len() > 64 {
+        "Octet64" | "Octet6" | "Octet16" => {
+            let cap = match b_type {
+                "Octet6" => 6,
+                "Octet16" => 16,
+                _ => 64,
+            };
+            let expected = format!("{b_type} (base64Binary)");
+            let bytes = decode_base64(raw).map_err(|cause| invalid(&expected, Some(cause)))?;
+            if bytes.len() > cap {
                 return Err(invalid(
-                    "Octet64 (base64Binary)",
-                    Some(format!("{} octets exceed the limit of 64", bytes.len())),
+                    &expected,
+                    Some(format!("{} octets exceed the limit of {cap}", bytes.len())),
                 ));
             }
             Ok(MmsValue::OctetString(bytes))
@@ -1561,11 +1569,13 @@ pub fn parse_val_for_b_type(
         "Timestamp" => parse_timestamp(raw)
             .map(MmsValue::UtcTime)
             .map_err(|cause| invalid("Timestamp (xs:dateTime)", Some(cause))),
-        // A bType this function does not parse: warn and return the zero value
-        // of the corresponding type, which leaves the attribute at its default.
-        "Quality" | "Check" | "EntryTime" | "EntryID" | "OptFlds" | "TrgOps" | "PhyComAddr" => {
+        // IEC 61850-6 §9.5.4.1 Table 45 gives these no value representation,
+        // and §9.5.4.2 leaves their values out of SCL, so a `<Val>` on one is
+        // warned about and the attribute keeps the zero value of its type.
+        "Quality" | "Check" | "EntryTime" | "EntryID" | "OptFlds" | "SvOptFlds" | "LogOptFlds"
+        | "TrgOps" | "PhyComAddr" => {
             tracing::warn!(
-                "a `<Val>` on bType=\"{}\" is not parsed yet, so the attribute keeps its default",
+                "IEC 61850-6 defines no `<Val>` representation for bType=\"{}\", so the attribute keeps its default",
                 b_type
             );
             let dat = b_type_to_dat(b_type, span, path)?;
@@ -1890,6 +1900,7 @@ pub fn b_type_to_dat(
         "BOOLEAN" => T::Boolean,
         "INT8" => T::Int8,
         "INT16" => T::Int16,
+        "INT24" => T::Int24,
         "INT32" => T::Int32,
         "INT64" => T::Int64,
         "INT128" => T::Int128,
@@ -1902,6 +1913,8 @@ pub fn b_type_to_dat(
         "Enum" => T::Enumerated,
         "Dbpos" | "Tcmd" => T::CodedEnum,
         "Check" => T::Check,
+        "Octet6" => T::OctetString(6),
+        "Octet16" => T::OctetString(16),
         "Octet64" => T::OctetString(64),
         "Quality" => T::Quality,
         "Timestamp" => T::Timestamp,
@@ -1916,6 +1929,8 @@ pub fn b_type_to_dat(
         "ObjRef" => T::VisibleString(129),
         "Unicode255" => T::UnicodeString255,
         "OptFlds" => T::OptFlds,
+        "SvOptFlds" => T::SvOptFlds,
+        "LogOptFlds" => T::LogOptFlds,
         "TrgOps" => T::TrgOpsBits,
         // `EntryID` maps to an 8-byte octet string.
         "EntryID" => T::OctetString(8),
@@ -1944,6 +1959,7 @@ pub fn b_type_to_dat(
                         "BOOLEAN",
                         "INT8",
                         "INT16",
+                        "INT24",
                         "INT32",
                         "INT64",
                         "INT128",
@@ -1957,6 +1973,8 @@ pub fn b_type_to_dat(
                         "Dbpos",
                         "Tcmd",
                         "Check",
+                        "Octet6",
+                        "Octet16",
                         "Octet64",
                         "Quality",
                         "Timestamp",
@@ -1969,6 +1987,8 @@ pub fn b_type_to_dat(
                         "ObjRef",
                         "Unicode255",
                         "OptFlds",
+                        "SvOptFlds",
+                        "LogOptFlds",
                         "TrgOps",
                         "EntryID",
                         "EntryTime",

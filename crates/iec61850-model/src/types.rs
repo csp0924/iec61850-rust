@@ -21,6 +21,8 @@ pub enum DataAttributeType {
     Int8,
     /// 16-bit signed integer.
     Int16,
+    /// 24-bit signed integer, the INT24 basic type of IEC 61850-6 §9.5.4.2.
+    Int24,
     /// 32-bit signed integer.
     Int32,
     /// 64-bit signed integer.
@@ -70,6 +72,13 @@ pub enum DataAttributeType {
     OptFlds,
     /// A 6-bit bit string carrying the trigger options.
     TrgOpsBits,
+    /// A 5-bit bit string carrying the option fields of a sampled values
+    /// control block: refresh-time, sample-synchronised, sample-rate,
+    /// data-set and security (IEC 61850-9-2 Table 9).
+    SvOptFlds,
+    /// A 1-bit bit string carrying the option field of a log control block,
+    /// reason-for-inclusion (IEC 61850-7-2 §17.3.2.3).
+    LogOptFlds,
 }
 
 impl DataAttributeType {
@@ -79,6 +88,7 @@ impl DataAttributeType {
             DataAttributeType::Boolean => "Boolean",
             DataAttributeType::Int8 => "Int8",
             DataAttributeType::Int16 => "Int16",
+            DataAttributeType::Int24 => "Int24",
             DataAttributeType::Int32 => "Int32",
             DataAttributeType::Int64 => "Int64",
             DataAttributeType::Int128 => "Int128",
@@ -103,6 +113,8 @@ impl DataAttributeType {
             DataAttributeType::Currency => "Currency",
             DataAttributeType::OptFlds => "OptFlds",
             DataAttributeType::TrgOpsBits => "TrgOpsBits",
+            DataAttributeType::SvOptFlds => "SvOptFlds",
+            DataAttributeType::LogOptFlds => "LogOptFlds",
         }
     }
 }

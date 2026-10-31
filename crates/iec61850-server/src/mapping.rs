@@ -497,6 +497,7 @@ fn leaf_from_da_type(ty: DataAttributeType) -> Result<MmsLeafType> {
         T::Boolean => MmsLeafType::Boolean,
         T::Int8 => MmsLeafType::Integer(8),
         T::Int16 => MmsLeafType::Integer(16),
+        T::Int24 => MmsLeafType::Integer(24),
         T::Int32 => MmsLeafType::Integer(32),
         T::Int64 => MmsLeafType::Integer(64),
         T::Int128 => MmsLeafType::Integer(128),
@@ -518,6 +519,8 @@ fn leaf_from_da_type(ty: DataAttributeType) -> Result<MmsLeafType> {
         T::Quality => MmsLeafType::BitString(StringSize::Max(13)),
         T::OptFlds => MmsLeafType::BitString(StringSize::Max(10)),
         T::TrgOpsBits => MmsLeafType::BitString(StringSize::Max(6)),
+        T::SvOptFlds => MmsLeafType::BitString(StringSize::Max(5)),
+        T::LogOptFlds => MmsLeafType::BitString(StringSize::Max(1)),
         T::GenericBitString(n) => {
             if n == 0 {
                 // A generic bit string declares no size.

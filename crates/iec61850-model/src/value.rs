@@ -65,7 +65,7 @@ impl MmsValue {
         use crate::types::DataAttributeType as T;
         match ty {
             T::Boolean => MmsValue::Boolean(false),
-            T::Int8 | T::Int16 | T::Int32 | T::Int64 | T::Int128 => MmsValue::Integer(0),
+            T::Int8 | T::Int16 | T::Int24 | T::Int32 | T::Int64 | T::Int128 => MmsValue::Integer(0),
             T::Int8U | T::Int16U | T::Int24U | T::Int32U => MmsValue::Unsigned(0),
             T::Float32 => MmsValue::Float32(0.0),
             T::Float64 => MmsValue::Float64(0.0),
@@ -97,13 +97,22 @@ impl MmsValue {
                     data: vec![0; bytes],
                 }
             }
-            // OptFlds is 10 bits wide and TrgOps 6; each gets its own width.
+            // OptFlds is 10 bits wide, TrgOps 6, SvOptFlds 5 and LogOptFlds 1;
+            // each gets its own width.
             T::OptFlds => MmsValue::BitString {
                 padding: 6,
                 data: vec![0, 0],
             },
             T::TrgOpsBits => MmsValue::BitString {
                 padding: 2,
+                data: vec![0],
+            },
+            T::SvOptFlds => MmsValue::BitString {
+                padding: 3,
+                data: vec![0],
+            },
+            T::LogOptFlds => MmsValue::BitString {
+                padding: 7,
                 data: vec![0],
             },
             T::Constructed | T::PhyComAddr => MmsValue::Structure(Vec::new()),
