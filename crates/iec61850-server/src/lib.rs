@@ -44,6 +44,8 @@ pub mod config;
 // level so that `reporting` and `logging` can each be enabled alone and still
 // reach the same wire encoding.
 pub mod flags;
+#[cfg(feature = "full-server")]
+pub mod from_model;
 // `connection` needs std for tokio and its socket types. `ConnectionId` and
 // `ClientConnection` are the routing keys of every sub-feature module, so it is
 // available whenever any sub-feature is on, not only under `full-server`.
@@ -89,6 +91,8 @@ pub use config::{Edition, IedServerConfig, TimeQuality};
 ))]
 pub use connection::{ClientConnection, ConnectionId};
 pub use error::{Result, ServerError};
+#[cfg(feature = "full-server")]
+pub use from_model::{FromModelOptions, FromModelSummary, GooseCommFactory, LogStorageFactory};
 #[cfg(feature = "goose-mapping")]
 pub use goose_mapping::{
     apply_gocb_write, encode_gocb_da, encode_gocb_structure, parse_go_item_id, GoCBHandle,

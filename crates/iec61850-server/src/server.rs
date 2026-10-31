@@ -940,7 +940,9 @@ impl IedServer {
     ///
     /// Besides handing both to the engine, this indexes every member of the
     /// data set by the address of its value, so that a later update can find
-    /// the attribute reference the engine knows it by.
+    /// the attribute reference the engine knows it by, and registers the data
+    /// set so that a read by name resolves it. A data set with an empty name
+    /// stands for none and is not registered.
     ///
     /// # Errors
     ///
@@ -970,9 +972,11 @@ impl IedServer {
         // `<domain>/<LN>$RP$<rcb>`, and the data set keeps its own name. The
         // copy placed in the registry is a separate data set object sharing the
         // same member values.
+        // A control block that names no data set registers none.
         let dataset_key: Option<(String, String)> = rc
             .mms_path
             .split_once('/')
+            .filter(|_| !ds.name.is_empty())
             .map(|(domain, _)| (domain.to_string(), ds.name.clone()));
         let dataset_arc = Arc::new(ds.clone());
 
@@ -1004,7 +1008,7 @@ impl IedServer {
                     );
                 }
             }
-        } else {
+        } else if !dataset_arc.name.is_empty() {
             tracing::warn!(
                 rcb_path = %dataset_arc.name,
                 "the control block reference names no domain; the data set was not registered"
@@ -1042,6 +1046,7 @@ impl IedServer {
         let dataset_key: Option<(String, String)> = brc
             .mms_path
             .split_once('/')
+            .filter(|_| !ds.name.is_empty())
             .map(|(domain, _)| (domain.to_string(), ds.name.clone()));
         let dataset_arc = Arc::new(ds.clone());
 
@@ -1073,7 +1078,7 @@ impl IedServer {
                     );
                 }
             }
-        } else {
+        } else if !dataset_arc.name.is_empty() {
             tracing::warn!(
                 rcb_path = %dataset_arc.name,
                 "the control block reference names no domain; the data set was not registered"

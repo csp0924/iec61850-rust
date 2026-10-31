@@ -72,6 +72,14 @@ pub enum ServerError {
     #[error("server is stopped")]
     NotRunning,
 
+    /// An item is already registered under the reference a registration would
+    /// give another one.
+    #[error("`{reference}` is already registered")]
+    AlreadyRegistered {
+        /// The reference both would have.
+        reference: String,
+    },
+
     /// A `ctlModel` value outside the valid range 0..=4 was found in the model.
     ///
     /// An out-of-range value is rejected rather than coerced, so construction

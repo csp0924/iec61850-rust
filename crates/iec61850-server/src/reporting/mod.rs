@@ -12,6 +12,8 @@ pub mod buffer;
 pub mod dataset;
 pub mod dynamic_ops;
 pub mod engine;
+#[cfg(feature = "full-server")]
+pub(crate) mod multi_instance;
 pub mod pdu;
 pub mod rcb;
 pub mod service;
