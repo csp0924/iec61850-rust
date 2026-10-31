@@ -116,9 +116,10 @@ impl IedServer {
     /// For each logical node of each logical device:
     ///
     /// - each data set, as `<LN>$<name>`, its members bound to the attributes
-    ///   of the model; a member that names a data object or a constructed
-    ///   attribute is bound as the basic-type attributes below it under its
-    ///   functional constraint;
+    ///   of the model; a member that names a data object, a constructed
+    ///   attribute or an array is bound as one member holding the attributes
+    ///   below it under its functional constraint, its value a structure or an
+    ///   MMS array;
     /// - each instance of each report control block, named as the model
     ///   declares (`<name>01` to `<name>NN` when indexed), with its `RptID`,
     ///   `DatSet`, `TrgOps`, `OptFlds`, `BufTm`, `IntgPd` and `ConfRev`; each

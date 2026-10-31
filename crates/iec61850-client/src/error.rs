@@ -127,10 +127,9 @@ pub enum ClientError {
     NameListNotAdvancing,
 
     /// A journal read by `IedConnection::query_journal_all` did not advance:
-    /// the server reported that more entries follow but sent none past the
-    /// last entry received, or a continuation began before the entry it
-    /// resumes after. Following `moreFollows` would repeat the same request
-    /// forever.
+    /// the server reported that more entries follow but a page brought no
+    /// entry whose EntryID was not yet received. Following `moreFollows` would
+    /// repeat the same request forever.
     #[error("the server reported more journal entries but sent none past the last one received")]
     JournalNotAdvancing,
 
