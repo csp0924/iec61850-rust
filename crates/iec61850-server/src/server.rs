@@ -1302,7 +1302,8 @@ impl IedServer {
 
     /// Changes the active setting group of a logical device without consulting
     /// the callbacks, as an application does at start-up or when restoring
-    /// stored state. A client write goes through the callbacks instead.
+    /// stored state, and loads the values of the group into the FC=SG data
+    /// attributes. A client write goes through the callbacks instead.
     ///
     /// # Errors
     ///
@@ -1318,6 +1319,14 @@ impl IedServer {
         rt.force_active_sg(sg).map_err(|e| {
             ServerError::InvalidModel(format!("setting group {} is out of range: {:?}", sg, e))
         })
+    }
+
+    /// Writes `value`, of whatever variant the attribute holds, through the
+    /// update path, so it triggers reports and log entries as an `update_*`
+    /// call does; for values the server itself loads.
+    fn update_value(&self, da: &DataAttribute, value: MmsValue) -> Result<()> {
+        let expected = mms_value_variant_name(&value);
+        self.update_with(da, expected, |_| Ok(value))
     }
 }
 
@@ -1735,7 +1744,7 @@ impl IedServerBuilder<Bound> {
             }
         };
 
-        Ok(IedServer {
+        let server = IedServer {
             inner: Arc::new(IedServerInner {
                 model,
                 config: self.config,
@@ -1766,7 +1775,33 @@ impl IedServerBuilder<Bound> {
                 tls_acceptor: self.tls_acceptor,
                 gocb_registry,
             }),
-        })
+        };
+        server.install_value_hooks();
+        Ok(server)
+    }
+}
+
+impl IedServer {
+    /// Routes the values the server writes on its own, the setting group
+    /// values, through the update path. The hooks hold the server weakly, so
+    /// they do not keep it alive.
+    fn install_value_hooks(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.setting_groups.set_writer(Arc::new(
+            move |da: &DataAttribute, value: MmsValue| {
+                let Some(inner) = weak.upgrade() else {
+                    da.store(value);
+                    return;
+                };
+                if let Err(e) = (IedServer { inner }).update_value(da, value) {
+                    tracing::warn!(
+                        attribute = %da.name,
+                        error = %e,
+                        "a setting group value does not fit its attribute and was not written"
+                    );
+                }
+            },
+        ));
     }
 }
 

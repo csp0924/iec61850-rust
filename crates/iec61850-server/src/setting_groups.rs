@@ -15,22 +15,45 @@
 //! all; [`SettingGroupRegistry::tick_reservations`] releases expired sessions in
 //! the background as well.
 //!
-//! This module implements the control protocol only. The values of a setting
-//! group are stored by the application, which receives the commit through
-//! [`SettingGroupHandler::confirm_edit_sg`] and writes the data attributes
-//! itself. The model holds one value per setting: the FC=SE data attribute is
-//! the edit buffer and the FC=SG data attribute of the same name the value of
-//! the active group. Once a commit of the active group succeeds, every FC=SE
-//! value of the logical device is copied to its FC=SG counterpart; selecting
-//! another active group leaves the FC=SG values to the application.
+//! The runtime also holds the values of every setting group (IEC 61850-7-2
+//! §16). In the model the FC=SG data attribute of a setting is the active
+//! buffer and the FC=SE data attribute of the same name the edit buffer; the
+//! runtime keeps, for each such setting of its logical device, one value per
+//! group:
+//!
+//! - initially the `<Val sGroup="n">` of the model, and for a group the model
+//!   gives no value, the value of the attribute itself;
+//! - SelectActiveSG loads the values of the new group into the FC=SG
+//!   attributes (§16.3.2.2.2);
+//! - SelectEditSG loads the values of the selected group into the FC=SE
+//!   attributes (§16.3.3.1);
+//! - ConfirmEditSGValues stores the FC=SE values into the edited group and,
+//!   when that group is active, loads them into the FC=SG attributes as well
+//!   (§16.2.2.5, §16.3.5.1).
+//!
+//! A value an application writes to an FC=SG attribute directly lasts until
+//! the active group is loaded again; [`SettingGroupRuntime::set_group_value`]
+//! changes what a group holds. Inside an `IedServer` the values are written
+//! through the server's update path, so a data set member they change triggers
+//! reports and log entries as an `update_*` call does.
+//!
+//! The values to load are taken under the lock of the settings and written
+//! once it is released, in the order the changes were made: a load that a
+//! later change of the same buffer has overtaken writes nothing, so the
+//! attributes always end at the values of the latest change. A storage or a
+//! handler reached from such a write may read [`SettingGroupRuntime::group_value`]
+//! but must not change a group from within it.
 
 use crate::connection::ConnectionId;
 use iec61850_mms::mms::pdu::common::{
     AccessResult, DataAccessError, MmsData, ObjectName, WriteOutcome,
 };
-use iec61850_model::{DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, FC};
+use iec61850_model::{
+    DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, MmsValue, FC,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,11 +63,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Application callbacks for the setting group control block.
 ///
 /// Every default implementation allows the operation, which is also the
-/// behavior when no handler is installed. The commit callback is a
-/// notification and cannot veto.
+/// behavior when no handler is installed. The server keeps the values of every
+/// group itself, so a handler only decides whether an operation proceeds and
+/// may persist the values elsewhere; it does not have to write any data
+/// attribute.
 pub trait SettingGroupHandler: Send + Sync {
     /// Called before the active setting group changes. Returning `false`
-    /// refuses the change with `ObjectAccessDenied`.
+    /// refuses the change with `ObjectAccessDenied`, and the FC=SG values stay
+    /// those of the current group.
     fn act_sg_changed(&self, _new_act_sg: u8, _conn_id: ConnectionId) -> bool {
         true
     }
@@ -56,13 +82,17 @@ pub trait SettingGroupHandler: Send + Sync {
         true
     }
 
-    /// Called once a commit has passed every check and just before the edit
-    /// session is cleared. The application reads the edited values here and
-    /// stores them.
-    fn confirm_edit_sg(&self, _edit_sg: u8, _conn_id: ConnectionId) {}
+    /// Called once a commit has passed every check, before the server stores
+    /// the edited values. The FC=SE data attributes hold the edited values of
+    /// group `edit_sg` at this point. Returning `false` refuses the commit with
+    /// `ObjectAccessDenied`: the group keeps its values and the edit session
+    /// stays open.
+    fn confirm_edit_sg(&self, _edit_sg: u8, _conn_id: ConnectionId) -> bool {
+        true
+    }
 }
 
-/// Handler that allows every operation and stores nothing on commit.
+/// Handler that allows every operation.
 #[derive(Debug)]
 pub struct DefaultSettingGroupHandler;
 impl SettingGroupHandler for DefaultSettingGroupHandler {}
@@ -83,6 +113,60 @@ pub struct SettingGroupRuntime {
     pub default_resv_tms_s: u16,
     state: RwLock<State>,
     handler: RwLock<Arc<dyn SettingGroupHandler>>,
+    /// The settings of the logical device and the values of each group. Held
+    /// across every change of the active or edited group and the loads it
+    /// causes, so the values loaded always belong to the group the state
+    /// names.
+    settings: Mutex<Vec<SettingLeaf>>,
+    writer: WriterSlot,
+    /// Serializes the writes of the loads, outside the settings lock.
+    loads: Mutex<()>,
+    /// Number of loads of the FC=SG attributes taken so far.
+    active_loads: AtomicU64,
+    /// Number of loads of the FC=SE attributes taken so far.
+    edit_loads: AtomicU64,
+}
+
+/// Which buffer a load writes.
+#[derive(Debug, Clone, Copy)]
+enum Buffer {
+    /// The FC=SG attributes, the values of the active group.
+    Active,
+    /// The FC=SE attributes, the edit buffer.
+    Edit,
+}
+
+/// The values of one group for one buffer, taken under the settings lock and
+/// written once it is released.
+struct Load {
+    buffer: Buffer,
+    /// The position of this load among the loads of its buffer.
+    ticket: u64,
+    writes: Vec<(DataAttribute, MmsValue)>,
+}
+
+/// Writes a setting value into a data attribute of the served model.
+pub(crate) type SettingWriter = Arc<dyn Fn(&DataAttribute, MmsValue) + Send + Sync>;
+
+/// The writer a registry and its runtimes share; empty until a server installs
+/// its update path, in which case a value is stored directly.
+type WriterSlot = Arc<RwLock<Option<SettingWriter>>>;
+
+/// One leaf setting of a logical device: the FC=SG and FC=SE attributes that
+/// share its path, and the value each group holds, group `n` at index `n - 1`.
+struct SettingLeaf {
+    active: Option<DataAttribute>,
+    edit: Option<DataAttribute>,
+    groups: Vec<MmsValue>,
+}
+
+impl SettingLeaf {
+    fn holds(&self, da: &DataAttribute) -> bool {
+        [&self.active, &self.edit]
+            .into_iter()
+            .flatten()
+            .any(|own| Arc::ptr_eq(&own.value, &da.value))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -116,8 +200,26 @@ pub struct SgcbSnapshot {
 }
 
 impl SettingGroupRuntime {
-    /// Creates the runtime with its configured fields.
+    /// Creates the runtime with its configured fields and no settings; a
+    /// runtime that [`SettingGroupRegistry::from_model`] creates holds the
+    /// settings of its logical device.
     pub fn new(num_of_sg: u8, act_sg: u8, has_resv_tms: bool, default_resv_tms_s: u16) -> Self {
+        Self::with_writer(
+            num_of_sg,
+            act_sg,
+            has_resv_tms,
+            default_resv_tms_s,
+            Arc::default(),
+        )
+    }
+
+    fn with_writer(
+        num_of_sg: u8,
+        act_sg: u8,
+        has_resv_tms: bool,
+        default_resv_tms_s: u16,
+        writer: WriterSlot,
+    ) -> Self {
         let now_ms = now_ms();
         Self {
             num_of_sg,
@@ -131,6 +233,11 @@ impl SettingGroupRuntime {
                 reservation_deadline: None,
             }),
             handler: RwLock::new(Arc::new(DefaultSettingGroupHandler)),
+            settings: Mutex::new(Vec::new()),
+            writer,
+            loads: Mutex::new(()),
+            active_loads: AtomicU64::new(0),
+            edit_loads: AtomicU64::new(0),
         }
     }
 
@@ -178,9 +285,10 @@ impl SettingGroupRuntime {
         }
     }
 
-    /// Selects the active setting group.
+    /// Selects the active setting group and loads its values into the FC=SG
+    /// attributes.
     ///
-    /// Selecting the group that is already active succeeds and changes nothing.
+    /// Selecting the group that is already active loads its values again.
     ///
     /// # Errors
     ///
@@ -208,17 +316,29 @@ impl SettingGroupRuntime {
             );
             return Err(DataAccessError::ObjectAccessDenied);
         }
-        let mut g = self.state.write().map_err(|_| {
-            tracing::error!("setting group state lock is poisoned");
-            DataAccessError::HardwareFault
-        })?;
-        g.act_sg = new_act_sg;
-        g.last_act_tm_ms = now_ms();
+        self.activate(new_act_sg)
+    }
+
+    /// Makes `group` the active group and loads its values into the FC=SG
+    /// attributes; the caller has checked the range.
+    fn activate(&self, group: u8) -> Result<(), DataAccessError> {
+        let load = {
+            let settings = self.lock_settings()?;
+            let mut g = self.state.write().map_err(|_| {
+                tracing::error!("setting group state lock is poisoned");
+                DataAccessError::HardwareFault
+            })?;
+            g.act_sg = group;
+            g.last_act_tm_ms = now_ms();
+            self.prepare_load(&settings, Buffer::Active, group)
+        };
+        self.run_load(load);
         Ok(())
     }
 
-    /// Opens an edit session on a setting group; a group of zero cancels the
-    /// session this association holds.
+    /// Opens an edit session on a setting group and loads its values into the
+    /// FC=SE attributes; a group of zero cancels the session this association
+    /// holds and loads nothing.
     ///
     /// # Errors
     ///
@@ -271,14 +391,31 @@ impl SettingGroupRuntime {
                 );
                 return Err(DataAccessError::ObjectAccessDenied);
             }
-            let mut g = self.state.write().map_err(|_| {
-                tracing::error!("setting group state lock is poisoned");
-                DataAccessError::HardwareFault
-            })?;
-            g.edit_sg = new_edit_sg;
-            g.editing_conn = Some(conn_id);
-            let lifetime = Duration::from_secs(u64::from(self.default_resv_tms_s));
-            g.reservation_deadline = Instant::now().checked_add(lifetime);
+            let load = {
+                let settings = self.lock_settings()?;
+                let mut g = self.state.write().map_err(|_| {
+                    tracing::error!("setting group state lock is poisoned");
+                    DataAccessError::HardwareFault
+                })?;
+                // Another association may have taken the session while the
+                // callback ran; the first to take it keeps it.
+                if let Some(owner) = g.editing_conn {
+                    if owner != conn_id {
+                        tracing::warn!(
+                            owner,
+                            requester = conn_id,
+                            "edit-sg: another association took the edit session"
+                        );
+                        return Err(DataAccessError::TemporarilyUnavailable);
+                    }
+                }
+                g.edit_sg = new_edit_sg;
+                g.editing_conn = Some(conn_id);
+                let lifetime = Duration::from_secs(u64::from(self.default_resv_tms_s));
+                g.reservation_deadline = Instant::now().checked_add(lifetime);
+                self.prepare_load(&settings, Buffer::Edit, new_edit_sg)
+            };
+            self.run_load(load);
         } else {
             g.edit_sg = 0;
             g.editing_conn = None;
@@ -289,14 +426,17 @@ impl SettingGroupRuntime {
 
     /// Commits the open edit session and clears it.
     ///
-    /// The application is notified through
-    /// [`SettingGroupHandler::confirm_edit_sg`] before the session is cleared.
+    /// Once [`SettingGroupHandler::confirm_edit_sg`] allows it, the FC=SE
+    /// values become the values of the edited group, and when that group is
+    /// the active one at the time of the commit, the FC=SG attributes take them
+    /// too.
     ///
     /// # Errors
     ///
     /// Returns `ObjectValueInvalid` when the written value is not `true`, and
     /// `ObjectAccessDenied` when no session is open, when the session has
-    /// expired, or when it belongs to another association.
+    /// expired, when it belongs to another association, or when the handler
+    /// refuses.
     pub fn try_confirm_edit_sg(
         &self,
         cnf_edit_value: bool,
@@ -340,15 +480,52 @@ impl SettingGroupRuntime {
         // The application may persist the values, so the callback runs without
         // the lock held.
         let handler = self.handler_clone();
-        handler.confirm_edit_sg(edit_sg, conn_id);
+        if !handler.confirm_edit_sg(edit_sg, conn_id) {
+            tracing::warn!(
+                edit_sg,
+                conn_id,
+                "confirm-edit-sg: the handler refused the commit"
+            );
+            return Err(DataAccessError::ObjectAccessDenied);
+        }
 
-        let mut g = self.state.write().map_err(|_| {
-            tracing::error!("setting group state lock is poisoned");
-            DataAccessError::HardwareFault
-        })?;
-        g.edit_sg = 0;
-        g.editing_conn = None;
-        g.reservation_deadline = None;
+        let mut settings = self.lock_settings()?;
+        let act_sg = {
+            let mut g = self.state.write().map_err(|_| {
+                tracing::error!("setting group state lock is poisoned");
+                DataAccessError::HardwareFault
+            })?;
+            // The session may have ended while the callback ran.
+            if g.edit_sg != edit_sg || g.editing_conn != Some(conn_id) {
+                tracing::warn!(
+                    conn_id,
+                    "confirm-edit-sg: the edit session ended before the commit"
+                );
+                return Err(DataAccessError::ObjectAccessDenied);
+            }
+            g.edit_sg = 0;
+            g.editing_conn = None;
+            g.reservation_deadline = None;
+            // Read under the settings lock, which a change of the active group
+            // also takes, so the group cannot change before the load below.
+            g.act_sg
+        };
+        let index = usize::from(edit_sg) - 1;
+        for leaf in settings.iter_mut() {
+            let Some(edit) = &leaf.edit else {
+                continue;
+            };
+            let value = edit.snapshot();
+            if let Some(slot) = leaf.groups.get_mut(index) {
+                *slot = value;
+            }
+        }
+        let load =
+            (edit_sg == act_sg).then(|| self.prepare_load(&settings, Buffer::Active, act_sg));
+        drop(settings);
+        if let Some(load) = load {
+            self.run_load(load);
+        }
         Ok(())
     }
 
@@ -413,7 +590,8 @@ impl SettingGroupRuntime {
     }
 
     /// Changes the active setting group from the server side, bypassing the
-    /// handler; intended for application start-up.
+    /// handler, and loads its values into the FC=SG attributes; intended for
+    /// application start-up.
     ///
     /// # Errors
     ///
@@ -423,13 +601,118 @@ impl SettingGroupRuntime {
         if new_act_sg < 1 || new_act_sg > self.num_of_sg {
             return Err(DataAccessError::ObjectValueInvalid);
         }
-        let mut g = self.state.write().map_err(|_| {
-            tracing::error!("setting group state lock is poisoned");
-            DataAccessError::HardwareFault
-        })?;
-        g.act_sg = new_act_sg;
-        g.last_act_tm_ms = now_ms();
+        self.activate(new_act_sg)
+    }
+
+    /// Returns the value setting group `group` holds for the setting `da`,
+    /// the FC=SG or the FC=SE data attribute of a leaf setting of this logical
+    /// device, as the served model holds it.
+    ///
+    /// Returns `None` for a group outside 1 through the group count or an
+    /// attribute that is not such a setting.
+    pub fn group_value(&self, group: u8, da: &DataAttribute) -> Option<MmsValue> {
+        let index = usize::from(group).checked_sub(1)?;
+        let settings = self.settings.lock().ok()?;
+        settings
+            .iter()
+            .find(|leaf| leaf.holds(da))
+            .and_then(|leaf| leaf.groups.get(index).cloned())
+    }
+
+    /// Replaces the value setting group `group` holds for the setting `da`, as
+    /// an application restoring values it persisted does. When `group` is the
+    /// active group, the FC=SG attribute takes the value too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ObjectValueInvalid` for a group outside 1 through the group
+    /// count, `ObjectNonExistent` when `da` is not the FC=SG or FC=SE data
+    /// attribute of a leaf setting of this logical device, and
+    /// `TypeInconsistent` when `value` is not of the type the setting holds.
+    pub fn set_group_value(
+        &self,
+        group: u8,
+        da: &DataAttribute,
+        value: MmsValue,
+    ) -> Result<(), DataAccessError> {
+        if group < 1 || group > self.num_of_sg {
+            return Err(DataAccessError::ObjectValueInvalid);
+        }
+        let mut settings = self.lock_settings()?;
+        let leaf = settings
+            .iter_mut()
+            .find(|leaf| leaf.holds(da))
+            .ok_or(DataAccessError::ObjectNonExistent)?;
+        let slot = leaf
+            .groups
+            .get_mut(usize::from(group) - 1)
+            .ok_or(DataAccessError::ObjectNonExistent)?;
+        if core::mem::discriminant(slot) != core::mem::discriminant(&value) {
+            return Err(DataAccessError::TypeInconsistent);
+        }
+        *slot = value;
+        let load = (group == self.snapshot().act_sg)
+            .then(|| self.prepare_load(&settings, Buffer::Active, group));
+        drop(settings);
+        if let Some(load) = load {
+            self.run_load(load);
+        }
         Ok(())
+    }
+
+    /// Takes the values of `group` for `buffer`, under the settings lock the
+    /// caller holds, as the latest load of that buffer.
+    fn prepare_load(&self, settings: &[SettingLeaf], buffer: Buffer, group: u8) -> Load {
+        let ticket = self.load_count(buffer).fetch_add(1, Ordering::SeqCst) + 1;
+        let index = usize::from(group).saturating_sub(1);
+        let writes = settings
+            .iter()
+            .filter_map(|leaf| {
+                let da = match buffer {
+                    Buffer::Active => leaf.active.as_ref(),
+                    Buffer::Edit => leaf.edit.as_ref(),
+                }?;
+                Some((handle(da), leaf.groups.get(index)?.clone()))
+            })
+            .collect();
+        Load {
+            buffer,
+            ticket,
+            writes,
+        }
+    }
+
+    /// Writes a load, with no settings lock held, unless a later load of the
+    /// same buffer has been taken, which then writes its own values.
+    fn run_load(&self, load: Load) {
+        let _order = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+        if self.load_count(load.buffer).load(Ordering::SeqCst) != load.ticket {
+            return;
+        }
+        let writer = self.writer();
+        for (da, value) in load.writes {
+            write_setting(writer.as_ref(), &da, value);
+        }
+    }
+
+    fn load_count(&self, buffer: Buffer) -> &AtomicU64 {
+        match buffer {
+            Buffer::Active => &self.active_loads,
+            Buffer::Edit => &self.edit_loads,
+        }
+    }
+
+    fn lock_settings(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Vec<SettingLeaf>>, DataAccessError> {
+        self.settings.lock().map_err(|_| {
+            tracing::error!("setting group values lock is poisoned");
+            DataAccessError::HardwareFault
+        })
+    }
+
+    fn writer(&self) -> Option<SettingWriter> {
+        self.writer.read().ok().and_then(|g| g.clone())
     }
 
     fn handler_clone(&self) -> Arc<dyn SettingGroupHandler> {
@@ -469,6 +752,7 @@ pub struct SettingGroupRegistry {
     inner: RwLock<HashMap<String, Arc<SettingGroupRuntime>>>,
     /// Time quality octet of every timestamp the control blocks report.
     time_quality: u8,
+    writer: WriterSlot,
 }
 
 impl std::fmt::Debug for SettingGroupRegistry {
@@ -505,6 +789,7 @@ impl SettingGroupRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             time_quality: crate::TimeQuality::default().to_byte(),
+            writer: Arc::default(),
         }
     }
 
@@ -516,26 +801,56 @@ impl SettingGroupRegistry {
         self
     }
 
+    /// Installs the writer every runtime of the registry writes setting
+    /// values through.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn set_writer(&self, writer: SettingWriter) {
+        match self.writer.write() {
+            Ok(mut g) => *g = Some(writer),
+            Err(_) => tracing::warn!(
+                "setting group writer lock is poisoned, values are stored without the update path"
+            ),
+        }
+    }
+
     /// Builds a registry from a model, with one runtime per logical device
     /// whose LLN0 declares a setting group control block.
+    ///
+    /// Each runtime holds the settings of its logical device with the initial
+    /// value of every group, and the FC=SG attributes of `model` are set to the
+    /// values of the active group. The FC=SE attributes are left as they are
+    /// until an edit session loads them.
     pub fn from_model(model: &IedModel) -> Self {
         let reg = Self::new();
         for ld in &model.lds {
+            // A logical device holds at most one control block.
+            let Some(sgcb) = ld.lns.iter().find_map(|ln| ln.sgcb.as_ref()) else {
+                continue;
+            };
+            let rt = SettingGroupRuntime::with_writer(
+                sgcb.num_of_sg,
+                sgcb.act_sg,
+                sgcb.has_resv_tms,
+                sgcb.default_resv_tms_s,
+                Arc::clone(&reg.writer),
+            );
+            let mut leaves = Vec::new();
             for ln in &ld.lns {
-                if let Some(sgcb) = &ln.sgcb {
-                    let domain = ld.domain_name(&model.ied_name);
-                    let rt = Arc::new(SettingGroupRuntime::new(
-                        sgcb.num_of_sg,
-                        sgcb.act_sg,
-                        sgcb.has_resv_tms,
-                        sgcb.default_resv_tms_s,
-                    ));
-                    if let Ok(mut g) = reg.inner.write() {
-                        g.insert(domain, rt);
-                    }
-                    // A logical device holds at most one control block.
-                    break;
+                for dobj in &ln.dos {
+                    collect_settings(dobj, sgcb.num_of_sg, &mut leaves);
                 }
+            }
+            let active = usize::from(sgcb.act_sg.max(1)) - 1;
+            for leaf in &leaves {
+                if let (Some(da), Some(value)) = (&leaf.active, leaf.groups.get(active)) {
+                    da.store(value.clone());
+                }
+            }
+            if let Ok(mut g) = rt.settings.lock() {
+                *g = leaves;
+            }
+            if let Ok(mut g) = reg.inner.write() {
+                g.insert(ld.domain_name(&model.ied_name), Arc::new(rt));
             }
         }
         reg
@@ -593,35 +908,27 @@ impl SettingGroupRegistry {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Active values
+// Setting values
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Copies every FC=SE value of the logical device named `domain` to the FC=SG
-/// data attribute of the same name, making the committed edit buffer the
-/// values of the active group.
-///
-/// A setting without an FC=SG counterpart, or whose counterpart differs in
-/// type or structure, is left as it is.
-pub(crate) fn activate_edited_values(model: &IedModel, domain: &str) {
-    for ld in &model.lds {
-        if ld.domain_name(&model.ied_name) != domain {
-            continue;
-        }
-        for ln in &ld.lns {
-            for dobj in &ln.dos {
-                copy_edit_buffer(dobj);
-            }
-        }
-    }
-}
-
-fn copy_edit_buffer(dobj: &DataObject) {
+/// Collects the leaf settings below `dobj`, pairing each FC=SG attribute with
+/// the FC=SE attribute of the same name and type.
+fn collect_settings(dobj: &DataObject, num_of_sg: u8, out: &mut Vec<SettingLeaf>) {
     for child in &dobj.children {
         match child {
-            DoChild::SubDo(sub) => copy_edit_buffer(sub),
+            DoChild::SubDo(sub) => collect_settings(sub, num_of_sg, out),
+            DoChild::Da(sg) if sg.fc == FC::Sg => {
+                let se = dobj
+                    .children_with_fc(FC::Se)
+                    .find(|se| se.name == sg.name && se.ty == sg.ty);
+                collect_leaves(Some(sg), se, num_of_sg, out);
+            }
             DoChild::Da(se) if se.fc == FC::Se => {
-                if let Some(sg) = dobj.children_with_fc(FC::Sg).find(|d| d.name == se.name) {
-                    copy_values(se, sg);
+                let paired = dobj
+                    .children_with_fc(FC::Sg)
+                    .any(|sg| sg.name == se.name && sg.ty == se.ty);
+                if !paired {
+                    collect_leaves(None, Some(se), num_of_sg, out);
                 }
             }
             DoChild::Da(_) => {}
@@ -629,18 +936,60 @@ fn copy_edit_buffer(dobj: &DataObject) {
     }
 }
 
-fn copy_values(from: &DataAttribute, to: &DataAttribute) {
-    if from.ty != to.ty {
+/// Collects the leaves of one setting attribute, walking the FC=SG and the
+/// FC=SE tree side by side.
+fn collect_leaves(
+    active: Option<&DataAttribute>,
+    edit: Option<&DataAttribute>,
+    num_of_sg: u8,
+    out: &mut Vec<SettingLeaf>,
+) {
+    let Some(first) = active.or(edit) else {
+        return;
+    };
+    if first.ty == DataAttributeType::Constructed {
+        for c in &first.children {
+            let a = active.and_then(|a| a.child_by_name(&c.name));
+            let e = edit
+                .and_then(|e| e.child_by_name(&c.name))
+                .filter(|e| a.is_none_or(|a| a.ty == e.ty));
+            collect_leaves(a, e, num_of_sg, out);
+        }
         return;
     }
-    if from.ty == DataAttributeType::Constructed {
-        for c in &from.children {
-            if let Some(t) = to.child_by_name(&c.name) {
-                copy_values(c, t);
-            }
-        }
-    } else {
-        to.store(from.snapshot());
+    let groups = (1..=num_of_sg)
+        .map(|g| {
+            active
+                .and_then(|a| a.sgroup_value(g))
+                .or_else(|| edit.and_then(|e| e.sgroup_value(g)))
+                .cloned()
+                .unwrap_or_else(|| first.snapshot())
+        })
+        .collect();
+    out.push(SettingLeaf {
+        active: active.map(handle),
+        edit: edit.map(handle),
+        groups,
+    });
+}
+
+/// A handle on a leaf attribute of the model, sharing its value.
+fn handle(da: &DataAttribute) -> DataAttribute {
+    DataAttribute::with_shared_value(
+        da.name.clone(),
+        da.fc,
+        da.ty,
+        da.trg_ops,
+        Arc::clone(&da.value),
+    )
+}
+
+/// Writes a setting value through the server's update path when one is
+/// installed, and stores it directly otherwise.
+fn write_setting(writer: Option<&SettingWriter>, da: &DataAttribute, value: MmsValue) {
+    match writer {
+        Some(w) => w(da, value),
+        None => da.store(value),
     }
 }
 
@@ -978,9 +1327,10 @@ mod tests {
             last: AtomicU8,
         }
         impl SettingGroupHandler for Spy {
-            fn confirm_edit_sg(&self, edit_sg: u8, _: ConnectionId) {
+            fn confirm_edit_sg(&self, edit_sg: u8, _: ConnectionId) -> bool {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 self.last.store(edit_sg, Ordering::SeqCst);
+                true
             }
         }
         let spy = Arc::new(Spy {
@@ -1436,5 +1786,389 @@ mod tests {
         assert_eq!(extract_sgcb_target(&dom("GGIO1$SP$SGCB")), None);
         assert_eq!(extract_sgcb_target(&dom("GGIO1$SP$SGCB$ActSG")), None);
         assert_eq!(extract_sgcb_target(&dom("$SP$SGCB$ActSG")), None);
+    }
+
+    // ── Values of the setting groups ────────────────────────────────────────
+
+    /// A setting declared under `fc` with one value per group.
+    fn setting(fc: FC, values: [i64; 3]) -> DataAttribute {
+        let mut da = DataAttribute::new(
+            "setVal",
+            fc,
+            DataAttributeType::Int32,
+            iec61850_model::TrgOps::DCHG,
+            MmsValue::Integer(values[0]),
+        );
+        da.sgroup_values = (1u8..).zip(values.map(MmsValue::Integer)).collect();
+        da
+    }
+
+    /// LD0 with three setting groups, group 1 active, and `PTOC1.OpDlTmms`
+    /// holding 10, 20 and 30 under FC=SE and FC=SG, plus
+    /// `PTOC1.StrVal.setMag.f`, an FC=SE-only structured setting with one value
+    /// for every group.
+    fn settings_model() -> IedModel {
+        use iec61850_model::{
+            IedModelBuilder, LogicalDeviceBuilder, LogicalNode, LogicalNodeBuilder,
+            SettingGroupControlBlock,
+        };
+        let op_dl = DataObject::new(
+            "OpDlTmms",
+            vec![
+                DoChild::Da(setting(FC::Se, [10, 20, 30])),
+                DoChild::Da(setting(FC::Sg, [10, 20, 30])),
+            ],
+        );
+        let f = DataAttribute::new(
+            "f",
+            FC::Se,
+            DataAttributeType::Float32,
+            iec61850_model::TrgOps::NONE,
+            MmsValue::Float32(1.5),
+        );
+        let str_val = DataObject::new(
+            "StrVal",
+            vec![DoChild::Da(DataAttribute::constructed(
+                "setMag",
+                FC::Se,
+                vec![f],
+            ))],
+        );
+        let ptoc = LogicalNode::new(String::new(), "PTOC", "1", vec![op_dl, str_val]);
+        let lln0 = LogicalNodeBuilder::lln0()
+            .set_sgcb({
+                let mut sgcb = SettingGroupControlBlock::default();
+                sgcb.num_of_sg = 3;
+                sgcb.act_sg = 1;
+                sgcb
+            })
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(lln0)
+            .add_ln(ptoc)
+            .build()
+            .unwrap();
+        IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn setting_da(model: &IedModel, fc: FC) -> &DataAttribute {
+        let dobj = model.lds[0]
+            .ln_by_name("PTOC1")
+            .unwrap()
+            .do_by_name("OpDlTmms")
+            .unwrap();
+        match dobj.child_by_name("setVal", Some(fc)) {
+            Some(DoChild::Da(da)) => da,
+            other => panic!("setVal under {fc:?}: {other:?}"),
+        }
+    }
+
+    fn str_val_f(model: &IedModel) -> &DataAttribute {
+        let dobj = model.lds[0]
+            .ln_by_name("PTOC1")
+            .unwrap()
+            .do_by_name("StrVal")
+            .unwrap();
+        match dobj.child_by_name("setMag", Some(FC::Se)) {
+            Some(DoChild::Da(da)) => da.child_by_name("f").unwrap(),
+            other => panic!("setMag: {other:?}"),
+        }
+    }
+
+    fn int(da: &DataAttribute) -> i64 {
+        match da.snapshot() {
+            MmsValue::Integer(v) => v,
+            other => panic!("{} holds {other:?}", da.name),
+        }
+    }
+
+    fn settings_runtime(model: &IedModel) -> Arc<SettingGroupRuntime> {
+        SettingGroupRegistry::from_model(model)
+            .lookup("IED1LD0")
+            .expect("runtime")
+    }
+
+    #[test]
+    fn the_model_starts_at_the_values_of_the_active_group() {
+        let model = settings_model();
+        setting_da(&model, FC::Sg).store(MmsValue::Integer(99));
+        let rt = settings_runtime(&model);
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10);
+        assert_eq!(int(setting_da(&model, FC::Se)), 10);
+        assert_eq!(
+            rt.group_value(3, setting_da(&model, FC::Sg)),
+            Some(MmsValue::Integer(30))
+        );
+        // A setting with no value for a group takes the value it holds.
+        assert_eq!(
+            rt.group_value(2, str_val_f(&model)),
+            Some(MmsValue::Float32(1.5))
+        );
+    }
+
+    #[test]
+    fn selecting_the_active_group_loads_its_values() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.try_select_active_sg(2, 100).expect("select 2");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 20);
+        assert_eq!(int(setting_da(&model, FC::Se)), 10, "the edit buffer stays");
+        rt.force_active_sg(3).expect("force 3");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 30);
+    }
+
+    #[test]
+    fn a_refused_selection_loads_nothing() {
+        struct Veto;
+        impl SettingGroupHandler for Veto {
+            fn act_sg_changed(&self, _: u8, _: ConnectionId) -> bool {
+                false
+            }
+        }
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.install_handler(Arc::new(Veto));
+        assert!(rt.try_select_active_sg(2, 100).is_err());
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10);
+    }
+
+    #[test]
+    fn an_edited_group_keeps_its_values_across_selections() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.try_edit_sg(3, 100).expect("edit 3");
+        assert_eq!(int(setting_da(&model, FC::Se)), 30);
+        setting_da(&model, FC::Se).store(MmsValue::Integer(777));
+        str_val_f(&model).store(MmsValue::Float32(9.5));
+        rt.try_confirm_edit_sg(true, 100).expect("commit");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10, "group 3 is not active");
+        assert_eq!(
+            rt.group_value(3, setting_da(&model, FC::Sg)),
+            Some(MmsValue::Integer(777))
+        );
+        assert_eq!(
+            rt.group_value(3, str_val_f(&model)),
+            Some(MmsValue::Float32(9.5))
+        );
+
+        rt.try_select_active_sg(3, 100).expect("select 3");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 777);
+        rt.try_select_active_sg(1, 100).expect("select 1");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10);
+        rt.try_select_active_sg(3, 100).expect("select 3 again");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 777);
+
+        rt.try_edit_sg(1, 100).expect("edit 1");
+        assert_eq!(int(setting_da(&model, FC::Se)), 10);
+        assert_eq!(str_val_f(&model).snapshot(), MmsValue::Float32(1.5));
+    }
+
+    #[test]
+    fn committing_the_active_group_loads_the_edited_values() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.try_edit_sg(1, 100).expect("edit 1");
+        setting_da(&model, FC::Se).store(MmsValue::Integer(11));
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10, "not before the commit");
+        rt.try_confirm_edit_sg(true, 100).expect("commit");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 11);
+    }
+
+    #[test]
+    fn a_cancelled_edit_changes_no_group() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.try_edit_sg(2, 100).expect("edit 2");
+        setting_da(&model, FC::Se).store(MmsValue::Integer(22));
+        rt.try_edit_sg(0, 100).expect("cancel");
+        assert_eq!(
+            rt.group_value(2, setting_da(&model, FC::Se)),
+            Some(MmsValue::Integer(20))
+        );
+    }
+
+    #[test]
+    fn a_commit_the_handler_refuses_keeps_the_group_and_the_session() {
+        struct Refuse;
+        impl SettingGroupHandler for Refuse {
+            fn confirm_edit_sg(&self, _: u8, _: ConnectionId) -> bool {
+                false
+            }
+        }
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        rt.install_handler(Arc::new(Refuse));
+        rt.try_edit_sg(1, 100).expect("edit 1");
+        setting_da(&model, FC::Se).store(MmsValue::Integer(11));
+        assert_eq!(
+            rt.try_confirm_edit_sg(true, 100),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(rt.snapshot().edit_sg, 1, "the session stays open");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10);
+        assert_eq!(
+            rt.group_value(1, setting_da(&model, FC::Sg)),
+            Some(MmsValue::Integer(10))
+        );
+    }
+
+    #[test]
+    fn a_commit_loads_only_into_the_group_active_when_it_completes() {
+        /// Selects group 2 while the commit of group 1 is under way, as
+        /// another association can.
+        struct SwitchDuringCommit(std::sync::OnceLock<Arc<SettingGroupRuntime>>);
+        impl SettingGroupHandler for SwitchDuringCommit {
+            fn confirm_edit_sg(&self, _: u8, _: ConnectionId) -> bool {
+                self.0.get().unwrap().force_active_sg(2).unwrap();
+                true
+            }
+        }
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        let handler = Arc::new(SwitchDuringCommit(std::sync::OnceLock::new()));
+        assert!(handler.0.set(Arc::clone(&rt)).is_ok());
+        rt.install_handler(handler);
+        rt.try_edit_sg(1, 100).expect("edit 1");
+        setting_da(&model, FC::Se).store(MmsValue::Integer(11));
+        rt.try_confirm_edit_sg(true, 100).expect("commit");
+        assert_eq!(int(setting_da(&model, FC::Sg)), 20, "group 2 is active");
+        assert_eq!(
+            rt.group_value(1, setting_da(&model, FC::Sg)),
+            Some(MmsValue::Integer(11))
+        );
+    }
+
+    #[test]
+    fn a_group_value_set_by_the_application_is_kept() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        let sg = setting_da(&model, FC::Sg);
+        rt.set_group_value(2, sg, MmsValue::Integer(25))
+            .expect("group 2");
+        assert_eq!(int(sg), 10, "group 2 is not active");
+        rt.set_group_value(1, setting_da(&model, FC::Se), MmsValue::Integer(15))
+            .expect("group 1 through the edit attribute");
+        assert_eq!(int(sg), 15, "group 1 is active");
+        rt.try_select_active_sg(2, 100).expect("select 2");
+        assert_eq!(int(sg), 25);
+
+        assert_eq!(
+            rt.set_group_value(2, sg, MmsValue::Boolean(true)),
+            Err(DataAccessError::TypeInconsistent)
+        );
+        assert_eq!(
+            rt.set_group_value(4, sg, MmsValue::Integer(1)),
+            Err(DataAccessError::ObjectValueInvalid)
+        );
+        let stranger = DataAttribute::new(
+            "setVal",
+            FC::Sg,
+            DataAttributeType::Int32,
+            iec61850_model::TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        assert_eq!(
+            rt.set_group_value(1, &stranger, MmsValue::Integer(1)),
+            Err(DataAccessError::ObjectNonExistent)
+        );
+        assert_eq!(rt.group_value(1, &stranger), None);
+    }
+
+    #[cfg(feature = "full-server")]
+    #[test]
+    fn values_are_written_through_the_installed_writer() {
+        let model = settings_model();
+        let reg = SettingGroupRegistry::from_model(&model);
+        let written: Arc<std::sync::Mutex<Vec<(FC, MmsValue)>>> = Arc::default();
+        let log = Arc::clone(&written);
+        reg.set_writer(Arc::new(move |da: &DataAttribute, v: MmsValue| {
+            log.lock().unwrap().push((da.fc, v));
+        }));
+        let rt = reg.lookup("IED1LD0").unwrap();
+        rt.try_select_active_sg(2, 100).expect("select 2");
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![(FC::Sg, MmsValue::Integer(20))]
+        );
+        assert_eq!(int(setting_da(&model, FC::Sg)), 10, "the writer decides");
+    }
+
+    #[test]
+    fn a_session_taken_while_the_handler_runs_stays_with_its_owner() {
+        /// Lets association 200 take the session while the request of
+        /// association 100 is in the handler.
+        struct TakenMeanwhile(std::sync::OnceLock<Arc<SettingGroupRuntime>>);
+        impl SettingGroupHandler for TakenMeanwhile {
+            fn edit_sg_changed(&self, _: u8, conn_id: ConnectionId) -> bool {
+                if conn_id == 100 {
+                    self.0.get().unwrap().try_edit_sg(2, 200).unwrap();
+                }
+                true
+            }
+        }
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        let handler = Arc::new(TakenMeanwhile(std::sync::OnceLock::new()));
+        assert!(handler.0.set(Arc::clone(&rt)).is_ok());
+        rt.install_handler(handler);
+        assert_eq!(
+            rt.try_edit_sg(3, 100),
+            Err(DataAccessError::TemporarilyUnavailable)
+        );
+        assert!(rt.is_edit_session_owner(200));
+        assert_eq!(rt.snapshot().edit_sg, 2);
+        assert_eq!(
+            int(setting_da(&model, FC::Se)),
+            20,
+            "group 3 was not loaded"
+        );
+    }
+
+    #[test]
+    fn a_load_overtaken_by_a_later_one_writes_nothing() {
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        let (first, second) = {
+            let settings = rt.settings.lock().unwrap();
+            (
+                rt.prepare_load(&settings, Buffer::Active, 2),
+                rt.prepare_load(&settings, Buffer::Active, 3),
+            )
+        };
+        rt.run_load(second);
+        rt.run_load(first);
+        assert_eq!(int(setting_da(&model, FC::Sg)), 30);
+    }
+
+    #[cfg(feature = "full-server")]
+    #[test]
+    fn the_writer_runs_without_the_settings_lock() {
+        let model = settings_model();
+        let reg = SettingGroupRegistry::from_model(&model);
+        let rt = reg.lookup("IED1LD0").unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<Option<MmsValue>>>> = Arc::default();
+        let (log, reader) = (Arc::clone(&seen), Arc::clone(&rt));
+        reg.set_writer(Arc::new(move |da: &DataAttribute, v: MmsValue| {
+            // Reading a group takes the settings lock, which a writer called
+            // under it would never get.
+            log.lock().unwrap().push(reader.group_value(1, da));
+            da.store(v);
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&rt);
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.try_select_active_sg(2, 100));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the selection completes");
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec![Some(MmsValue::Integer(10))]);
+        assert_eq!(int(setting_da(&model, FC::Sg)), 20);
     }
 }

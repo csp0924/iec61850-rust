@@ -1,9 +1,9 @@
 //! An SCL setting declared with `fc="SE"` served under FC=SG as well.
 //!
 //! IEC 61850-6 makes an FC=SE data attribute visible under FC=SG, the value of
-//! the active setting group, which a client reads and never writes. The model
-//! holds one value per setting: committing an edit of the active group makes
-//! the edited value the FC=SG value, and committing another group leaves it.
+//! the active setting group, which a client reads and never writes.
+//! Committing an edit of the active group makes the edited value the FC=SG
+//! value, and committing another group leaves it.
 //! A setting declared with `fc="SG"` only is not editable under FC=SE. A data
 //! set created at run time takes a member under FC=SG.
 
@@ -272,7 +272,9 @@ async fn data_set_created_at_run_time_takes_an_sg_member() {
     )
     .await
     .expect("CreateDataSet with FC=SG members");
-    // An SE value is available once a setting group is selected for editing.
+    // An SE value is available once a setting group is selected for editing,
+    // which loads the values of the group: for `MinOpTmms`, declared under both
+    // constraints with different values, the group holds the FC=SG value.
     write(&mut c, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(1))
         .await
         .expect("select the edit group");
@@ -285,7 +287,7 @@ async fn data_set_created_at_run_time_takes_an_sg_member() {
         vec![
             AccessResult::Success(MmsData::Integer(250)),
             AccessResult::Success(MmsData::Integer(250)),
-            AccessResult::Success(MmsData::Integer(4)),
+            AccessResult::Success(MmsData::Integer(3)),
             AccessResult::Success(MmsData::Integer(3)),
         ]
     );
