@@ -557,8 +557,10 @@ pub struct DataSetEntry {
     pub ln_name: String,
     /// Functional constraint of the referenced attribute.
     pub fc: FC,
-    /// The path `["DO", "DA", "SDA", ...]`; the last segment may be a data
-    /// attribute or one of its components.
+    /// The path `["DO", "DA", "SDA", ...]`, one name per segment; the last
+    /// segment may be a data attribute or one of its components. A segment
+    /// containing `.` does not resolve, and `IedModelBuilder::build` rejects
+    /// the entry.
     pub do_path: Vec<String>,
     /// Array index, when the referenced data object is an array container.
     pub array_index: Option<u32>,

@@ -97,8 +97,8 @@ impl IedModelBuilder {
     /// an SGCB is attached outside LLN0; [`ModelError::DuplicateName`] when two
     /// logical devices resolve to the same domain name; and
     /// [`ModelError::DataSetEntryUnresolved`] when a data set entry references a
-    /// node that does not exist, or one that carries no attribute under the
-    /// entry's functional constraint.
+    /// node that does not exist, one that carries no attribute under the
+    /// entry's functional constraint, or holds a path segment containing `.`.
     pub fn build(self) -> Result<IedModel> {
         if self.ied_name.is_empty() {
             return Err(ModelError::InvalidObjectRef {
@@ -212,13 +212,13 @@ enum PathNode<'a> {
 /// Reports whether `do_path` names a data object or attribute of `ln` that
 /// carries the functional constraint `fc`.
 ///
-/// The first name names a data object; each further name names a sub-object
-/// or a data attribute below the previous node. A segment holding several
-/// `.`-joined names is walked name by name. A path ending at a data attribute
-/// resolves when the attribute carries `fc`, and one ending at a data object
-/// when any attribute below it does.
+/// The first segment names a data object; each further segment names a
+/// sub-object or a data attribute below the previous node. A segment holds
+/// exactly one name, so one containing `.` resolves to nothing. A path ending
+/// at a data attribute resolves when the attribute carries `fc`, and one
+/// ending at a data object when any attribute below it does.
 fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
-    let mut names = do_path.iter().flat_map(|s| s.split('.'));
+    let mut names = do_path.iter();
     let Some(mut node) = names
         .next()
         .and_then(|n| ln.do_by_name(n))
@@ -1073,12 +1073,20 @@ mod tests {
         }
     }
 
-    /// A segment holding `.`-joined names, as in `["AnIn1", "mag.f"]`, is
-    /// resolved name by name.
+    /// A segment holds one name: `["AnIn1", "mag.f"]` is rejected, while the
+    /// same member written one name per segment resolves.
     #[test]
-    fn dataset_entry_dotted_segment_resolves() {
-        assert!(model_with_entry(FC::Mx, &["AnIn1", "mag.f"]).is_ok());
-        assert!(model_with_entry(FC::Mx, &["AnIn1", "mag.i"]).is_err());
+    fn dataset_entry_dotted_segment_rejected() {
+        for path in [&["AnIn1", "mag.f"][..], &["AnIn1.mag", "f"][..]] {
+            assert!(
+                matches!(
+                    model_with_entry(FC::Mx, path),
+                    Err(ModelError::DataSetEntryUnresolved { .. })
+                ),
+                "{path:?} accepted"
+            );
+        }
+        assert!(model_with_entry(FC::Mx, &["AnIn1", "mag", "f"]).is_ok());
     }
 
     /// Control: complete paths to an attribute, a component, a data object
