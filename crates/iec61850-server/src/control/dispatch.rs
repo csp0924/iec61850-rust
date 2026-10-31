@@ -494,8 +494,8 @@ pub(crate) fn last_appl_error_code(refusal: Refusal) -> ControlLastApplError {
 #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
 pub(crate) fn termination_error_code(test: bool, time_activated: bool) -> ControlLastApplError {
     match (test, time_activated) {
-        (true, true) => ControlLastApplError::TimeoutTest,
-        (true, false) => ControlLastApplError::OperationFailed,
+        (true, true) => ControlLastApplError::TimeoutTestNotOk,
+        (true, false) => ControlLastApplError::OperatorTestNotOk,
         (false, _) => ControlLastApplError::NoError,
     }
 }

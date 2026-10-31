@@ -16,8 +16,9 @@ use iec61850_model::MmsValue;
 /// Additional cause reported for a control request.
 ///
 /// A handler returns it to refuse or fail a command, and it is carried in the
-/// LastApplError data attribute. The discriminants are the wire integers of
-/// IEC 61850-7-2 and must not be renumbered.
+/// LastApplError data attribute. The names and discriminants are those of the
+/// AddCause mapping of IEC 61850-8-1 Table 110; the discriminants are wire
+/// integers and must not be renumbered.
 ///
 /// `Unknown = 0` is the default. `None = 25` means "no additional cause".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,8 +48,8 @@ pub enum ControlAddCause {
     BlockedByProcess = 9,
     /// The interlock check failed.
     BlockedByInterlocking = 10,
-    /// The synchro check failed.
-    BlockedBySynchroCheck = 11,
+    /// Blocked by the synchro check.
+    BlockedBySynchrocheck = 11,
     /// Another command is already executing.
     CommandAlreadyInExecution = 12,
     /// Blocked by the health status.
@@ -73,8 +74,8 @@ pub enum ControlAddCause {
     AbortionDueToDeviation = 22,
     /// Aborted because communication was lost.
     AbortionByCommunicationLoss = 23,
-    /// Aborted by another command.
-    AbortionByCommand = 24,
+    /// Blocked by a command, the `CmdBlk` data object being set.
+    BlockedByCommand = 24,
     /// No additional cause; the operation succeeded.
     None = 25,
     /// The parameters are inconsistent, for example between a select and its
@@ -99,7 +100,7 @@ impl ControlAddCause {
             8 => Self::BlockedByMode,
             9 => Self::BlockedByProcess,
             10 => Self::BlockedByInterlocking,
-            11 => Self::BlockedBySynchroCheck,
+            11 => Self::BlockedBySynchrocheck,
             12 => Self::CommandAlreadyInExecution,
             13 => Self::BlockedByHealth,
             14 => Self::OneOfNControl,
@@ -112,7 +113,7 @@ impl ControlAddCause {
             21 => Self::EndedWithOvershoot,
             22 => Self::AbortionDueToDeviation,
             23 => Self::AbortionByCommunicationLoss,
-            24 => Self::AbortionByCommand,
+            24 => Self::BlockedByCommand,
             25 => Self::None,
             26 => Self::InconsistentParameters,
             27 => Self::LockedByOtherClient,
@@ -125,20 +126,22 @@ impl ControlAddCause {
 // ControlLastApplError
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The `error` field of the LastApplError data attribute, per IEC 61850-7-2.
+/// The `Error` member of the LastApplError variable, per IEC 61850-8-1
+/// §20.11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 #[non_exhaustive]
 pub enum ControlLastApplError {
-    /// No error.
+    /// No error: a negative test result of the control model, whose add cause
+    /// tells why.
     #[default]
     NoError = 0,
-    /// Unknown error.
+    /// An internal error of the server.
     Unknown = 1,
-    /// The command timed out.
-    TimeoutTest = 2,
-    /// The operation failed.
-    OperationFailed = 3,
+    /// A time-activated test command failed.
+    TimeoutTestNotOk = 2,
+    /// An operate test command failed.
+    OperatorTestNotOk = 3,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -672,8 +675,7 @@ mod tests {
 
     #[test]
     fn control_add_cause_wire_values_match_iec61850() {
-        // The wire integers of IEC 61850-7-2 must not drift.
-        // Regression test for Diff #1 in docs/protocol-map/control/regressions.md
+        // The wire integers of IEC 61850-8-1 Table 110 must not drift.
         assert_eq!(ControlAddCause::Unknown as i32, 0);
         assert_eq!(ControlAddCause::NotSupported as i32, 1);
         assert_eq!(ControlAddCause::BlockedBySwitchingHierarchy as i32, 2);
@@ -685,7 +687,7 @@ mod tests {
         assert_eq!(ControlAddCause::BlockedByMode as i32, 8);
         assert_eq!(ControlAddCause::BlockedByProcess as i32, 9);
         assert_eq!(ControlAddCause::BlockedByInterlocking as i32, 10);
-        assert_eq!(ControlAddCause::BlockedBySynchroCheck as i32, 11);
+        assert_eq!(ControlAddCause::BlockedBySynchrocheck as i32, 11);
         assert_eq!(ControlAddCause::CommandAlreadyInExecution as i32, 12);
         assert_eq!(ControlAddCause::BlockedByHealth as i32, 13);
         assert_eq!(ControlAddCause::OneOfNControl as i32, 14);
@@ -698,13 +700,26 @@ mod tests {
         assert_eq!(ControlAddCause::EndedWithOvershoot as i32, 21);
         assert_eq!(ControlAddCause::AbortionDueToDeviation as i32, 22);
         assert_eq!(ControlAddCause::AbortionByCommunicationLoss as i32, 23);
-        assert_eq!(ControlAddCause::AbortionByCommand as i32, 24);
+        assert_eq!(ControlAddCause::BlockedByCommand as i32, 24);
         assert_eq!(ControlAddCause::None as i32, 25);
         assert_eq!(ControlAddCause::InconsistentParameters as i32, 26);
         assert_eq!(ControlAddCause::LockedByOtherClient as i32, 27);
         // The default add cause is Unknown(0).
         assert_eq!(ControlAddCause::default() as i32, 0);
         assert_eq!(ControlAddCause::default(), ControlAddCause::Unknown);
+    }
+
+    #[test]
+    fn control_last_appl_error_wire_values_match_iec61850() {
+        // The Error values of IEC 61850-8-1 §20.11 must not drift.
+        assert_eq!(ControlLastApplError::NoError as i32, 0);
+        assert_eq!(ControlLastApplError::Unknown as i32, 1);
+        assert_eq!(ControlLastApplError::TimeoutTestNotOk as i32, 2);
+        assert_eq!(ControlLastApplError::OperatorTestNotOk as i32, 3);
+        assert_eq!(
+            ControlLastApplError::default(),
+            ControlLastApplError::NoError
+        );
     }
 
     #[test]

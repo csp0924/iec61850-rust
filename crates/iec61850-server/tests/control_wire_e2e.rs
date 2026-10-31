@@ -529,7 +529,7 @@ async fn operate_with_a_dynamic_check_is_answered_by_its_outcome() {
             .with_wait(Arc::new(GatedCheck {
                 entered: entered.clone(),
                 release: release.clone(),
-                result: Err(ControlAddCause::BlockedBySynchroCheck),
+                result: Err(ControlAddCause::BlockedBySynchrocheck),
             }) as Arc<dyn WaitForExecutionHandler>)
             .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
     );
@@ -557,7 +557,7 @@ async fn enhanced_operate_refused_by_the_dynamic_check_has_no_command_terminatio
     s.control_objects().register(
         ControlObjectEntry::new(obj.clone())
             .with_wait(Arc::new(GatedCheck::open(Err(
-                ControlAddCause::BlockedBySynchroCheck,
+                ControlAddCause::BlockedBySynchrocheck,
             ))) as Arc<dyn WaitForExecutionHandler>)
             .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
     );
@@ -825,7 +825,7 @@ async fn refused_enhanced_operate_in_a_multi_variable_write_is_terminated() {
     s.control_objects().register(
         ControlObjectEntry::new(object("SPCSO3", ControlModel::DirectEnhanced))
             .with_wait(Arc::new(GatedCheck::open(Err(
-                ControlAddCause::BlockedBySynchroCheck,
+                ControlAddCause::BlockedBySynchrocheck,
             ))) as Arc<dyn WaitForExecutionHandler>)
             .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
     );
@@ -1018,7 +1018,7 @@ async fn last_appl_error_arrives_before_the_negative_response() {
     s.control_objects().register(
         ControlObjectEntry::new(object("SPCSO1", ControlModel::DirectNormal))
             .with_wait(Arc::new(GatedCheck::open(Err(
-                ControlAddCause::BlockedBySynchroCheck,
+                ControlAddCause::BlockedBySynchrocheck,
             ))) as Arc<dyn WaitForExecutionHandler>)
             .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
     );

@@ -150,7 +150,7 @@ async fn direct_enhanced_check_rejected_sends_no_command_termination() {
             _test: bool,
             _interlock_check: bool,
         ) -> Result<(), ControlAddCause> {
-            Err(ControlAddCause::BlockedBySynchroCheck)
+            Err(ControlAddCause::BlockedBySynchrocheck)
         }
     }
 
@@ -174,7 +174,7 @@ async fn direct_enhanced_check_rejected_sends_no_command_termination() {
 
     assert_eq!(
         result,
-        ServiceResult::Failure(ControlAddCause::BlockedBySynchroCheck)
+        ServiceResult::Failure(ControlAddCause::BlockedBySynchrocheck)
     );
 
     assert!(events.lock().unwrap().is_empty());

@@ -1340,12 +1340,12 @@ mod tests {
     async fn a_refusing_dynamic_check_ends_the_operate_before_the_command() {
         let obj = make_direct_obj(ControlModel::DirectEnhanced);
         let wait: Arc<dyn WaitForExecutionHandler> =
-            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchroCheck));
+            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchrocheck));
         let accepted = accept(&obj, Some(wait), DelayedOperate(None));
         assert!(accepted.has_dynamic_check());
         assert_eq!(
             accepted.dynamic_check().await,
-            Err(ControlAddCause::BlockedBySynchroCheck)
+            Err(ControlAddCause::BlockedBySynchrocheck)
         );
         assert_eq!(obj.state(), ControlState::Unselected);
     }
@@ -1354,7 +1354,7 @@ mod tests {
     async fn handle_operate_refused_by_the_dynamic_check_sends_no_command_termination() {
         let obj = make_direct_obj(ControlModel::DirectEnhanced);
         let wait_h: Arc<dyn WaitForExecutionHandler> =
-            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchroCheck));
+            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchrocheck));
         let oper_h: Arc<dyn ControlHandler> = Arc::new(AlwaysSuccessOperateHandler);
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ct = RecordingCommandTermination {
@@ -1372,7 +1372,7 @@ mod tests {
         .await;
         assert_eq!(
             r,
-            ServiceResult::Failure(ControlAddCause::BlockedBySynchroCheck)
+            ServiceResult::Failure(ControlAddCause::BlockedBySynchrocheck)
         );
         assert!(events.lock().unwrap().is_empty());
     }
