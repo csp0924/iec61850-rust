@@ -6,6 +6,9 @@
 //! to it. A write may name a whole data object under one
 //! functional constraint (FCD): every leaf is checked, and every handler asked,
 //! before any of them changes.
+//!
+//! A read of the setting group edit buffer, FC SE, answers
+//! temporarily-unavailable until a setting group is selected for editing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,7 +110,24 @@ fn build_model() -> Arc<IedModel> {
             ),
         ],
     );
-    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt]);
+    let set = DataObject::new(
+        "Set",
+        vec![
+            da(
+                "setVal",
+                FC::Se,
+                DataAttributeType::Int32,
+                MmsValue::Integer(5),
+            ),
+            da(
+                "setVal",
+                FC::Sg,
+                DataAttributeType::Int32,
+                MmsValue::Integer(5),
+            ),
+        ],
+    );
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt, set]);
     let lln0 = LogicalNodeBuilder::lln0()
         .set_sgcb({
             let mut sgcb = SettingGroupControlBlock::default();
@@ -408,6 +428,50 @@ async fn write_handler_on_a_data_object_decides_a_leaf_write() {
         assert_eq!(
             client.read(DOMAIN, "GGIO1$SP$Pt$phsA$lim").await.unwrap(),
             MmsData::Unsigned(0)
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+fn access_error(result: Result<MmsData, ClientError>) -> DataAccessError {
+    match result {
+        Err(ClientError::DataAccessError(e)) => e,
+        other => panic!("expected a data access error, got {other:?}"),
+    }
+}
+
+/// While EditSG is 0, a read of FC SE answers temporarily-unavailable whether
+/// it names an attribute, a data object or the whole SE group, and a read of
+/// the active group under SG still answers. Once a group is selected for
+/// editing, SE reads answer from the edit buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edit_buffer_reads_wait_for_a_selected_edit_group() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_server, handle) = start().await;
+        let mut client = connect(&handle).await;
+
+        for item in ["GGIO1$SE$Set$setVal", "GGIO1$SE$Set", "GGIO1$SE"] {
+            assert_eq!(
+                access_error(client.read(DOMAIN, item).await),
+                DataAccessError::TemporarilyUnavailable,
+                "{item}"
+            );
+        }
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$SG$Set$setVal").await.unwrap(),
+            MmsData::Integer(5)
+        );
+
+        client
+            .write(DOMAIN, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(1))
+            .await
+            .expect("select the edit group");
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$SE$Set$setVal").await.unwrap(),
+            MmsData::Integer(5)
         );
 
         handle.stop().await;

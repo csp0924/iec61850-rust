@@ -979,6 +979,31 @@ fn read_results_budget(req: &ReadRequest, negotiated_max_pdu_size: Option<u32>) 
     Some(budget.saturating_sub(spec.len() + 4))
 }
 
+/// Reports whether a read of `name` addresses the edit buffer of a setting
+/// group, FC SE, in a domain where no setting group is being edited: EditSG is
+/// 0, or the domain has no setting group control block and so nothing to edit.
+/// IEC 61850-7-2 §16.2.2.5 answers GetEditSGValue negatively in that case.
+///
+/// The functional constraint is the second segment of every path below a
+/// logical node, so this covers `LN$SE` and every name beneath it. A data set
+/// member is read by GetDataSetValues, not GetEditSGValue, and is not covered.
+#[cfg(feature = "setting-groups")]
+fn reads_closed_edit_buffer(
+    setting_groups: &crate::setting_groups::SettingGroupRegistry,
+    name: &iec61850_mms::mms::pdu::common::ObjectName,
+) -> bool {
+    let iec61850_mms::mms::pdu::common::ObjectName::DomainSpecific { domain_id, item_id } = name
+    else {
+        return false;
+    };
+    if item_id.split('$').nth(1) != Some(iec61850_model::FC::Se.as_str()) {
+        return false;
+    }
+    setting_groups
+        .lookup(domain_id)
+        .is_none_or(|rt| rt.snapshot().edit_sg == 0)
+}
+
 /// Dispatches a Read request (`0xa4`) with data set, control, reporting,
 /// setting group, and GOOSE control block routing.
 ///
@@ -1175,6 +1200,23 @@ fn dispatch_read(
     for entry in &entries {
         let (entry_name, entry_alt_access) =
             fold_leading_components(&entry.name, entry.alt_access.as_ref());
+        #[cfg(feature = "setting-groups")]
+        if reads_closed_edit_buffer(setting_groups, &entry_name) {
+            tracing::warn!(
+                invoke_id,
+                "read: FC SE names the edit buffer while no setting group is being edited, answering temporarily-unavailable"
+            );
+            let refusal = AccessResult::Failure(DataAccessError::TemporarilyUnavailable);
+            if let Some(b) = remaining_budget.as_mut() {
+                let used = refusal.estimated_encoded_size();
+                if *b < used {
+                    return make_confirmed_error(invoke_id, ErrorClass::Resource(resource::OTHER));
+                }
+                *b -= used;
+            }
+            results.push(refusal);
+            continue;
+        }
         #[cfg(any(
             feature = "reporting",
             feature = "logging",

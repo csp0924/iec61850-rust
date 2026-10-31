@@ -4,11 +4,12 @@
 //! A hand-built model drives a real client against a real server, so the tests
 //! cover the wire path, the setting group state machine and the access checks
 //! together. The assertions are that SelectActiveSG switches the active group
-//! and reads back, that an SE write without an edit session is denied, that
-//! SelectEditSG opens a session in which the owning connection can write SE
-//! values and read them back, that ConfirmEditSGValues closes the session so a
-//! second confirm is denied, and that a write with FC=SG is refused even when
-//! the write policy allows that functional constraint.
+//! and reads back, that an SE write without an edit session is temporarily
+//! unavailable, that SelectEditSG opens a session in which the owning
+//! connection can write SE values and read them back, that
+//! ConfirmEditSGValues closes the session so a second confirm is denied, and
+//! that a write with FC=SG is refused even when the write policy allows that
+//! functional constraint.
 
 use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_mms::mms::pdu::DataAccessError;
@@ -145,7 +146,7 @@ async fn edit_sg_confirm_round_trip_persists_se_fc_value() {
         .await
         .expect("client.connect");
 
-    // An SE write without an edit session is denied.
+    // An SE write without an edit session is temporarily unavailable.
     let r = tokio::time::timeout(
         Duration::from_secs(5),
         client.write("TESTLD0", "GGIO1$SE$Setpoint$setVal", MmsData::Integer(11)),
@@ -154,9 +155,9 @@ async fn edit_sg_confirm_round_trip_persists_se_fc_value() {
     .expect("write timeout");
     match r {
         Err(iec61850_mms::mms::client::error::ClientError::DataAccessError(
-            DataAccessError::ObjectAccessDenied,
+            DataAccessError::TemporarilyUnavailable,
         )) => {}
-        other => panic!("expected ObjectAccessDenied for SE without session, got {other:?}"),
+        other => panic!("expected TemporarilyUnavailable for SE without session, got {other:?}"),
     }
 
     // 2. EditSG = 2
@@ -213,7 +214,7 @@ async fn edit_sg_confirm_round_trip_persists_se_fc_value() {
         other => panic!("expected ObjectAccessDenied after session cleared, got {other:?}"),
     }
 
-    // An SE write after the session closed is refused as well.
+    // An SE write after the session closed is temporarily unavailable as well.
     let r = tokio::time::timeout(
         Duration::from_secs(5),
         client.write("TESTLD0", "GGIO1$SE$Setpoint$setVal", MmsData::Integer(99)),
@@ -222,9 +223,9 @@ async fn edit_sg_confirm_round_trip_persists_se_fc_value() {
     .expect("write timeout");
     match r {
         Err(iec61850_mms::mms::client::error::ClientError::DataAccessError(
-            DataAccessError::ObjectAccessDenied,
+            DataAccessError::TemporarilyUnavailable,
         )) => {}
-        other => panic!("expected ObjectAccessDenied for SE after CnfEdit, got {other:?}"),
+        other => panic!("expected TemporarilyUnavailable for SE after CnfEdit, got {other:?}"),
     }
 
     client.disconnect().await.expect("disconnect");
@@ -319,9 +320,9 @@ async fn second_client_cannot_steal_edit_session() {
     .expect("B SE timeout");
     match r {
         Err(iec61850_mms::mms::client::error::ClientError::DataAccessError(
-            DataAccessError::ObjectAccessDenied,
+            DataAccessError::TemporarilyUnavailable,
         )) => {}
-        other => panic!("expected ObjectAccessDenied for B SE write, got {other:?}"),
+        other => panic!("expected TemporarilyUnavailable for B SE write, got {other:?}"),
     }
 
     client_a.disconnect().await.expect("A disconnect");

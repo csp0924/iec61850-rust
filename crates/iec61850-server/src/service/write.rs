@@ -10,7 +10,12 @@
 //! 3. CF, DC, SP, SV, BL: subject to the `WriteAccessPolicies` bitmask; a
 //!    refusal is `ObjectAccessDenied`, otherwise the value is checked and
 //!    written.
-//! 4. SE: the same bitmask, plus the setting-group edit session gate.
+//! 4. SE: the same bitmask, plus the setting-group edit session gate: while
+//!    the caller does not hold the edit session, whether because no setting
+//!    group is being edited or another association edits one, the write
+//!    answers `TemporarilyUnavailable`, as IEC 61850-8-1 §8.1.3.4.4.2 answers a
+//!    write whose writability depends on another object or on a reservation
+//!    by another client.
 //!
 //! A path names functional-constrained data (FCD), `LN$FC$DO[$SDO...]`, or a
 //! functional-constrained data attribute (FCDA),
@@ -85,7 +90,7 @@ enum FcWriteRoute {
     PolicyControlled(FC),
     /// Governed by the policy bitmask and by the setting-group edit session:
     /// the writing association must own the session and the edit group must be
-    /// non-zero (IEC 61850-7-2 §20.3).
+    /// non-zero (IEC 61850-7-2 §16.2.2.5), else temporarily-unavailable.
     #[cfg(feature = "setting-groups")]
     SettingEdit,
 }
@@ -237,15 +242,17 @@ pub fn handle_single_write(
                 );
                 return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
             }
+            // Whether SE is writable depends on the edit session, so a write
+            // outside one is temporarily unavailable rather than denied.
             let registry = match setting_groups {
                 Some(r) => r,
                 None => {
                     tracing::warn!(
                         domain = domain,
                         item_id = item_id,
-                        "write: no setting group registry is configured, refusing an SE write"
+                        "write: no setting group registry is configured, answering temporarily-unavailable to an SE write"
                     );
-                    return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
+                    return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
                 }
             };
             let rt = match registry.lookup(domain) {
@@ -254,9 +261,9 @@ pub fn handle_single_write(
                     tracing::warn!(
                         domain = domain,
                         item_id = item_id,
-                        "write: the domain declares no setting group control block, refusing an SE write"
+                        "write: the domain declares no setting group control block, answering temporarily-unavailable to an SE write"
                     );
-                    return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
+                    return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
                 }
             };
             if !rt.is_edit_session_owner(conn_id) {
@@ -264,9 +271,9 @@ pub fn handle_single_write(
                     domain = domain,
                     item_id = item_id,
                     conn_id,
-                    "write: the caller does not own an open edit session, refusing an SE write"
+                    "write: the caller does not hold the edit session, answering temporarily-unavailable to an SE write"
                 );
-                return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
+                return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
             }
             write_to_target(
                 ied_model,
@@ -1850,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn write_se_fc_without_edit_session_denied() {
+    fn write_se_fc_without_edit_session_temporarily_unavailable() {
         let (model, mms_model, registry) = build_sg_test_model();
         let mut policies = WriteAccessPolicies::default();
         policies.set(FC::Se, true);
@@ -1871,13 +1878,13 @@ mod tests {
         );
         assert_eq!(
             result,
-            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+            WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable),
             "a write under functional constraint SE needs an open edit session, per IEC 61850-7-2 §20.3"
         );
     }
 
     #[test]
-    fn write_se_fc_wrong_owner_denied() {
+    fn write_se_fc_wrong_owner_temporarily_unavailable() {
         let (model, mms_model, registry) = build_sg_test_model();
         let mut policies = WriteAccessPolicies::default();
         policies.set(FC::Se, true);
@@ -1904,7 +1911,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+            WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable),
             "an association that does not own the edit session must be refused"
         );
     }
@@ -1975,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn write_se_fc_no_registry_denied() {
+    fn write_se_fc_no_registry_temporarily_unavailable() {
         // No registry was configured, so no edit session can be verified.
         let (model, mms_model, _registry) = build_sg_test_model();
         let mut policies = WriteAccessPolicies::default();
@@ -1989,12 +1996,12 @@ mod tests {
             handle_single_write(&model, &mms_model, &policies, None, None, 100, &name, &data);
         assert_eq!(
             result,
-            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
+            WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable)
         );
     }
 
     #[test]
-    fn write_se_fc_no_sgcb_on_domain_denied() {
+    fn write_se_fc_no_sgcb_on_domain_temporarily_unavailable() {
         // The registry is empty, so the domain has no control block.
         let (model, mms_model, _registry) = build_sg_test_model();
         let empty = SettingGroupRegistry::new();
@@ -2017,7 +2024,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
+            WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable)
         );
         let _ = Arc::new(SettingGroupRuntime::new(0, 0, false, 0));
     }
