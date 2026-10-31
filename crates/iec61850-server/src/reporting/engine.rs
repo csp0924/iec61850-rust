@@ -118,6 +118,9 @@ pub struct ReportingEngine {
     /// Segments of a report longer than the channel that are still to be
     /// sent, keyed by the MMS path of the URCB or BRCB.
     partial_reports: Mutex<HashMap<String, PartialReport>>,
+    /// MMS paths of the control blocks whose report header alone exceeds the
+    /// negotiated PDU size; such a control block logs once, not per report.
+    header_too_large: Mutex<HashSet<String>>,
     /// Engine-level metrics. `dropped_buffer_full` is incremented by the buffer
     /// backends themselves when an entry has to be discarded.
     metrics: Arc<ReportingEngineMetrics>,
@@ -362,6 +365,7 @@ impl ReportingEngine {
             channel_sink: None,
             brcb_blocked: Mutex::new(HashSet::new()),
             partial_reports: Mutex::new(HashMap::new()),
+            header_too_large: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: registry,
@@ -396,6 +400,7 @@ impl ReportingEngine {
             channel_sink: Some(sink),
             brcb_blocked: Mutex::new(HashSet::new()),
             partial_reports: Mutex::new(HashMap::new()),
+            header_too_large: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: registry,
@@ -1270,6 +1275,7 @@ impl ReportingEngine {
                 mms_path = %rc_guard.mms_path,
                 "connection lost, disabling urcb and clearing its reservation"
             );
+            self.header_fits(&rc_guard.mms_path);
             state.rpt_ena = false;
             state.client_conn_id = None;
             state.pending = None;
@@ -1295,6 +1301,7 @@ impl ReportingEngine {
                 mms_path = %brcb.mms_path,
                 "connection lost, disabling brcb and keeping its buffer"
             );
+            self.header_fits(&brcb.mms_path);
             state.rpt_ena = false;
             state.client_conn_id = None;
             state.gi = false;
@@ -1444,7 +1451,16 @@ impl ReportingEngine {
                 }
             }
         }
+        self.header_fits(&rc.mms_path);
         None
+    }
+
+    /// Records that a report of the control block at `mms_path` went out, so
+    /// a header that exceeds the PDU size later is logged again.
+    fn header_fits(&self, mms_path: &str) {
+        if let Ok(mut set) = self.header_too_large.lock() {
+            set.remove(mms_path);
+        }
     }
 
     /// Counts `sent` report PDUs of a URCB, and logs when they end a run of
@@ -1570,6 +1586,10 @@ impl ReportingEngine {
 
     /// Logs and counts a URCB report or BRCB entry that cannot be encoded within
     /// the negotiated PDU size; the caller drops it.
+    ///
+    /// A member too large is logged for every report that carries it. A header
+    /// that alone exceeds the size is logged once per control block, until a
+    /// report of that control block goes out or its connection is lost.
     fn report_oversized(
         &self,
         mms_path: &str,
@@ -1585,7 +1605,24 @@ impl ReportingEngine {
                 .entry(*index)
                 .map(|e| e.attr_ref.as_str())
                 .unwrap_or_default(),
-            _ => "",
+            _ => {
+                // The header does not fit whatever the report carries, so the
+                // control block logs once until a report goes out again.
+                let first = self
+                    .header_too_large
+                    .lock()
+                    .map(|mut set| set.insert(mms_path.to_string()))
+                    .unwrap_or(true);
+                if !first {
+                    tracing::debug!(
+                        mms_path = %mms_path,
+                        error = %error,
+                        "report header still exceeds the negotiated pdu size, dropping it"
+                    );
+                    return;
+                }
+                ""
+            }
         };
         tracing::error!(
             mms_path = %mms_path,
@@ -1842,6 +1879,7 @@ impl ReportingEngine {
                 "report channel drained, brcb transmission resumed"
             );
         }
+        self.header_fits(&brcb.mms_path);
         if let Ok(mut state) = brcb.state.lock() {
             state.sq_num = state.sq_num.wrapping_add(1);
             state.transmit_anchor = TransmitAnchor::AfterEntryId(entry_id);
@@ -4551,5 +4589,93 @@ mod tests {
             "nothing is sent twice"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Triggers `attr` with the value `v` and runs a tick.
+    fn urcb_report(engine: &ReportingEngine, attr: &DataAttributeRef, v: i64) {
+        let flag = InclusionFlag::VALUE_CHANGED;
+        engine.on_value_updated(attr, MmsValue::Integer(v), flag, v as u64);
+        engine.tick_at(Instant::now(), v as u64);
+    }
+
+    /// An RptID long enough that the report header alone exceeds 64 bytes.
+    fn long_rpt_id() -> String {
+        format!("IED1LD0/GGIO1$RP$urcb01_{}", "r".repeat(60))
+    }
+
+    #[test]
+    fn urcb_header_over_the_pdu_size_is_logged_once_until_a_report_goes_out() {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_rpt_id(long_rpt_id())
+            .with_trg_ops(TriggerOptions::DATA_CHANGED);
+        engine
+            .register_rcb(
+                ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb),
+                make_ds(vec![(attr.as_str(), MmsValue::Integer(0))]),
+            )
+            .unwrap();
+        engine.register_peer(3, "10.0.0.3".parse().unwrap(), 64);
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 3);
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            for v in 1..=20 {
+                urcb_report(&engine, &attr, v);
+            }
+        });
+        assert_eq!(logs.errors(), 1, "one error for the control block");
+        assert_eq!(engine.engine_metrics().dropped_oversized(), 20);
+        assert!(sink.pdus.lock().unwrap().is_empty());
+
+        // A report that goes out resets it: the next oversized one logs again.
+        engine.register_peer(3, "10.0.0.3".parse().unwrap(), 1_000);
+        tracing::subscriber::with_default(logs.clone(), || urcb_report(&engine, &attr, 21));
+        assert_eq!(sink.pdus.lock().unwrap().len(), 1);
+        engine.register_peer(3, "10.0.0.3".parse().unwrap(), 64);
+        tracing::subscriber::with_default(logs.clone(), || urcb_report(&engine, &attr, 22));
+        assert_eq!(logs.errors(), 2);
+    }
+
+    #[test]
+    fn brcb_header_over_the_pdu_size_is_logged_once_and_every_entry_is_passed() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let sink = Arc::new(CollectReportSink::default());
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_rpt_id(long_rpt_id())
+            .with_trg_ops(TriggerOptions::DATA_CHANGED);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(
+            BufferedReportControl::new(path, brcb),
+            make_ds(vec![(attr.as_str(), MmsValue::Integer(0))]),
+        )
+        .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 64);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        for v in 1..=5 {
+            eng.on_brcb_value_updated(&attr, MmsValue::Integer(v), InclusionFlag::VALUE_CHANGED, 1);
+        }
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let entries = brcb_arc.lock_buffer().unwrap().iter_entries();
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        });
+        assert_eq!(logs.errors(), 1, "one error for the control block");
+        assert_eq!(eng.engine_metrics().dropped_oversized(), 5);
+        assert_eq!(
+            brcb_arc.state.lock().unwrap().transmit_anchor,
+            TransmitAnchor::AfterEntryId(entries[4].entry_id)
+        );
     }
 }
