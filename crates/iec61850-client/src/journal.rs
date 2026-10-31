@@ -1,9 +1,12 @@
 //! Journal (log) client API: the ACSI QueryLogByTime and QueryLogAfter
 //! services, carried by the MMS ReadJournal request.
 //!
-//! A [`JournalQuery`] holds the four OPTIONAL selections of a ReadJournal
-//! request; `IedConnection::query_journal` sends one request and
-//! `IedConnection::query_journal_all` follows `moreFollows` until the
+//! IEC 61850-8-1 maps the two ACSI services onto ReadJournal in two forms:
+//! QueryLogByTime sends startingTime and endingTime, and QueryLogAfter sends
+//! entryToStartAfter. A [`JournalQuery`] holds the four OPTIONAL selections of
+//! a ReadJournal request, so it can also express other combinations; a server
+//! is free to refuse those. `IedConnection::query_journal` sends one request
+//! and `IedConnection::query_journal_all` follows `moreFollows` until the
 //! selection is exhausted. `IedConnection::query_journal_by_time` and
 //! `query_journal_after_entry` are the two ACSI services in their usual form.
 //! This module also holds the entry types and the conversions to and from the
@@ -103,8 +106,12 @@ pub struct JournalCursor {
 /// Each selection that is set narrows the result, and a server returns the
 /// entries that meet all of them; with none set the query reads the whole
 /// journal. [`Self::by_time`] is the ACSI QueryLogByTime and
-/// [`Self::after_entry`] the ACSI QueryLogAfter; the `with_` methods add the
-/// other selections to either.
+/// [`Self::after_entry`] the ACSI QueryLogAfter, the two forms IEC 61850-8-1
+/// defines; the `with_` methods add the other selections to either, which
+/// gives a request outside those two forms that a server may refuse. A query
+/// of either form that a server answers in pages continues with
+/// [`Self::continuation`], which adds entryToStartAfter to the original
+/// selections; IEC 61850-8-1 defines no form for that request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JournalQuery {
@@ -201,21 +208,36 @@ impl JournalQuery {
     }
 }
 
-/// Whether `page`, the answer to a continuation that resumes after `cursor`,
-/// moves past it: its first entry is neither the cursor entry nor older than
-/// it, nor `previous_first`, the first entry of the page before, which a
-/// server that ignores entryToStartAfter sends again. An empty page moves
-/// nothing back.
-fn advances(
+/// Removes from `page`, the answer to a request that resumes after `cursor`,
+/// the entries a server sends again although they are not after the cursor.
+///
+/// When the cursor entry is in `page`, it and every entry ahead of it are
+/// removed: a server that treats entryToStartAfter as inclusive starts with
+/// it, and a server that resumes at the cursor's time starts with the entries
+/// of that time ahead of it. Otherwise the leading entries of the cursor's
+/// time that `received` already ends with are removed. `received` is what the
+/// read has collected so far, in order. EntryIDs are compared only for
+/// equality; entries after the first new one are kept.
+fn drop_resent(
     cursor: &JournalCursor,
-    previous_first: ClientJournalEntryId,
-    page: &[ClientJournalEntry],
-) -> bool {
-    page.first().is_none_or(|first| {
-        first.entry_id != cursor.entry_id
-            && first.entry_id != previous_first
-            && first.time_ms >= cursor.time_ms
-    })
+    received: &[ClientJournalEntry],
+    page: &mut Vec<ClientJournalEntry>,
+) {
+    if let Some(at) = page.iter().rposition(|e| e.entry_id == cursor.entry_id) {
+        page.drain(..=at);
+        return;
+    }
+    let at_cursor_time = received
+        .iter()
+        .rev()
+        .take_while(|r| r.time_ms == cursor.time_ms);
+    let resent = page
+        .iter()
+        .take_while(|e| {
+            e.time_ms == cursor.time_ms && at_cursor_time.clone().any(|r| r.entry_id == e.entry_id)
+        })
+        .count();
+    page.drain(..resent);
 }
 
 /// Splits a log reference `<domain>/<item>` into its two parts.
@@ -290,7 +312,10 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     /// `log_ref` is the LogRef of the journal, an MMS path of the form
     /// `<domain>/<item>`, for example `IED1LD0/LLN0$GeneralLog`. When more
     /// follow, [`JournalQuery::continuation`] gives the next request; it
-    /// keeps the stop of `query`, so the result never runs past it.
+    /// keeps the stop of `query`, so the result never runs past it. The
+    /// entries are returned as the server sent them: a server that sends the
+    /// entry it resumes after again is corrected only by
+    /// [`Self::query_journal_all`].
     ///
     /// # Errors
     ///
@@ -322,14 +347,25 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     /// the end time of a time-range query bounds every page, and an entry
     /// count bounds the total.
     ///
+    /// The result holds each selected entry once, also from a server that
+    /// does not resume exactly after the entry a continuation names: entries
+    /// that are not after that entry are dropped. When the page holds the
+    /// cursor entry, it and the entries ahead of it go: a server that treats
+    /// entryToStartAfter as inclusive sends the cursor entry again, and a
+    /// server that resumes at the cursor's time also sends the entries of that
+    /// time ahead of it. Otherwise the leading entries of the cursor's time
+    /// that were already received go. EntryIDs are compared only for
+    /// equality. This applies to the first page as well when `query` sets
+    /// entryToStartAfter.
+    ///
     /// # Errors
     ///
     /// The errors of [`Self::query_journal`];
     /// [`ClientError::JournalNotAdvancing`] when the server reports that more
-    /// entries follow but returns none, which leaves nothing to resume after,
-    /// and when a continuation page does not move past the entry it resumes
-    /// after, as from a server that ignores entryToStartAfter, which would
-    /// otherwise repeat the same page forever.
+    /// entries follow but a page holds none beyond the entries dropped,
+    /// or when a continuation begins before the time of the entry it resumes
+    /// after, as from a server that ignores entryToStartAfter. Either would
+    /// otherwise repeat the same request forever.
     pub async fn query_journal_all(
         &self,
         log_ref: &str,
@@ -337,11 +373,12 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     ) -> Result<Vec<ClientJournalEntry>, ClientError> {
         let mut all = Vec::new();
         let mut next = query.clone();
-        let mut resumed: Option<(JournalCursor, ClientJournalEntryId)> = None;
+        let mut resumed = false;
         loop {
-            let (page, more) = self.query_journal(log_ref, &next).await?;
-            if let Some((cursor, previous_first)) = &resumed {
-                if !advances(cursor, *previous_first, &page) {
+            let (mut page, more) = self.query_journal(log_ref, &next).await?;
+            if let Some(cursor) = &next.after {
+                drop_resent(cursor, &all, &mut page);
+                if resumed && page.first().is_some_and(|e| e.time_ms < cursor.time_ms) {
                     return Err(ClientError::JournalNotAdvancing);
                 }
             }
@@ -349,11 +386,10 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
                 all.extend(page);
                 return Ok(all);
             }
-            let Some(continued) = next.continuation(&page) else {
-                return Err(ClientError::JournalNotAdvancing);
-            };
-            resumed = continued.after.zip(page.first().map(|e| e.entry_id));
-            next = continued;
+            next = next
+                .continuation(&page)
+                .ok_or(ClientError::JournalNotAdvancing)?;
+            resumed = true;
             all.extend(page);
         }
     }
@@ -427,39 +463,63 @@ mod tests {
         assert_eq!(next.stop, Some(JournalStop::Count(3)));
     }
 
-    #[test]
-    fn a_page_after_the_cursor_advances() {
-        let cursor = JournalCursor {
-            time_ms: 150,
-            entry_id: ClientJournalEntryId(2u64.to_be_bytes()),
-        };
-        let previous_first = ClientJournalEntryId(1u64.to_be_bytes());
-        assert!(advances(
-            &cursor,
-            previous_first,
-            &[entry(3, 160), entry(4, 170)]
-        ));
-        assert!(advances(&cursor, previous_first, &[entry(3, 150)]));
-        assert!(advances(&cursor, previous_first, &[]));
+    fn ids(page: &[ClientJournalEntry]) -> Vec<u64> {
+        page.iter().map(|e| e.entry_id.as_u64()).collect()
+    }
+
+    fn cursor(id: u64, time_ms: u64) -> JournalCursor {
+        JournalCursor {
+            time_ms,
+            entry_id: ClientJournalEntryId(id.to_be_bytes()),
+        }
     }
 
     #[test]
-    fn a_page_that_does_not_move_past_the_cursor_does_not_advance() {
-        let cursor = JournalCursor {
-            time_ms: 150,
-            entry_id: ClientJournalEntryId(2u64.to_be_bytes()),
-        };
-        let previous_first = ClientJournalEntryId(1u64.to_be_bytes());
-        // The page before, sent again by a server that ignores the cursor.
-        assert!(!advances(
-            &cursor,
-            previous_first,
-            &[entry(1, 100), entry(2, 150)]
-        ));
-        // The cursor entry itself.
-        assert!(!advances(&cursor, previous_first, &[entry(2, 150)]));
-        // An entry older than the cursor.
-        assert!(!advances(&cursor, previous_first, &[entry(9, 140)]));
+    fn a_page_after_the_cursor_is_kept_whole() {
+        let received = [entry(1, 140), entry(2, 150)];
+        let mut page = vec![entry(3, 150), entry(4, 160)];
+        drop_resent(&cursor(2, 150), &received, &mut page);
+        assert_eq!(ids(&page), [3, 4]);
+        let mut page = Vec::new();
+        drop_resent(&cursor(2, 150), &received, &mut page);
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn the_cursor_entry_at_the_head_is_dropped() {
+        let mut page = vec![entry(2, 150), entry(3, 150), entry(4, 160)];
+        drop_resent(&cursor(2, 150), &[], &mut page);
+        assert_eq!(ids(&page), [3, 4]);
+    }
+
+    #[test]
+    fn the_entries_ahead_of_the_cursor_entry_are_dropped() {
+        let mut page = vec![entry(1, 150), entry(2, 150), entry(3, 150), entry(4, 160)];
+        drop_resent(&cursor(2, 150), &[], &mut page);
+        assert_eq!(ids(&page), [3, 4]);
+        let mut page = vec![entry(9, 140), entry(1, 150), entry(2, 150), entry(3, 160)];
+        drop_resent(&cursor(2, 150), &[], &mut page);
+        assert_eq!(ids(&page), [3]);
+    }
+
+    #[test]
+    fn received_entries_of_the_cursor_time_are_dropped_without_the_cursor() {
+        let received = [entry(7, 140), entry(1, 150), entry(5, 150), entry(2, 150)];
+        let mut page = vec![entry(5, 150), entry(1, 150), entry(3, 150), entry(1, 150)];
+        drop_resent(&cursor(2, 150), &received, &mut page);
+        assert_eq!(ids(&page), [3, 1]);
+    }
+
+    #[test]
+    fn entries_received_at_another_time_are_kept() {
+        let received = [entry(7, 140), entry(2, 150)];
+        let mut page = vec![entry(7, 140), entry(3, 150)];
+        drop_resent(&cursor(2, 150), &received, &mut page);
+        assert_eq!(ids(&page), [7, 3]);
+        let received = [entry(5, 150), entry(6, 160), entry(2, 170)];
+        let mut page = vec![entry(5, 170)];
+        drop_resent(&cursor(2, 170), &received, &mut page);
+        assert_eq!(ids(&page), [5]);
     }
 
     #[test]

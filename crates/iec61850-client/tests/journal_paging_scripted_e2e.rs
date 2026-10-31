@@ -38,6 +38,15 @@ const STUCK_REQUESTS: u32 = 50;
 enum Paging {
     /// Resumes after the entry of entryToStartAfter and honours every bound.
     Exact,
+    /// Resumes at the entry of entryToStartAfter, sending it again.
+    CursorIncluded,
+    /// Resumes at the first entry of the time of entryToStartAfter, sending
+    /// again the entries of that time up to and including that entry.
+    CursorTime,
+    /// Resumes at the first entry of the time of entryToStartAfter but leaves
+    /// that entry out, sending again the other entries of that time ahead of
+    /// it.
+    CursorTimeWithoutCursor,
     /// Answers the first request with the first three entries and every
     /// continuation with the entry it resumes after, always with moreFollows.
     Stuck,
@@ -93,9 +102,19 @@ fn select(paging: Paging, req: &ReadJournalRequest, requests: u32) -> (Vec<usize
         Some(JournalRangeStop::EndingTime(ms)) => ms,
         _ => u64::MAX,
     };
-    let first = cursor.map_or(0, |(_, i)| i + 1);
+    let (first, skip) = match cursor {
+        None => (0, None),
+        Some((time_ms, i)) => match paging {
+            Paging::CursorIncluded => (i, None),
+            Paging::CursorTime => ((0..TOTAL).find(|&j| time(j) >= time_ms).unwrap(), None),
+            Paging::CursorTimeWithoutCursor => {
+                ((0..TOTAL).find(|&j| time(j) >= time_ms).unwrap(), Some(i))
+            }
+            _ => (i + 1, None),
+        },
+    };
     let selected: Vec<usize> = (first..TOTAL)
-        .filter(|&i| time(i) >= start && time(i) <= end)
+        .filter(|&i| Some(i) != skip && time(i) >= start && time(i) <= end)
         .collect();
     let more = selected.len() > PAGE;
     (selected.into_iter().take(PAGE).collect(), more)
@@ -201,6 +220,11 @@ fn after_with_end_time_expected() -> Vec<usize> {
     expected(6, 0, time(1_500))
 }
 
+/// The whole journal, through a query that sets only an end time.
+fn whole_journal() -> JournalQuery {
+    JournalQuery::new().with_end_time(time(TOTAL - 1))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_exact_server_pages_to_the_selection() {
     let read = read_all(Paging::Exact, &by_time()).await;
@@ -208,6 +232,41 @@ async fn an_exact_server_pages_to_the_selection() {
     let read = read_all(Paging::Exact, &after_with_end_time()).await;
     assert_eq!(read.result.unwrap(), after_with_end_time_expected());
     assert_eq!(read.past_end_requests, 0);
+}
+
+/// A server that sends the cursor entry again at the head of each
+/// continuation still yields every entry once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_includes_the_cursor_yields_each_entry_once() {
+    let read = read_all(Paging::CursorIncluded, &by_time()).await;
+    assert_eq!(read.result.unwrap(), by_time_expected());
+    let read = read_all(Paging::CursorIncluded, &after_with_end_time()).await;
+    assert_eq!(read.result.unwrap(), after_with_end_time_expected());
+}
+
+/// A server that resumes at the time of the cursor sends again the entries of
+/// that time up to the cursor entry; they are dropped, also ahead of the
+/// first page of QueryLogAfter, and the whole journal reads as `TOTAL`
+/// distinct entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_resumes_at_the_cursor_time_yields_each_entry_once() {
+    let read = read_all(Paging::CursorTime, &whole_journal()).await;
+    assert_eq!(read.result.unwrap(), (0..TOTAL).collect::<Vec<_>>());
+    let read = read_all(Paging::CursorTime, &by_time()).await;
+    assert_eq!(read.result.unwrap(), by_time_expected());
+    let read = read_all(Paging::CursorTime, &after_with_end_time()).await;
+    assert_eq!(read.result.unwrap(), after_with_end_time_expected());
+}
+
+/// A server that resumes at the time of the cursor without the cursor entry
+/// sends again the entries of that time already received; they are dropped,
+/// and the entries of that time not yet received are kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_resends_received_entries_of_the_cursor_time_yields_each_once() {
+    let read = read_all(Paging::CursorTimeWithoutCursor, &whole_journal()).await;
+    assert_eq!(read.result.unwrap(), (0..TOTAL).collect::<Vec<_>>());
+    let read = read_all(Paging::CursorTimeWithoutCursor, &by_time()).await;
+    assert_eq!(read.result.unwrap(), by_time_expected());
 }
 
 /// A server that reports more entries but sends only the cursor entry again
