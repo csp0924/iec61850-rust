@@ -112,6 +112,7 @@ mod linux_impl {
                         last_state.st_num, last_state.sq_num, last_state.time_allowed_to_live_ms,
                     );
                 }
+                _ => {}
             })
             .build();
 
