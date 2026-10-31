@@ -1,11 +1,11 @@
 //! Data read and write rules over the wire: our client against our server
 //! through the full ISO stack.
 //!
-//! A write is held to the type each attribute declares, its integer range and
-//! its string length; a bit string shorter than its declared maximum is padded
-//! to it. A write may name a whole data object under one
-//! functional constraint (FCD): every leaf is checked, and every handler asked,
-//! before any of them changes.
+//! A write is held to the type each attribute declares: its integer range
+//! (object-value-invalid) and its string length (type-inconsistent); a bit
+//! string shorter than its declared maximum is padded to it. A write may name
+//! a whole data object under one functional constraint (FCD): every leaf is
+//! checked, and every handler asked, before any of them changes.
 //!
 //! A read of the setting group edit buffer, FC SE, answers
 //! temporarily-unavailable until a setting group is selected for editing.
@@ -210,8 +210,9 @@ fn data_access_error(result: Result<(), ClientError>) -> DataAccessError {
     }
 }
 
-/// Values outside the declared range or length of an attribute answer
-/// object-value-invalid and leave the attribute as it was; the bounds succeed.
+/// An integer outside its declared range answers object-value-invalid and a
+/// string longer than its declared maximum answers type-inconsistent; either
+/// leaves the attribute as it was, and the bounds succeed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_outside_the_declared_type_is_refused() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -219,15 +220,31 @@ async fn write_outside_the_declared_type_is_refused() {
         let mut client = connect(&handle).await;
 
         let refused = [
-            ("GGIO1$SP$Lim$u8", MmsData::Unsigned(256)),
-            ("GGIO1$SP$Lim$i8", MmsData::Integer(-129)),
-            ("GGIO1$SP$Lim$vis", MmsData::VisibleString("abcde".into())),
-            ("GGIO1$SP$Lim$oct", MmsData::OctetString(vec![0; 5])),
+            (
+                "GGIO1$SP$Lim$u8",
+                MmsData::Unsigned(256),
+                DataAccessError::ObjectValueInvalid,
+            ),
+            (
+                "GGIO1$SP$Lim$i8",
+                MmsData::Integer(-129),
+                DataAccessError::ObjectValueInvalid,
+            ),
+            (
+                "GGIO1$SP$Lim$vis",
+                MmsData::VisibleString("abcde".into()),
+                DataAccessError::TypeInconsistent,
+            ),
+            (
+                "GGIO1$SP$Lim$oct",
+                MmsData::OctetString(vec![0; 5]),
+                DataAccessError::TypeInconsistent,
+            ),
         ];
-        for (item, data) in refused {
+        for (item, data, expected) in refused {
             assert_eq!(
                 data_access_error(client.write(DOMAIN, item, data).await),
-                DataAccessError::ObjectValueInvalid,
+                expected,
                 "{item}"
             );
         }

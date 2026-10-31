@@ -36,12 +36,15 @@
 //!
 //! Each leaf takes a value of the variant currently held in the model, else
 //! `ObjectValueInvalid`. The value must then lie within the type the attribute
-//! declares in GetVariableAccessAttributes (IEC 61850-8-1 §8.1.1, table 15): an
-//! integer outside the range of its width, and a visible, Unicode or octet
-//! string longer than its maximum length, or of another length than a fixed
-//! one, answer `ObjectValueInvalid` (§8.1.2.1). A bit string that does not fit
-//! the declared size answers `TypeInconsistent`; one shorter than a `Max(n)`
-//! size is padded with zero bits to n bits before it is stored.
+//! declares in GetVariableAccessAttributes. An integer outside the range of its
+//! width (IEC 61850-8-1 §8.1.1, table 15) answers `ObjectValueInvalid`, as a
+//! value the type can carry but the attribute does not support. A visible,
+//! Unicode or octet string, or a binary time, of another length than a fixed
+//! size or longer than a maximum one answers `TypeInconsistent`, as
+//! IEC 61850-8-1 §8.1.3.4.4.2 requires for these data type issues. A bit
+//! string that does not fit the declared size answers `TypeInconsistent`; one
+//! shorter than a `Max(n)` size is padded with zero bits to n bits before it is
+//! stored.
 //!
 //! A write of a node is also a write of each node above it, up to the data
 //! object: sub-data-objects, the data attribute and constructed
@@ -599,13 +602,13 @@ fn check_value(
 /// Checks a value of the right variant against the type its attribute declares
 /// and returns the value to store.
 ///
-/// The value must lie within the range of an integer width, the length of a
-/// visible, Unicode or octet string, and the octet count of a binary time; a
-/// structure that a scalar attribute such as PhyComAddr declares is checked
-/// member by member. Anything outside the declared type is object-value-invalid
-/// (IEC 61850-8-1 §8.1.2.1); a structure of another member count is
-/// type-inconsistent. The length of a Unicode string counts characters, as
-/// IEC 61850-8-1 §8.1.2.6 sizes an MMSString.
+/// An integer outside the range of its width is object-value-invalid. A
+/// visible, Unicode or octet string, or a binary time, whose length does not
+/// fit the declared size is type-inconsistent (IEC 61850-8-1 §8.1.3.4.4.2), as
+/// is a structure of another member count; a structure that a scalar
+/// attribute such as PhyComAddr declares is checked member by member. The
+/// length of a Unicode string counts characters, as IEC 61850-8-1 §8.1.2.6
+/// sizes an MMSString.
 ///
 /// A bit string must fit its declared size, else type-inconsistent. One
 /// shorter than a `Max(n)` size is padded with zero bits to n bits, as
@@ -615,7 +618,7 @@ fn check_declared_type(
     spec: &MmsTypeSpec,
     data: &MmsData,
 ) -> Result<iec61850_model::MmsValue, DataAccessError> {
-    let fits = match (spec, data) {
+    let in_range = match (spec, data) {
         (MmsTypeSpec::Leaf(MmsLeafType::Integer(bits)), MmsData::Integer(v)) => {
             fits_width(i128::from(*v), *bits, true)
         }
@@ -628,6 +631,12 @@ fn check_declared_type(
         (MmsTypeSpec::Leaf(MmsLeafType::Unsigned(bits)), MmsData::Unsigned(v)) => {
             fits_width(i128::from(*v), *bits, false)
         }
+        _ => true,
+    };
+    if !in_range {
+        return Err(DataAccessError::ObjectValueInvalid);
+    }
+    let length_fits = match (spec, data) {
         (MmsTypeSpec::Leaf(MmsLeafType::OctetString(size)), MmsData::OctetString(v)) => {
             fits_length(*size, v.len())
         }
@@ -657,10 +666,10 @@ fn check_declared_type(
         }
         _ => true,
     };
-    if fits {
+    if length_fits {
         Ok(mms_data_to_mms_value(data))
     } else {
-        Err(DataAccessError::ObjectValueInvalid)
+        Err(DataAccessError::TypeInconsistent)
     }
 }
 
@@ -2067,6 +2076,7 @@ mod tests {
             ("i32", DataAttributeType::Int32, MmsValue::Integer(0)),
             ("u32", DataAttributeType::Int32U, MmsValue::Unsigned(0)),
             ("i64", DataAttributeType::Int64, MmsValue::Integer(0)),
+            ("i24", DataAttributeType::Int24, MmsValue::Integer(0)),
             ("en", DataAttributeType::Enumerated, MmsValue::Integer(0)),
             (
                 "vis",
@@ -2082,6 +2092,16 @@ mod tests {
                 "oct8",
                 DataAttributeType::OctetString(8),
                 MmsValue::OctetString(vec![0; 8]),
+            ),
+            (
+                "oct6",
+                DataAttributeType::OctetString(6),
+                MmsValue::OctetString(vec![0; 6]),
+            ),
+            (
+                "oct16",
+                DataAttributeType::OctetString(16),
+                MmsValue::OctetString(vec![0; 16]),
             ),
             (
                 "uni",
@@ -2148,6 +2168,8 @@ mod tests {
             ("i32", MmsData::Integer(i64::from(i32::MAX))),
             ("u32", MmsData::Unsigned(u64::from(u32::MAX))),
             ("i64", MmsData::Integer(i64::MIN)),
+            ("i24", MmsData::Integer(-(1 << 23))),
+            ("i24", MmsData::Integer((1 << 23) - 1)),
             ("en", MmsData::Integer(127)),
             ("u8i", MmsData::Integer(255)),
         ];
@@ -2168,6 +2190,8 @@ mod tests {
             ("i32", MmsData::Integer(i64::from(i32::MIN) - 1)),
             ("i32", MmsData::Integer(i64::from(i32::MAX) + 1)),
             ("u32", MmsData::Unsigned(u64::from(u32::MAX) + 1)),
+            ("i24", MmsData::Integer(-(1 << 23) - 1)),
+            ("i24", MmsData::Integer(1 << 23)),
             ("en", MmsData::Integer(128)),
             ("u8i", MmsData::Integer(-1)),
             ("u8i", MmsData::Integer(256)),
@@ -2190,16 +2214,20 @@ mod tests {
     }
 
     /// A string or octet string longer than its maximum length, or of another
-    /// length than a fixed one, is object-value-invalid; a Unicode string is
-    /// measured in characters, not octets.
+    /// length than a fixed one, shorter included, is type-inconsistent; a
+    /// Unicode string is measured in characters, not octets.
     #[test]
-    fn write_string_longer_than_its_maximum_is_object_value_invalid() {
+    fn write_string_of_another_length_is_type_inconsistent() {
         let (model, mms_model) = build_limits_model();
         let accepted = [
             ("vis", MmsData::VisibleString("abcd".into())),
             ("oct", MmsData::OctetString(vec![1, 2, 3, 4])),
             ("oct", MmsData::OctetString(Vec::new())),
             ("oct8", MmsData::OctetString(vec![9; 8])),
+            ("oct6", MmsData::OctetString(vec![9; 6])),
+            ("oct6", MmsData::OctetString(vec![9; 5])),
+            ("oct16", MmsData::OctetString(vec![9; 16])),
+            ("oct16", MmsData::OctetString(vec![9; 15])),
             ("uni", MmsData::MmsString("\u{00e9}".repeat(255))),
         ];
         for (attr, data) in accepted {
@@ -2213,12 +2241,15 @@ mod tests {
             ("vis", MmsData::VisibleString("abcde".into())),
             ("oct", MmsData::OctetString(vec![1, 2, 3, 4, 5])),
             ("oct8", MmsData::OctetString(vec![9; 7])),
+            ("oct8", MmsData::OctetString(vec![9; 9])),
+            ("oct6", MmsData::OctetString(vec![9; 7])),
+            ("oct16", MmsData::OctetString(vec![9; 17])),
             ("uni", MmsData::MmsString("a".repeat(256))),
         ];
         for (attr, data) in refused {
             assert_eq!(
                 write_limit(&model, &mms_model, attr, data.clone()),
-                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid),
+                WriteOutcome::Failure(DataAccessError::TypeInconsistent),
                 "{attr} = {data:?}"
             );
         }
