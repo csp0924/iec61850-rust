@@ -67,7 +67,7 @@ source address is sent as the publisher sets it.
 | Data set (predefined) | Y | Y | |
 | Data set (created at run time) | Y | Y | DefineNamedVariableList and DeleteNamedVariableList, domain scope only |
 | Substitution | partial | partial | The SV functional constraint is writable by policy and `MV`/`CMV`/`SAV` carry the substitution attributes; the server Read path does not itself pivot to the substituted value |
-| Setting group control | Y | partial | Server: full SGCB runtime. Client: driven through generic writes; no dedicated setting-group API |
+| Setting group control | Y | partial | Server: the SGCB control protocol, with one value per setting in the model (see 3.4); the values of each group are kept and switched by the application through `SettingGroupHandler`. Client: driven through generic writes; no dedicated setting-group API |
 | Unbuffered reporting (URCB) | Y | Y | |
 | Buffered reporting (BRCB) | Y | Y | Includes buffer overflow indication, EntryID resynchronization and an optional persistent buffer |
 | Logging (LCB, journal) | partial | partial | Recording on data-change and quality-change, LCB reads and ReadJournal retrieval are implemented; integrity and general-interrogation entries are not written, and SetLCBValues is not implemented (see 3.7) |
@@ -137,7 +137,9 @@ source address is sent as the publisher sets it.
 | SetSGCBValues (SelectActiveSG) | Y | partial | `ActSG` accepts 1 through the configured group count |
 | SelectEditSG | Y | partial | An edit session is bound to one association and carries a reservation deadline; a competing association receives `temporarily-unavailable` |
 | ConfirmEditSG | Y | partial | `CnfEdit = true` commits and notifies the application |
-| GetEditSGValue / SetEditSGValue | Y | Y | Ordinary Read and Write of data attributes under functional constraint SE |
+| GetEditSGValue / SetEditSGValue | Y | Y | Ordinary Read and Write of data attributes under functional constraint SE; GetEditSGValue under functional constraint SG reads the active group, and a write under SG is refused. An SCL data attribute declared with `fc="SE"` is served under SG as well |
+
+The server does not keep the values of each setting group. The model holds one value per setting: the SE data attribute is the edit buffer and the SG data attribute of the same name the value of the active group. A committed edit of the active group copies every SE value of the logical device to its SG counterpart. The values of each group are kept and switched by the application through `SettingGroupHandler`: it stores the committed values in `confirm_edit_sg` and, when another group becomes active, writes that group's values into the SG data attributes from `act_sg_changed`.
 
 ### 3.5 Unbuffered reporting
 
