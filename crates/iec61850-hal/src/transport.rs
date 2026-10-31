@@ -412,12 +412,6 @@ where
 // }
 // ```
 
-// Keeps the dependency type-resolved in an embedded build, so enabling the
-// feature without otherwise naming the crate is not a warning.
-#[cfg(feature = "transport-embassy")]
-#[allow(unused_imports)]
-use embedded_io_async as _used;
-
 #[cfg(all(test, feature = "transport-tokio"))]
 mod tests_tokio {
     use super::*;

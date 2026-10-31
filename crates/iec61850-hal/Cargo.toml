@@ -53,7 +53,6 @@ transport-tokio = ["transport", "std", "dep:tokio"]
 transport-embassy = [
     "transport",
     "embedded",
-    "dep:embedded-io-async",
     "dep:embassy-time",
 ]
 
@@ -66,9 +65,7 @@ pcap  = { version = "2", optional = true }
 # tokio is pulled in only by `transport-tokio`; the feature set matches the one
 # used by the downstream mms, server and client crates.
 tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time"], optional = true }
-# embassy bindings. embedded-io-async supplies Cortex-M friendly Read/Write and
-# embassy-time supplies an RTC-tick Timer::after.
-embedded-io-async = { version = "0.6", default-features = false, optional = true }
+# embassy-time supplies the RTC-tick Timer::after behind `EmbassyTimer`.
 embassy-time      = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
