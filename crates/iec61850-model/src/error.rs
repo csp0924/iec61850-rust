@@ -67,6 +67,14 @@ pub enum ModelError {
         entry: String,
     },
 
+    /// An array was declared with no element; a count of 0 marks a scalar
+    /// (IEC 61850-6 §9.5.4.1 Table 47).
+    #[error("array `{name}` declares no element")]
+    EmptyArray {
+        /// Name of the array.
+        name: String,
+    },
+
     /// The requested node does not exist.
     #[error("node not found: `{0}`")]
     NodeNotFound(String),

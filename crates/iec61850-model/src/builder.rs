@@ -187,7 +187,7 @@ fn validate_datasets(model: &IedModel) -> Result<()> {
                             entry: "the data object path is empty".into(),
                         });
                     }
-                    if !entry_resolves(target_ln, &entry.do_path, entry.fc) {
+                    if !entry_resolves(target_ln, &entry.do_path, entry.array_index, entry.fc) {
                         return Err(unresolved());
                     }
                 }
@@ -198,6 +198,7 @@ fn validate_datasets(model: &IedModel) -> Result<()> {
 }
 
 /// A node reached while walking a data set entry path.
+#[derive(Clone, Copy)]
 enum PathNode<'a> {
     Do(&'a DataObject),
     Da(&'a DataAttribute),
@@ -208,10 +209,18 @@ enum PathNode<'a> {
 ///
 /// The first segment names a data object; each further segment names a
 /// sub-object or a data attribute below the previous node. A segment holds
-/// exactly one name, so one containing `.` resolves to nothing. A path ending
-/// at a data attribute resolves when the attribute carries `fc`, and one
-/// ending at a data object when any attribute below it does.
-fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
+/// exactly one name, so one containing `.` resolves to nothing. `array_index`
+/// selects an element of the first array on the path, which a further segment
+/// can only follow through an element; an index with no array on the path
+/// resolves to nothing. A path ending at a data attribute resolves when the
+/// attribute carries `fc`, and one ending at a data object when any attribute
+/// below it does.
+fn entry_resolves(
+    ln: &LogicalNode,
+    do_path: &[String],
+    mut array_index: Option<u32>,
+    fc: FC,
+) -> bool {
     let mut names = do_path.iter();
     let Some(mut node) = names
         .next()
@@ -221,6 +230,10 @@ fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
         return false;
     };
     for seg in names {
+        let Some(selected) = select_element(node, &mut array_index) else {
+            return false;
+        };
+        node = selected;
         let next = match node {
             PathNode::Do(d) => match d.child_by_name(seg, Some(fc)) {
                 Some(DoChild::SubDo(s)) => PathNode::Do(s),
@@ -234,9 +247,34 @@ fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
         };
         node = next;
     }
+    let Some(node) = select_element(node, &mut array_index) else {
+        return false;
+    };
+    if array_index.is_some() {
+        return false;
+    }
     match node {
         PathNode::Do(d) => do_carries_fc(d, fc),
         PathNode::Da(a) => a.fc == fc,
+    }
+}
+
+/// Selects element `index` of `node` when `node` is an array and `index` is
+/// still unused, consuming it; any other node passes unchanged.
+fn select_element<'a>(node: PathNode<'a>, index: &mut Option<u32>) -> Option<PathNode<'a>> {
+    let is_array = match node {
+        PathNode::Do(d) => d.is_array(),
+        PathNode::Da(a) => a.is_array(),
+    };
+    if !is_array {
+        return Some(node);
+    }
+    let Some(i) = index.take() else {
+        return Some(node);
+    };
+    match node {
+        PathNode::Do(d) => d.element(i).map(PathNode::Do),
+        PathNode::Da(a) => a.element(i).map(PathNode::Da),
     }
 }
 
@@ -463,6 +501,9 @@ impl DataObjectBuilder {
     }
 
     /// Creates a builder for an array data object of `count` elements.
+    ///
+    /// The children added describe one element; [`build`](Self::build) makes
+    /// `count` copies of it, each holding values of its own.
     pub fn array(name: impl Into<String>, count: u32) -> Self {
         Self {
             name: name.into(),
@@ -512,7 +553,8 @@ impl DataObjectBuilder {
     ///
     /// # Errors
     ///
-    /// [`ModelError::InvalidObjectRef`] when the name is empty, and
+    /// [`ModelError::InvalidObjectRef`] when the name is empty,
+    /// [`ModelError::EmptyArray`] for an array of 0 elements, and
     /// [`ModelError::DuplicateName`] when two children share a name. The one
     /// exception is a setting declared once under FC=SE and once under FC=SG:
     /// the pair is accepted when both have the same type and, recursively, the
@@ -546,11 +588,11 @@ impl DataObjectBuilder {
                 inherit_trg_ops(&mut da.children, trg_ops);
             }
         }
-        Ok(DataObject {
-            name: self.name,
-            array_count: self.array_count,
-            children,
-        })
+        let element = DataObject::new(self.name, children);
+        match self.array_count {
+            Some(count) => DataObject::array(element, count),
+            None => Ok(element),
+        }
     }
 }
 
@@ -583,6 +625,7 @@ fn is_setting_pair(a: &DoChild, b: &DoChild) -> bool {
 /// sub-attributes in the same order.
 fn same_shape(x: &DataAttribute, y: &DataAttribute) -> bool {
     x.ty == y.ty
+        && x.array_count == y.array_count
         && x.children.len() == y.children.len()
         && x.children
             .iter()
@@ -829,15 +872,93 @@ mod tests {
             .unwrap();
         for fc in [FC::Se, FC::Sg] {
             assert!(
-                entry_resolves(&ln, &["Spt".into(), "setVal".into()], fc),
+                entry_resolves(&ln, &["Spt".into(), "setVal".into()], None, fc),
                 "{fc:?}"
             );
         }
         assert!(!entry_resolves(
             &ln,
             &["Spt".into(), "setVal".into()],
+            None,
             FC::Cf
         ));
+    }
+
+    /// An array builder makes the declared number of elements, each a copy of
+    /// the children added, and refuses an array of no element.
+    #[test]
+    fn array_builder_makes_one_element_per_count() {
+        let har = DataObjectBuilder::array("har", 3)
+            .add_da(
+                "mag",
+                FC::Mx,
+                DataAttributeType::Float32,
+                TrgOps::DCHG,
+                MmsValue::Float32(0.0),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(har.array_count, Some(3));
+        assert_eq!(har.children.len(), 3);
+        let element = har.element(2).unwrap();
+        assert_eq!(element.name, "har");
+        assert!(element.child_by_name("mag", Some(FC::Mx)).is_some());
+        assert!(matches!(
+            DataObjectBuilder::array("har", 0).build(),
+            Err(ModelError::EmptyArray { .. })
+        ));
+    }
+
+    /// A data set entry index selects an element of the first array on its
+    /// path; an index with no array on the path, out of range, or a name past
+    /// an array without one resolves to nothing.
+    #[test]
+    fn entry_index_selects_an_array_element() {
+        let cmv = DataObjectBuilder::scalar("phsAHar")
+            .add_da(
+                "q",
+                FC::Mx,
+                DataAttributeType::Quality,
+                TrgOps::NONE,
+                MmsValue::default_for(DataAttributeType::Quality),
+            )
+            .build()
+            .unwrap();
+        let ha = DataObjectBuilder::scalar("HA")
+            .add_sub_do(DataObject::array(cmv, 4).unwrap())
+            .build()
+            .unwrap();
+        let ln = LogicalNodeBuilder::new("", "MHAI", "1")
+            .add_do(ha)
+            .build()
+            .unwrap();
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(entry_resolves(
+            &ln,
+            &path(&["HA", "phsAHar", "q"]),
+            Some(3),
+            FC::Mx
+        ));
+        assert!(entry_resolves(
+            &ln,
+            &path(&["HA", "phsAHar"]),
+            Some(0),
+            FC::Mx
+        ));
+        assert!(entry_resolves(&ln, &path(&["HA", "phsAHar"]), None, FC::Mx));
+        assert!(!entry_resolves(
+            &ln,
+            &path(&["HA", "phsAHar", "q"]),
+            Some(4),
+            FC::Mx
+        ));
+        assert!(!entry_resolves(
+            &ln,
+            &path(&["HA", "phsAHar", "q"]),
+            None,
+            FC::Mx
+        ));
+        assert!(!entry_resolves(&ln, &path(&["HA"]), Some(0), FC::Mx));
     }
 
     /// A sub-attribute of a constructed attribute takes the trigger options of

@@ -7,9 +7,9 @@
 //!    the stable enumeration `GetVariableAccessAttributes` and `GetNameList`
 //!    need, and keeps traversal cache-friendly.
 //! 2. A control block belongs to the logical node that owns it; see `cb.rs`.
-//! 3. An array container is marked with `Option<u32>` rather than by a
-//!    sentinel child, so the type carries the fact instead of an implicit
-//!    ordering convention.
+//! 3. An array is marked with `array_count: Option<u32>`, and its elements are
+//!    materialized as its children, in index order, each holding values of its
+//!    own; the snapshot of an array is an `MmsValue::Array` of its elements.
 //! 4. There is no reverse lookup from a value back to its data attribute; the
 //!    read path always carries an object reference or a node reference.
 //! 5. Every name is an owned `String`; there is no second borrowed path.
@@ -19,6 +19,7 @@ use crate::cb::{
     SvControlBlock,
 };
 use crate::compat::prelude::*;
+use crate::error::ModelError;
 use crate::fc::FC;
 use crate::object_ref::{ObjectRef, Segment};
 use crate::types::{DataAttributeType, TrgOps};
@@ -105,17 +106,10 @@ impl IedModel {
         // What follows is either an index, or a sub-object or attribute name.
         while idx < r.path.len() {
             match &r.path[idx] {
-                Segment::Index(_i) => {
-                    // An index is only meaningful on an array container, so
-                    // only the declaration is checked here; array elements are
-                    // not materialized by the model.
-                    current_do.array_count?;
+                Segment::Index(i) => {
+                    // An index selects one element of an array sub-object.
+                    current_do = current_do.element(*i)?;
                     idx += 1;
-                    // After an index the path either ends or continues into a
-                    // data attribute.
-                    if idx >= r.path.len() {
-                        return Some(NodeRef::Do(current_do));
-                    }
                 }
                 Segment::Name(name) => {
                     // Look the name up among the data object's children.
@@ -153,25 +147,21 @@ impl IedModel {
 }
 
 /// Resolves the remainder of a path below a data attribute, that is its
-/// sub-attributes.
+/// sub-attributes and the elements of its arrays.
 ///
-/// `idx` is the next segment not yet consumed. A sub-attribute cannot carry an
-/// array index, so a `Segment::Index` here yields `None`.
+/// `idx` is the next segment not yet consumed. An index selects an element of
+/// an array attribute and yields `None` on any other attribute.
 fn resolve_sda_path<'a>(
     mut da: &'a DataAttribute,
     path: &[Segment],
     mut idx: usize,
 ) -> Option<NodeRef<'a>> {
     while idx < path.len() {
-        match &path[idx] {
-            Segment::Name(n) => {
-                let child = da.child_by_name(n)?;
-                da = child;
-                idx += 1;
-            }
-            // An array index only ever follows a data object.
-            Segment::Index(_) => return None,
-        }
+        da = match &path[idx] {
+            Segment::Name(n) => da.child_by_name(n)?,
+            Segment::Index(i) => da.element(*i)?,
+        };
+        idx += 1;
     }
     Some(NodeRef::Da(da))
 }
@@ -346,13 +336,15 @@ impl LogicalNode {
 pub struct DataObject {
     /// Data object name.
     pub name: String,
-    /// `Some(n)` marks an array container of `n` elements, indexed `(0)` to
-    /// `(n-1)`; `None` marks a scalar data object.
+    /// `Some(n)` marks an array of `n` elements, indexed `(0)` to `(n-1)`
+    /// (IEC 61850-6 §9.5.3, SDO `count`); `None` marks a scalar data object.
     ///
-    /// Array elements are not materialized: `children` holds the template, and
-    /// only the element count is recorded here.
+    /// The elements of an array are its children, each a
+    /// [`DoChild::SubDo`] bearing the name of the array and holding data
+    /// attributes with values of their own.
     pub array_count: Option<u32>,
-    /// The children, in the order the type declared them.
+    /// The children, in the order the type declared them, or the elements of
+    /// an array in index order.
     pub children: Vec<DoChild>,
 }
 
@@ -367,7 +359,63 @@ impl DataObject {
         }
     }
 
-    /// Finds a direct child by name, one level only.
+    /// Creates an array data object of `count` elements, each a copy of
+    /// `element` with values of its own, named after `element`.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::EmptyArray`] when `count` is 0.
+    pub fn array(element: DataObject, count: u32) -> Result<Self, ModelError> {
+        if count == 0 {
+            return Err(ModelError::EmptyArray { name: element.name });
+        }
+        let mut children = Vec::with_capacity(count as usize);
+        for _ in 1..count {
+            children.push(DoChild::SubDo(element.duplicate()));
+        }
+        let name = element.name.clone();
+        children.push(DoChild::SubDo(element));
+        Ok(Self {
+            name,
+            array_count: Some(count),
+            children,
+        })
+    }
+
+    /// Reports whether the data object is an array.
+    pub fn is_array(&self) -> bool {
+        self.array_count.is_some()
+    }
+
+    /// Returns element `index` of an array, or `None` when the data object is
+    /// not an array or the index is out of range.
+    pub fn element(&self, index: u32) -> Option<&DataObject> {
+        self.array_count?;
+        match self.children.get(usize::try_from(index).ok()?)? {
+            DoChild::SubDo(element) => Some(element),
+            DoChild::Da(_) => None,
+        }
+    }
+
+    /// Returns a copy of the data object whose data attributes hold values of
+    /// their own, starting at the current values of this one.
+    pub fn duplicate(&self) -> DataObject {
+        DataObject {
+            name: self.name.clone(),
+            array_count: self.array_count,
+            children: self
+                .children
+                .iter()
+                .map(|c| match c {
+                    DoChild::Da(da) => DoChild::Da(da.duplicate()),
+                    DoChild::SubDo(sd) => DoChild::SubDo(sd.duplicate()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Finds a direct child by name, one level only; an array has no named
+    /// children, only elements.
     ///
     /// With `fc` set, a data attribute matches only when it carries that
     /// functional constraint, while a sub-object matches by name alone; this
@@ -375,6 +423,9 @@ impl DataObject {
     /// which share a name. With `fc` unset, the first child of that name in
     /// declaration order is returned.
     pub fn child_by_name(&self, name: &str, fc: Option<FC>) -> Option<&DoChild> {
+        if self.is_array() {
+            return None;
+        }
         self.children.iter().find(|c| match c {
             DoChild::Da(da) => da.name == name && fc.is_none_or(|fc| da.fc == fc),
             DoChild::SubDo(sd) => sd.name == name,
@@ -423,11 +474,19 @@ pub struct DataAttribute {
     /// a placeholder no read path consults; [`snapshot`](Self::snapshot)
     /// assembles the value from the children instead.
     pub value: Arc<RwLock<MmsValue>>,
-    /// Nested sub-attributes, such as `mag.f`, `origin.orCat` or
-    /// `Oper.ctlVal`.
+    /// `Some(n)` marks an array of `n` elements, indexed `(0)` to `(n-1)`
+    /// (IEC 61850-6 §9.5.4.1 Table 47, DA and BDA `count`); `None` marks a
+    /// scalar attribute.
     ///
-    /// Always empty unless the type is constructed. The order is fixed by the
-    /// builder and decides the order in which
+    /// The elements of an array are its [`children`](Self::children), each
+    /// bearing the name of the array, and [`ty`](Self::ty) is the type of an
+    /// element.
+    pub array_count: Option<u32>,
+    /// Nested sub-attributes, such as `mag.f`, `origin.orCat` or
+    /// `Oper.ctlVal`, or the elements of an array in index order.
+    ///
+    /// Always empty unless the type is constructed or the attribute is an
+    /// array. The order is fixed by the builder and decides the order in which
     /// `GetVariableAccessAttributes` enumerates the type specification, which
     /// some client tools depend on.
     pub children: Vec<DataAttribute>,
@@ -457,6 +516,7 @@ impl DataAttribute {
             ty,
             trg_ops,
             value: Arc::new(RwLock::new(initial)),
+            array_count: None,
             children: Vec::new(),
             sgroup_values: Vec::new(),
         }
@@ -480,6 +540,7 @@ impl DataAttribute {
             ty,
             trg_ops,
             value,
+            array_count: None,
             children: Vec::new(),
             sgroup_values: Vec::new(),
         }
@@ -498,19 +559,85 @@ impl DataAttribute {
             ty: DataAttributeType::Constructed,
             trg_ops: TrgOps::NONE,
             value: Arc::new(RwLock::new(MmsValue::Structure(Vec::new()))),
+            array_count: None,
             children,
             sgroup_values: Vec::new(),
         }
     }
 
+    /// Creates an array data attribute of `count` elements, each a copy of
+    /// `element` with values of its own. The array takes the name, functional
+    /// constraint, type and trigger options of `element`.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::EmptyArray`] when `count` is 0.
+    pub fn array(element: DataAttribute, count: u32) -> Result<Self, ModelError> {
+        if count == 0 {
+            return Err(ModelError::EmptyArray { name: element.name });
+        }
+        let mut children = Vec::with_capacity(count as usize);
+        for _ in 1..count {
+            children.push(element.duplicate());
+        }
+        let array = Self {
+            name: element.name.clone(),
+            fc: element.fc,
+            ty: element.ty,
+            trg_ops: element.trg_ops,
+            value: Arc::new(RwLock::new(MmsValue::Array(Vec::new()))),
+            array_count: Some(count),
+            children: Vec::new(),
+            sgroup_values: Vec::new(),
+        };
+        children.push(element);
+        Ok(Self { children, ..array })
+    }
+
+    /// Reports whether the attribute is an array.
+    pub fn is_array(&self) -> bool {
+        self.array_count.is_some()
+    }
+
+    /// Reports whether the attribute holds its value itself, that is, it is
+    /// neither constructed nor an array.
+    pub fn is_leaf(&self) -> bool {
+        !self.is_array() && self.ty != DataAttributeType::Constructed
+    }
+
+    /// Returns element `index` of an array, or `None` when the attribute is
+    /// not an array or the index is out of range.
+    pub fn element(&self, index: u32) -> Option<&DataAttribute> {
+        self.array_count?;
+        self.children.get(usize::try_from(index).ok()?)
+    }
+
+    /// Returns a copy of the attribute whose leaves hold values of their own,
+    /// starting at the current values of this one.
+    pub fn duplicate(&self) -> DataAttribute {
+        DataAttribute {
+            name: self.name.clone(),
+            fc: self.fc,
+            ty: self.ty,
+            trg_ops: self.trg_ops,
+            value: Arc::new(RwLock::new(rwlock_read(&self.value).clone())),
+            array_count: self.array_count,
+            children: self.children.iter().map(DataAttribute::duplicate).collect(),
+            sgroup_values: self.sgroup_values.clone(),
+        }
+    }
+
     /// Returns a copy of the current value.
     ///
-    /// A constructed attribute is assembled recursively from `children` into an
+    /// An array is assembled from its elements into an `MmsValue::Array`, and
+    /// a constructed attribute recursively from `children` into an
     /// `MmsValue::Structure` whose element order matches `children`, and so
     /// matches what `GetVariableAccessAttributes` declares. Each leaf takes its
     /// own read lock briefly, so the snapshot is not atomic across leaves.
     pub fn snapshot(&self) -> MmsValue {
-        if self.ty == DataAttributeType::Constructed {
+        if self.is_array() {
+            MmsValue::Array(self.children.iter().map(|c| c.snapshot()).collect())
+        } else if self.ty == DataAttributeType::Constructed {
             MmsValue::Structure(self.children.iter().map(|c| c.snapshot()).collect())
         } else {
             rwlock_read(&self.value).clone()
@@ -527,9 +654,10 @@ impl DataAttribute {
     /// makes a client read a type that contradicts what
     /// `GetVariableAccessAttributes` declared.
     ///
-    /// Only meaningful on a leaf attribute. A constructed attribute is read by
-    /// assembling its children, so a value stored on it is never observed; to
-    /// update a constructed attribute, store into each of its leaves.
+    /// Only meaningful on a leaf attribute. A constructed attribute or an
+    /// array is read by assembling its children, so a value stored on it is
+    /// never observed; to update one, store into each of its leaves, such as
+    /// [`element`](Self::element)`(i)` of an array of a basic type.
     ///
     /// This is a method rather than direct access to `self.value` because the
     /// way a guard is acquired differs between the `std` and the embedded
@@ -539,8 +667,90 @@ impl DataAttribute {
         *rwlock_write(&self.value) = value;
     }
 
-    /// Finds a direct sub-attribute by name, one level only.
+    /// Stores `value` into the leaves of the attribute: on a leaf, the value
+    /// itself; on a constructed attribute, the members of an
+    /// `MmsValue::Structure` into its sub-attributes; on an array, the
+    /// elements of an `MmsValue::Array` into its elements; recursively.
+    ///
+    /// The whole shape is checked before any leaf changes. As with
+    /// [`store`](Self::store), the variant of a basic leaf value is not
+    /// checked against its type, and no lock is held across leaves; a
+    /// structure or array for a leaf that does not hold one is another shape.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::TypeMismatch`] when `value` is not a structure for a
+    /// constructed attribute or an array for an array, holds another number
+    /// of members or elements, or gives a leaf a structure or array it does
+    /// not hold; nothing is stored then.
+    pub fn assign(&self, value: MmsValue) -> Result<(), ModelError> {
+        self.check_shape(&value)?;
+        self.assign_checked(value);
+        Ok(())
+    }
+
+    fn check_shape(&self, value: &MmsValue) -> Result<(), ModelError> {
+        let members = match value {
+            MmsValue::Array(members) if self.is_array() => members,
+            MmsValue::Structure(members)
+                if !self.is_array() && self.ty == DataAttributeType::Constructed =>
+            {
+                members
+            }
+            // A structure or array for a leaf is another shape, unless the
+            // leaf holds one itself, as a PhyComAddr does.
+            MmsValue::Array(_) | MmsValue::Structure(_)
+                if self.is_leaf() && !self.snapshot().same_variant(value) =>
+            {
+                return Err(ModelError::TypeMismatch {
+                    path: self.name.clone(),
+                    expected: "a basic value",
+                    got: value.type_name(),
+                })
+            }
+            _ if self.is_leaf() => return Ok(()),
+            other => {
+                return Err(ModelError::TypeMismatch {
+                    path: self.name.clone(),
+                    expected: if self.is_array() {
+                        "Array"
+                    } else {
+                        "Structure"
+                    },
+                    got: other.type_name(),
+                })
+            }
+        };
+        if members.len() != self.children.len() {
+            return Err(ModelError::TypeMismatch {
+                path: self.name.clone(),
+                expected: "a member per sub-attribute or element",
+                got: "another member count",
+            });
+        }
+        self.children
+            .iter()
+            .zip(members)
+            .try_for_each(|(child, member)| child.check_shape(member))
+    }
+
+    fn assign_checked(&self, value: MmsValue) {
+        match value {
+            MmsValue::Array(members) | MmsValue::Structure(members) if !self.is_leaf() => {
+                for (child, member) in self.children.iter().zip(members) {
+                    child.assign_checked(member);
+                }
+            }
+            value => self.store(value),
+        }
+    }
+
+    /// Finds a direct sub-attribute by name, one level only; an array has no
+    /// named sub-attributes, only elements.
     pub fn child_by_name(&self, name: &str) -> Option<&DataAttribute> {
+        if self.is_array() {
+            return None;
+        }
         self.children.iter().find(|c| c.name == name)
     }
 
@@ -595,7 +805,9 @@ pub struct DataSetEntry {
     /// containing `.` does not resolve, and `IedModelBuilder::build` rejects
     /// the entry.
     pub do_path: Vec<String>,
-    /// Array index, when the referenced data object is an array container.
+    /// The element the entry names in the first array on `do_path`, an
+    /// array of sub-objects or of attributes (IEC 61850-6 §9.3.7 Table 22,
+    /// FCDA `ix`); `None` when it names no element.
     pub array_index: Option<u32>,
     /// Component below the addressed attribute, if the entry names one.
     pub component: Option<String>,
@@ -1131,6 +1343,292 @@ mod tests {
             MmsValue::Boolean(true),
             "store must write through the same RwLock, or the handle the service layer holds reads a dead value"
         );
+    }
+
+    fn point() -> DataAttribute {
+        DataAttribute::constructed(
+            "pts",
+            FC::Sp,
+            vec![
+                da(
+                    "x",
+                    FC::Sp,
+                    DataAttributeType::Float32,
+                    TrgOps::NONE,
+                    MmsValue::Float32(0.0),
+                ),
+                da(
+                    "y",
+                    FC::Sp,
+                    DataAttributeType::Float32,
+                    TrgOps::NONE,
+                    MmsValue::Float32(0.0),
+                ),
+            ],
+        )
+    }
+
+    /// An array attribute holds its elements as children, each with a value
+    /// of its own, and its snapshot is an array of their values.
+    #[test]
+    fn array_elements_hold_values_of_their_own() {
+        let leaf = da(
+            "vals",
+            FC::Sp,
+            DataAttributeType::Int32,
+            TrgOps::DCHG,
+            MmsValue::Integer(5),
+        );
+        let arr = DataAttribute::array(leaf, 3).unwrap();
+        assert_eq!(arr.array_count, Some(3));
+        assert_eq!(arr.ty, DataAttributeType::Int32);
+        assert_eq!(arr.trg_ops, TrgOps::DCHG);
+        assert!(arr.is_array() && !arr.is_leaf());
+        assert_eq!(arr.children.len(), 3);
+        arr.element(1).unwrap().store(MmsValue::Integer(9));
+        assert_eq!(
+            arr.snapshot(),
+            MmsValue::Array(vec![
+                MmsValue::Integer(5),
+                MmsValue::Integer(9),
+                MmsValue::Integer(5)
+            ])
+        );
+        assert!(arr.element(3).is_none());
+        // Elements have no names, so no sub-attribute is found by name.
+        assert!(arr.child_by_name("vals").is_none());
+        // Control: a scalar has no elements.
+        assert!(arr.element(0).unwrap().element(0).is_none());
+    }
+
+    /// An array of structures snapshots as an array of structures.
+    #[test]
+    fn array_of_structures_snapshots_each_element() {
+        let arr = DataAttribute::array(point(), 2).unwrap();
+        arr.element(1)
+            .unwrap()
+            .child_by_name("y")
+            .unwrap()
+            .store(MmsValue::Float32(1.5));
+        assert_eq!(arr.ty, DataAttributeType::Constructed);
+        assert_eq!(
+            arr.snapshot(),
+            MmsValue::Array(vec![
+                MmsValue::Structure(vec![MmsValue::Float32(0.0), MmsValue::Float32(0.0)]),
+                MmsValue::Structure(vec![MmsValue::Float32(0.0), MmsValue::Float32(1.5)]),
+            ])
+        );
+    }
+
+    /// An array of no element is refused; a count of 0 marks a scalar.
+    #[test]
+    fn empty_arrays_are_refused() {
+        let leaf = da(
+            "vals",
+            FC::Sp,
+            DataAttributeType::Int32,
+            TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        assert_eq!(
+            DataAttribute::array(leaf, 0).unwrap_err(),
+            ModelError::EmptyArray {
+                name: "vals".into()
+            }
+        );
+        let element = DataObject::new("har", Vec::new());
+        assert!(matches!(
+            DataObject::array(element, 0),
+            Err(ModelError::EmptyArray { .. })
+        ));
+    }
+
+    /// A duplicate holds values of its own: a store into it leaves the
+    /// original unchanged.
+    #[test]
+    fn duplicates_do_not_share_values() {
+        let original = point();
+        let copy = original.duplicate();
+        copy.child_by_name("x")
+            .unwrap()
+            .store(MmsValue::Float32(3.0));
+        assert_eq!(
+            original.snapshot(),
+            MmsValue::Structure(vec![MmsValue::Float32(0.0), MmsValue::Float32(0.0)])
+        );
+        assert_eq!(
+            copy.snapshot(),
+            MmsValue::Structure(vec![MmsValue::Float32(3.0), MmsValue::Float32(0.0)])
+        );
+    }
+
+    /// `assign` stores an array into the elements and a structure into the
+    /// members, and refuses another shape without storing anything.
+    #[test]
+    fn assign_stores_every_element_or_nothing() {
+        let arr = DataAttribute::array(point(), 2).unwrap();
+        let p = |x, y| MmsValue::Structure(vec![MmsValue::Float32(x), MmsValue::Float32(y)]);
+        arr.assign(MmsValue::Array(vec![p(1.0, 2.0), p(3.0, 4.0)]))
+            .unwrap();
+        assert_eq!(
+            arr.snapshot(),
+            MmsValue::Array(vec![p(1.0, 2.0), p(3.0, 4.0)])
+        );
+        for bad in [
+            MmsValue::Array(vec![p(5.0, 5.0)]),
+            MmsValue::Array(vec![p(5.0, 5.0), MmsValue::Float32(5.0)]),
+            MmsValue::Structure(vec![p(5.0, 5.0), p(5.0, 5.0)]),
+            MmsValue::Array(vec![
+                p(5.0, 5.0),
+                MmsValue::Structure(vec![MmsValue::Float32(5.0)]),
+            ]),
+        ] {
+            assert!(
+                matches!(
+                    arr.assign(bad.clone()),
+                    Err(ModelError::TypeMismatch { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            arr.snapshot(),
+            MmsValue::Array(vec![p(1.0, 2.0), p(3.0, 4.0)])
+        );
+    }
+
+    /// `assign` refuses a structure or an array for a leaf of a basic type,
+    /// at any depth, and stores nothing; a leaf that holds a structure, such
+    /// as a PhyComAddr, takes one.
+    #[test]
+    fn assign_refuses_a_composite_value_for_a_basic_leaf() {
+        let ints = DataAttribute::array(
+            da(
+                "vals",
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::NONE,
+                MmsValue::Integer(0),
+            ),
+            2,
+        )
+        .unwrap();
+        for bad in [
+            MmsValue::Array(vec![MmsValue::Integer(1), MmsValue::Structure(vec![])]),
+            MmsValue::Array(vec![MmsValue::Array(vec![]), MmsValue::Integer(2)]),
+        ] {
+            assert!(
+                matches!(
+                    ints.assign(bad.clone()),
+                    Err(ModelError::TypeMismatch { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            ints.snapshot(),
+            MmsValue::Array(vec![MmsValue::Integer(0), MmsValue::Integer(0)])
+        );
+        let addr = da(
+            "addr",
+            FC::Cf,
+            DataAttributeType::PhyComAddr,
+            TrgOps::NONE,
+            MmsValue::Structure(vec![MmsValue::Unsigned(0)]),
+        );
+        addr.assign(MmsValue::Structure(vec![MmsValue::Unsigned(4)]))
+            .unwrap();
+        assert_eq!(
+            addr.snapshot(),
+            MmsValue::Structure(vec![MmsValue::Unsigned(4)])
+        );
+    }
+
+    /// An object reference with an index reaches an element of an array of
+    /// sub-objects and of an array of attributes; an index on a scalar, out of
+    /// range, or a name past an array reaches nothing.
+    #[test]
+    fn object_references_index_into_arrays() {
+        use crate::builder::{
+            DataObjectBuilder, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
+        };
+        let cmv = DataObjectBuilder::scalar("phsAHar")
+            .add_da_node(DataAttribute::constructed(
+                "cVal",
+                FC::Mx,
+                vec![da(
+                    "f",
+                    FC::Mx,
+                    DataAttributeType::Float32,
+                    TrgOps::NONE,
+                    MmsValue::Float32(0.0),
+                )],
+            ))
+            .build()
+            .unwrap();
+        let ha = DataObjectBuilder::scalar("HA")
+            .add_sub_do(DataObject::array(cmv, 4).unwrap())
+            .add_da_node(
+                DataAttribute::array(
+                    da(
+                        "hst",
+                        FC::St,
+                        DataAttributeType::Int32,
+                        TrgOps::NONE,
+                        MmsValue::Integer(0),
+                    ),
+                    2,
+                )
+                .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let ln = LogicalNodeBuilder::new("", "MHAI", "1")
+            .add_do(ha)
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ln)
+            .build()
+            .unwrap();
+        let m = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let resolve = |s: &str| m.node_by_object_ref(&ObjectRef::parse(s).unwrap());
+
+        let Some(NodeRef::Da(f)) = resolve("IED1LD0/MHAI1$MX$HA$phsAHar(3)$cVal$f") else {
+            panic!("phsAHar(3).cVal.f resolves");
+        };
+        f.store(MmsValue::Float32(2.5));
+        let Some(NodeRef::Do(har)) = resolve("IED1LD0/MHAI1$MX$HA$phsAHar") else {
+            panic!("phsAHar resolves");
+        };
+        let Some(DoChild::Da(c_val)) = har.element(3).unwrap().child_by_name("cVal", None) else {
+            panic!("cVal");
+        };
+        assert_eq!(
+            c_val.snapshot(),
+            MmsValue::Structure(vec![MmsValue::Float32(2.5)])
+        );
+        assert!(matches!(
+            resolve("IED1LD0/MHAI1$MX$HA$phsAHar(0)"),
+            Some(NodeRef::Do(_))
+        ));
+        assert!(matches!(
+            resolve("IED1LD0/MHAI1$ST$HA$hst(1)"),
+            Some(NodeRef::Da(_))
+        ));
+        for nothing in [
+            "IED1LD0/MHAI1$MX$HA$phsAHar(4)",
+            "IED1LD0/MHAI1$MX$HA$phsAHar$cVal",
+            "IED1LD0/MHAI1$ST$HA$hst(2)",
+            "IED1LD0/MHAI1$MX$HA$phsAHar(1)$cVal(0)",
+        ] {
+            assert!(resolve(nothing).is_none(), "{nothing}");
+        }
     }
 
     /// Navigating the tree to a data attribute and storing there, then reading
