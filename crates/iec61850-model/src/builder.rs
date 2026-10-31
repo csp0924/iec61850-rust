@@ -509,6 +509,15 @@ impl DataObjectBuilder {
     }
 
     /// Freezes the data object.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::InvalidObjectRef`] when the name is empty, and
+    /// [`ModelError::DuplicateName`] when two children share a name. The one
+    /// exception is a setting declared once under FC=SE and once under FC=SG:
+    /// the pair is accepted when both have the same type and, recursively, the
+    /// same sub-attributes in the same order, and rejected with
+    /// `DuplicateName` otherwise.
     pub fn build(self) -> Result<DataObject> {
         if self.name.is_empty() {
             return Err(ModelError::InvalidObjectRef {
