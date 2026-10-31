@@ -377,6 +377,7 @@ impl ErrorClass {
 ///   0x8n 0x01 c  -- inner choice tag + sub-code
 /// (0x81 ... )    -- additionalCode [1] IMPLICIT INTEGER, OPTIONAL
 /// (0x82 ... )    -- additionalDescription [2] IMPLICIT VisibleString, OPTIONAL
+/// (0xa3 ... )    -- serviceSpecificInformation [3] CHOICE, OPTIONAL
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -387,6 +388,59 @@ pub struct ServiceError {
     pub additional_code: Option<i32>,
     /// additionalDescription `[2]` IMPLICIT VisibleString, OPTIONAL.
     pub additional_description: Option<String>,
+    /// serviceSpecificInformation `[3]` CHOICE, OPTIONAL.
+    ///
+    /// An alternative this type does not model decodes as `None`.
+    pub service_specific: Option<ServiceSpecificInfo>,
+}
+
+/// The serviceSpecificInformation of a ServiceError: the extra result a
+/// failed service reports beside its error class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServiceSpecificInfo {
+    /// deleteNamedVariableList `[6]` IMPLICIT Unsigned32: how many named
+    /// variable lists the failed DeleteNamedVariableList did delete.
+    DeleteNamedVariableList(u32),
+}
+
+impl ServiceSpecificInfo {
+    /// Context tag of the alternative inside the serviceSpecificInformation
+    /// CHOICE.
+    const DELETE_NAMED_VARIABLE_LIST: u8 = 0x86;
+
+    /// Encodes the alternative, without the `[3]` wrapper.
+    fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            ServiceSpecificInfo::DeleteNamedVariableList(n) => {
+                let bytes = super::common::encode_unsigned_int_minimal(u64::from(*n));
+                buf.extend_from_slice(&[Self::DELETE_NAMED_VARIABLE_LIST]);
+                super::initiate::encode_length(bytes.len(), buf);
+                buf.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    /// Decodes the content of the `[3]` wrapper: `None` for an alternative
+    /// this type does not model, and for content that does not decode, so the
+    /// rest of the ServiceError still does.
+    fn decode(data: &[u8]) -> Option<Self> {
+        let decoded = split_tlv(data).and_then(|(tag, content, _)| match tag {
+            Self::DELETE_NAMED_VARIABLE_LIST => decode_unsigned32(content)
+                .map(|n| Some(ServiceSpecificInfo::DeleteNamedVariableList(n))),
+            other => {
+                tracing::debug!(
+                    "skipping unmodelled servicespecificinformation alternative 0x{:02X}",
+                    other
+                );
+                Ok(None)
+            }
+        });
+        decoded.unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "skipping undecodable servicespecificinformation");
+            None
+        })
+    }
 }
 
 impl ServiceError {
@@ -396,6 +450,7 @@ impl ServiceError {
             error_class,
             additional_code: None,
             additional_description: None,
+            service_specific: None,
         }
     }
 
@@ -408,6 +463,12 @@ impl ServiceError {
     /// Sets the additionalDescription.
     pub fn with_additional_description(mut self, description: impl Into<String>) -> Self {
         self.additional_description = Some(description.into());
+        self
+    }
+
+    /// Sets the serviceSpecificInformation.
+    pub fn with_service_specific(mut self, info: ServiceSpecificInfo) -> Self {
+        self.service_specific = Some(info);
         self
     }
 
@@ -430,6 +491,15 @@ impl ServiceError {
             buf.extend_from_slice(&[0x82, bytes.len() as u8]);
             buf.extend_from_slice(bytes);
         }
+
+        if let Some(info) = &self.service_specific {
+            // serviceSpecificInformation [3] CHOICE, an explicit wrapper
+            let mut inner = BytesMut::new();
+            info.encode(&mut inner);
+            buf.extend_from_slice(&[0xa3]);
+            super::initiate::encode_length(inner.len(), buf);
+            buf.extend_from_slice(&inner);
+        }
     }
 
     /// Decodes ServiceError content; `data` is what follows the outer `0xaa` length.
@@ -446,21 +516,12 @@ impl ServiceError {
 
         let mut additional_code: Option<i32> = None;
         let mut additional_description: Option<String> = None;
+        let mut service_specific: Option<ServiceSpecificInfo> = None;
 
         // optional fields
         while pos < data.len() {
-            let tag = data[pos];
-            pos += 1;
-            if pos >= data.len() {
-                return Err(MmsError::TruncatedPdu);
-            }
-            let len = data[pos] as usize;
-            pos += 1;
-            if pos + len > data.len() {
-                return Err(MmsError::TruncatedPdu);
-            }
-            let val_bytes = &data[pos..pos + len];
-            pos += len;
+            let (tag, val_bytes, consumed) = split_tlv(&data[pos..])?;
+            pos += consumed;
 
             match tag {
                 0x81 => {
@@ -474,6 +535,10 @@ impl ServiceError {
                         .to_string();
                     additional_description = Some(s);
                 }
+                0xa3 => {
+                    // serviceSpecificInformation [3] CHOICE
+                    service_specific = ServiceSpecificInfo::decode(val_bytes);
+                }
                 _ => {
                     // an unknown optional field is logged and skipped
                     tracing::debug!("skipping unknown serviceerror tag 0x{:02X}", tag);
@@ -485,6 +550,7 @@ impl ServiceError {
             error_class,
             additional_code,
             additional_description,
+            service_specific,
         })
     }
 }
@@ -732,11 +798,75 @@ mod tests {
             error_class: ErrorClass::Access(2),
             additional_code: Some(42),
             additional_description: Some("test error".to_string()),
+            service_specific: None,
         };
         let mut buf = BytesMut::new();
         se.encode_inner(&mut buf);
         let decoded = ServiceError::decode_inner(&buf).unwrap();
         assert_eq!(decoded, se);
+    }
+
+    #[test]
+    fn service_specific_delete_named_variable_list_encodes_as_choice_six() {
+        let se = ServiceError::new(ErrorClass::Access(3))
+            .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(2));
+        let mut buf = BytesMut::new();
+        se.encode_inner(&mut buf);
+        assert_eq!(
+            &buf[..],
+            &[0xa0, 0x03, 0x87, 0x01, 0x03, 0xa3, 0x03, 0x86, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn service_specific_round_trips_alongside_the_other_optional_fields() {
+        for n in [0u32, 1, 0x7f, 0x80, 0xffff_ffff] {
+            let se = ServiceError::new(ErrorClass::Access(3))
+                .with_additional_code(-5)
+                .with_additional_description("partly deleted")
+                .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(n));
+            let mut buf = BytesMut::new();
+            se.encode_inner(&mut buf);
+            assert_eq!(ServiceError::decode_inner(&buf).unwrap(), se, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn service_specific_survives_a_confirmed_error_pdu() {
+        let se = ServiceError::new(ErrorClass::Access(3))
+            .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(300));
+        let mut buf = BytesMut::new();
+        encode_confirmed_error_pdu(9, &se, &mut buf);
+        let (invoke_id, decoded) = decode_confirmed_error_pdu(&buf).unwrap();
+        assert_eq!(invoke_id, 9);
+        assert_eq!(decoded, se);
+    }
+
+    #[test]
+    fn unmodelled_service_specific_alternative_decodes_as_none() {
+        // serviceSpecificInformation [3] carrying obtainFile [0] IMPLICIT.
+        let data = [0xa0, 0x03, 0x87, 0x01, 0x00, 0xa3, 0x03, 0x80, 0x01, 0x01];
+        let decoded = ServiceError::decode_inner(&data).unwrap();
+        assert_eq!(decoded.error_class, ErrorClass::Access(0));
+        assert_eq!(decoded.service_specific, None);
+    }
+
+    #[test]
+    fn undecodable_service_specific_keeps_the_error_class() {
+        for data in [
+            // A negative count.
+            &[0xa0, 0x03, 0x87, 0x01, 0x03, 0xa3, 0x03, 0x86, 0x01, 0x80][..],
+            // An empty CHOICE.
+            &[0xa0, 0x03, 0x87, 0x01, 0x03, 0xa3, 0x00][..],
+            // A count wider than an Unsigned32.
+            &[
+                0xa0, 0x03, 0x87, 0x01, 0x03, 0xa3, 0x08, 0x86, 0x06, 0, 1, 2, 3, 4, 5,
+            ][..],
+        ] {
+            let decoded = ServiceError::decode_inner(data).unwrap();
+            assert_eq!(decoded.error_class, ErrorClass::Access(3), "{data:02x?}");
+            assert_eq!(decoded.service_specific, None, "{data:02x?}");
+        }
     }
 
     #[test]
@@ -1191,6 +1321,7 @@ mod tests {
             error_class: ErrorClass::Access(subcode::access::OBJECT_ACCESS_DENIED),
             additional_code: Some(-7),
             additional_description: Some("no read access".to_string()),
+            service_specific: None,
         };
         let mut buf = BytesMut::new();
         encode_confirmed_error_pdu(9, &se, &mut buf);

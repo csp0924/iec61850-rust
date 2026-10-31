@@ -19,7 +19,6 @@
 //! a control block uses it.
 
 use bytes::BytesMut;
-use iec61850_asn1::encode_length;
 
 use iec61850_mms::mms::pdu::{
     delete_named_variable_list::{
@@ -27,8 +26,9 @@ use iec61850_mms::mms::pdu::{
         DeleteNamedVariableListResponse, ScopeOfDelete,
     },
     service_error::{
+        encode_confirmed_error_pdu,
         subcode::{access, service},
-        ErrorClass, ServiceError,
+        ErrorClass, ServiceError, ServiceSpecificInfo,
     },
     ObjectName,
 };
@@ -197,42 +197,14 @@ pub(crate) fn handle_delete_named_variable_list(
 }
 
 /// Builds the negative DeleteNamedVariableList response: a ConfirmedError
-/// whose ServiceError carries `error_class` and, as serviceSpecificInformation
-/// `deleteNamedVariableList [6] IMPLICIT Unsigned32`, `number_deleted`.
+/// whose ServiceError carries `error_class` and, as serviceSpecificInformation,
+/// `number_deleted`.
 fn delete_error(invoke_id: u32, error_class: ErrorClass, number_deleted: u32) -> ConfirmedResponse {
-    let mut service_error = BytesMut::new();
-    ServiceError::new(error_class).encode_inner(&mut service_error);
-    let deleted = unsigned_octets(number_deleted);
-    service_error.extend_from_slice(&[0xa3]);
-    encode_length(2 + deleted.len(), &mut service_error);
-    service_error.extend_from_slice(&[0x86, deleted.len() as u8]);
-    service_error.extend_from_slice(&deleted);
-
-    // invokeID [0] IMPLICIT Unsigned32, then serviceError [2] IMPLICIT.
-    let id = unsigned_octets(invoke_id);
-    let mut inner = BytesMut::new();
-    inner.extend_from_slice(&[0x80, id.len() as u8]);
-    inner.extend_from_slice(&id);
-    inner.extend_from_slice(&[0xa2]);
-    encode_length(service_error.len(), &mut inner);
-    inner.extend_from_slice(&service_error);
-
-    // confirmedErrorPdu [2] IMPLICIT SEQUENCE.
+    let service_error = ServiceError::new(error_class)
+        .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(number_deleted));
     let mut buf = BytesMut::new();
-    buf.extend_from_slice(&[0xa2]);
-    encode_length(inner.len(), &mut buf);
-    buf.extend_from_slice(&inner);
+    encode_confirmed_error_pdu(invoke_id, &service_error, &mut buf);
     ConfirmedResponse::Error(buf.freeze())
-}
-
-/// Returns the content octets of an Unsigned32 as the shortest BER INTEGER.
-fn unsigned_octets(v: u32) -> Vec<u8> {
-    let bytes = u64::from(v).to_be_bytes();
-    let mut start = 3;
-    while start < 7 && bytes[start] == 0 && bytes[start + 1] & 0x80 == 0 {
-        start += 1;
-    }
-    bytes[start..].to_vec()
 }
 
 #[cfg(test)]
@@ -360,11 +332,20 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_octets_are_the_shortest_ber_integer() {
-        assert_eq!(unsigned_octets(0), [0x00]);
-        assert_eq!(unsigned_octets(0x7f), [0x7f]);
-        assert_eq!(unsigned_octets(0x80), [0x00, 0x80]);
-        assert_eq!(unsigned_octets(0x1234), [0x12, 0x34]);
-        assert_eq!(unsigned_octets(u32::MAX), [0x00, 0xff, 0xff, 0xff, 0xff]);
+    fn in_use_response_decodes_to_the_number_deleted() {
+        use iec61850_mms::mms::pdu::service_error::decode_confirmed_error_pdu;
+        let ConfirmedResponse::Error(pdu) = delete_error(
+            3,
+            ErrorClass::Service(service::OBJECT_CONSTRAINT_CONFLICT),
+            0x1234,
+        ) else {
+            panic!("a confirmed error");
+        };
+        let (invoke_id, se) = decode_confirmed_error_pdu(&pdu).unwrap();
+        assert_eq!(invoke_id, 3);
+        assert_eq!(
+            se.service_specific,
+            Some(ServiceSpecificInfo::DeleteNamedVariableList(0x1234))
+        );
     }
 }

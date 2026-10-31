@@ -115,7 +115,7 @@ pub use reject::{
 };
 pub use service_error::{
     decode_confirmed_error_inner, decode_confirmed_error_pdu, encode_confirmed_error_pdu,
-    ErrorClass, ServiceError,
+    ErrorClass, ServiceError, ServiceSpecificInfo,
 };
 pub use status::{
     decode_confirmed_status_request, decode_confirmed_status_response, decode_status_request,

@@ -85,11 +85,11 @@ pub use mms::{
     ConcludeRequestPdu, ConcludeResponsePdu, DataAccessError, ErrorClass, InitRequestDetail,
     InitResponseDetail, InitiateErrorPdu, InitiateRequestPdu, InitiateResponsePdu,
     ListOfVariableEntry, MmsData, MmsError, MmsPdu, ObjectName, ReadRequest, ReadResponse,
-    ServiceError, StructComponent, TypeSpecification, VariableAccessSpecification, WriteOutcome,
-    WriteRequest, WriteResponse, DEFAULT_MAX_PDU_SIZE, DEFAULT_MAX_SERV_OUTSTANDING_CALLED,
-    DEFAULT_MAX_SERV_OUTSTANDING_CALLING, DEFAULT_PARAMETER_CBB_CLIENT,
-    DEFAULT_SERVICES_SUPPORTED_CLIENT, MAX_DATA_NESTING_DEPTH, MAX_IDENTIFIER_LEN, MAX_WRITE_ITEMS,
-    SERVICE_TAG_READ, SERVICE_TAG_WRITE,
+    ServiceError, ServiceSpecificInfo, StructComponent, TypeSpecification,
+    VariableAccessSpecification, WriteOutcome, WriteRequest, WriteResponse, DEFAULT_MAX_PDU_SIZE,
+    DEFAULT_MAX_SERV_OUTSTANDING_CALLED, DEFAULT_MAX_SERV_OUTSTANDING_CALLING,
+    DEFAULT_PARAMETER_CBB_CLIENT, DEFAULT_SERVICES_SUPPORTED_CLIENT, MAX_DATA_NESTING_DEPTH,
+    MAX_IDENTIFIER_LEN, MAX_WRITE_ITEMS, SERVICE_TAG_READ, SERVICE_TAG_WRITE,
 };
 
 // Presentation types used by ACSE and the MMS client
