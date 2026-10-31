@@ -773,8 +773,7 @@ fn exposed_entry(brcb: &super::brcb::BufferedReportControl) -> Option<(EntryId, 
     }
     let buffer = brcb.report_buffer.lock().ok()?;
     let newest = buffer
-        .iter_entries()
-        .last()
+        .newest_entry()
         .map_or((EntryId::ZERO, 0), |e| (e.entry_id, e.time_of_entry_ms));
     Some(newest)
 }
@@ -2403,6 +2402,104 @@ mod tests {
             read(time_of_entry()),
             MmsData::BinaryTime(encode_binary_time6_bytes(1_700_000_000_500))
         );
+    }
+
+    /// A buffer backend that counts how often each read path is taken and, on
+    /// every `newest_entry` call, stands for a buffer one entry newer than at the
+    /// previous call, as if an entry had been enqueued in between.
+    #[derive(Debug, Default)]
+    struct CountingBuffer {
+        iter_calls: Arc<std::sync::atomic::AtomicUsize>,
+        newest_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingBuffer {
+        fn entry(n: usize) -> Arc<super::super::buffer::ReportEntry> {
+            let ms = 1_700_000_000_000 + n as u64;
+            Arc::new(super::super::buffer::ReportEntry::new(
+                EntryId::from_ms(ms),
+                ms,
+                false,
+                false,
+                bytes::Bytes::new(),
+            ))
+        }
+    }
+
+    impl super::super::buffer::ReportBufferBackend for CountingBuffer {
+        fn push(&mut self, _entry: Arc<super::super::buffer::ReportEntry>) -> bool {
+            false
+        }
+        fn find_entry(&self, _id: &EntryId) -> Option<Arc<super::super::buffer::ReportEntry>> {
+            None
+        }
+        fn seek_to_after_entry_id(&self, _id: &EntryId) -> super::super::buffer::SeekResult {
+            super::super::buffer::SeekResult::NotFound
+        }
+        fn purge(&mut self) -> usize {
+            0
+        }
+        fn len(&self) -> usize {
+            1
+        }
+        fn is_overflow(&self) -> bool {
+            false
+        }
+        fn clear_overflow(&mut self) {}
+        fn iter_entries(&self) -> Vec<Arc<super::super::buffer::ReportEntry>> {
+            use std::sync::atomic::Ordering;
+            let n = self.iter_calls.fetch_add(1, Ordering::SeqCst)
+                + self.newest_calls.load(Ordering::SeqCst);
+            vec![Self::entry(n)]
+        }
+        fn newest_entry(&self) -> Option<Arc<super::super::buffer::ReportEntry>> {
+            use std::sync::atomic::Ordering;
+            let n = self.newest_calls.fetch_add(1, Ordering::SeqCst)
+                + self.iter_calls.load(Ordering::SeqCst);
+            Some(Self::entry(n))
+        }
+    }
+
+    /// Registers a disabled BRCB backed by a `CountingBuffer` and returns the
+    /// engine, the path, and the call counters for iter_entries and newest_entry.
+    #[allow(clippy::type_complexity)]
+    fn counting_brcb() -> (
+        Arc<Mutex<ReportingEngine>>,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use super::super::brcb::{Brcb, BufferedReportControl};
+        let backend = CountingBuffer::default();
+        let (iter_calls, newest_calls) = (backend.iter_calls.clone(), backend.newest_calls.clone());
+        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let path = "IED1LD0/MMXU1$BR$brcbCount".to_string();
+        engine
+            .register_brcb(BufferedReportControl::with_backend(
+                &path,
+                Brcb::new("brcbCount", "MMXU1$ds1"),
+                Box::new(backend),
+            ))
+            .unwrap();
+        (Arc::new(Mutex::new(engine)), path, iter_calls, newest_calls)
+    }
+
+    /// A disabled BRCB reads its exposed EntryID through `newest_entry`, without
+    /// copying the buffer through `iter_entries`.
+    #[test]
+    fn exposed_entry_reads_only_the_newest_entry() {
+        use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+        use std::sync::atomic::Ordering;
+        let (engine, path, iter_calls, newest_calls) = counting_brcb();
+        let r = handle_get_brcb_field(&engine, &path, RcbField::EntryId);
+        assert_eq!(
+            r,
+            Some(AccessResult::Success(MmsData::OctetString(
+                CountingBuffer::entry(0).entry_id.0.to_vec()
+            )))
+        );
+        assert_eq!(iter_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(newest_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -463,6 +463,30 @@ impl ReportBufferBackend for SqliteReportBuffer {
         }
     }
 
+    fn newest_entry(&self) -> Option<Arc<ReportEntry>> {
+        // The row with the largest seq for this control block, read alone.
+        let g = self.inner.lock().ok()?;
+        match g
+            .conn
+            .query_row(
+                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+                 FROM report_entries
+                 WHERE brcb_id = ?
+                 ORDER BY seq DESC
+                 LIMIT 1",
+                params![&g.brcb_id],
+                SqliteInner::row_to_entry,
+            )
+            .optional()
+        {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(error = %e, "sqlite report buffer newest_entry failed");
+                None
+            }
+        }
+    }
+
     fn iter_from(&self, after: &EntryId) -> Vec<Arc<ReportEntry>> {
         let Ok(g) = self.inner.lock() else {
             return Vec::new();
@@ -660,6 +684,38 @@ mod tests {
         assert_eq!(purged, 3);
         assert_eq!(buf_b.len(), 0);
         assert_eq!(buf_a.len(), 5, "purging B must not affect A");
+    }
+
+    /// `newest_entry` returns the row this control block inserted last, never a
+    /// newer row of another control block in the same file.
+    #[test]
+    fn newest_entry_is_the_last_row_of_this_control_block() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("newest.db");
+        let mut buf_a =
+            SqliteReportBuffer::open(&path, "brcbA", 2, OverflowStrategy::DropOldest).unwrap();
+        let mut buf_b =
+            SqliteReportBuffer::open(&path, "brcbB", 16, OverflowStrategy::DropOldest).unwrap();
+        assert!(buf_a.newest_entry().is_none());
+
+        for i in 0..3u64 {
+            buf_a.push(make_entry(1000 + i, i as u8));
+        }
+        buf_b.push(make_entry(5000, 9));
+        let newest = buf_a.newest_entry().expect("a newest entry");
+        assert_eq!(newest.entry_id, EntryId::from_ms(1002));
+        assert_eq!(newest.time_of_entry_ms, 1002);
+        assert_eq!(
+            buf_a.iter_entries().last().map(|e| e.entry_id),
+            Some(newest.entry_id)
+        );
+
+        buf_a.purge();
+        assert!(buf_a.newest_entry().is_none());
+        assert_eq!(
+            buf_b.newest_entry().map(|e| e.entry_id),
+            Some(EntryId::from_ms(5000))
+        );
     }
 
     /// `iter_from` returns the entries whose EntryID is strictly greater than the

@@ -74,7 +74,20 @@ struct Fixture {
     st_val: DataAttribute,
 }
 
+fn brcb_config() -> Brcb {
+    Brcb::new("brcbPos", "LLN0$dsPos")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(
+            OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::ENTRY_ID | OptFlds::BUFFER_OVERFLOW,
+        )
+}
+
 async fn start() -> Fixture {
+    start_with(BufferedReportControl::new(BRCB_PATH, brcb_config())).await
+}
+
+/// Starts the fixture with `brcb` as its buffered control block.
+async fn start_with(brcb: BufferedReportControl) -> Fixture {
     let server = IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -88,13 +101,8 @@ async fn start() -> Fixture {
         ds
     };
 
-    let brcb = Brcb::new("brcbPos", "LLN0$dsPos")
-        .with_trg_ops(TriggerOptions::DATA_CHANGED)
-        .with_opt_flds(
-            OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::ENTRY_ID | OptFlds::BUFFER_OVERFLOW,
-        );
     server
-        .register_brcb(BufferedReportControl::new(BRCB_PATH, brcb), data_set())
+        .register_brcb(brcb, data_set())
         .expect("register_brcb");
     let rcb = Rcb::new("urcbPos", "LLN0$dsPos")
         .with_trg_ops(TriggerOptions::DATA_CHANGED)
@@ -392,5 +400,60 @@ async fn brcb_entry_id_and_purge_buf_refused_while_enabled() {
     assert_eq!(
         read_brcb(&mut mms, "EntryID").await,
         MmsData::OctetString(vec![0; 8])
+    );
+}
+
+/// A BRCB on the SQLite backend exposes its newest buffered entry: the EntryID
+/// and TimeofEntry read while it is disabled belong to the last report it then
+/// sends.
+#[cfg(feature = "sqlite-backend")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_on_sqlite_exposes_its_newest_entry() {
+    use iec61850_server::reporting::{OverflowStrategy, SqliteReportBuffer};
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let backend = SqliteReportBuffer::open(
+        &dir.path().join("buffer.db"),
+        "brcbPos",
+        16,
+        OverflowStrategy::DropOldest,
+    )
+    .expect("open sqlite buffer");
+    let f = start_with(BufferedReportControl::with_backend(
+        BRCB_PATH,
+        brcb_config(),
+        Box::new(backend),
+    ))
+    .await;
+    let mut mms = f.connect().await;
+    f.set_st_val(2);
+    let first = wait_for_buffered_entry(&mut mms).await;
+    f.set_st_val(1);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let newest = loop {
+        let entry_id = read_brcb(&mut mms, "EntryID").await;
+        if entry_id != first {
+            break entry_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second entry was not buffered"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let MmsData::BinaryTime(time_of_entry) = read_brcb(&mut mms, "TimeofEntry").await else {
+        panic!("TimeofEntry is a BinaryTime");
+    };
+
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable");
+    let r1 = next_report(&mut mms).await;
+    let r2 = next_report(&mut mms).await;
+    assert_eq!(MmsData::OctetString(r1.entry_id.clone().unwrap()), first);
+    assert_eq!(MmsData::OctetString(r2.entry_id.clone().unwrap()), newest);
+    assert_eq!(read_brcb(&mut mms, "EntryID").await, newest);
+    assert_eq!(
+        read_brcb(&mut mms, "TimeofEntry").await,
+        MmsData::BinaryTime(time_of_entry)
     );
 }

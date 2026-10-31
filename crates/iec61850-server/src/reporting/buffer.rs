@@ -283,6 +283,16 @@ pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
     /// Returns every stored entry in insertion order.
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>>;
 
+    /// Returns the newest stored entry, the one inserted last, or `None` when the
+    /// buffer is empty.
+    ///
+    /// The default implementation takes the last element of `iter_entries`, which
+    /// copies the whole buffer; a backend that can reach its newest entry directly
+    /// overrides it.
+    fn newest_entry(&self) -> Option<Arc<ReportEntry>> {
+        self.iter_entries().pop()
+    }
+
     /// Returns every entry whose EntryID is strictly greater than `after`, in
     /// insertion order.
     ///
@@ -505,6 +515,10 @@ impl ReportBufferBackend for InMemoryReportBuffer {
 
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>> {
         self.entries.iter().cloned().collect()
+    }
+
+    fn newest_entry(&self) -> Option<Arc<ReportEntry>> {
+        self.entries.back().cloned()
     }
 
     fn iter_from(&self, after: &EntryId) -> Vec<Arc<ReportEntry>> {
@@ -825,6 +839,21 @@ mod tests {
         assert_eq!(got.entry_id, e1.entry_id);
         // The result is an owned Arc clone, so the reference count is above one.
         assert!(Arc::strong_count(&got) >= 2);
+    }
+
+    #[test]
+    fn newest_entry_is_the_last_pushed() {
+        let mut buf = InMemoryReportBuffer::new(2);
+        assert!(buf.newest_entry().is_none());
+        for id in [100, 200, 300] {
+            buf.push(make_entry(id, 0x01));
+            assert_eq!(
+                buf.newest_entry().map(|e| e.entry_id),
+                Some(EntryId::from_ms(id))
+            );
+        }
+        buf.purge();
+        assert!(buf.newest_entry().is_none());
     }
 
     #[test]
