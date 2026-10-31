@@ -203,7 +203,6 @@ impl GooseFrame {
 
             let et = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
             if et != GOOSE_ETHER_TYPE {
-                tracing::warn!("goose frame ethertype 0x{:04x}, expected 0x88b8", et);
                 return Err(GooseError::WrongEtherType(et));
             }
             pos += 2;
@@ -211,10 +210,6 @@ impl GooseFrame {
             vlan = None;
             pos += 2;
         } else {
-            tracing::warn!(
-                "goose frame ethertype 0x{:04x}, expected 0x88b8",
-                ethertype_candidate
-            );
             return Err(GooseError::WrongEtherType(ethertype_candidate));
         }
 

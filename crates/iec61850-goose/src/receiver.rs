@@ -157,8 +157,9 @@ impl GooseReceiver<Running> {
     /// Decodes one Ethernet frame and dispatches it to every matching
     /// subscriber, then sweeps every subscriber for an expired publication.
     ///
-    /// A frame that fails to decode is logged and dropped; the receiver stays
-    /// usable. Equivalent to `handle_message_at(buf, Instant::now())`.
+    /// A GOOSE frame that fails to decode is logged and dropped; a frame of
+    /// another EtherType is dropped silently. The receiver stays usable either
+    /// way. Equivalent to `handle_message_at(buf, Instant::now())`.
     pub fn handle_message(&mut self, buf: &[u8]) {
         self.handle_message_at(buf, Instant::now());
     }
@@ -172,6 +173,10 @@ impl GooseReceiver<Running> {
     pub fn handle_message_at(&mut self, buf: &[u8], now: Instant) {
         match self.do_handle_message(buf, now) {
             Ok(_) => {}
+            // Traffic other than GOOSE shares the interface and is not an error.
+            Err(GooseError::WrongEtherType(et)) => {
+                tracing::trace!("ignored a frame of ethertype 0x{:04x}", et);
+            }
             Err(e) => {
                 tracing::warn!("dropped goose frame that failed to decode: {}", e);
             }

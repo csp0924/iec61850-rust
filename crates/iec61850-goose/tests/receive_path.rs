@@ -543,3 +543,43 @@ fn observer_evictions_are_logged_once() {
     });
     assert_eq!(logged, 1);
 }
+
+/// Builds a frame of another EtherType, optionally behind an 802.1Q tag.
+fn foreign_frame(ether_type: u16, vlan: bool) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&DST);
+    f.extend_from_slice(&[0, 0x50, 0xc2, 0, 0, 2]);
+    if vlan {
+        f.extend_from_slice(&[0x81, 0x00, 0x80, 0x01]);
+    }
+    f.extend_from_slice(&ether_type.to_be_bytes());
+    f.resize(64, 0);
+    f
+}
+
+#[test]
+fn frames_of_another_ether_type_are_dropped_without_a_warning() {
+    let (sub, hits) = counting(Some("LD/LLN0$GO$g"), None);
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    let goose = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    let logged = warnings_containing("", || {
+        rx.handle_message(&foreign_frame(0x88ba, false));
+        rx.handle_message(&foreign_frame(0x0800, true));
+        rx.handle_message(&goose);
+    });
+    assert_eq!(logged, 0);
+    assert_eq!(*hits.lock().unwrap(), 1);
+}
+
+#[test]
+fn malformed_goose_frame_is_still_reported() {
+    let mut rx = GooseReceiver::new().start();
+    let mut truncated = frame_of(&pdu("LD/LLN0$GO$g", 1, 0), 0x1000);
+    truncated.truncate(20);
+    let logged = warnings_containing("dropped goose frame", || {
+        rx.handle_message(&truncated);
+    });
+    assert_eq!(logged, 1);
+}
