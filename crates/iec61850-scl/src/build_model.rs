@@ -825,16 +825,17 @@ pub fn sv_control_sv_id(raw_svcb: &RawSampledValueControl, domain: &str) -> Stri
     }
 }
 
-/// Returns the MMS domain name of a logical device: its `ldName` when set, and
-/// otherwise the IED name followed by the `inst`.
+/// Returns the MMS domain name of a raw logical device, by the rule of
+/// [`iec61850_model::LogicalDevice::compose_domain_name`].
 ///
 /// Also used by the build-script path through [`crate::__build_internals`].
 #[doc(hidden)]
 pub fn ld_domain_name(raw_ld: &RawLogicalDevice, ied_name: &str) -> String {
-    match &raw_ld.ld_name {
-        Some(name) => name.clone(),
-        None => format!("{ied_name}{}", raw_ld.inst),
-    }
+    iec61850_model::LogicalDevice::compose_domain_name(
+        ied_name,
+        &raw_ld.inst,
+        raw_ld.ld_name.as_deref(),
+    )
 }
 
 /// Converts a `<SampledValueControl>` into an [`SvControlBlock`], whose svID

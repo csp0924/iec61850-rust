@@ -225,12 +225,22 @@ impl LogicalDevice {
     /// Returns the MMS domain name: `ld_name` when set, otherwise
     /// `ied_name + inst`.
     pub fn domain_name(&self, ied_name: &str) -> String {
-        match &self.ld_name {
-            Some(n) => n.clone(),
+        Self::compose_domain_name(ied_name, &self.inst, self.ld_name.as_deref())
+    }
+
+    /// Returns the MMS domain name of a logical device with instance name
+    /// `inst` and functional name `ld_name` in the IED `ied_name`: `ld_name`
+    /// when given, otherwise `ied_name + inst` (IEC 61850-6 §8.5).
+    ///
+    /// The rule [`domain_name`](Self::domain_name) applies, for a caller that
+    /// holds the parts without a built logical device.
+    pub fn compose_domain_name(ied_name: &str, inst: &str, ld_name: Option<&str>) -> String {
+        match ld_name {
+            Some(n) => n.into(),
             None => {
-                let mut s = String::with_capacity(ied_name.len() + self.inst.len());
+                let mut s = String::with_capacity(ied_name.len() + inst.len());
                 s.push_str(ied_name);
-                s.push_str(&self.inst);
+                s.push_str(inst);
                 s
             }
         }
@@ -733,6 +743,22 @@ mod tests {
         let m = IedModel::from_parts("IED1".into(), vec![ld]);
         assert!(m.ld_by_domain("FuncName").is_some());
         assert!(m.ld_by_domain("IED1Cfg").is_none()); // ld_name replaces it
+    }
+
+    #[test]
+    fn compose_domain_name_matches_domain_name() {
+        assert_eq!(
+            LogicalDevice::compose_domain_name("IED1", "LD0", None),
+            "IED1LD0"
+        );
+        assert_eq!(
+            LogicalDevice::compose_domain_name("IED1", "LD0", Some("Func")),
+            "Func"
+        );
+        let mut ld = LogicalDevice::new("LD0", vec![]);
+        assert_eq!(ld.domain_name("IED1"), "IED1LD0");
+        ld.ld_name = Some("Func".into());
+        assert_eq!(ld.domain_name("IED1"), "Func");
     }
 
     #[test]
