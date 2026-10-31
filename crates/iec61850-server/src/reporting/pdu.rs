@@ -49,11 +49,13 @@
 //! `encode_report_pdus` splits a report that would exceed the PDU limit into
 //! segments. Every segment repeats the full header (RptID, OptFlds, SqNum,
 //! TimeOfEntry, and so on), numbers itself with a zero-based `subSeqNum`, and
-//! sets `moreFollows` on every segment but the last. The limit is the smaller of
-//! the maximum PDU size the caller passes and 65535 bytes. The size of a PDU is
-//! computed before it is encoded, so a report larger than the limit is split
-//! rather than emitted as one oversized PDU, and a client is never handed a PDU
-//! it cannot receive.
+//! sets `moreFollows` on every segment but the last. The inclusion bitstring of
+//! a segment marks only the members that segment carries, per IEC 61850-8-1
+//! §17.2.1, so the segments of a report mark disjoint sets of members whose
+//! union is the whole report. The limit is the smaller of the maximum PDU size
+//! the caller passes and 65535 bytes. The size of a PDU is computed before it
+//! is encoded, so a report larger than the limit is split rather than emitted
+//! as one oversized PDU, and a client is never handed a PDU it cannot receive.
 //!
 //! ## variableAccessSpecification
 //!
@@ -413,15 +415,7 @@ fn encode_pdus(
     let unsegmented =
         pdu_len(fixed_len + header.segmentation_len(false, 0) + costs.iter().sum::<usize>());
     if unsegmented <= limit {
-        return Ok(vec![encode_pdu(
-            header,
-            false,
-            0,
-            false,
-            ds_len,
-            all_included,
-            &members,
-        )]);
+        return Ok(vec![encode_pdu(header, false, 0, false, ds_len, &members)]);
     }
     if members.is_empty() {
         return Err(ReportEncodeError::PduTooSmall {
@@ -455,7 +449,6 @@ fn encode_pdus(
             sub_seq_num,
             more_follows,
             ds_len,
-            all_included,
             &members[start..end],
         ));
         if more_follows {
@@ -479,7 +472,6 @@ fn encode_pdu(
     sub_seq_num: u16,
     more_follows: bool,
     ds_len: usize,
-    all_included: bool,
     members: &[IncludedMember<'_>],
 ) -> Bytes {
     let mut access_result = BytesMut::new();
@@ -487,13 +479,9 @@ fn encode_pdu(
     // RptID, OptFlds, the optional header fields, and the segmentation fields.
     header.encode(segmented, sub_seq_num, more_follows, &mut access_result);
 
-    // inclusionField: BIT_STRING(N), N = data set length.
-    encode_inclusion_field(
-        members.iter().map(|m| m.index),
-        ds_len,
-        all_included,
-        &mut access_result,
-    );
+    // inclusionField: BIT_STRING(N), N = data set length, marking the members
+    // this PDU carries.
+    encode_inclusion_field(members.iter().map(|m| m.index), ds_len, &mut access_result);
 
     // One VisibleString per included member if DATA_REFERENCE.
     for m in members {
@@ -621,12 +609,12 @@ fn encode_binary_time(ms: u64, buf: &mut BytesMut) {
 
 /// Encodes the inclusionField as a BIT_STRING(N), N = data set length.
 ///
-/// A general interrogation or integrity report sets every bit; a data-change
-/// report sets only the bits of the members in `included`.
+/// Sets the bit of every member in `included` and no other, so the bitstring
+/// marks exactly the members whose values the PDU carries. The unused trailing
+/// bits of the last byte are zero.
 fn encode_inclusion_field(
     included: impl Iterator<Item = usize>,
     ds_len: usize,
-    all_included: bool,
     buf: &mut BytesMut,
 ) {
     // BIT_STRING byte count and the number of unused trailing bits.
@@ -634,20 +622,10 @@ fn encode_inclusion_field(
     let padding = (n_bytes * 8 - ds_len) as u8;
 
     let mut bitmap = vec![0u8; n_bytes];
-    if all_included {
-        for b in bitmap.iter_mut() {
-            *b = 0xff;
-        }
-        // The unused trailing bits of the last byte must be zero.
-        if padding > 0 && n_bytes > 0 {
-            bitmap[n_bytes - 1] &= 0xff << padding;
-        }
-    } else {
-        for idx in included {
+    for idx in included {
+        if let Some(byte) = bitmap.get_mut(idx / 8) {
             if idx < ds_len {
-                let byte_idx = idx / 8;
-                let bit_idx = 7 - (idx % 8); // most significant bit first
-                bitmap[byte_idx] |= 1 << bit_idx;
+                *byte |= 1 << (7 - (idx % 8)); // most significant bit first
             }
         }
     }
@@ -860,8 +838,8 @@ pub fn pending_from_brcb_entry(entry: &Arc<ReportEntry>, ds_len: usize) -> Pendi
             }
         }
         // For general interrogation and integrity the snapshot already holds every
-        // data set value. The encoder forces the inclusion field to all-included for
-        // those reports, so the flags need no adjustment here.
+        // data set value, and the encoder includes every member of those reports,
+        // so the flags need no adjustment here.
         return p;
     }
 
@@ -1635,6 +1613,170 @@ mod tests {
         ));
     }
 
+    /// The fields of one decoded report segment.
+    struct Segment {
+        sub_seq_num: u64,
+        more_follows: bool,
+        /// Data set positions whose inclusion bit is set.
+        included: Vec<usize>,
+        references: Vec<String>,
+        /// Number of value and reason access results after the references.
+        trailing: usize,
+        len: usize,
+    }
+
+    /// Decodes a segmented report PDU whose SubSeqNum is access result
+    /// `sub_seq_at`, with DATA_REFERENCE and REASON set.
+    fn decode_segment(pdu: &[u8], sub_seq_at: usize, ds_len: usize) -> Segment {
+        use iec61850_mms::mms::pdu::common::MmsData;
+        use iec61850_mms::mms::pdu::information_report::decode_information_report;
+        let (len, hdr) = iec61850_asn1::decode_length(&pdu[1..]).expect("outer length");
+        let report = decode_information_report(&pdu[1 + hdr..1 + hdr + len]).expect("decode");
+        let r = &report.list_of_access_result;
+        let sub_seq_num = match &r[sub_seq_at] {
+            MmsData::Unsigned(v) => *v,
+            other => panic!("SubSeqNum expected, got {other:?}"),
+        };
+        let more_follows = match &r[sub_seq_at + 1] {
+            MmsData::Boolean(b) => *b,
+            other => panic!("MoreSegmentsFollow expected, got {other:?}"),
+        };
+        let included = match &r[sub_seq_at + 2] {
+            MmsData::BitString { padding, data } => {
+                assert_eq!(data.len() * 8 - usize::from(*padding), ds_len, "bit count");
+                (0..ds_len)
+                    .filter(|i| data[i / 8] & (0x80 >> (i % 8)) != 0)
+                    .collect::<Vec<_>>()
+            }
+            other => panic!("inclusion bitstring expected, got {other:?}"),
+        };
+        let rest = &r[sub_seq_at + 3..];
+        let references = rest[..included.len()]
+            .iter()
+            .map(|v| match v {
+                MmsData::VisibleString(s) => s.clone(),
+                other => panic!("data reference expected, got {other:?}"),
+            })
+            .collect();
+        Segment {
+            sub_seq_num,
+            more_follows,
+            trailing: rest.len() - included.len(),
+            included,
+            references,
+            len: pdu.len(),
+        }
+    }
+
+    /// Checks that `pdus` is a segmented report of every member of `ds`: each
+    /// segment marks only the members it carries, the segments are numbered
+    /// from zero, and only the last one clears MoreSegmentsFollow.
+    fn assert_segments_cover_the_data_set(pdus: &[Bytes], sub_seq_at: usize, ds: &Dataset) {
+        let mut seen = vec![false; ds.len()];
+        for (i, pdu) in pdus.iter().enumerate() {
+            let seg = decode_segment(pdu, sub_seq_at, ds.len());
+            assert_eq!(seg.sub_seq_num, i as u64, "segment {i}: SubSeqNum");
+            assert_eq!(seg.more_follows, i + 1 < pdus.len(), "segment {i}: more");
+            assert!(!seg.included.is_empty(), "segment {i}: carries a member");
+            // One value and one reason per marked member.
+            assert_eq!(seg.trailing, 2 * seg.included.len(), "segment {i}: values");
+            for (idx, reference) in seg.included.iter().zip(&seg.references) {
+                assert_eq!(reference, &ds.entries[*idx].attr_ref, "segment {i}");
+                assert!(!seen[*idx], "segment {i}: member {idx} marked twice");
+                seen[*idx] = true;
+            }
+        }
+        assert!(seen.iter().all(|s| *s), "every member is carried once");
+    }
+
+    #[test]
+    fn segmented_gi_and_integrity_reports_mark_the_members_of_each_segment() {
+        let (ds, gi) = large_gi(60);
+        let mut integrity = gi.clone();
+        integrity.is_gi = false;
+        integrity.is_integrity = true;
+        for pending in [&gi, &integrity] {
+            let params = ReportEncodeParams {
+                opt_flds: OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::DATA_REFERENCE,
+                max_pdu_size_bytes: 1024,
+                ..base_params(&ds, pending)
+            };
+            let pdus = encode_report_pdus(&params).expect("segmented");
+            assert!(pdus.len() >= 3, "{} segments", pdus.len());
+            assert!(pdus.iter().all(|p| p.len() <= 1024));
+            assert_segments_cover_the_data_set(&pdus, 3, &ds);
+
+            let mut brcb = brcb_base_params(&ds, pending, EntryId::from_ms(9), false);
+            brcb.opt_flds |= OptFlds::DATA_REFERENCE;
+            brcb.max_pdu_size_bytes = 1024;
+            let pdus = encode_brcb_report_pdus(&brcb).expect("segmented");
+            assert!(pdus.len() >= 3, "brcb: {} segments", pdus.len());
+            assert!(pdus.iter().all(|p| p.len() <= 1024));
+            assert_segments_cover_the_data_set(&pdus, 6, &ds);
+        }
+    }
+
+    #[test]
+    fn unsegmented_gi_report_marks_every_member() {
+        let ds = make_dataset(11);
+        let pending = make_gi_pending(11, vec![MmsValue::Boolean(true); 11]);
+        let params = ReportEncodeParams {
+            opt_flds: OptFlds::NONE,
+            ..base_params(&ds, &pending)
+        };
+        let pdus = encode_report_pdus(&params).expect("encode");
+        assert_eq!(pdus.len(), 1);
+        // BIT_STRING(11): five unused bits, eleven ones.
+        assert!(find(&pdus[0], &[0x84, 0x03, 0x05, 0xff, 0xe0]).is_some());
+    }
+
+    #[test]
+    fn segmented_data_change_report_marks_the_members_of_each_segment() {
+        let (ds, gi) = large_gi(40);
+        let mut pending = PendingReport::new_empty(40, 1_000_000);
+        for i in (0..40).step_by(3) {
+            pending.inclusion_flags[i] = InclusionFlag::VALUE_CHANGED;
+            pending.snapshot[i] = gi.snapshot[i].clone();
+        }
+        let params = ReportEncodeParams {
+            opt_flds: OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::DATA_REFERENCE,
+            max_pdu_size_bytes: 700,
+            ..base_params(&ds, &pending)
+        };
+        let pdus = encode_report_pdus(&params).expect("segmented");
+        assert!(pdus.len() >= 3, "{} segments", pdus.len());
+        let mut carried = Vec::new();
+        for pdu in &pdus {
+            carried.extend(decode_segment(pdu, 3, 40).included);
+        }
+        assert_eq!(carried, (0..40).step_by(3).collect::<Vec<_>>());
+    }
+
+    /// A segment that fills the limit to the byte keeps every member that fits:
+    /// lowering the limit to the size of a segment leaves that segment as it is.
+    #[test]
+    fn segment_that_fills_the_limit_exactly_keeps_its_members() {
+        let (ds, pending) = large_gi(60);
+        for limit in [700usize, 1024, 1500, 2048, 4096] {
+            let mut params = ReportEncodeParams {
+                opt_flds: OptFlds::SEQ_NUM | OptFlds::REASON | OptFlds::DATA_REFERENCE,
+                max_pdu_size_bytes: limit,
+                ..base_params(&ds, &pending)
+            };
+            let pdus = encode_report_pdus(&params).expect("segmented");
+            assert!(pdus.len() > 1, "limit {limit}: segmented");
+            let first = decode_segment(&pdus[0], 3, ds.len());
+            params.max_pdu_size_bytes = first.len;
+            let exact = encode_report_pdus(&params).expect("segmented at the exact size");
+            assert_eq!(
+                exact[0], pdus[0],
+                "limit {limit}: the first segment is unchanged"
+            );
+            assert!(exact.iter().all(|p| p.len() <= first.len));
+            assert_segments_cover_the_data_set(&exact, 3, &ds);
+        }
+    }
+
     #[test]
     fn pending_from_brcb_entry_data_change_marks_all_included() {
         // A data-change entry without a snapshot includes the whole data set.
@@ -1667,7 +1809,7 @@ mod tests {
         ));
         let p = pending_from_brcb_entry(&entry, 3);
         assert!(p.is_gi);
-        // General interrogation does not set VALUE_CHANGED; the encoder takes the
-        // all-included path for it.
+        // General interrogation does not set VALUE_CHANGED; the encoder includes
+        // every member of such a report.
     }
 }
