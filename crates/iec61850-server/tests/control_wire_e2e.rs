@@ -1159,6 +1159,73 @@ async fn closing_the_association_ends_its_selection() {
     h.stop().await;
 }
 
+// ── An association lost while the response waits ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operate_whose_association_closes_before_its_response_does_not_run() {
+    let seen: Arc<Mutex<Vec<MmsValue>>> = Arc::default();
+    let check = GatedCheck {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        result: Ok(()),
+    };
+    let (entered, release) = (check.entered.clone(), check.release.clone());
+    let s = server();
+    let obj = object("SPCSO2", ControlModel::SboNormal);
+    let mut changes = observe(&obj);
+    s.control_objects().register(
+        ControlObjectEntry::new(obj.clone())
+            .with_wait(Arc::new(check) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(Recorder(seen.clone())) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut conn = raw_connect(&h).await;
+
+    let mut alloc = InvokeIdAllocator::new(8);
+    let select = iec61850_mms::mms::client::services::read_variable(
+        &mut conn,
+        &mut alloc,
+        DOMAIN,
+        "GGIO1$CO$SPCSO2$SBO",
+    )
+    .await
+    .expect("select");
+    assert_eq!(
+        select,
+        MmsData::VisibleString(format!("{DOMAIN}/GGIO1$CO$SPCSO2"))
+    );
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Selected
+    );
+
+    let req = WriteRequest::single_domain(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 95));
+    let mut full = BytesMut::new();
+    encode_confirmed_write_request(9, &req, &mut full);
+    conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(request_content(full)))
+        .await
+        .expect("send");
+    entered.notified().await;
+    conn.abort().await.expect("abort");
+    tokio::time::timeout(WAIT, async {
+        while s.connection_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the association is released");
+
+    // The dynamic check passes after the association is gone.
+    release.notify_one();
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Disconnected
+    );
+    assert_eq!(obj.state(), ControlState::Unselected);
+    assert!(seen.lock().unwrap().is_empty(), "the command ran");
+    h.stop().await;
+}
+
 // ── A handler that panics ──────────────────────────────────────────────────
 
 /// Control handler that panics while it executes.

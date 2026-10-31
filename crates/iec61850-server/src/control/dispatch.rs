@@ -15,7 +15,9 @@
 //!   it passes, after which the command runs, and negatively, preceded by
 //!   `LastApplError`, when it refuses. Without a dynamic check the answer is
 //!   immediate. With a dynamic check the write response is deferred: the
-//!   connection holds it back and sends the outcome the task posts. A write of
+//!   connection holds it back and sends the outcome the task posts, and the
+//!   command runs only once the connection has sent the positive response; a
+//!   command whose association closed first does not run. A write of
 //!   more than one variable cannot be deferred and is answered positively when
 //!   the Operate is accepted; when its dynamic check then refuses, an
 //!   enhanced-security command is ended with a negative CommandTermination, the
@@ -25,6 +27,7 @@
 //!   CommandTermination that ends it; normal security reports no outcome.
 
 use super::conform::{conforms, declared_co_attribute, CoDeclaration};
+use super::handler::SelectStateChangedReason;
 use super::model::{CancelParams, ControlAddCause, ControlLastApplError, OperParams, OriginValue};
 use super::registry::{ControlObjectEntry, ControlObjectsRegistry};
 use super::service::{
@@ -40,7 +43,7 @@ use iec61850_model::{IedModel, MmsValue};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ControlOutbox
@@ -62,6 +65,10 @@ pub(crate) struct DeferredWrite {
     /// dynamic check refused it, sent instead when the write could not wait and
     /// was answered positively at acceptance.
     pub(crate) termination: Option<ConnectionTerminationEvent>,
+    /// Signal that lets a command answered positively run, sent once the
+    /// positive response is on its way. Dropping it unsent abandons the
+    /// command.
+    pub(crate) released: Option<oneshot::Sender<()>>,
 }
 
 struct Slot {
@@ -403,10 +410,15 @@ fn operate(
     });
     runtime.spawn(async move {
         let checked = accepted.dynamic_check().await;
+        let mut release = None;
         match reply {
             Some(reply) => {
-                let (outcome, last_appl_error, termination) = match checked {
-                    Ok(()) => (WriteOutcome::Success, None, None),
+                let (outcome, last_appl_error, termination, released) = match checked {
+                    Ok(()) => {
+                        let (tx, rx) = oneshot::channel();
+                        release = Some(rx);
+                        (WriteOutcome::Success, None, None, Some(tx))
+                    }
                     Err(cause) => (
                         WriteOutcome::Failure(add_cause_to_data_access_error(cause)),
                         Some(encode_last_appl_error(
@@ -416,6 +428,7 @@ fn operate(
                             Refusal::by_check(cause),
                         )),
                         accepted.negative_termination(cause, false),
+                        None,
                     ),
                 };
                 let id = reply.id;
@@ -424,6 +437,7 @@ fn operate(
                     outcome,
                     last_appl_error,
                     termination,
+                    released,
                 }) {
                     tracing::warn!(
                         cntrl_obj,
@@ -442,10 +456,23 @@ fn operate(
                 }
             }
         }
-        if checked.is_ok() {
-            accepted.mark_answered();
-            run_answered(accepted, ct_sink, cntrl_obj).await;
+        if checked.is_err() {
+            return;
         }
+        // The action follows the positive response, IEC 61850-7-2 §20.2.1 and
+        // §20.3.3 (d); a response that never left does not start it.
+        if let Some(release) = release {
+            if release.await.is_err() {
+                tracing::warn!(
+                    cntrl_obj,
+                    "operate abandoned: the association closed before its positive response was sent"
+                );
+                accepted.abandon(SelectStateChangedReason::Disconnected);
+                return;
+            }
+        }
+        accepted.mark_answered();
+        run_answered(accepted, ct_sink, cntrl_obj).await;
     });
     CoWriteResult::Accepted
 }
@@ -482,6 +509,7 @@ impl Drop for DeferredReply {
             outcome: WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
             last_appl_error: Some(self.last_appl_error.clone()),
             termination: self.termination.take(),
+            released: None,
         });
     }
 }
@@ -591,6 +619,192 @@ pub(crate) fn add_cause_to_data_access_error(cause: ControlAddCause) -> DataAcce
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::handler::{
+        ControlHandler, OperateFuture, SelectStateChangedHandler, WaitForExecFuture,
+        WaitForExecutionHandler,
+    };
+    use crate::control::model::{ControlAction, ControlModel};
+    use crate::control::object::{ControlObject, ControlObjectConfig};
+    use crate::control::state::ControlState;
+    use iec61850_model::{IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    /// Dynamic check that passes once released.
+    struct HeldCheck(Arc<Notify>);
+
+    impl WaitForExecutionHandler for HeldCheck {
+        fn wait_for_execution<'a>(
+            &'a self,
+            _a: &'a ControlAction,
+            _v: &'a MmsValue,
+            _t: bool,
+            _s: bool,
+        ) -> WaitForExecFuture<'a> {
+            let release = self.0.clone();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(())
+            })
+        }
+    }
+
+    /// Control handler that counts its runs and signals each.
+    struct Counted(Arc<AtomicUsize>, Arc<Notify>);
+
+    impl ControlHandler for Counted {
+        fn operate<'a>(
+            &'a self,
+            _a: &'a ControlAction,
+            _v: &'a MmsValue,
+            _t: bool,
+        ) -> OperateFuture<'a> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1.notify_one();
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Forwards every selection change reason to a channel.
+    struct Changes(mpsc::UnboundedSender<SelectStateChangedReason>);
+
+    impl SelectStateChangedHandler for Changes {
+        fn on_select_state_changed(
+            &self,
+            _a: &ControlAction,
+            _selected: bool,
+            reason: SelectStateChangedReason,
+        ) {
+            let _ = self.0.send(reason);
+        }
+    }
+
+    struct Fixture {
+        registry: ControlObjectsRegistry,
+        model: IedModel,
+        entry: ControlObjectEntry,
+        check: Arc<Notify>,
+        runs: Arc<AtomicUsize>,
+        ran: Arc<Notify>,
+        changes: mpsc::UnboundedReceiver<SelectStateChangedReason>,
+    }
+
+    /// A selected select-before-operate object with a held dynamic check.
+    fn fixture() -> Fixture {
+        let model = IedModelBuilder::new("x")
+            .add_ld(
+                LogicalDeviceBuilder::new("LD0")
+                    .add_ln(LogicalNodeBuilder::lln0().build().expect("lln0"))
+                    .build()
+                    .expect("ld"),
+            )
+            .expect("add_ld")
+            .build()
+            .expect("model");
+        let obj = ControlObject::new(ControlObjectConfig::new(
+            "SPCSO1",
+            "GGIO1",
+            "xLD0",
+            ControlModel::SboNormal,
+        ));
+        let (tx, mut changes) = mpsc::unbounded_channel();
+        obj.set_select_state_handler(Arc::new(Changes(tx)));
+        assert!(obj.try_select(1).expect("select"));
+        assert_eq!(changes.try_recv(), Ok(SelectStateChangedReason::Selected));
+        let check = Arc::new(Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(Notify::new());
+        let entry = ControlObjectEntry::new(obj)
+            .with_wait(Arc::new(HeldCheck(check.clone())) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(Counted(runs.clone(), ran.clone())) as Arc<dyn ControlHandler>);
+        Fixture {
+            registry: ControlObjectsRegistry::new(),
+            model,
+            entry,
+            check,
+            runs,
+            ran,
+            changes,
+        }
+    }
+
+    fn oper_value() -> MmsValue {
+        MmsValue::Structure(vec![
+            MmsValue::Boolean(true),
+            MmsValue::Structure(vec![MmsValue::Integer(3), MmsValue::OctetString(vec![1])]),
+            MmsValue::Unsigned(1),
+            MmsValue::UtcTime([0; 8]),
+            MmsValue::Boolean(false),
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0],
+            },
+        ])
+    }
+
+    /// Awaits `fut`, failing the test when it does not finish within 5 s.
+    async fn bounded<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("an event that never came")
+    }
+
+    fn operate_on(f: &Fixture) -> CoWriteResult {
+        let target = CoTarget {
+            domain: "xLD0",
+            ln_name: "GGIO1",
+            do_name: "SPCSO1",
+            attr: CoAttr::Oper,
+        };
+        write(&f.registry, &f.model, &f.entry, 1, &target, &oper_value())
+    }
+
+    #[tokio::test]
+    async fn a_deferred_operate_runs_once_its_positive_response_is_sent() {
+        let f = fixture();
+        let mut rx = f.registry.outbox().register(1);
+        assert_eq!(operate_on(&f), CoWriteResult::Accepted);
+        assert_eq!(f.registry.outbox().take_deferred(1).len(), 1);
+        f.check.notify_one();
+        let done = bounded(rx.recv()).await.expect("the outcome");
+        assert_eq!(done.outcome, WriteOutcome::Success);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0, "ran before its response");
+        done.released.expect("a release").send(()).expect("send");
+        bounded(f.ran.notified()).await;
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_operate_whose_response_is_not_sent_does_not_run() {
+        let mut f = fixture();
+        let mut rx = f.registry.outbox().register(1);
+        assert_eq!(operate_on(&f), CoWriteResult::Accepted);
+        f.check.notify_one();
+        // The connection takes the outcome but fails to send the response.
+        drop(bounded(rx.recv()).await.expect("the outcome"));
+        assert_eq!(
+            bounded(f.changes.recv()).await,
+            Some(SelectStateChangedReason::Disconnected)
+        );
+        assert_eq!(f.entry.object.state(), ControlState::Unselected);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_operate_of_a_closed_association_does_not_run() {
+        let mut f = fixture();
+        let rx = f.registry.outbox().register(1);
+        assert_eq!(operate_on(&f), CoWriteResult::Accepted);
+        drop(rx);
+        f.registry.outbox().deregister(1);
+        f.check.notify_one();
+        assert_eq!(
+            bounded(f.changes.recv()).await,
+            Some(SelectStateChangedReason::Disconnected)
+        );
+        assert_eq!(f.entry.object.state(), ControlState::Unselected);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn refusals_carry_no_error_and_internal_failures_unknown() {

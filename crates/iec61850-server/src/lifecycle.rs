@@ -704,6 +704,9 @@ where
                                 send_user_data_mms(&mut cotp, &session, &pres, &buf),
                             )
                             .await?;
+                            if let Some(released) = done.released {
+                                let _ = released.send(());
+                            }
                         } else if let Some(event) = &done.termination {
                             tracing::warn!(
                                 conn_id,
@@ -716,6 +719,9 @@ where
                                 send_command_termination(&mut cotp, &session, &pres, event),
                             )
                             .await?;
+                        } else if let Some(released) = done.released {
+                            // The write was answered positively at acceptance.
+                            let _ = released.send(());
                         } else {
                             tracing::warn!(
                                 conn_id,

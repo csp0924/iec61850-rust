@@ -15,7 +15,9 @@
 //! not. That is an unsolicited push rather than a confirmed response, so it is
 //! routed through the `CommandTerminationSink` trait instead of the request path.
 
-use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
+use super::handler::{
+    CheckHandler, ControlHandler, SelectStateChangedReason, WaitForExecutionHandler,
+};
 use super::model::{
     CancelParams, ControlAction, ControlAddCause, ControlLastApplError, ControlModel, OperParams,
 };
@@ -721,6 +723,14 @@ impl AcceptedOperate {
     /// run.
     pub(crate) fn mark_answered(&self) {
         self.phase.store(ANSWERED, Ordering::Release);
+    }
+
+    /// Gives up a command whose positive response was not delivered: the
+    /// command does not run and the object returns to unselected, reporting
+    /// `reason`.
+    pub(crate) fn abandon(&self, reason: SelectStateChangedReason) {
+        self.phase.store(FINISHED, Ordering::Release);
+        self.obj.abort(reason);
     }
 
     /// Returns whether the object uses enhanced security, whose result travels
