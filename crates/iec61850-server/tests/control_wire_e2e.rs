@@ -935,6 +935,111 @@ async fn failed_test_commands_terminate_with_the_test_error_codes() {
     h.stop().await;
 }
 
+// ── Services outside the control model ─────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sbow_outside_the_enhanced_select_model_is_refused() {
+    let s = server();
+    let declared = object("SPCSO1", ControlModel::DirectNormal);
+    let undeclared = object("SPCSO9", ControlModel::DirectNormal);
+    register(&s, declared.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    register(
+        &s,
+        undeclared.clone(),
+        Arc::new(AlwaysSuccessOperateHandler),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    // The model declares SPCSO1 without SBOw, so the attribute does not exist.
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$SBOw", oper(on(), 81))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectNonExistent);
+    assert_eq!(queued_report(&mut a).await, None);
+    assert_eq!(declared.state(), ControlState::Unselected);
+
+    // An object the model does not declare answers unknown.
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO9$SBOw", oper(on(), 82))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO9$SBOw"), 82, 0);
+    assert_eq!(undeclared.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+/// Returns the data access error a read answers with.
+fn read_denied(r: Result<MmsData, ClientError>) -> DataAccessError {
+    match r {
+        Err(ClientError::DataAccessError(e)) => e,
+        other => panic!("expected a data access error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_of_sbo_outside_the_normal_select_model_does_not_exist() {
+    let s = server();
+    for (name, model) in [
+        ("SPCSO1", ControlModel::DirectNormal),
+        ("SPCSO2", ControlModel::SboNormal),
+        ("SPCSO4", ControlModel::SboEnhanced),
+        ("SPCSO9", ControlModel::DirectNormal),
+    ] {
+        register(
+            &s,
+            object(name, model),
+            Arc::new(AlwaysSuccessOperateHandler),
+        );
+    }
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    for item in [
+        "GGIO1$CO$SPCSO1$SBO",
+        "GGIO1$CO$SPCSO4$SBO",
+        "GGIO1$CO$SPCSO9$SBO",
+    ] {
+        let r = a.read(DOMAIN, item).await;
+        assert_eq!(read_denied(r), DataAccessError::ObjectNonExistent, "{item}");
+    }
+    let sel = a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("select");
+    assert_eq!(
+        sel,
+        MmsData::VisibleString(format!("{DOMAIN}/GGIO1$CO$SPCSO2"))
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_of_an_idle_direct_object_is_not_supported() {
+    let s = server();
+    for (name, model) in [
+        ("SPCSO1", ControlModel::DirectNormal),
+        ("SPCSO3", ControlModel::DirectEnhanced),
+    ] {
+        register(
+            &s,
+            object(name, model),
+            Arc::new(AlwaysSuccessOperateHandler),
+        );
+    }
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    for (item, ctl_num) in [
+        ("GGIO1$CO$SPCSO1$Cancel", 83),
+        ("GGIO1$CO$SPCSO3$Cancel", 84),
+    ] {
+        let r = a.write(DOMAIN, item, cancel(ctl_num)).await;
+        assert_eq!(denied(r), DataAccessError::ObjectAccessDenied, "{item}");
+        let lae = last_appl_error_only(queued_report(&mut a).await);
+        assert_last_appl_error(&lae, &format!("{DOMAIN}/{item}"), ctl_num, 1);
+    }
+    h.stop().await;
+}
+
 // ── TimeActivatedOperate ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

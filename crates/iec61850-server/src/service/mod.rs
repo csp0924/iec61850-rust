@@ -2748,6 +2748,22 @@ fn handle_read_with_co_routing(
                             ));
                         }
                     };
+                    // SBO exists only under the normal-security
+                    // select-before-operate model, IEC 61850-8-1 Table 94, and
+                    // only where the model declares it.
+                    if crate::control::dispatch::sbo_absent(ied_model, domain, ln, do_name)
+                        || entry.object.config.ctl_model != crate::control::ControlModel::SboNormal
+                    {
+                        tracing::warn!(
+                            domain,
+                            ln,
+                            do_name,
+                            "read: the control object has no SBO attribute, answering object-non-existent"
+                        );
+                        return ReadRoutingOutcome::Result(AccessResult::Failure(
+                            DataAccessError::ObjectNonExistent,
+                        ));
+                    }
                     let result =
                         handle_read_sbo(&entry.object, conn_id, entry.check_handler.as_ref());
                     match result {
@@ -3009,6 +3025,9 @@ fn handle_write_with_co_routing(
                 CoWriteResult::Accepted => WriteOutcome::Success,
                 CoWriteResult::TypeInconsistent => {
                     WriteOutcome::Failure(DataAccessError::TypeInconsistent)
+                }
+                CoWriteResult::NonExistent => {
+                    WriteOutcome::Failure(DataAccessError::ObjectNonExistent)
                 }
                 CoWriteResult::Refused(cause) => {
                     tracing::warn!(

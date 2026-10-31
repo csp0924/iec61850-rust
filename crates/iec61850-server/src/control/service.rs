@@ -406,7 +406,8 @@ pub fn handle_read_sbo(
 /// select-before-operate model.
 ///
 /// A value that does not parse as an SBOw structure is refused with
-/// `InconsistentParameters`.
+/// `InconsistentParameters`, and an object of any other control model with
+/// `Unknown`.
 pub async fn handle_sbow(
     obj: &ControlObject,
     conn_id: u64,
@@ -441,10 +442,15 @@ pub(crate) fn select_with_value(
     // Expire a stale selection first.
     obj.check_sbo_timeout();
 
-    // A status-only object never accepts a control request.
-    if obj.config.ctl_model == ControlModel::StatusOnly {
-        tracing::warn!(name = %obj.config.name, "SBOw refused: the object is status-only");
-        return Err(Refusal::by_check(ControlAddCause::NotSupported));
+    // SelectWithValue belongs to the enhanced-security select-before-operate
+    // model alone; any other model answers unknown, IEC 61850-7-2 Table 47.
+    if obj.config.ctl_model != ControlModel::SboEnhanced {
+        tracing::warn!(
+            name = %obj.config.name,
+            ctl_model = ?obj.config.ctl_model,
+            "SBOw refused: the control model is not select-before-operate with enhanced security"
+        );
+        return Err(Refusal::by_check(ControlAddCause::Unknown));
     }
 
     // The origin field must be well formed.

@@ -24,7 +24,7 @@
 //! - Under enhanced security the outcome of the command travels in the
 //!   CommandTermination that ends it; normal security reports no outcome.
 
-use super::conform::{conforms, declared_co_attribute};
+use super::conform::{conforms, declared_co_attribute, CoDeclaration};
 use super::model::{CancelParams, ControlAddCause, ControlLastApplError, OperParams, OriginValue};
 use super::registry::{ControlObjectEntry, ControlObjectsRegistry};
 use super::service::{
@@ -190,6 +190,8 @@ pub(crate) enum CoWriteResult {
     Refused(ControlAddCause),
     /// The value does not have the type of the attribute.
     TypeInconsistent,
+    /// The model declares the data object without this attribute.
+    NonExistent,
 }
 
 /// Target of a write under functional constraint CO.
@@ -205,7 +207,7 @@ pub(crate) struct CoTarget<'a> {
 }
 
 impl CoTarget<'_> {
-    fn attr_name(&self) -> &'static str {
+    pub(crate) fn attr_name(&self) -> &'static str {
         match self.attr {
             CoAttr::Sbo => "SBO",
             CoAttr::SBOw => "SBOw",
@@ -228,9 +230,11 @@ impl CoTarget<'_> {
 
 /// Runs a write of `SBOw`, `Oper`, or `Cancel` on a registered control object.
 ///
-/// The value is checked against the attribute the model declares; an object the
-/// model does not declare is checked against the structure of the service only.
-/// A refusal queues `LastApplError` on the connection before the caller answers.
+/// The value is checked against the attribute the model declares; an attribute
+/// the model leaves out of a data object it declares does not exist, and an
+/// object the model does not declare is checked against the structure of the
+/// service only. A refusal queues `LastApplError` on the connection before the
+/// caller answers.
 pub(crate) fn write(
     registry: &ControlObjectsRegistry,
     model: &IedModel,
@@ -239,23 +243,36 @@ pub(crate) fn write(
     target: &CoTarget<'_>,
     value: &MmsValue,
 ) -> CoWriteResult {
-    if let Some(da) = declared_co_attribute(
+    match declared_co_attribute(
         model,
         target.domain,
         target.ln_name,
         target.do_name,
         target.attr_name(),
     ) {
-        if !conforms(da, value) {
+        CoDeclaration::Attribute(da) => {
+            if !conforms(da, value) {
+                tracing::warn!(
+                    domain = target.domain,
+                    ln = target.ln_name,
+                    do_name = target.do_name,
+                    attr = target.attr_name(),
+                    "control write refused: the value does not have the type of the attribute"
+                );
+                return CoWriteResult::TypeInconsistent;
+            }
+        }
+        CoDeclaration::Absent => {
             tracing::warn!(
                 domain = target.domain,
                 ln = target.ln_name,
                 do_name = target.do_name,
                 attr = target.attr_name(),
-                "control write refused: the value does not have the type of the attribute"
+                "control write refused: the data object has no such attribute"
             );
-            return CoWriteResult::TypeInconsistent;
+            return CoWriteResult::NonExistent;
         }
+        CoDeclaration::Undeclared => {}
     }
 
     let outbox = registry.outbox();
@@ -296,6 +313,15 @@ pub(crate) fn write(
         }
         CoAttr::Oper => operate(registry, outbox, entry, conn_id, target, value),
     }
+}
+
+/// Returns whether the model declares the data object `<domain>/<ln>$CO$<do_name>`
+/// without an `SBO` attribute, which a read of `SBO` then does not find.
+pub(crate) fn sbo_absent(model: &IedModel, domain: &str, ln_name: &str, do_name: &str) -> bool {
+    matches!(
+        declared_co_attribute(model, domain, ln_name, do_name, "SBO"),
+        CoDeclaration::Absent
+    )
 }
 
 fn type_inconsistent(target: &CoTarget<'_>) -> CoWriteResult {

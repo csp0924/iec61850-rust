@@ -593,8 +593,10 @@ impl ControlObject {
     ///
     /// An executing command is not cancellable and is refused with
     /// `CommandAlreadyInExecution`. A selected object is deselected when the
-    /// request comes from the connection that holds it. Canceling an unselected
-    /// object succeeds and does nothing.
+    /// request comes from the connection that holds it. An idle object of a
+    /// direct control model has no selection to cancel and refuses with
+    /// `NotSupported`, per IEC 61850-7-2 Table 47; canceling an unselected
+    /// select-before-operate object succeeds and does nothing.
     pub fn try_cancel(&self, conn_id: u64) -> CancelResult {
         let g = match self.inner.lock() {
             Ok(g) => g,
@@ -623,6 +625,17 @@ impl ControlObject {
             drop(g);
             let _ = self.try_unselect(conn_id, SelectStateChangedReason::Canceled, false);
             return CancelResult::Accepted;
+        }
+
+        if matches!(
+            self.config.ctl_model,
+            ControlModel::DirectNormal | ControlModel::DirectEnhanced
+        ) {
+            tracing::warn!(
+                name = %self.config.name,
+                "cancel refused: direct control has no selection to cancel"
+            );
+            return CancelResult::Denied(ControlAddCause::NotSupported);
         }
 
         // Canceling an unselected object is accepted and does nothing.
@@ -968,6 +981,21 @@ mod tests {
             CancelResult::Denied(ControlAddCause::LockedByOtherClient)
         );
         assert_eq!(obj.state(), ControlState::Ready);
+    }
+
+    // ── Cancel of an idle direct object ──────────────────────────────────
+
+    #[test]
+    fn cancel_of_an_idle_direct_object_is_not_supported() {
+        for model in [ControlModel::DirectNormal, ControlModel::DirectEnhanced] {
+            let obj = ControlObject::new(make_config(model));
+            assert_eq!(
+                obj.try_cancel(1),
+                CancelResult::Denied(ControlAddCause::NotSupported)
+            );
+        }
+        let obj = ControlObject::new(make_config(ControlModel::SboNormal));
+        assert_eq!(obj.try_cancel(1), CancelResult::Accepted);
     }
 
     // ── Losing the connection deselects the object ───────────────────────

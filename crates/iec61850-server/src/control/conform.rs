@@ -9,23 +9,44 @@
 use super::model::bit_string_len;
 use iec61850_model::{DataAttribute, DataAttributeType, DoChild, IedModel, MmsValue, FC};
 
-/// Returns the control attribute `attr` of `<domain>/<ln>$CO$<do_name>` as the
-/// model declares it, or `None` when the model does not declare it.
+/// What the model declares for one control attribute of a data object.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CoDeclaration<'a> {
+    /// The model declares the data object and this attribute of it.
+    Attribute(&'a DataAttribute),
+    /// The model declares the data object but not this attribute, so the
+    /// attribute does not exist.
+    Absent,
+    /// The model does not declare the data object.
+    Undeclared,
+}
+
+/// Looks up the control attribute `attr` of `<domain>/<ln>$CO$<do_name>` in the
+/// model.
 pub(crate) fn declared_co_attribute<'a>(
     model: &'a IedModel,
     domain: &str,
     ln_name: &str,
     do_name: &str,
     attr: &str,
-) -> Option<&'a DataAttribute> {
-    let data_object = model
-        .ld_by_domain(domain)?
-        .ln_by_name(ln_name)?
-        .do_by_name(do_name)?;
-    data_object.children.iter().find_map(|child| match child {
-        DoChild::Da(da) if da.name == attr && da.fc == FC::Co => Some(da),
-        _ => None,
-    })
+) -> CoDeclaration<'a> {
+    let Some(data_object) = model
+        .ld_by_domain(domain)
+        .and_then(|ld| ld.ln_by_name(ln_name))
+        .and_then(|ln| ln.do_by_name(do_name))
+    else {
+        return CoDeclaration::Undeclared;
+    };
+    data_object
+        .children
+        .iter()
+        .find_map(|child| match child {
+            DoChild::Da(da) if da.name == attr && da.fc == FC::Co => {
+                Some(CoDeclaration::Attribute(da))
+            }
+            _ => None,
+        })
+        .unwrap_or(CoDeclaration::Absent)
 }
 
 /// Returns whether `value` has the type of `da`, member by member.
