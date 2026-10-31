@@ -144,6 +144,7 @@ impl GooseFrameHeader {
 
 /// A complete GOOSE Ethernet frame: header plus PDU payload bytes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GooseFrame {
     /// Frame header.
     pub header: GooseFrameHeader,
