@@ -54,6 +54,9 @@ use iec61850_mms::mms::pdu::{
         encode_confirmed_get_var_access_attrs_response, GetVariableAccessAttributesRequest,
         SERVICE_TAG_GET_VAR_ACCESS_ATTRS,
     },
+    identify::{
+        encode_confirmed_identify_response, IdentifyResponse, SERVICE_TAG_IDENTIFY_REQUEST,
+    },
     read::{encode_confirmed_read_response, ReadRequest, ReadResponse, SERVICE_TAG_READ},
     service_error::{
         subcode::{access, resource},
@@ -490,7 +493,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "logging")]
                 &self.log_controls,
             ),
-            SERVICE_TAG_IDENTIFY => dispatch_identify(invoke_id, &self.identification),
+            SERVICE_TAG_IDENTIFY_REQUEST => dispatch_identify(invoke_id, &self.identification),
             SERVICE_TAG_READ => dispatch_read(
                 invoke_id,
                 &body,
@@ -580,16 +583,6 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
         )
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Identify service tag
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `Identify-Request ::= NULL`, `[2] IMPLICIT` and primitive, hence tag `0x82`.
-///
-/// `Identify-Response ::= SEQUENCE { ... }`, `[2] IMPLICIT` and constructed,
-/// hence tag `0xa2`.
-const SERVICE_TAG_IDENTIFY: u8 = 0x82;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-service dispatch
@@ -1818,27 +1811,13 @@ fn dispatch_write(
 ///     0x82 <len> <revision>  revision [2] IMPLICIT VisibleString
 /// ```
 fn dispatch_identify(invoke_id: u32, ident: &IdentificationStrings) -> ConfirmedResponse {
-    let id_bytes = ber_encode_u32(invoke_id);
-
-    let mut identify_body = BytesMut::new();
-    encode_tlv_visible_string(0x80, ident.vendor_name.as_bytes(), &mut identify_body);
-    encode_tlv_visible_string(0x81, ident.model_name.as_bytes(), &mut identify_body);
-    encode_tlv_visible_string(0x82, ident.revision.as_bytes(), &mut identify_body);
-
-    let mut inner = BytesMut::new();
-    inner.extend_from_slice(&[0x02]);
-    ber_encode_length(id_bytes.len(), &mut inner);
-    inner.extend_from_slice(&id_bytes);
-
-    inner.extend_from_slice(&[0xa2]);
-    ber_encode_length(identify_body.len(), &mut inner);
-    inner.extend_from_slice(&identify_body);
-
+    let resp = IdentifyResponse::new(
+        ident.vendor_name.as_str(),
+        ident.model_name.as_str(),
+        ident.revision.as_str(),
+    );
     let mut buf = BytesMut::new();
-    buf.extend_from_slice(&[0xa1]);
-    ber_encode_length(inner.len(), &mut buf);
-    buf.extend_from_slice(&inner);
-
+    encode_confirmed_identify_response(invoke_id, &resp, &mut buf);
     ConfirmedResponse::Response(buf.freeze())
 }
 
@@ -3025,12 +3004,6 @@ fn handle_write_with_co_routing(
 // ─────────────────────────────────────────────────────────────────────────────
 // Encoding helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-fn encode_tlv_visible_string(tag: u8, value: &[u8], buf: &mut BytesMut) {
-    buf.extend_from_slice(&[tag]);
-    ber_encode_length(value.len(), buf);
-    buf.extend_from_slice(value);
-}
 
 /// Encodes a BER length, delegating to the single shared implementation.
 fn ber_encode_length(len: usize, buf: &mut BytesMut) {
