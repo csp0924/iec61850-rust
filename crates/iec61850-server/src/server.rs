@@ -741,6 +741,16 @@ impl IedServer {
         Some(conn)
     }
 
+    /// Returns the ids of the registered associations.
+    #[cfg(test)]
+    pub(crate) fn connection_ids(&self) -> Vec<ConnectionId> {
+        self.inner
+            .connections
+            .read()
+            .map(|g| g.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Allocates the next connection id.
     #[allow(dead_code)]
     pub(crate) fn next_connection_id(&self) -> ConnectionId {

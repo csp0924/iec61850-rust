@@ -677,6 +677,9 @@ where
         .map(Duration::from_millis);
     let send_timeout = Duration::from_millis(server.config().association_send_timeout_ms);
     let mut last_activity = tokio::time::Instant::now();
+    // Cleared once the report channel closes, which takes its branch out of
+    // the select below instead of letting it complete on every iteration.
+    let mut rpt_open = true;
 
     loop {
         // Polled rather than awaited, so no future is built per iteration.
@@ -812,7 +815,7 @@ where
                     }
                 }
             }
-            ev = rpt_rx.recv() => {
+            ev = rpt_rx.recv(), if rpt_open => {
                 match ev {
                     Some(pdu) => {
                         if let Err(e) = send_bounded(
@@ -828,6 +831,7 @@ where
                     }
                     None => {
                         tracing::warn!(conn_id, "the report channel has closed");
+                        rpt_open = false;
                         Step::Continue
                     }
                 }
@@ -1657,6 +1661,47 @@ mod tests {
         let mut default = associate(client).await;
         assert!(oversized_request_is_answered(&mut default, 12_000).await);
         assert!(!task.is_finished());
+    }
+
+    /// An association whose report channel closes, as when the report sink
+    /// drops it, goes on answering requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_report_channel_leaves_the_association_serving() {
+        use iec61850_mms::mms::client::MmsClient;
+        use iec61850_mms::mms::pdu::ObjectClass;
+
+        let server = build_server(IedServerConfig::default());
+        let (client, _task) = spawn_connection(&server, 4096);
+        let mut client = MmsClient::<DuplexStream>::from_transport(client)
+            .await
+            .expect("associate");
+        // An answered request means the association has registered itself and
+        // its report channel.
+        client
+            .get_name_list(ObjectClass::Domain, None, None)
+            .await
+            .expect("a request before the channel closes");
+        let ids = server.connection_ids();
+        assert_eq!(ids.len(), 1, "one registered association: {ids:?}");
+        let conn_id = ids[0];
+        server.report_sink().deregister(conn_id);
+        assert_eq!(
+            server
+                .report_sink()
+                .try_send_pdu(conn_id, Bytes::from_static(&[0xa3, 0x00])),
+            crate::reporting::sink::SendOutcome::NotFound,
+            "the association's report channel is deregistered"
+        );
+
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_name_list(ObjectClass::Domain, None, None),
+        )
+        .await;
+        assert!(
+            matches!(answered, Ok(Ok(_))),
+            "a request after the report channel closed: {answered:?}"
+        );
     }
 
     /// A client that sends a request every 100 s stays open through three
