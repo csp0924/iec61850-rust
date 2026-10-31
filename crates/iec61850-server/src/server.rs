@@ -661,7 +661,7 @@ impl IedServer {
                 });
             }
             let new_value = build(&guard)?;
-            let flag = update_triggers(da, &guard, &new_value);
+            let flag = update_triggers(da.trg_ops, &guard, &new_value);
             *guard = new_value.clone();
             PendingTrigger {
                 cell: Arc::clone(&da.value),
@@ -684,17 +684,17 @@ impl IedServer {
         Ok(())
     }
 
-    /// Raises the report and log triggers of the leaves an MMS write stored,
-    /// as one batch, or defers them while the data model is locked. Each leaf
-    /// raises the triggers its trigger options declare for the change from its
-    /// old value to its new one, as an `update_*` call would.
-    fn raise_written(&self, leaves: &[WrittenLeaf<'_>]) {
+    /// Raises the report and log triggers of the leaves an MMS write request
+    /// stored, as one batch, or defers them while the data model is locked.
+    /// Each leaf raises the triggers its trigger options declare for the
+    /// change from its old value to its new one, as an `update_*` call would.
+    fn raise_written(&self, leaves: &[WrittenLeaf]) {
         let triggers: Vec<PendingTrigger> = leaves
             .iter()
             .filter_map(|leaf| {
-                let flag = update_triggers(leaf.da, &leaf.old, &leaf.new);
+                let flag = update_triggers(leaf.trg_ops, &leaf.old, &leaf.new);
                 flag.has_trigger().then(|| PendingTrigger {
-                    cell: Arc::clone(&leaf.da.value),
+                    cell: Arc::clone(&leaf.value),
                     value: leaf.new.clone(),
                     flag,
                 })
@@ -1458,9 +1458,9 @@ fn log_reason(flag: InclusionFlag, trg_ops: TriggerOptions) -> u8 {
 /// table 21): a changed value raises data-change for `dchg`, quality-change
 /// for `qchg` and data-update for `dupd`; an unchanged value raises
 /// data-update for `dupd` and nothing else.
-fn update_triggers(da: &DataAttribute, old: &MmsValue, new: &MmsValue) -> InclusionFlag {
+fn update_triggers(trg_ops: TrgOps, old: &MmsValue, new: &MmsValue) -> InclusionFlag {
     let declared = |trg: TrgOps, flag: InclusionFlag| {
-        if da.trg_ops.contains(trg) {
+        if trg_ops.contains(trg) {
             flag
         } else {
             InclusionFlag::NONE
@@ -1913,7 +1913,7 @@ impl IedServer {
 }
 
 impl WrittenLeaves for IedServerInner {
-    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf<'_>]) {
+    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf]) {
         IedServer { inner: self }.raise_written(leaves);
     }
 }
@@ -2215,7 +2215,7 @@ mod tests {
                 old.clone(),
             );
             assert_eq!(
-                update_triggers(&da, old, new),
+                update_triggers(da.trg_ops, old, new),
                 expected,
                 "{trg_ops:?}: {old:?} -> {new:?}"
             );

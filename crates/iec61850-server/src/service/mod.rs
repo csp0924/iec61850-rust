@@ -1706,6 +1706,10 @@ fn dispatch_write(
         }
     };
 
+    // The leaves every item of the request stores raise their report and log
+    // triggers as one batch, before the response is sent.
+    let _batch = mms_model.open_write_batch(conn_id);
+
     // A write names either a list of variables or one data set.
     let entries = match &req.variable_access_spec {
         iec61850_mms::mms::pdu::common::VariableAccessSpecification::ListOfVariable(v) => v.clone(),
@@ -5534,5 +5538,138 @@ mod data_set_read_tests {
             ]
         );
         assert!(mms_model.value_lock().try_write().is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "reporting"))]
+mod write_batch_tests {
+    use super::*;
+    use crate::service::write::{WrittenLeaf, WrittenLeaves};
+    use iec61850_mms::mms::pdu::common::{MmsData, VariableAccessSpecification};
+    use iec61850_mms::mms::pdu::write::WriteRequest;
+    use iec61850_model::{
+        DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder,
+        LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
+    };
+
+    /// Records the batches it is handed: the new values of each.
+    #[derive(Default)]
+    struct Batches(Mutex<Vec<Vec<MmsValue>>>);
+
+    impl WrittenLeaves for Batches {
+        fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(leaves.iter().map(|l| l.new.clone()).collect());
+        }
+    }
+
+    /// A dispatcher over `GGIO1.Set` with the SP attributes `a` and `b`, the
+    /// data set `GGIO1$dsSet` holding both, and a recorder of write batches.
+    fn dispatcher() -> (Arc<MmsModelDispatcher>, Arc<Batches>) {
+        let leaf = |name: &str| {
+            DoChild::Da(DataAttribute::new(
+                name,
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::DCHG,
+                MmsValue::Integer(0),
+            ))
+        };
+        let set = DataObject::new("Set", vec![leaf("a"), leaf("b")]);
+        let ggio = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![set]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = Arc::new(MmsDeviceModel::from_ied_model(&model).unwrap());
+        let batches = Arc::new(Batches::default());
+        let sink: Arc<dyn WrittenLeaves> = batches.clone();
+        mms_model.set_written_leaves(Arc::downgrade(&sink));
+        let dispatcher = Arc::new(MmsModelDispatcher::new(
+            Arc::new(model),
+            mms_model,
+            Arc::new(WriteAccessPolicies::default()),
+        ));
+        crate::reporting::DynamicDatasetOps::add_dynamic(
+            &dispatcher.dataset_registry,
+            &dispatcher.model,
+            "IED1LD0",
+            "GGIO1$dsSet",
+            vec![
+                ("IED1LD0".into(), "GGIO1$SP$Set$a".into()),
+                ("IED1LD0".into(), "GGIO1$SP$Set$b".into()),
+            ],
+        )
+        .unwrap();
+        (dispatcher, batches)
+    }
+
+    fn write(dispatcher: &MmsModelDispatcher, req: WriteRequest) {
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        let req = ConfirmedRequest {
+            invoke_id: 9,
+            service_body: body.freeze(),
+        };
+        let ConfirmedResponse::Response(_) = dispatcher.dispatch(&MmsServerConnection::new(), req)
+        else {
+            panic!("the write answers with a response");
+        };
+    }
+
+    fn item(name: &str) -> iec61850_mms::mms::pdu::common::ListOfVariableEntry {
+        iec61850_mms::ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".into(),
+            item_id: name.into(),
+        }
+        .into()
+    }
+
+    /// The leaves of every item of one write request, a list of variables or
+    /// a data set, are handed over as one batch once the request is served;
+    /// a request of one item is one batch of its own.
+    #[test]
+    fn one_write_request_hands_over_one_batch() {
+        let (dispatcher, sink) = dispatcher();
+        write(
+            &dispatcher,
+            WriteRequest {
+                variable_access_spec: VariableAccessSpecification::ListOfVariable(vec![
+                    item("GGIO1$SP$Set$a"),
+                    item("GGIO1$SP$Set$b"),
+                ]),
+                list_of_data: vec![MmsData::Integer(1), MmsData::Integer(2)],
+            },
+        );
+        write(
+            &dispatcher,
+            WriteRequest::named_list(
+                iec61850_mms::ObjectName::DomainSpecific {
+                    domain_id: "IED1LD0".into(),
+                    item_id: "GGIO1$dsSet".into(),
+                },
+                vec![MmsData::Integer(3), MmsData::Integer(4)],
+            ),
+        );
+        write(
+            &dispatcher,
+            WriteRequest::single_domain("IED1LD0", "GGIO1$SP$Set$a", MmsData::Integer(5)),
+        );
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            [
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![MmsValue::Integer(3), MmsValue::Integer(4)],
+                vec![MmsValue::Integer(5)],
+            ]
+        );
     }
 }

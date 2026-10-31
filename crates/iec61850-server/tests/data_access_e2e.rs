@@ -950,6 +950,15 @@ async fn data_object_write_is_reported_as_one_batch() {
     .expect("timed out");
 }
 
+/// The number of entries the BRCB of [`start_reporting`] has buffered.
+fn buffered_entries(server: &IedServer) -> usize {
+    let engine = server.reporting_engine();
+    let engine = engine.lock().unwrap();
+    let brcb = engine.get_brcb("IED1LD0/LLN0$BR$brcbRep").expect("brcb");
+    let n = brcb.lock_buffer().unwrap().len();
+    n
+}
+
 /// While the data model is locked, the triggers of an FCD write wait for the
 /// release and then go out as one report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -972,6 +981,39 @@ async fn data_object_write_under_the_model_lock_is_reported_on_release() {
             (
                 vec![true, true],
                 vec![MmsValue::Integer(4), MmsValue::Integer(5)]
+            )
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A write request of several items, here a SetDataSetValues of both members,
+/// raises the triggers of all of them as one batch: a BRCB without a buffer
+/// time buffers one entry, sent as one report, by the time the write is
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_request_of_several_items_is_reported_as_one_batch() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle, mut client) = start_reporting().await;
+
+        let outcomes = client
+            .write_named_variable_list_values(
+                DOMAIN,
+                "LLN0$dsRep",
+                vec![MmsData::Integer(6), MmsData::Integer(7)],
+            )
+            .await
+            .expect("SetDataSetValues");
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(buffered_entries(&server), 1, "one entry for the request");
+        assert_eq!(
+            next_report(&mut client).await,
+            (
+                vec![true, true],
+                vec![MmsValue::Integer(6), MmsValue::Integer(7)]
             )
         );
 

@@ -16,7 +16,7 @@
 
 use crate::compat::{Arc, HashMap, RwLock};
 use crate::error::{Result, ServerError};
-use crate::service::write::WrittenLeaves;
+use crate::service::write::{WrittenLeaf, WrittenLeaves};
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
@@ -175,6 +175,33 @@ pub struct MmsDeviceModel {
     /// Where a write hands the leaves it stored, to raise their report and log
     /// triggers; unset for a view no server owns.
     written_leaves: Arc<RwLock<Option<Weak<dyn WrittenLeaves>>>>,
+    /// The leaves stored so far by the write request each association is
+    /// being served, keyed by connection id, while the request lasts.
+    write_batches: Arc<RwLock<HashMap<u64, Vec<WrittenLeaf>>>>,
+}
+
+/// Keeps the write batch of an association open while one write request is
+/// served; dropping it hands the leaves the request stored over as one batch.
+pub(crate) struct WriteBatch<'a> {
+    view: &'a MmsDeviceModel,
+    conn_id: u64,
+    /// Whether this guard opened the batch, rather than finding it open.
+    opened: bool,
+}
+
+impl Drop for WriteBatch<'_> {
+    fn drop(&mut self) {
+        if !self.opened {
+            return;
+        }
+        let leaves = crate::compat::rwlock_write(&self.view.write_batches)
+            .and_then(|mut batches| batches.remove(&self.conn_id));
+        if let (Some(leaves), Some(sink)) = (leaves, self.view.written_leaves()) {
+            if !leaves.is_empty() {
+                sink.leaves_written(&leaves);
+            }
+        }
+    }
 }
 
 impl MmsDeviceModel {
@@ -206,7 +233,48 @@ impl MmsDeviceModel {
             domain_index,
             value_lock: Arc::new(RwLock::new(())),
             written_leaves: Arc::new(RwLock::new(None)),
+            write_batches: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Opens the write batch of association `conn_id` for one write request:
+    /// until the returned guard is dropped, the leaves its writes store are
+    /// held back, and then handed over together. A batch already open for
+    /// the association stays in the hands of its own guard.
+    #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
+    pub(crate) fn open_write_batch(&self, conn_id: u64) -> WriteBatch<'_> {
+        let opened = crate::compat::rwlock_write(&self.write_batches).is_some_and(|mut batches| {
+            let open = batches.len();
+            batches.entry(conn_id).or_default();
+            batches.len() > open
+        });
+        WriteBatch {
+            view: self,
+            conn_id,
+            opened,
+        }
+    }
+
+    /// Hands over the leaves one write of association `conn_id` stored: into
+    /// its open write batch, or, with none open, straight to where a write
+    /// hands its leaves.
+    pub(crate) fn hand_over_written(&self, conn_id: u64, leaves: Vec<WrittenLeaf>) {
+        if leaves.is_empty() {
+            return;
+        }
+        let leaves = match crate::compat::rwlock_write(&self.write_batches) {
+            Some(mut batches) => match batches.get_mut(&conn_id) {
+                Some(batch) => {
+                    batch.extend(leaves);
+                    return;
+                }
+                None => leaves,
+            },
+            None => leaves,
+        };
+        if let Some(sink) = self.written_leaves() {
+            sink.leaves_written(&leaves);
+        }
     }
 
     /// Sets where a write hands the leaves it stored.

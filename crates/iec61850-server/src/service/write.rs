@@ -467,13 +467,14 @@ fn write_to_target(
 
     // Every leaf is stored under the exclusive value lock, so a read sees the
     // whole write or none of it.
-    let mut written: Vec<WrittenLeaf<'_>> = Vec::with_capacity(updates.len());
+    let mut written: Vec<WrittenLeaf> = Vec::with_capacity(updates.len());
     {
         let _values = crate::compat::rwlock_write(mms_model.value_lock());
         for (leaf, new_value) in updates {
             match store_value(leaf, new_value.clone()) {
                 Ok(old) => written.push(WrittenLeaf {
-                    da: leaf,
+                    value: Arc::clone(&leaf.value),
+                    trg_ops: leaf.trg_ops,
                     old,
                     new: new_value.clone(),
                 }),
@@ -488,11 +489,9 @@ fn write_to_target(
             }
         }
     }
-    // The report and log triggers of all the leaves go out as one batch, once
-    // the values are in place.
-    if let Some(sink) = mms_model.written_leaves() {
-        sink.leaves_written(&written);
-    }
+    // The report and log triggers of all the leaves go out once the values are
+    // in place, with those of the other writes of the same request.
+    mms_model.hand_over_written(conn_id, written);
     tracing::debug!(
         domain = domain,
         ln = ln_name,
@@ -781,20 +780,22 @@ fn handler_at<'h>(
         .find_map(|(key, handler)| (key == path).then_some(handler))
 }
 
-/// A leaf a write stored: the attribute, the value it held before and the
-/// value it holds now.
+/// A leaf a write stored: the value lock of the attribute, its trigger
+/// options, the value it held before and the value it holds now.
+#[derive(Debug)]
 #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
-pub(crate) struct WrittenLeaf<'a> {
-    pub(crate) da: &'a DataAttribute,
+pub(crate) struct WrittenLeaf {
+    pub(crate) value: Arc<crate::compat::RwLock<iec61850_model::MmsValue>>,
+    pub(crate) trg_ops: iec61850_model::TrgOps,
     pub(crate) old: iec61850_model::MmsValue,
     pub(crate) new: iec61850_model::MmsValue,
 }
 
-/// Raises the report and log triggers of the leaves one write stored, as one
-/// batch.
+/// Raises the report and log triggers of the leaves one write request stored,
+/// as one batch.
 pub(crate) trait WrittenLeaves: Send + Sync {
-    /// Takes the leaves one write stored, in the order it stored them.
-    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf<'_>]);
+    /// Takes the leaves one write request stored, in the order it stored them.
+    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf]);
 }
 
 /// Replaces the cached value of a leaf and returns the value it held.
