@@ -3,6 +3,7 @@
 //! The layers stack as `CotpError`, then `IsoError`, then `MmsError`.
 
 use crate::compat::prelude::*;
+use iec61850_hal::transport::TransportError;
 use thiserror::Error;
 
 /// Errors of the COTP layer, ISO 8073 class 0 over RFC 1006.
@@ -111,9 +112,10 @@ pub enum CotpError {
         op: &'static str,
     },
 
-    /// An error reported by the transport.
+    /// An error reported by the transport, with its category and, when the
+    /// backend has one, the text of the underlying error.
     #[error("i/o error: {0}")]
-    Io(String),
+    Io(TransportError),
 
     /// The peer closed the connection before a complete PDU arrived.
     #[error("cotp input ended unexpectedly")]
@@ -135,18 +137,15 @@ pub enum CotpError {
 #[cfg(feature = "std")]
 impl From<std::io::Error> for CotpError {
     fn from(e: std::io::Error) -> Self {
-        CotpError::Io(e.to_string())
+        CotpError::from(TransportError::from(e))
     }
 }
 
-impl From<iec61850_hal::transport::TransportError> for CotpError {
-    fn from(e: iec61850_hal::transport::TransportError) -> Self {
-        use iec61850_hal::transport::TransportError;
+impl From<TransportError> for CotpError {
+    fn from(e: TransportError) -> Self {
         match e {
-            TransportError::Closed => CotpError::UnexpectedEof,
-            // The transport error type has four variants and carries no OS error code,
-            // so the textual form is all that survives the conversion.
-            other => CotpError::Io(other.to_string()),
+            TransportError::Closed { .. } => CotpError::UnexpectedEof,
+            other => CotpError::Io(other),
         }
     }
 }

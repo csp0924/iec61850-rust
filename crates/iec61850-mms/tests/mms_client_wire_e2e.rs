@@ -7,6 +7,8 @@
 //! a Conclude-ErrorPDU or a Session abort.
 
 use bytes::BytesMut;
+use iec61850_hal::time::TokioTimer;
+use iec61850_hal::transport::{AsyncTransport, IoErrorKind, TransportError};
 use iec61850_mms::iso::acse::{encode_aare, AcseConnection, AcseIndication};
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions};
 use iec61850_mms::iso::presentation::{
@@ -452,4 +454,74 @@ async fn pending_unconfirmed_pdus_are_bounded() {
         vec![vec![0xa0, 0x01, 0x02], vec![0xa0, 0x01, 0x03]],
         "kept {kept:02x?}"
     );
+}
+
+/// A TCP transport whose reads fail with a chosen error once `fail` is set.
+struct FailingReads {
+    tcp: TcpStream,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error: TransportError,
+}
+
+impl AsyncTransport for FailingReads {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(self.error.clone());
+        }
+        AsyncTransport::read(&mut self.tcp, buf).await
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+        AsyncTransport::write_all(&mut self.tcp, buf).await
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        AsyncTransport::close(&mut self.tcp).await
+    }
+}
+
+#[tokio::test]
+async fn transport_failure_keeps_its_cause() {
+    let (l, port) = listener().await;
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let alert = TransportError::io(IoErrorKind::InvalidData)
+        .with_detail("received fatal alert: CertificateRequired");
+    let transport = FailingReads {
+        tcp: TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+        fail: fail.clone(),
+        error: alert.clone(),
+    };
+    let (c, mut peer) = tokio::join!(
+        MmsClient::<FailingReads, TokioTimer>::from_transport(transport),
+        accept(&l, Aare::Accept)
+    );
+    let mut c = c.expect("association");
+
+    fail.store(true, std::sync::atomic::Ordering::Release);
+    let (r, _) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
+    match r {
+        Err(ClientError::Transport(cause)) => {
+            assert_eq!(cause, alert);
+            assert_eq!(cause.kind(), IoErrorKind::InvalidData);
+        }
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+    assert_eq!(c.state(), ConnectionState::Closed);
+}
+
+#[tokio::test]
+async fn refused_tcp_connection_reports_its_kind() {
+    // a port that was just released refuses the connection
+    let (l, port) = listener().await;
+    drop(l);
+    // Windows retries a refused loopback connect for about two seconds
+    let mut c = MmsClientBuilder::new().connect_timeout_ms(30_000).build();
+    let r = c.connect("127.0.0.1", port).await;
+    match r {
+        Err(ClientError::Transport(cause)) => {
+            assert_eq!(cause.kind(), IoErrorKind::ConnectionRefused, "{cause}");
+            assert!(cause.detail().is_some(), "{cause}");
+        }
+        other => panic!("expected a transport error, got {other:?}"),
+    }
 }

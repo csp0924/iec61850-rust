@@ -11,38 +11,250 @@
 //! is therefore not object safe; every caller is generic over
 //! `T: AsyncTransport`, and dynamic dispatch would need an adapter.
 
+use crate::compat::prelude::*;
 use core::fmt;
+
+/// Category of an I/O failure, available without `std`.
+///
+/// Mirrors the `std::io::ErrorKind` categories a byte-stream transport
+/// produces, so a no_std backend can classify its own errors the same way a
+/// std backend does. Under `std` the two convert into each other; a std kind
+/// with no counterpart here becomes `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IoErrorKind {
+    /// An entity was not found, such as a host name with no address.
+    NotFound,
+    /// The operation lacked the necessary privileges.
+    PermissionDenied,
+    /// The remote host refused the connection.
+    ConnectionRefused,
+    /// The remote host reset the connection.
+    ConnectionReset,
+    /// The remote host is not reachable.
+    HostUnreachable,
+    /// The network containing the remote host is not reachable.
+    NetworkUnreachable,
+    /// The connection was aborted by the local side or the network.
+    ConnectionAborted,
+    /// The operation needs a connection that does not exist.
+    NotConnected,
+    /// The local address is already in use.
+    AddrInUse,
+    /// The requested local address is not available.
+    AddrNotAvailable,
+    /// The local network is down.
+    NetworkDown,
+    /// The write half was closed by the peer.
+    BrokenPipe,
+    /// The operation would block on a non-blocking stream.
+    WouldBlock,
+    /// An argument passed to the backend was invalid.
+    InvalidInput,
+    /// The data read was not valid for the operation, such as a TLS record
+    /// that fails to decrypt or a fatal TLS alert.
+    InvalidData,
+    /// The operation timed out.
+    TimedOut,
+    /// A write returned zero bytes written.
+    WriteZero,
+    /// The operation was interrupted.
+    Interrupted,
+    /// The operation is not supported by the backend.
+    Unsupported,
+    /// The stream ended before the expected number of bytes was read.
+    UnexpectedEof,
+    /// The backend ran out of memory.
+    OutOfMemory,
+    /// Any failure no other category describes.
+    Other,
+}
+
+impl IoErrorKind {
+    /// Returns a short lowercase description, as used by `Display`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IoErrorKind::NotFound => "entity not found",
+            IoErrorKind::PermissionDenied => "permission denied",
+            IoErrorKind::ConnectionRefused => "connection refused",
+            IoErrorKind::ConnectionReset => "connection reset",
+            IoErrorKind::HostUnreachable => "host unreachable",
+            IoErrorKind::NetworkUnreachable => "network unreachable",
+            IoErrorKind::ConnectionAborted => "connection aborted",
+            IoErrorKind::NotConnected => "not connected",
+            IoErrorKind::AddrInUse => "address in use",
+            IoErrorKind::AddrNotAvailable => "address not available",
+            IoErrorKind::NetworkDown => "network down",
+            IoErrorKind::BrokenPipe => "broken pipe",
+            IoErrorKind::WouldBlock => "operation would block",
+            IoErrorKind::InvalidInput => "invalid input parameter",
+            IoErrorKind::InvalidData => "invalid data",
+            IoErrorKind::TimedOut => "timed out",
+            IoErrorKind::WriteZero => "write zero",
+            IoErrorKind::Interrupted => "operation interrupted",
+            IoErrorKind::Unsupported => "unsupported",
+            IoErrorKind::UnexpectedEof => "unexpected end of file",
+            IoErrorKind::OutOfMemory => "out of memory",
+            IoErrorKind::Other => "other error",
+        }
+    }
+}
+
+impl fmt::Display for IoErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::ErrorKind> for IoErrorKind {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        use std::io::ErrorKind as K;
+        match kind {
+            K::NotFound => IoErrorKind::NotFound,
+            K::PermissionDenied => IoErrorKind::PermissionDenied,
+            K::ConnectionRefused => IoErrorKind::ConnectionRefused,
+            K::ConnectionReset => IoErrorKind::ConnectionReset,
+            K::HostUnreachable => IoErrorKind::HostUnreachable,
+            K::NetworkUnreachable => IoErrorKind::NetworkUnreachable,
+            K::ConnectionAborted => IoErrorKind::ConnectionAborted,
+            K::NotConnected => IoErrorKind::NotConnected,
+            K::AddrInUse => IoErrorKind::AddrInUse,
+            K::AddrNotAvailable => IoErrorKind::AddrNotAvailable,
+            K::NetworkDown => IoErrorKind::NetworkDown,
+            K::BrokenPipe => IoErrorKind::BrokenPipe,
+            K::WouldBlock => IoErrorKind::WouldBlock,
+            K::InvalidInput => IoErrorKind::InvalidInput,
+            K::InvalidData => IoErrorKind::InvalidData,
+            K::TimedOut => IoErrorKind::TimedOut,
+            K::WriteZero => IoErrorKind::WriteZero,
+            K::Interrupted => IoErrorKind::Interrupted,
+            K::Unsupported => IoErrorKind::Unsupported,
+            K::UnexpectedEof => IoErrorKind::UnexpectedEof,
+            K::OutOfMemory => IoErrorKind::OutOfMemory,
+            _ => IoErrorKind::Other,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<IoErrorKind> for std::io::ErrorKind {
+    fn from(kind: IoErrorKind) -> Self {
+        use std::io::ErrorKind as K;
+        match kind {
+            IoErrorKind::NotFound => K::NotFound,
+            IoErrorKind::PermissionDenied => K::PermissionDenied,
+            IoErrorKind::ConnectionRefused => K::ConnectionRefused,
+            IoErrorKind::ConnectionReset => K::ConnectionReset,
+            IoErrorKind::HostUnreachable => K::HostUnreachable,
+            IoErrorKind::NetworkUnreachable => K::NetworkUnreachable,
+            IoErrorKind::ConnectionAborted => K::ConnectionAborted,
+            IoErrorKind::NotConnected => K::NotConnected,
+            IoErrorKind::AddrInUse => K::AddrInUse,
+            IoErrorKind::AddrNotAvailable => K::AddrNotAvailable,
+            IoErrorKind::NetworkDown => K::NetworkDown,
+            IoErrorKind::BrokenPipe => K::BrokenPipe,
+            IoErrorKind::WouldBlock => K::WouldBlock,
+            IoErrorKind::InvalidInput => K::InvalidInput,
+            IoErrorKind::InvalidData => K::InvalidData,
+            IoErrorKind::TimedOut => K::TimedOut,
+            IoErrorKind::WriteZero => K::WriteZero,
+            IoErrorKind::Interrupted => K::Interrupted,
+            IoErrorKind::Unsupported => K::Unsupported,
+            IoErrorKind::UnexpectedEof => K::UnexpectedEof,
+            IoErrorKind::OutOfMemory => K::OutOfMemory,
+            IoErrorKind::Other => K::Other,
+        }
+    }
+}
 
 /// An error raised by the transport layer.
 ///
-/// Deliberately coarse and free of `std::io::Error`, so a no_std backend can
-/// produce it. Under `std`, `From<std::io::Error>` maps an I/O error onto
-/// these categories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Free of `std::io::Error`, so a no_std backend can produce it, yet it keeps
+/// the cause: the [`IoErrorKind`] of the failure and, when the backend has one,
+/// the text of the underlying error, such as the fatal alert a TLS peer sent.
+/// Under `std`, `From<std::io::Error>` fills both in.
+///
+/// The `Io` and `Closed` variants are `#[non_exhaustive]`: a backend builds
+/// them with [`TransportError::io`], [`TransportError::closed`] and
+/// [`TransportError::with_detail`], and a match names the fields it reads
+/// followed by `..`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportError {
     /// A read or a write failed.
-    Io,
+    #[non_exhaustive]
+    Io {
+        /// Category of the failure.
+        kind: IoErrorKind,
+        /// Text of the underlying error, when the backend has one.
+        detail: Option<String>,
+    },
     /// The peer closed the connection, or an unexpected EOF was reached.
-    Closed,
+    #[non_exhaustive]
+    Closed {
+        /// How the close was observed: `UnexpectedEof` for an end of stream,
+        /// `ConnectionReset`, `ConnectionAborted` or `BrokenPipe` otherwise.
+        kind: IoErrorKind,
+    },
     /// The operation timed out.
     Timeout,
-    /// Any other failure, one no specific variant describes.
+}
+
+impl TransportError {
+    /// Builds a failed read or write of the given category, with no detail.
+    pub fn io(kind: IoErrorKind) -> Self {
+        TransportError::Io { kind, detail: None }
+    }
+
+    /// Builds a closed connection observed as `kind`.
+    pub fn closed(kind: IoErrorKind) -> Self {
+        TransportError::Closed { kind }
+    }
+
+    /// Attaches the text of the underlying error to an `Io` failure.
     ///
-    /// The enum is `#[non_exhaustive]`, so a later variant is not a breaking
-    /// change by itself; a match must keep a wildcard arm either way.
-    Other,
+    /// The other variants carry no detail and are returned unchanged.
+    pub fn with_detail(self, text: impl Into<String>) -> Self {
+        match self {
+            TransportError::Io { kind, .. } => TransportError::Io {
+                kind,
+                detail: Some(text.into()),
+            },
+            other => other,
+        }
+    }
+
+    /// Returns the category of the failure; `Timeout` reports `TimedOut`.
+    pub fn kind(&self) -> IoErrorKind {
+        match self {
+            TransportError::Io { kind, .. } | TransportError::Closed { kind } => *kind,
+            TransportError::Timeout => IoErrorKind::TimedOut,
+        }
+    }
+
+    /// Returns the text of the underlying error, if the backend supplied one.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            TransportError::Io { detail, .. } => detail.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            TransportError::Io => "transport IO error",
-            TransportError::Closed => "transport closed",
-            TransportError::Timeout => "transport timeout",
-            TransportError::Other => "transport other error",
-        };
-        f.write_str(msg)
+        match self {
+            TransportError::Io { kind, detail } => {
+                write!(f, "transport IO error ({kind})")?;
+                if let Some(detail) = detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
+            }
+            TransportError::Closed { kind } => write!(f, "transport closed ({kind})"),
+            TransportError::Timeout => f.write_str("transport timeout"),
+        }
     }
 }
 
@@ -53,13 +265,14 @@ impl std::error::Error for TransportError {}
 impl From<std::io::Error> for TransportError {
     fn from(e: std::io::Error) -> Self {
         use std::io::ErrorKind;
+        let kind = IoErrorKind::from(e.kind());
         match e.kind() {
             ErrorKind::UnexpectedEof
             | ErrorKind::ConnectionAborted
             | ErrorKind::ConnectionReset
-            | ErrorKind::BrokenPipe => TransportError::Closed,
+            | ErrorKind::BrokenPipe => TransportError::closed(kind),
             ErrorKind::TimedOut => TransportError::Timeout,
-            _ => TransportError::Io,
+            _ => TransportError::io(kind).with_detail(e.to_string()),
         }
     }
 }
@@ -190,7 +403,9 @@ where
 // impl iec61850_hal::transport::AsyncTransport for MySocket {
 //     fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
 //         async move {
-//             embedded_io_async::Read::read(&mut self.0, buf).await.map_err(|_| TransportError::Io)
+//             embedded_io_async::Read::read(&mut self.0, buf)
+//                 .await
+//                 .map_err(|_| TransportError::io(IoErrorKind::Other))
 //         }
 //     }
 //     // write_all and close follow the same shape
@@ -230,7 +445,62 @@ mod tests_tokio {
     #[test]
     fn io_error_maps_closed() {
         let e = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
-        assert_eq!(TransportError::from(e), TransportError::Closed);
+        assert_eq!(
+            TransportError::from(e),
+            TransportError::closed(IoErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn a_reset_keeps_its_kind() {
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let t = TransportError::from(e);
+        assert_eq!(t, TransportError::closed(IoErrorKind::ConnectionReset));
+        assert_eq!(t.kind(), IoErrorKind::ConnectionReset);
+    }
+
+    #[test]
+    fn an_io_error_keeps_its_kind_and_text() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "received fatal alert: CertificateRequired",
+        );
+        let t = TransportError::from(e);
+        assert_eq!(t.kind(), IoErrorKind::InvalidData);
+        assert_eq!(
+            t.detail(),
+            Some("received fatal alert: CertificateRequired")
+        );
+        assert_eq!(
+            t.to_string(),
+            "transport IO error (invalid data): received fatal alert: CertificateRequired"
+        );
+    }
+
+    #[test]
+    fn a_kind_without_counterpart_becomes_other() {
+        let e = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
+        assert_eq!(TransportError::from(e).kind(), IoErrorKind::Other);
+    }
+
+    #[test]
+    fn kinds_convert_both_ways() {
+        for kind in [
+            IoErrorKind::ConnectionRefused,
+            IoErrorKind::InvalidData,
+            IoErrorKind::UnexpectedEof,
+            IoErrorKind::NetworkDown,
+        ] {
+            assert_eq!(IoErrorKind::from(std::io::ErrorKind::from(kind)), kind);
+        }
+    }
+
+    #[test]
+    fn detail_attaches_only_to_io_failures() {
+        let t = TransportError::closed(IoErrorKind::BrokenPipe).with_detail("ignored");
+        assert_eq!(t.detail(), None);
+        let t = TransportError::io(IoErrorKind::Other).with_detail("x");
+        assert_eq!(t.detail(), Some("x"));
     }
 
     #[test]

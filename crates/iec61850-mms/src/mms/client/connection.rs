@@ -33,6 +33,9 @@
 //!   the transport is closed and the caller sees `ConnectionLost`.
 //! - The end of the transport, a COTP DR, and a Session AB, FN or DN close the
 //!   connection and surface as `ConnectionLost`.
+//! - An I/O error of the transport closes the connection and surfaces as
+//!   `Transport`, carrying the category and text the transport reported; a TLS
+//!   alert received after the handshake arrives this way.
 
 use super::error::ClientError;
 use crate::compat::prelude::*;
@@ -52,6 +55,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use iec61850_hal::time::{with_timeout, Timer};
 use iec61850_hal::transport::AsyncTransport;
+#[cfg(feature = "std")]
+use iec61850_hal::transport::{IoErrorKind, TransportError};
 use tracing::{debug, warn};
 
 // std only: the tokio TcpStream and TokioTimer defaults, plus the TLS connector.
@@ -405,7 +410,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         let tcp = with_timeout(&self.timer, connect_dur, TcpStream::connect(addr))
             .await
             .map_err(|_| ClientError::ConnectTimeout { timeout_ms })?
-            .map_err(|e| ClientError::IsoError(format!("TCP connect: {e}")))?;
+            .map_err(|e| ClientError::Transport(TransportError::from(e)))?;
         let _ = tcp.set_nodelay(true);
 
         // Step 0b: TLS handshake
@@ -419,7 +424,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         let opts = cotp_options(&self.iso_parameters);
         let mut cotp = CotpConnection::connect(tls_stream, opts)
             .await
-            .map_err(|e| ClientError::IsoError(format!("cotp tls: {e}")))?;
+            .map_err(|e| association_failed("cotp tls", e))?;
         debug!("cotp connection over tls established");
 
         // Step 3: Session CN + Presentation CP + ACSE AARQ + MMS Initiate-Request
@@ -430,7 +435,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
 
             cotp.send_data(&sess_buf)
                 .await
-                .map_err(|e| ClientError::IsoError(format!("cotp tls send: {e}")))?;
+                .map_err(|e| association_failed("cotp tls send", e))?;
         }
 
         // Step 4: Session AC + Presentation CPA + ACSE AARE + MMS Initiate-Response
@@ -442,7 +447,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
                 .map_err(|_| ClientError::ServiceTimeout {
                     timeout_ms: request_timeout_ms,
                 })?
-                .map_err(|e| ClientError::IsoError(format!("cotp tls recv: {e}")))?;
+                .map_err(|e| association_failed("cotp tls recv", e))?;
 
             let sess_ind = self
                 .session
@@ -520,7 +525,7 @@ async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ClientError> {
         .unwrap_or(host);
     let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
         warn!(host, port, error = %e, "address resolution failed");
-        ClientError::IsoError(format!("address resolution: {e}"))
+        ClientError::Transport(TransportError::from(e))
     })?;
     let mut last_error: Option<std::io::Error> = None;
     for addr in addrs {
@@ -533,10 +538,13 @@ async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ClientError> {
         }
     }
     Err(match last_error {
-        Some(e) => ClientError::IsoError(format!("TCP connect: {e}")),
+        Some(e) => ClientError::Transport(TransportError::from(e)),
         None => {
             warn!(host, port, "address resolution returned no address");
-            ClientError::IsoError(format!("address resolution: no address for {host}"))
+            ClientError::Transport(
+                TransportError::io(IoErrorKind::NotFound)
+                    .with_detail(format!("no address for {host}")),
+            )
         }
     })
 }
@@ -571,7 +579,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             Ok(cotp) => cotp,
             Err(e) => {
                 self.set_state(ConnectionState::Closed);
-                return Err(ClientError::IsoError(format!("cotp: {e}")));
+                return Err(association_failed("cotp", e));
             }
         };
         debug!("cotp connection established over the supplied transport");
@@ -650,7 +658,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
 
             cotp.send_data(&sess_buf)
                 .await
-                .map_err(|e| ClientError::IsoError(format!("cotp send: {e}")))?;
+                .map_err(|e| association_failed("cotp send", e))?;
         }
 
         // Step 4
@@ -661,7 +669,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             .map_err(|_| ClientError::ServiceTimeout {
                 timeout_ms: request_timeout_ms,
             })?
-            .map_err(|e| ClientError::IsoError(format!("cotp recv: {e}")))?;
+            .map_err(|e| association_failed("cotp recv", e))?;
 
         let sess_ind = self
             .session
@@ -834,7 +842,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     ///
     /// - `PduTooLarge` as above.
     /// - `NotConnected` when there is no transport.
-    /// - `ConnectionLost` when the transport fails; the connection is closed.
+    /// - `ConnectionLost` when the peer has closed the transport, and
+    ///   `Transport` when the transport reports an I/O error; either way the
+    ///   connection is closed.
     pub async fn send_mms_pdu(&mut self, pdu: &MmsPdu) -> Result<(), ClientError> {
         // MMS PDU encode
         let mut mms_buf = BytesMut::new();
@@ -969,6 +979,8 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// - `ServiceTimeout` when no complete PDU arrives in time.
     /// - `ConnectionLost` when the transport ends, a COTP DR arrives, or the peer
     ///   sends a Session AB, FN or DN; the connection is closed.
+    /// - `Transport` when the transport reports an I/O error; the connection is
+    ///   closed.
     /// - `NotConnected` when there is no transport.
     /// - `IsoError` or `PduParse` for a PDU that does not decode.
     pub async fn recv_mms_pdu(&mut self) -> Result<MmsPdu, ClientError> {
@@ -1231,14 +1243,19 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
 
     /// Closes the connection after a COTP failure and maps the failure.
     ///
-    /// The end of the transport, an I/O error and a COTP DR become
-    /// `ConnectionLost`; a framing error becomes `IsoError`.
+    /// The end of the transport and a COTP DR become `ConnectionLost`, an I/O
+    /// error becomes `Transport` with its cause, and a framing error becomes
+    /// `IsoError`.
     fn transport_failed(&mut self, context: &str, e: CotpError) -> ClientError {
         self.close_raw();
         match e {
-            CotpError::UnexpectedEof | CotpError::Io(_) | CotpError::DisconnectRequest { .. } => {
+            CotpError::UnexpectedEof | CotpError::DisconnectRequest { .. } => {
                 warn!(error = %e, "cotp {context}: the transport connection was lost");
                 ClientError::ConnectionLost
+            }
+            CotpError::Io(cause) => {
+                warn!(error = %cause, "cotp {context}: the transport failed, closing the connection");
+                ClientError::Transport(cause)
             }
             other => {
                 warn!(error = %other, "cotp {context} failed, closing the connection");
@@ -1296,6 +1313,21 @@ fn cotp_options(params: &IsoConnectionParameters) -> CotpOptions {
         tsel_src: params.local_t_sel.clone(),
         tsel_dst: params.remote_t_sel.clone(),
         tpdu_size: crate::iso::cotp::TpduSize::default(),
+    }
+}
+
+/// Maps a COTP failure met while the association is being established.
+///
+/// An I/O error becomes `Transport` with its cause, the end of the transport
+/// and a COTP DR become `ConnectionLost`, and a framing error becomes
+/// `IsoError` prefixed with `context`.
+fn association_failed(context: &str, e: CotpError) -> ClientError {
+    match e {
+        CotpError::Io(cause) => ClientError::Transport(cause),
+        CotpError::UnexpectedEof | CotpError::DisconnectRequest { .. } => {
+            ClientError::ConnectionLost
+        }
+        other => ClientError::IsoError(format!("{context}: {other}")),
     }
 }
 

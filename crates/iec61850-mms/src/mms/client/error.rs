@@ -8,7 +8,8 @@
 //! - `ConcludeRejected`: the peer refused the release with a Conclude-ErrorPDU
 //!   (`0xad`)
 //! - `ServiceTimeout`: no answer arrived within the request timeout
-//! - `ConnectionLost`: the transport closed
+//! - `ConnectionLost`: the peer closed the transport or aborted the association
+//! - `Transport`: the transport failed, with the cause it reported
 //! - `IsoError`: a lower ISO layer failed to parse
 //! - `ServiceError`: the peer answered with a confirmed error PDU
 //! - `DataAccessError`: a read or write reported a data access error
@@ -20,6 +21,7 @@ use crate::compat::prelude::*;
 use crate::iso::presentation::provider_reason_name;
 use crate::iso::session::refuse_reason_name;
 use crate::mms::pdu::{DataAccessError, ErrorClass, RejectReason};
+use iec61850_hal::transport::TransportError;
 use thiserror::Error;
 
 /// Renders a session refusal, naming the values ISO 8327-1 and ISO 8823 define
@@ -98,9 +100,18 @@ pub enum ClientError {
         timeout_ms: u64,
     },
 
-    /// The transport closed.
+    /// The peer closed the transport, sent a COTP DR, or aborted the
+    /// association; the connection is closed.
     #[error("the transport connection was lost")]
     ConnectionLost,
+
+    /// The transport failed with an I/O error; the connection is closed.
+    ///
+    /// Carries the category of the failure and, when the transport reported
+    /// one, the text of the underlying error, such as a fatal TLS alert or the
+    /// operating system message of a refused TCP connection.
+    #[error("transport error: {0}")]
+    Transport(TransportError),
 
     /// A protocol error in the COTP, Session, Presentation or ACSE layer.
     #[error("iso protocol error: {0}")]
