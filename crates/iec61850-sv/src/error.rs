@@ -37,6 +37,7 @@ pub enum SvError {
 
     /// Input truncated: the slice is shorter than the field requires.
     #[error("truncated input, need {needed} bytes but {available} available")]
+    #[non_exhaustive]
     TruncatedInput { needed: usize, available: usize },
 
     /// The outer PDU tag is not 0x60, the savPdu.
@@ -55,6 +56,7 @@ pub enum SvError {
     /// 2 bytes or a confRev that is not 4 bytes. With tag `0xA2`, the sequence of
     /// ASDU holds `actual` ASDUs where noASDU declared `expected`.
     #[error("field tag 0x{tag:02x} length is {actual}, expected {expected}")]
+    #[non_exhaustive]
     InvalidFieldLength {
         tag: u8,
         expected: usize,
@@ -64,6 +66,7 @@ pub enum SvError {
     /// A mandatory field is absent: noASDU, svID, smpCnt, confRev, smpSynch, or
     /// the sample data.
     #[error("missing required field tag 0x{tag:02x} ({name})")]
+    #[non_exhaustive]
     MissingRequiredField { tag: u8, name: &'static str },
 
     /// A savPdu member that appears at most once, noASDU or the sequence of
@@ -103,6 +106,7 @@ pub enum SvError {
 
     /// An ASDU field reaches past the length its ASDU declared.
     #[error("asdu field tag 0x{tag:02x} ends at {value_end}, past the asdu end {asdu_end}")]
+    #[non_exhaustive]
     AsduFieldOutOfBounds {
         tag: u8,
         value_end: usize,
@@ -123,6 +127,7 @@ pub enum SvError {
 
     /// The sample data length differs from the size declared by `add_asdu`.
     #[error("sample data length {actual} does not match the expected {expected}")]
+    #[non_exhaustive]
     SampleSizeMismatch { expected: usize, actual: usize },
 
     /// `set_refr_tm` was called on an ASDU without a refrTm field; enable it

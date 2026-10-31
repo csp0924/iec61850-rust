@@ -9,6 +9,7 @@ pub enum SntpError {
     /// The datagram is shorter than the 48 bytes RFC 4330 defines, excluding
     /// the optional authenticator.
     #[error("invalid SNTP packet length: got {got}, expected at least {expected}")]
+    #[non_exhaustive]
     InvalidLength {
         /// Length actually received.
         got: usize,

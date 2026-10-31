@@ -78,6 +78,7 @@ mod linux_impl {
                     prev_st_num,
                     state,
                     parse_result,
+                    ..
                 } => {
                     eprintln!(
                         "[subscriber] [NewState] stNum {} → {} sqNum={} dataset_len={} valid={}",
@@ -97,6 +98,7 @@ mod linux_impl {
                 GooseEvent::Retransmission {
                     state,
                     parse_result,
+                    ..
                 } => {
                     eprintln!(
                         "[subscriber] [Retx]     stNum={} sqNum={} valid={}",
@@ -106,7 +108,7 @@ mod linux_impl {
                         eprintln!("[subscriber]   parse_result Err: {e:?}");
                     }
                 }
-                GooseEvent::Expired { last_state } => {
+                GooseEvent::Expired { last_state, .. } => {
                     eprintln!(
                         "[subscriber] [Expired]  last stNum={} sqNum={} after TATL={}ms",
                         last_state.st_num, last_state.sq_num, last_state.time_allowed_to_live_ms,

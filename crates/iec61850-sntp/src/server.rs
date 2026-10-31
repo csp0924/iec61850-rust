@@ -33,6 +33,7 @@ pub enum SntpClockStatus {
     /// configured stratum. `None` stands for a clock under continuous
     /// discipline, for which a reply reports its receive time as the
     /// Reference Timestamp.
+    #[non_exhaustive]
     Synchronized {
         /// When the clock was last set, or `None` under continuous discipline.
         last_set: Option<NtpTimestamp>,
@@ -40,10 +41,25 @@ pub enum SntpClockStatus {
     /// The clock is not synchronized. A reply carries leap indicator 3 and
     /// [`UNSYNCHRONIZED_STRATUM`]. `None` stands for a clock that was never
     /// set, for which a reply carries a zero Reference Timestamp.
+    #[non_exhaustive]
     Unsynchronized {
         /// When the clock was last set, or `None` when it never was.
         last_set: Option<NtpTimestamp>,
     },
+}
+
+impl SntpClockStatus {
+    /// A synchronized clock last set at `last_set`, or under continuous
+    /// discipline when `None`.
+    pub const fn synchronized(last_set: Option<NtpTimestamp>) -> Self {
+        Self::Synchronized { last_set }
+    }
+
+    /// An unsynchronized clock last set at `last_set`, or never set when
+    /// `None`.
+    pub const fn unsynchronized(last_set: Option<NtpTimestamp>) -> Self {
+        Self::Unsynchronized { last_set }
+    }
 }
 
 impl Default for SntpClockStatus {

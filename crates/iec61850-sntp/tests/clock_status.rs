@@ -43,9 +43,7 @@ async fn ask(addr: SocketAddr) -> SntpPacket {
 
 #[tokio::test]
 async fn unsynchronized_clock_is_reported_with_leap_indicator_3() {
-    let clock = SntpClock::new(SntpClockStatus::Unsynchronized {
-        last_set: Some(LAST_SET),
-    });
+    let clock = SntpClock::new(SntpClockStatus::unsynchronized(Some(LAST_SET)));
     let addr = spawn_server(clock).await;
 
     let reply = ask(addr).await;
@@ -56,15 +54,13 @@ async fn unsynchronized_clock_is_reported_with_leap_indicator_3() {
 
 #[tokio::test]
 async fn a_running_server_reports_each_change_of_state() {
-    let clock = SntpClock::new(SntpClockStatus::Unsynchronized { last_set: None });
+    let clock = SntpClock::new(SntpClockStatus::unsynchronized(None));
     let addr = spawn_server(clock.clone()).await;
     let reply = ask(addr).await;
     assert_eq!(reply.leap, LeapIndicator::AlarmUnsynchronized);
     assert_eq!(reply.reference_ts, NtpTimestamp::ZERO);
 
-    clock.set(SntpClockStatus::Synchronized {
-        last_set: Some(LAST_SET),
-    });
+    clock.set(SntpClockStatus::synchronized(Some(LAST_SET)));
     let reply = ask(addr).await;
     assert_eq!(reply.leap, LeapIndicator::NoWarning);
     assert_eq!(reply.stratum, 1);

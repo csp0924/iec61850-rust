@@ -93,12 +93,14 @@ pub enum GooseEvent {
     /// `prev_st_num` is 0 for the first publication received. `parse_result`
     /// carries a decode or consistency error while `state` is still provided,
     /// leaving the decision to the application.
+    #[non_exhaustive]
     NewState {
         prev_st_num: u32,
         state: Arc<GooseSubscriberState>,
         parse_result: Result<(), GooseError>,
     },
     /// A retransmission of the same state.
+    #[non_exhaustive]
     Retransmission {
         state: Arc<GooseSubscriberState>,
         parse_result: Result<(), GooseError>,
@@ -107,6 +109,7 @@ pub enum GooseEvent {
     ///
     /// Raised by `check_expired` once per state; `last_state` is the snapshot
     /// that expired.
+    #[non_exhaustive]
     Expired {
         last_state: Arc<GooseSubscriberState>,
     },

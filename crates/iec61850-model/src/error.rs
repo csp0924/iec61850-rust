@@ -14,6 +14,7 @@ pub enum ModelError {
     /// Rejecting an over-long reference keeps the parse bounded instead of
     /// leaving the length check to a later stage.
     #[error("object reference too long: {got} bytes, limit {limit}")]
+    #[non_exhaustive]
     ObjectRefTooLong {
         /// Length of the offending reference, in bytes.
         got: usize,
@@ -24,6 +25,7 @@ pub enum ModelError {
     /// The object reference is malformed: a missing `/`, an empty token or an
     /// illegal character.
     #[error("malformed object reference: {reason}")]
+    #[non_exhaustive]
     InvalidObjectRef {
         /// What is wrong with the reference.
         reason: String,
@@ -35,6 +37,7 @@ pub enum ModelError {
 
     /// A node of that name already exists under this parent.
     #[error("name conflict: {kind} `{name}` already exists in `{parent}`")]
+    #[non_exhaustive]
     DuplicateName {
         /// Kind of node that collided, such as "LogicalNode" or "DataObject".
         kind: &'static str,
@@ -49,6 +52,7 @@ pub enum ModelError {
     #[error(
         "wrong parent: {kind} must be attached under `{expected_parent}`, found `{got_parent}`"
     )]
+    #[non_exhaustive]
     InvalidParent {
         /// Kind of node that was misplaced.
         kind: &'static str,
@@ -60,6 +64,7 @@ pub enum ModelError {
 
     /// A data set entry references a path that does not resolve.
     #[error("data set `{dataset}` has an entry `{entry}` referencing a node that does not exist")]
+    #[non_exhaustive]
     DataSetEntryUnresolved {
         /// Name of the data set holding the entry.
         dataset: String,
@@ -70,6 +75,7 @@ pub enum ModelError {
     /// An array was declared with no element; a count of 0 marks a scalar
     /// (IEC 61850-6 §9.5.4.1 Table 47).
     #[error("array `{name}` declares no element")]
+    #[non_exhaustive]
     EmptyArray {
         /// Name of the array.
         name: String,
@@ -81,6 +87,7 @@ pub enum ModelError {
 
     /// The value written does not match the type the data attribute declares.
     #[error("type mismatch: DA `{path}` expects `{expected}`, received `{got}`")]
+    #[non_exhaustive]
     TypeMismatch {
         /// Object reference of the data attribute written to.
         path: String,

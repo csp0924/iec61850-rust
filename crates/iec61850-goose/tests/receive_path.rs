@@ -200,7 +200,9 @@ fn recording(builder: GooseSubscriberBuilder) -> (GooseSubscriber, Arc<Mutex<Vec
                 GooseEvent::Retransmission { state, .. } => {
                     Seen::Retx(state.gocb_ref.clone(), state.st_num, state.state_valid)
                 }
-                GooseEvent::Expired { last_state } => Seen::Expired(last_state.gocb_ref.clone()),
+                GooseEvent::Expired { last_state, .. } => {
+                    Seen::Expired(last_state.gocb_ref.clone())
+                }
                 _ => return,
             };
             s.lock().unwrap().push(item);

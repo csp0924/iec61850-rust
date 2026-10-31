@@ -196,6 +196,7 @@ impl CompileBuilder {
 pub enum CompileError {
     /// The input SCL file could not be read.
     #[error("failed to read the input SCL `{path}`: {source}")]
+    #[non_exhaustive]
     ReadInput {
         /// Path that was opened.
         path: PathBuf,
@@ -214,6 +215,7 @@ pub enum CompileError {
 
     /// The run-time model build rejected an IED the file covers.
     #[error("failed to build the model of IED `{ied}`: {source}")]
+    #[non_exhaustive]
     BuildModel {
         /// Name of the IED whose model failed to build.
         ied: String,
@@ -235,6 +237,7 @@ pub enum CompileError {
     /// The emitted `TokenStream` is not a valid Rust file, which means a defect
     /// in this crate.
     #[error("the emitted TokenStream is not a valid Rust file: {detail}")]
+    #[non_exhaustive]
     Syn {
         /// Text of the `syn::Error`.
         detail: String,
@@ -246,6 +249,7 @@ pub enum CompileError {
 
     /// The generated file could not be written.
     #[error("failed to write the generated file `{path}`: {source}")]
+    #[non_exhaustive]
     WriteOut {
         /// Path that was written to.
         path: PathBuf,

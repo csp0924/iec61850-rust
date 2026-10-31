@@ -110,7 +110,7 @@ pub(crate) fn build_ied_model(
 
     model_b.build().map_err(|e| {
         let detail = format!("the model builder rejected the IED: {}", e);
-        if let ModelError::DataSetEntryUnresolved { dataset, entry } = &e {
+        if let ModelError::DataSetEntryUnresolved { dataset, entry, .. } = &e {
             if let Some((span, path)) = locate_fcda(ied, dataset, entry) {
                 return SclParseError::at(span, path, ErrorKind::SemanticConflict { detail });
             }

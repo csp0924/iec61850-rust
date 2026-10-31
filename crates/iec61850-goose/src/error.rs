@@ -91,6 +91,7 @@ pub enum GooseError {
     /// Accepting the mismatch would let a publisher and a subscriber disagree
     /// about the data set layout without either side noticing.
     #[error("numdatsetentries ({expected}) does not match alldata length ({actual})")]
+    #[non_exhaustive]
     DataSetLengthMismatch { expected: usize, actual: usize },
 
     /// BER length error from `iec61850-asn1`.
@@ -99,6 +100,7 @@ pub enum GooseError {
 
     /// Input truncated: the slice is shorter than the field requires.
     #[error("truncated input, need {needed} bytes but {available} available")]
+    #[non_exhaustive]
     TruncatedInput { needed: usize, available: usize },
 
     /// `confRev` differs from the configured revision.
@@ -107,6 +109,7 @@ pub enum GooseError {
     /// values, so the application decides whether to act on the publication;
     /// the listener is still invoked.
     #[error("confrev mismatch, expected {expected} but got {actual}")]
+    #[non_exhaustive]
     ConfRevMismatch { expected: u32, actual: u32 },
 
     /// The receiver is running and its subscriber list cannot be modified.

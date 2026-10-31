@@ -70,6 +70,7 @@ pub enum ErrorKind {
 
     /// A required attribute is absent.
     #[error("attribute `{name}` is required but was not provided")]
+    #[non_exhaustive]
     MissingRequiredAttribute {
         /// Name of the missing attribute.
         name: String,
@@ -77,6 +78,7 @@ pub enum ErrorKind {
 
     /// A required child element is absent.
     #[error("element `{name}` must appear at least once")]
+    #[non_exhaustive]
     MissingRequiredElement {
         /// Name of the missing child element.
         name: String,
@@ -84,6 +86,7 @@ pub enum ErrorKind {
 
     /// An attribute value does not parse as the expected type.
     #[error("attribute `{name}` expects {expected_type}, saw `{raw_value}`")]
+    #[non_exhaustive]
     AttributeValueInvalid {
         /// Name of the offending attribute.
         name: String,
@@ -97,6 +100,7 @@ pub enum ErrorKind {
 
     /// An enumeration string is outside the permitted set.
     #[error("enum `{name}` does not accept `{raw_value}`; permitted values: {}", allowed.join(", "))]
+    #[non_exhaustive]
     EnumValueUnknown {
         /// Name of the offending attribute.
         name: String,
@@ -112,6 +116,7 @@ pub enum ErrorKind {
     /// EnumType, and its identifier; the element path of the reference is on
     /// [`SclParseError::element_path`].
     #[error("no {type_kind} with `id=\"{type_id}\"` is declared in DataTypeTemplates")]
+    #[non_exhaustive]
     UnresolvedTypeReference {
         /// Kind of type that was sought.
         type_kind: TypeKind,
@@ -122,6 +127,7 @@ pub enum ErrorKind {
     /// The same identifier appears twice, such as two logical devices sharing
     /// one instance name, which SCL forbids.
     #[error("`{element}` has a duplicate `{key}=\"{value}\"`; the first is at {first_span}")]
+    #[non_exhaustive]
     DuplicateIdentifier {
         /// Name of the element that repeats.
         element: String,
@@ -135,6 +141,7 @@ pub enum ErrorKind {
 
     /// Two attribute values contradict each other.
     #[error("conflicting attributes: {detail}")]
+    #[non_exhaustive]
     SemanticConflict {
         /// What the two attribute values disagree about.
         detail: String,
@@ -149,6 +156,7 @@ pub enum ErrorKind {
     /// the model a client sees.
     // TODO: return this for a skipped construct that alters the resulting model.
     #[error("unsupported SCL construct: {element} (see {issue_ref})")]
+    #[non_exhaustive]
     Unsupported {
         /// The unsupported element.
         element: String,

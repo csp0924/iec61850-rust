@@ -26,6 +26,7 @@ pub enum Asn1Error {
     #[error(
         "BER length field too long (first byte 0x{first_byte:02X}, at most 0x82 is supported)"
     )]
+    #[non_exhaustive]
     LengthTooLong {
         /// The first length byte, which selects the form and the byte count.
         first_byte: u8,
