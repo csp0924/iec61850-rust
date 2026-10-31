@@ -1,14 +1,14 @@
 //! smpMod travels as an INT16U in two octets, per IEC 61850-9-2 §8.5.2
 //! Table 14.
+//!
+//! The once-per-process report of a one-octet smpMod is tested in its own
+//! binary, `sv_smp_mod_report`.
 
 use bytes::BytesMut;
 use iec61850_sv::{
     decode_sav_pdu, encode_sav_pdu, Asdu, SavPdu, SmpMod, SmpSynch, SvPublisherBuilder,
     SV_HEADER_NO_VLAN,
 };
-
-mod log_capture;
-use log_capture::warnings_containing;
 
 #[test]
 fn publisher_encodes_smp_mod_in_two_octets() {
@@ -44,48 +44,18 @@ fn publisher_without_smp_mod_sends_none() {
     assert_eq!(pdu.asdus[0].smp_mod, None);
 }
 
-/// Encodes a one-ASDU savPdu whose smpMod member carries `smp_mod`.
-fn pdu_with_smp_mod(smp_mod: &[u8]) -> Vec<u8> {
+#[test]
+fn unassigned_smp_mod_round_trips() {
     let pdu = SavPdu::new(vec![{
         let mut asdu = Asdu::new("MU01", 0, vec![0; 8]);
         asdu.smp_synch = SmpSynch::GlobalClock;
-        asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+        asdu.smp_mod = Some(SmpMod::Unknown(256));
         asdu
     }]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).unwrap();
-    let mut b = buf.to_vec();
-    // smpMod is the last member: 88 02 00 01.
-    let n = b.len();
-    assert_eq!(&b[n - 4..], &[0x88, 0x02, 0x00, 0x01]);
-    b.truncate(n - 4);
-    b.push(0x88);
-    b.push(smp_mod.len() as u8);
-    b.extend_from_slice(smp_mod);
-    let delta = smp_mod.len() as u8;
-    // Every enclosing length is in the short form; patch savPdu, the ASDU
-    // sequence, and the ASDU, which sit at fixed offsets.
-    for at in [1usize, 6, 8] {
-        b[at] = b[at] + delta - 2;
-    }
-    b
-}
-
-#[test]
-fn unassigned_smp_mod_is_kept() {
-    let frame = pdu_with_smp_mod(&[0x01, 0x00]);
-    let pdu = decode_sav_pdu(&frame).unwrap();
-    assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::Unknown(256)));
-}
-
-#[test]
-fn one_octet_smp_mod_is_logged_once() {
-    let frame = pdu_with_smp_mod(&[0x01]);
-    let logged = warnings_containing("smpmod is 1 octet", || {
-        for _ in 0..10 {
-            let pdu = decode_sav_pdu(&frame).unwrap();
-            assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::SamplesPerSecond));
-        }
-    });
-    assert_eq!(logged, 1);
+    let n = buf.len();
+    assert_eq!(&buf[n - 4..], &[0x88, 0x02, 0x01, 0x00]);
+    let decoded = decode_sav_pdu(&buf).unwrap();
+    assert_eq!(decoded.asdus[0].smp_mod, Some(SmpMod::Unknown(256)));
 }
