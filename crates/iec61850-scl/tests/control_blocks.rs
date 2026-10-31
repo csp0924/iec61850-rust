@@ -206,3 +206,18 @@ fn rpt_enabled_max_attribute_is_not_read() {
     ));
     assert_eq!(rcbs(&m)[0].max_instances, 1);
 }
+
+/// An empty `smvID` is filled with the control block reference, as an empty
+/// GoID is (IEC 61850-6 Annex I.3.2.7); a given one is kept.
+#[test]
+fn empty_smv_id_takes_the_control_block_reference() {
+    let m = build(&wrap(
+        r#"<SampledValueControl name="msv" smvID="" datSet="ds1" smpRate="80" nofASDU="1"/>
+           <SampledValueControl name="usv" smvID="" datSet="ds1" smpRate="80" nofASDU="1" multicast="false"/>
+           <SampledValueControl name="named" smvID="SV1" datSet="ds1" smpRate="80" nofASDU="1"/>"#,
+    ));
+    let svcbs = &m.lds[0].lns[0].svcbs;
+    assert_eq!(svcbs[0].sv_id, "IED1LD0/LLN0$MS$msv");
+    assert_eq!(svcbs[1].sv_id, "IED1LD0/LLN0$US$usv");
+    assert_eq!(svcbs[2].sv_id, "SV1");
+}

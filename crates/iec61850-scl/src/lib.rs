@@ -100,8 +100,8 @@ pub mod __build_internals {
         attribute_type, b_type_to_dat, dai_values, derives_setting_view, fcda_do_path,
         gse_control_go_id, ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model,
         opt_fields_to_model, parse_fc, parse_val_for_b_type, report_instances,
-        report_trg_ops_to_model, skip_indexed_instance, template_initial_value, trg_ops_to_model,
-        warn_count_not_modeled,
+        report_trg_ops_to_model, skip_indexed_instance, sv_control_sv_id, template_initial_value,
+        trg_ops_to_model, warn_count_not_modeled,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};

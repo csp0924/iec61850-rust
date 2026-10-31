@@ -202,7 +202,7 @@ fn build_ln(
 
     // Sampled value control blocks
     for raw_svcb in &raw_ln.smv_controls {
-        ln_b = ln_b.add_svcb(build_svcb(raw_svcb));
+        ln_b = ln_b.add_svcb(build_svcb(raw_svcb, domain));
     }
 
     // Log control blocks
@@ -806,6 +806,25 @@ pub fn gse_control_go_id(raw_gcb: &RawGseControl, domain: &str) -> String {
     }
 }
 
+/// Returns the svID of a `<SampledValueControl>` in the logical device whose
+/// MMS domain name is `domain`.
+///
+/// The `smvID` attribute is the svID. An empty `smvID` is filled with the
+/// control block reference (IEC 61850-6 Annex I.3.2.7), as an empty GoID is:
+/// `<domain>/LLN0$MS$<name>` for a multicast block and `<domain>/LLN0$US$<name>`
+/// for a unicast one.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn sv_control_sv_id(raw_svcb: &RawSampledValueControl, domain: &str) -> String {
+    if raw_svcb.smv_id.is_empty() {
+        let fc = if raw_svcb.multicast { "MS" } else { "US" };
+        format!("{domain}/LLN0${fc}${}", raw_svcb.name)
+    } else {
+        raw_svcb.smv_id.clone()
+    }
+}
+
 /// Returns the MMS domain name of a logical device: its `ldName` when set, and
 /// otherwise the IED name followed by the `inst`.
 ///
@@ -818,15 +837,16 @@ pub fn ld_domain_name(raw_ld: &RawLogicalDevice, ied_name: &str) -> String {
     }
 }
 
-/// Converts a `<SampledValueControl>` into an [`SvControlBlock`].
+/// Converts a `<SampledValueControl>` into an [`SvControlBlock`], whose svID
+/// comes from [`sv_control_sv_id`].
 ///
 /// The sample rate, ASDU count, sample mode and options are server settings and
 /// are not part of the model schema.
-fn build_svcb(raw_svcb: &RawSampledValueControl) -> SvControlBlock {
+fn build_svcb(raw_svcb: &RawSampledValueControl, domain: &str) -> SvControlBlock {
     let mut svcb = SvControlBlock::new(
         raw_svcb.name.clone(),
         raw_svcb.data_set.clone(),
-        raw_svcb.smv_id.clone(),
+        sv_control_sv_id(raw_svcb, domain),
     );
     svcb.conf_rev = raw_svcb.conf_rev;
     svcb.is_multicast = raw_svcb.multicast;

@@ -30,7 +30,7 @@ use quote::{format_ident, quote};
 use iec61850_scl::__build_internals::{
     attribute_type, dai_values, derives_setting_view, fcda_do_path, gse_control_go_id,
     ld_domain_name, ld_num_of_sgs, parse_fc, report_instances, skip_indexed_instance,
-    template_initial_value, warn_count_not_modeled, MmsValue,
+    sv_control_sv_id, template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -287,7 +287,7 @@ fn emit_ln_expr(
         .collect::<Vec<_>>();
     let svcb_exprs = sorted_by_name(ln.smv_controls.iter(), cfg, |s| s.name.as_str())
         .into_iter()
-        .map(emit_svcb_expr)
+        .map(|s| emit_svcb_expr(s, domain))
         .collect::<Vec<_>>();
     let lcb_exprs = sorted_by_name(ln.log_controls.iter(), cfg, |l| l.name.as_str())
         .into_iter()
@@ -666,11 +666,13 @@ fn emit_gocb_expr(g: &RawGseControl, domain: &str) -> TokenStream {
     }
 }
 
-fn emit_svcb_expr(s: &RawSampledValueControl) -> TokenStream {
+fn emit_svcb_expr(s: &RawSampledValueControl, domain: &str) -> TokenStream {
     let name = s.name.as_str();
     let dataset_ref = s.data_set.as_str();
     let conf_rev = s.conf_rev;
-    let sv_id = s.smv_id.as_str();
+    // The svID follows the runtime path: the `smvID`, or the control block
+    // reference when it is empty.
+    let sv_id = sv_control_sv_id(s, domain);
     let is_multicast = s.multicast;
     quote! {
         {
