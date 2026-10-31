@@ -32,8 +32,8 @@ for exactly which ACSI services are implemented.
 
 ## Compatibility
 
-A libiec61850 TLS client built with mbedtls 3.6.0 closes the connection when
-it receives a TLS 1.3 session ticket; mbedtls 3.6.1 and later fix this. A
+A TLS client built with mbedtls 3.6.0 closes the connection when it receives
+a TLS 1.3 session ticket; mbedtls 3.6.1 and later fix this. A
 server built by `TlsConfigBuilder` therefore sends no TLS 1.3 session ticket
 by default: TLS 1.3 sessions do not resume, and TLS 1.2 session ID resumption
 keeps working. `tls13_session_tickets(n)` sends `n` tickets after each

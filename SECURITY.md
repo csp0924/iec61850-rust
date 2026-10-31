@@ -71,7 +71,8 @@ These are contracts, checked in review and pinned by tests:
   indefinite BER length form is rejected rather than scanned, so a malformed
   length cannot drive an unbounded loop.
 - **Rejections are not silent.** A refused PDU or a dropped frame is reported
-  through `tracing::warn!`, so an operator can see an attack in progress.
+  through `tracing::warn!`, so an operator can see an attack in progress. This
+  includes every SNTP reply the client rejects.
 
 [`docs/robustness.md`](docs/robustness.md) catalogs the malformed-input cases
 that pin these properties, each with the class of input, the required outcome
@@ -90,7 +91,9 @@ serve MMS on port 3782. `TlsConfigBuilder` applies the IEC 62351-3 constraints â
 TLS 1.2 as the floor, a fixed cipher suite whitelist. A server requires a
 client certificate only with `require_client_auth(true)` or
 `allow_only_known_peers(true)`; by default a server with trust anchors still
-accepts a client that presents none and reports it as `WrnNoPeerCert`.
+accepts a client that presents none and reports it as `WrnNoPeerCert`. A server
+built without trust anchors requests no client certificate and logs a warning
+when it is built.
 `allow_only_known_peers(true)` tightens the profile further: a peer must then
 also present one of the leaf certificates added with `add_known_peer_pem` or
 `add_known_peer_der`, beyond passing chain validation. Two settings weaken the
@@ -103,13 +106,18 @@ profile and exist only for interoperating with equipment that cannot be fixed:
   acceptable. Every other chain error is still rejected, and each downgrade is
   reported through the event handler. Do not use it in production.
 
-A server sends no TLS 1.3 session ticket by default, because libiec61850 TLS
-clients built with mbedtls 3.6.0 drop the connection on receiving one; mbedtls
-3.6.1 and later fix this. `tls13_session_tickets(n)` turns tickets back on.
+A server sends no TLS 1.3 session ticket by default, because TLS clients
+built with mbedtls 3.6.0 drop the connection on receiving one; mbedtls 3.6.1
+and later fix this. `tls13_session_tickets(n)` turns tickets back on.
 Those clients, built with any mbedtls 3.6 release up to at least 3.6.7, also
 drop the connection on a TLS 1.3 KeyUpdate, which rustls sends after 2^24
 records under one key; the `iec61850-tls` README describes the effect on
 long-lived associations.
+
+**ACSE password.** The password mechanism carries the password in clear in the
+AARQ, so on a plain TCP association it is not a secret; run the association
+over TLS (port 3782) when the password matters. Neither the server nor the
+client logs it: the server logs only the mechanism and its decision.
 
 **Server limits.** `IedServerConfig::max_mms_connections` bounds concurrent
 associations; a connection beyond the limit has its socket closed. The
@@ -127,10 +135,12 @@ enabled. Rejected PDUs, dropped frames and TLS downgrades are only visible
 through it.
 
 **Time.** Report and log timestamps are only as trustworthy as the clock behind
-them. `iec61850-sntp` provides a time service; the quality bits the server
-reports come from `IedServerConfig::time_quality` and must be set to reflect the
-real synchronization state rather than left at a default that claims more than
-is true.
+them. `iec61850-sntp` provides a time service. The time quality of a timestamp
+attribute is the one the application writes with its value;
+`IedServerConfig::time_quality` applies only to the timestamps the server
+generates itself: the `LActTm` of a setting group control block and the GOOSE
+`t` of a publisher `IedServer::register_from_model` creates. Both must reflect
+the real synchronization state rather than claim more than is true.
 
 ## Known dependency advisories
 

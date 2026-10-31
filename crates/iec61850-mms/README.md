@@ -6,8 +6,12 @@ IEC 61850 semantics. The crate carries both halves of an association, an MMS
 client and an MMS server, and is what `iec61850-client` and `iec61850-server`
 map the ACSI services onto.
 
-PDU size and the outstanding-request count are negotiated on Initiate and
-enforced afterwards. The stack is written against the `AsyncTransport` and
+PDU size and the outstanding-request limits are negotiated on Initiate.
+Every outbound PDU is checked against the negotiated size, and the client
+holds to the negotiated limit of outstanding requests, counting a request
+that timed out until its late answer arrives. `BlockingMmsClient` wraps every
+`MmsClient` service for a synchronous caller; each of its methods panics when
+called inside an async runtime. The stack is written against the `AsyncTransport` and
 `Timer` traits of `iec61850-hal` rather than binding a runtime directly, so
 the same code runs over tokio on a desktop target and over a caller-supplied
 transport elsewhere. As in the `asn1`, `model` and `hal` crates, `std` is a

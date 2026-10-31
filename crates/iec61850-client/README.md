@@ -7,6 +7,13 @@ data set administration, RCB read and write with report dispatch, control
 over all five control models, journal queries and GoCB access. The primary
 API is `async`; a synchronous caller wraps it in `block_on`.
 
+A segmented report is delivered one segment at a time: the report callback
+runs once per segment, and `ClientReport::included`, `reasons` and
+`segmentation` describe that segment. Segments of one report share its
+SeqNum; `segmentation`, when present, carries `sub_seq_num`, which counts them
+from zero, and `more_segments_follow`, which is false on the last one. The
+client does not reassemble them.
+
 Part of [iec61850-rust](https://github.com/csp0924/iec61850-rust), an
 independent Rust implementation of IEC 61850 (MMS, GOOSE, Sampled Values,
 SCL) written from the published standards. See the workspace

@@ -10,14 +10,14 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 
 ## 現況
 
-本 workspace 以 stable Rust 建置，帶有約 2,000 個測試：BER 與 PDU 的往返編解碼、協定狀態機、client 對 server 的 loopback 整合測試，以及 [`docs/robustness.md`](docs/robustness.md) 所編錄的畸形輸入回歸測試。九個 `cargo-fuzz` target 涵蓋 GOOSE、Sampled Values、COTP、Session、Presentation、ACSE 與 MMS 解碼器。
+本 workspace 以 stable Rust 建置，帶有約 3,800 個測試：BER 與 PDU 的往返編解碼、協定狀態機、client 對 server 的 loopback 整合測試，以及 [`docs/robustness.md`](docs/robustness.md) 所編錄的畸形輸入回歸測試。九個 `cargo-fuzz` target 涵蓋 GOOSE、Sampled Values、COTP、Session、Presentation、ACSE 與 MMS 解碼器。
 
 本專案不主張的事項：
 
 - **未取得一致性認證。** 本實作未曾送交任何受認可的測試實驗室，也不存在對應的證書。
-- **GOOSE 與 Sampled Values 僅能在 Linux 上執行。** 兩者都直接跑在 Ethernet 之上，需要具備 `CAP_NET_RAW` 的 `AF_PACKET` socket。Windows 能編譯這些 crate，但無法執行其 publisher 與 subscriber；開發用途另有 libpcap 或 NPCAP backend 可用。
+- **GOOSE 與 Sampled Values 在 Linux 上受支援。** 兩者都直接跑在 Ethernet 之上；在 Linux 上使用具備 `CAP_NET_RAW` 的 `AF_PACKET` socket。在 Windows 與 macOS 上，`iec61850-hal` 的 libpcap 或 NPCAP backend（`ethernet-pcap`、`ethernet-windows-npcap`）可供開發與測試執行，但不是受支援的部署方式。
 - **未實作 MMS 檔案服務。** 沒有任何 handler 回應這類請求，`iec61850-server` 也不宣告任何聲稱支援它的 feature。
-- **GetNameList 探索依循執行期登錄表，而非 SCL 模型。** 資料集、報告控制區塊與 GOOSE 控制區塊一經登錄即會被列出。這些登錄表正是 Read 路徑解析的依據，因此列出的每個名稱都可讀取，而模型雖有宣告但未登錄者則不會列出。`Journal` 類別的請求會列出各已登錄 log 控制區塊的 `LogRef` 所指的 journal。
+- **GetNameList 探索依循執行期登錄表，而非 SCL 模型。** 資料集、報告控制區塊與 GOOSE 控制區塊一經登錄即會被列出。這些登錄表正是 Read 路徑解析的依據，因此列出的每個名稱都可讀取，而模型雖有宣告但未登錄者則不會列出。應用呼叫 `IedServer::register_from_model` 時，模型宣告的項目會一次登錄；模型未宣告的區塊仍以個別的 `register_*` 呼叫登錄。`Journal` 類別的請求會列出各已登錄 log 控制區塊的 `LogRef` 所指的 journal。
 - **未實作 MMS 之上的 SVCB 管理、R-GOOSE 與 R-SV。**
 
 ## Crate 組成
@@ -43,23 +43,23 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 
 ## 協定涵蓋範圍
 
-**MMS 服務，server 側。** Initiate 與 Conclude、Status、GetNameList、GetVariableAccessAttributes、Read、Write、Identify、DefineNamedVariableList、GetNamedVariableListAttributes、DeleteNamedVariableList、ReadJournal，以及用於報告、LastApplError 與命令終止的 InformationReport。PDU 大小在 Initiate 時協商，並在每個送出的 PDU 上強制執行；單一 PDU 裝不下的報告會被分段。
+**MMS 服務，server 側。** Initiate 與 Conclude、Status、GetNameList、GetVariableAccessAttributes、Read、Write、Identify、DefineNamedVariableList、GetNamedVariableListAttributes、DeleteNamedVariableList、ReadJournal，以及用於報告、LastApplError 與命令終止的 InformationReport。PDU 大小在 Initiate 時協商，並在每個送出的 PDU 上強制執行；超過協商大小的報告會被分段，每一段只標示本段帶的成員。
 
 **報告。** 非緩衝（URCB）與緩衝（BRCB）報告控制區塊：觸發選項、選用欄位、general interrogation、緩衝區溢位與 entry id。BRCB 預設在記憶體中緩衝，`sqlite-backend` feature 另外提供以 SQLite 為後端的緩衝區。
 
-**控制。** IEC 61850-7-2 的全部五種控制模型 —— status-only、direct-with-normal-security、SBO-with-normal-security、direct-with-enhanced-security 與 SBO-with-enhanced-security —— 含 Select、SelectWithValue、Operate、Cancel、命令終止，以及檢查與等待執行的 handler hook。
+**控制。** IEC 61850-7-2 的全部五種控制模型 —— status-only、direct-with-normal-security、SBO-with-normal-security、direct-with-enhanced-security 與 SBO-with-enhanced-security —— 含 Select、SelectWithValue、Operate、Cancel、命令終止，以及檢查與等待執行的 handler hook。控制物件的 `ctlModel`、`sboTimeout`、`sboClass` 與 `operTimeout` 取自模型宣告的屬性，`stSeld` 由 server 維護。
 
-**記錄。** log 控制區塊透過 `LogStorage` trait 寫入，client 端以 QueryLogByTime 與 QueryLogAfterEntry 經 ReadJournal 讀回。資料集成員在資料變化與品質變化時寫入 log。WriteJournal 未實作。
+**記錄。** log 控制區塊透過 `LogStorage` trait 寫入，client 端以 QueryLogByTime 與 QueryLogAfter 經 ReadJournal 讀回，可使用其選用欄位的任何組合。資料集成員在資料變化、品質變化與資料更新時寫入 log，每個完整性週期另寫入整個資料集。WriteJournal 未實作。
 
-**設定群組。** SGCB runtime 提供 `ActSG`、`EditSG` 與 `CnfEdit`，編輯 session 由單一 association 持有，並以保留期限釋放遭棄置的 session。
+**設定群組。** SGCB runtime 提供 `ActSG`、`EditSG` 與 `CnfEdit`，編輯 session 由單一 association 持有，並以保留期限釋放遭棄置的 session。server 保存每個設定群組的值，並在 SelectActiveSG 與 SelectEditSG 時載入所選的群組。
 
-**GOOSE。** publisher 的重送排程由呼叫端驅動，subscriber 會拋出 new-state、重送與逾期事件，receiver 則把訊框分派給各個 subscriber。`iec61850-server` 把 GoCB 暴露成 MMS 變數，因此 GetGoCBValues 與 SetGoCBValues 可透過 Read 與 Write 運作。
+**GOOSE。** publisher 的重送排程由呼叫端驅動，subscriber 會拋出 new-state、重送與逾期事件，receiver 則把訊框分派給各個 subscriber。`iec61850-server` 把 GoCB 暴露成 IEC 61850-8-1 規定的 MMS 結構，因此 GetGoCBValues 與 SetGoCBValues 可透過 Read 與 Write 運作。SCL 的 Communication 段會解析：model 內含各接取點的 server 位址與控制塊的 GSE、SMV 位址，`IedServer::register_from_model` 依 GSE 位址發布各個 GoCB。
 
 **Sampled Values。** 針對 IEC 61850-9-2 LE profile 的 publisher 與 subscriber，發佈路徑上使用預先建好的訊框範本，接收路徑上做取樣連續性計數。
 
 **Client。** 以快取的裝置模型瀏覽目錄、以 IEC 表示法讀寫物件、動態資料集管理、RCB 讀寫並分派報告、控制、journal 查詢與 GoCB 存取。
 
-**資安。** `iec61850-tls` 建立的 `rustls` 設定已套用 IEC 62351-3 的限制：TLS 1.2 為下限、固定的密碼套件白名單、可選或強制的 client 憑證認證、可選的僅允許已知憑證驗證，以及該 profile 的事件代碼。`iec61850-client` 與 `iec61850-server` 透過各自的 `tls` feature 使用它。
+**資安。** `iec61850-tls` 建立的 `rustls` 設定已套用 IEC 62351-3 的限制：TLS 1.2 為下限、固定的密碼套件白名單、可選或強制的 client 憑證認證、可選的僅允許已知憑證驗證，以及該 profile 的事件代碼。`iec61850-client` 與 `iec61850-server` 透過各自的 `tls` feature 使用它。server 上安裝的 `AssociationAuthenticator` 依每個 association 的 AP-title、AE-qualifier 與 ACSE 密碼決定接受或拒絕，client 則從 `IsoConnectionParameters::authentication` 送出密碼。
 
 ## 快速上手
 
@@ -92,21 +92,19 @@ client 預設以慣用的 MMS 定址建立 association：IEC 61850-8-1 規定的
 use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};
 use iec61850_mms::iso::presentation::PSelector;
 
-let params = IsoConnectionParameters {
-    local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?,
-    local_ap_title: Some("1.3.9999.13".parse::<ApTitle>()?),
-    local_ae_qualifier: Some(1),
-    ..IsoConnectionParameters::default()
-};
+let mut params = IsoConnectionParameters::default();
+params.local_p_sel = PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?;
+params.local_ap_title = Some("1.3.9999.13".parse::<ApTitle>()?);
+params.local_ae_qualifier = Some(1);
 let conn = IedConnection::with_iso_parameters(params);
 conn.connect("192.0.2.10", 102).await?;
 ```
 
-對端拒絕 association 時會回覆 session REFUSE SPDU，此時 connect 會回傳 `ClientError::SessionRefused`，指出 session 拒絕原因碼與 presentation provider-reason，而不是回報一則無法解析的訊息。
+對端拒絕 association 時會回覆 session REFUSE SPDU，此時 connect 會回傳 `ClientError::SessionRefused`，指出 session 拒絕原因碼與 presentation provider-reason，而不是回報一則無法解析的訊息。ACSE diagnostic 指明拒絕的是呼叫端身分或認證資料時，則改回傳 `ClientError::AuthenticationRejected`。
 
 ## Server 設定
 
-`IedServerConfig` 帶有 association 上限、edition、以功能約束遮罩表示的寫入權限政策、回報的時間品質，以及 Identify 服務回傳的三個字串。識別欄位若未設定，則採用內建預設值：
+`IedServerConfig` 帶有 association 上限、edition、以功能約束遮罩表示的寫入權限政策、server 自己產生的時間戳記所帶的時間品質，以及 Identify 服務回傳的三個字串。edition 只決定 client 能否寫入 GOOSE 控制區塊的 `GoID` 與 `DatSet`。識別欄位若未設定，則採用內建預設值：
 
 | 欄位 | 預設值 |
 |---|---|
@@ -135,7 +133,7 @@ sudo setcap cap_net_raw+ep target/debug/examples/goose_publisher
 
 六個 crate 可在 `--no-default-features` 下建置到 `thumbv7em-none-eabihf`：`iec61850-asn1` 與 `iec61850-hal` 搭配 `alloc`，`iec61850-model` 與 `iec61850-mms` 搭配 `embedded`，`iec61850-client` 與 `iec61850-server` 採用 `minimal,embedded` feature 集合。在這條路徑上，`hashbrown` 取代標準函式庫的集合型別，`spin::RwLock` 取代 `std::sync::RwLock`，MMS 堆疊則跑在 `iec61850-hal` 的 `AsyncTransport` 與 `Timer` trait 之上，而不直接綁定 `tokio`。`CONTRIBUTING.md` 列出這六道指令。
 
-`std` 在每個 crate 都是 default feature，因此桌面環境的建置不受影響。client 與 server 標示為部分支援，是因為兩者各只有一部分能跨過去：server 的 `full-server` runtime 與 client 的報告分派器需要一個 runtime 與一個位址型別，仍留在 `std` 這條路徑上。
+`std` 是這六個 crate 各自的 default feature，因此桌面環境的建置不受影響；其他 crate 沒有 `no_std` 路徑，也沒有 `std` feature。client 與 server 標示為部分支援，是因為兩者各只有一部分能跨過去：server 的 `full-server` runtime 與 client 的報告分派器需要一個 runtime 與一個位址型別，仍留在 `std` 這條路徑上。
 
 這些建置只是編譯檢查。本 repository 中沒有任何東西在實體硬體上跑過，也沒有涵蓋 bare-metal target 的持續整合。
 

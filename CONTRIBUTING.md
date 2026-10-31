@@ -28,42 +28,81 @@ takes longer to build than the rest of the workspace.
 
 ## Checks CI enforces
 
-The first four run on both Linux and Windows for a pull request; `cargo deny
-check` runs once, on Linux, as a separate job. A failure in any of them blocks
-the merge, so run them locally before opening one.
+A failure in any CI job blocks the merge, so run the checks for the code you
+touched locally before opening a pull request.
+
+**build** (Linux and Windows):
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+for features in minimal,std std,control std,logging std,setting-groups std,reporting; do
+  cargo clippy -p iec61850-server --no-default-features --features "$features" --all-targets -- -D warnings
+done
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo deny check
 ```
 
 `cargo clippy` runs with warnings denied, so a new warning is a failure. The
-documentation build denies rustdoc warnings too, which catches a broken intra-doc
-link or a malformed code block.
+server feature subsets lint the tests and examples too: each server test and
+example names the features it needs with a `[[test]]` or `[[example]]` entry
+and `required-features` in `crates/iec61850-server/Cargo.toml`, and a new one
+without that entry fails the subset that lacks its features. The documentation
+build denies rustdoc warnings, which catches a broken intra-doc link or a
+malformed code block.
 
-`cargo deny check` covers advisories, the license allow list, duplicate versions
-and dependency sources. No advisories stand open against `0.3.3`; a change must
-not introduce one. Adding a crate under a license outside the allow list, or
-suppressing an advisory, needs the reason recorded in `deny.toml` next to the
-entry.
+**e2e over TLS** (Linux and Windows) runs the wire tests again with the TLS
+paths of the client and the MMS stack compiled in. It needs `cargo-nextest`:
 
-Cross-compilation is worth running when you touch a crate that supports it. All
-six build for `thumbv7em-none-eabihf`:
+```sh
+cargo nextest run --workspace \
+  --features iec61850-client/tls,iec61850-mms/tls \
+  -E "binary(/_e2e$/) | binary(=server_tls_handshake) | binary(=tls_setup_timeout_event) | binary_id(=iec61850-tls::handshake)"
+```
+
+**L2 over veth** (Linux) runs the ignored raw Ethernet, GOOSE and Sampled
+Values tests over a veth pair. They need `CAP_NET_RAW` and libpcap, and a test
+binary that lists no ignored test fails the job:
+
+```sh
+sudo ip link add vf0 type veth peer name vf1
+sudo sysctl -w net.ipv6.conf.vf0.disable_ipv6=1 net.ipv6.conf.vf1.disable_ipv6=1
+sudo ip link set vf0 up
+sudo ip link set vf1 up
+cargo test -p iec61850-goose --test afpacket_veth --no-run
+sudo IEC61850_VETH=vf0,vf1 <test binary> --ignored --test-threads=1
+```
+
+The other binaries are `-p iec61850-hal --features ethernet-linux-afpacket
+--test afpacket_veth`, `-p iec61850-hal --features ethernet-pcap --test
+pcap_veth` and `-p iec61850-sv --test afpacket_veth`.
+
+**thumbv7em-none-eabihf** checks the `no_std` builds with warnings denied
+(`RUSTFLAGS="-D warnings"`):
 
 ```sh
 cargo check -p iec61850-asn1   --target thumbv7em-none-eabihf --no-default-features --features alloc
 cargo check -p iec61850-model  --target thumbv7em-none-eabihf --no-default-features --features embedded
 cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features alloc,transport
+cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features alloc,ethernet
+cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features transport-embassy
 cargo check -p iec61850-mms    --target thumbv7em-none-eabihf --no-default-features --features embedded
 cargo check -p iec61850-client --target thumbv7em-none-eabihf --no-default-features --features minimal,embedded
+cargo check -p iec61850-client --target thumbv7em-none-eabihf --no-default-features --features embedded,reporting,control,datasets
 cargo check -p iec61850-server --target thumbv7em-none-eabihf --no-default-features --features minimal,embedded
 ```
 
-CI does not run these, so a bare-metal regression is only caught by whoever
-runs them.
+**MSRV** checks the workspace against the declared `rust-version`:
+
+```sh
+cargo +1.88 check --workspace --all-targets
+```
+
+**cargo-deny** runs `cargo deny check`, which covers advisories, the license
+allow list, duplicate versions and dependency sources. No advisories stand open
+against `0.3.3`; a change must not introduce one. Adding a crate under a license
+outside the allow list, or suppressing an advisory, needs the reason recorded
+in `deny.toml` next to the entry.
 
 ## Contracts
 
@@ -161,8 +200,12 @@ vector is wrong, that is its own finding, and it needs the standard cited in the
 pull request.
 
 Tests that need two peers use loopback and pick a port at run time; nothing in
-the suite needs hardware, elevated privileges or an external server. A test that
-would need a real NIC belongs in an example named `*_live` instead.
+the default suite needs hardware, elevated privileges or an external server.
+Tests that need a raw Ethernet link are ignored by default and run over a veth
+pair in CI, and measurements that depend on the machine, such as
+`cargo test -p iec61850-client --test urcb_latency -- --ignored --nocapture`,
+are ignored characterizations rather than gates. A test that would need a real
+NIC belongs in an example named `*_live` instead.
 
 ## Adding a robustness case
 

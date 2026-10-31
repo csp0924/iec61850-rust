@@ -7,11 +7,18 @@ issues over the MMS stack, and drives reporting (URCB and BRCB), control,
 logging, GOOSE control blocks and setting groups.
 
 Behavior a caller can rely on: values are updated through typed entry
-points (`update_int32`, `update_float32`, ...); PDU size negotiation clamps
-to at least 64 bytes and one outstanding request; the data model lock
-returns `Err(AlreadyLocked)` instead of deadlocking on reentry; an
-association beyond `max_mms_connections` has its socket closed without a
-COTP disconnect-request.
+points (`update_int32`, `update_float32`, ...); PDU size negotiation refuses
+a proposal below 64 bytes and clamps the outstanding requests to at least
+one; the data model lock returns `Err(AlreadyLocked)` instead of deadlocking
+on reentry; an association beyond `max_mms_connections` has its socket closed
+without a COTP disconnect-request. An `AssociationAuthenticator` installed on
+the server decides on each association from its AP-titles, AE-qualifiers and
+ACSE credentials; without one every association is accepted.
+
+`IedServer::register_from_model` registers the data sets, report, GOOSE and
+log control blocks and controllable data objects the model declares, when
+the application calls it; the individual `register_*` calls remain for
+blocks the model does not declare.
 
 Part of [iec61850-rust](https://github.com/csp0924/iec61850-rust), an
 independent Rust implementation of IEC 61850 (MMS, GOOSE, Sampled Values,
@@ -55,8 +62,9 @@ Defaults enable the full desktop server: `std`, `tls`, `full-server`.
   `reporting`, `control`, `logging`, `goose-mapping` and `setting-groups`.
 - `tls` (default) - a TLS listener per IEC 62351-3, through
   [iec61850-tls](https://crates.io/crates/iec61850-tls).
-- `sqlite-backend` - a SQLite-backed buffered-report store in place of the
-  in-memory ring buffer.
+- `sqlite-backend` - `SqliteReportBuffer`, a SQLite-backed buffered-report
+  store that a BRCB built with `BufferedReportControl::with_backend` uses; a
+  BRCB built with `new` keeps the in-memory ring buffer.
 - `mms-core-server` - the five core MMS services without the integrated
   runtime.
 - `embedded` - `no_std` plus `alloc` over the MMS transport skeleton; the

@@ -108,7 +108,7 @@ been run on this project's development machine, which is Windows.
 | `iec61850-server` | `server_from_scl` | Every data set and control block the SCL declares, bound to the runtime, plus the control object | `client_reporting_subscriber` | `cargo run -p iec61850-server --example server_from_scl` |
 | `iec61850-server` | `server_basic_io` | The same model with a task moving the process values once a second | `read_write_cycle` | `cargo run -p iec61850-server --example server_basic_io` |
 | `iec61850-server` | `server_with_reporting` | The same model built in Rust instead of loaded from SCL, with one report control block registered by hand | `client_reporting_subscriber` | `cargo run -p iec61850-server --example server_with_reporting` |
-| `iec61850-server` | `server_control_io` | The four control models of IEC 61850-7-2 on one control object, and the interlocking refusal | none yet | `cargo run -p iec61850-server --example server_control_io -- sbo-enhanced` |
+| `iec61850-server` | `server_control_io` | The four control models of IEC 61850-7-2 on one control object, the model on the command line replacing the `ctlModel` the CID declares, and the interlocking refusal | none yet | `cargo run -p iec61850-server --example server_control_io -- sbo-enhanced` |
 | `iec61850-server` | `server_with_log` | A log control block whose journal is seeded before the server starts | none yet | `cargo run -p iec61850-server --example server_with_log` |
 | `iec61850-client` | `min_client` | Connect, read four attributes, write one, disconnect | `min_server` | `cargo run -p iec61850-client --example min_client` |
 | `iec61850-client` | `read_write_cycle` | The type-narrow read and write helpers over one association | `server_from_scl` | `cargo run -p iec61850-client --example read_write_cycle` |
@@ -165,7 +165,10 @@ sudo setcap cap_net_raw+ep target/debug/examples/goose_publisher
 The publisher and subscriber pairs default to the loopback interface, so they
 demonstrate a full exchange on one machine; `lo` carries multicast frames the
 same way a wired interface does. The examples named `*_live` transmit on a real
-NIC and take its name as a required argument.
+NIC and take its name as a required argument. They open their socket through
+`iec61850_hal::ethernet::open_socket`, so outside Linux they run on the libpcap
+or NPCAP backend when built with `--features iec61850-hal/ethernet-pcap`;
+without a backend they print a hint and exit.
 
 | Crate | Example | What it shows | Pairs with | Run |
 |---|---|---|---|---|

@@ -17,7 +17,7 @@ Licensed under `MIT OR Apache-2.0`.
 
 ## Status
 
-The workspace builds on stable Rust and carries roughly 2,000 tests: BER and
+The workspace builds on stable Rust and carries about 3,800 tests: BER and
 PDU round trips, protocol state machines, loopback client-to-server integration
 tests, and the malformed-input regressions cataloged in
 [`docs/robustness.md`](docs/robustness.md). Nine `cargo-fuzz` targets cover the
@@ -27,18 +27,22 @@ What this project does not claim:
 
 - **No conformance certification.** The implementation has not been submitted
   to a recognized test laboratory, and no certificate exists for it.
-- **GOOSE and Sampled Values run on Linux only.** Both ride directly on
-  Ethernet and need an `AF_PACKET` socket with `CAP_NET_RAW`. Windows compiles
-  the crates but cannot run their publishers and subscribers; a libpcap or
-  NPCAP backend is available for development.
+- **GOOSE and Sampled Values are supported on Linux.** Both ride directly on
+  Ethernet; on Linux they use an `AF_PACKET` socket with `CAP_NET_RAW`. On
+  Windows and macOS the libpcap or NPCAP backend of `iec61850-hal`
+  (`ethernet-pcap`, `ethernet-windows-npcap`) runs them for development and
+  testing; it is not a supported deployment path.
 - **MMS file services are not implemented.** No handler answers them, and
   `iec61850-server` advertises no feature that claims to.
 - **GetNameList discovery follows the run-time registries, not the SCL model.**
   Data sets, report control blocks and GOOSE control blocks are listed once they
   are registered. Those registries are what the Read paths resolve against, so
   every listed name is readable, and one the model declares but nothing
-  registered is not listed. A `Journal`-class request lists the journals the
-  `LogRef` of each registered log control block names.
+  registered is not listed. `IedServer::register_from_model` registers what
+  the model declares when the application calls it; the individual
+  `register_*` calls remain for blocks the model does not declare. A
+  `Journal`-class request lists the journals the `LogRef` of each registered
+  log control block names.
 - **SVCB management over MMS, R-GOOSE and R-SV are not implemented.**
 
 ## Crates
@@ -74,7 +78,8 @@ GetVariableAccessAttributes, Read, Write, Identify, DefineNamedVariableList,
 GetNamedVariableListAttributes, DeleteNamedVariableList, ReadJournal, and
 InformationReport for reports, LastApplError and command terminations. PDU
 size is negotiated on Initiate and enforced on every outbound PDU; a report too
-large for one PDU is segmented.
+large for the negotiated size is segmented, and each segment marks only the
+members it carries.
 
 **Reporting.** Unbuffered (URCB) and buffered (BRCB) report control blocks:
 trigger options, optional fields, general interrogation, buffer overflow and
@@ -85,21 +90,29 @@ adds a SQLite-backed buffer.
 direct-with-normal-security, SBO-with-normal-security,
 direct-with-enhanced-security and SBO-with-enhanced-security — with Select,
 SelectWithValue, Operate, Cancel, command termination, and the check and
-wait-for-execution handler hooks.
+wait-for-execution handler hooks. A control object takes `ctlModel`,
+`sboTimeout`, `sboClass` and `operTimeout` from the attributes the model
+declares, and the server keeps `stSeld` up to date.
 
 **Logging.** A log control block writing through a `LogStorage` trait, read
-back by a client with QueryLogByTime and QueryLogAfterEntry over ReadJournal.
-Data set members are logged on data-change and quality-change. WriteJournal is
-not implemented.
+back by a client with QueryLogByTime and QueryLogAfter over ReadJournal, with
+every combination of its optional fields. Data set members are logged on
+data-change, quality-change and data-update, and the whole data set once per
+integrity period. WriteJournal is not implemented.
 
 **Setting groups.** An SGCB runtime with `ActSG`, `EditSG` and `CnfEdit`, an
 edit session owned by one association, and a reservation deadline that releases
-an abandoned session.
+an abandoned session. The server keeps the values of every setting group and
+loads the selected one on SelectActiveSG and SelectEditSG.
 
 **GOOSE.** A publisher whose retransmission schedule the caller drives, a
 subscriber raising new-state, retransmission and expiry events, and a receiver
-that fans frames out to subscribers. `iec61850-server` exposes a GoCB as MMS
-variables, so GetGoCBValues and SetGoCBValues work over Read and Write.
+that fans frames out to subscribers. `iec61850-server` exposes a GoCB as the MMS
+structure of IEC 61850-8-1, so GetGoCBValues and SetGoCBValues work over Read
+and Write. The SCL Communication section is read: the model holds the server
+address of each access point and the GSE and SMV addressing of the control
+blocks, and `IedServer::register_from_model` publishes each GoCB to its GSE
+address.
 
 **Sampled Values.** Publisher and subscriber for the IEC 61850-9-2 LE profile,
 with a prebuilt frame template on the publish path and sample-continuity
@@ -113,7 +126,9 @@ report dispatch, control, journal queries and GoCB access.
 62351-3 constraints already applied: TLS 1.2 as the floor, a fixed cipher suite
 whitelist, optional or mandatory client authentication, optional
 allow-only-known-certificate verification, and the profile's event codes. `iec61850-client` and `iec61850-server` reach it through their
-`tls` features.
+`tls` features. An `AssociationAuthenticator` installed on the server decides
+on each association from its AP-titles, AE-qualifiers and ACSE password, and
+the client sends a password from `IsoConnectionParameters::authentication`.
 
 ## Quick start
 
@@ -157,12 +172,10 @@ expect. An IED that validates the calling address takes its own values:
 use iec61850_client::{ApTitle, IedConnection, IsoConnectionParameters};
 use iec61850_mms::iso::presentation::PSelector;
 
-let params = IsoConnectionParameters {
-    local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?,
-    local_ap_title: Some("1.3.9999.13".parse::<ApTitle>()?),
-    local_ae_qualifier: Some(1),
-    ..IsoConnectionParameters::default()
-};
+let mut params = IsoConnectionParameters::default();
+params.local_p_sel = PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02])?;
+params.local_ap_title = Some("1.3.9999.13".parse::<ApTitle>()?);
+params.local_ae_qualifier = Some(1);
 let conn = IedConnection::with_iso_parameters(params);
 conn.connect("192.0.2.10", 102).await?;
 ```
@@ -170,14 +183,17 @@ conn.connect("192.0.2.10", 102).await?;
 A peer that refuses the association answers with a session REFUSE SPDU; the
 connect call then returns `ClientError::SessionRefused`, naming the session
 reason code and the presentation provider-reason rather than reporting an
-unparsable message.
+unparsable message. A refusal whose ACSE diagnostic names the calling identity
+or the credentials returns `ClientError::AuthenticationRejected` instead.
 
 ## Server configuration
 
 `IedServerConfig` carries the association limit, the edition, the write-access
-policy as a functional-constraint mask, the reported time quality, and the three
-strings the Identify service returns. Leaving an identification field unset
-selects a built-in default:
+policy as a functional-constraint mask, the time quality of the timestamps the
+server generates itself, and the three strings the Identify service returns.
+The edition decides only whether a client may write the `GoID` and `DatSet` of
+a GOOSE control block. Leaving an identification field unset selects a built-in
+default:
 
 | Field | Default |
 |---|---|
@@ -215,7 +231,8 @@ standard collections, `spin::RwLock` replaces `std::sync::RwLock`, and the MMS
 stack runs over the `AsyncTransport` and `Timer` traits of `iec61850-hal` rather
 than binding `tokio` directly. `CONTRIBUTING.md` lists the six commands.
 
-`std` is a default feature everywhere, so a desktop build is unaffected. The
+`std` is a default feature of each of these six crates, so a desktop build is
+unaffected; the other crates have no `no_std` path and no `std` feature. The
 client and server are marked partial because only part of each crosses: the
 server's `full-server` runtime and the client's report dispatcher need a runtime
 and an address type and stay on the `std` path.
