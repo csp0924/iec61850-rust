@@ -1651,6 +1651,11 @@ impl ReportingEngine {
     ///   having resolved the anchor, the anchor is resolved here, once, with an
     ///   error logged, and sending resumes after the resynchronized entry
     ///
+    /// Whatever the anchor, the first report sent after RptEna went from false
+    /// to true carries `BufOvfl = true` (IEC 61850-7-2 §17.2.3.2.2.8); after
+    /// it, `BufOvfl` is the backend flag, which reports an entry lost unsent
+    /// while the control block is enabled.
+    ///
     /// Each entry is encoded, segmented at the PDU size the association
     /// negotiated, then sent segment by segment. Every segment of an entry
     /// carries the EntryID of that entry. `sq_num`, the transmit anchor, and the

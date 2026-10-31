@@ -985,11 +985,11 @@ impl BufferedReportControl {
     /// - `Err(InvalidEntryId)` when the entry is not in the buffer, which the
     ///   dispatcher answers with `DataAccessError::ObjectValueInvalid`
     ///
-    /// The buffer overflow flag is not set here. The send path implies
-    /// `BufOvfl = true` whenever the anchor is `FromHead` or unset, which covers the
-    /// not-found case as well, so a resynchronizing client still sees
-    /// `BufOvfl = true` on its first report without widening the
-    /// `ReportBufferBackend` trait.
+    /// The buffer overflow flag is not set here. Whatever the outcome, the
+    /// first report after the client enables the control block carries
+    /// `BufOvfl = true`, as `BrcbState::overflow_on_enable` makes it
+    /// (IEC 61850-7-2 §17.2.3.2.2.8); the backend flag reports only entries
+    /// lost while it is enabled.
     ///
     /// # Errors
     ///

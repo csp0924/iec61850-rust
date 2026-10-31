@@ -9,11 +9,14 @@
 //! An EntryID index maps each identifier to a monotonic sequence number, which
 //! makes a resynchronization lookup constant time rather than a linear scan.
 //!
-//! Invariants a caller relies on: a fresh buffer has `isOverflow` set, so the
-//! first report a reconnecting client receives carries `BufOvfl = true`; a full
-//! buffer evicts its oldest entry unless the configured strategy rejects the new
-//! one instead; and `purge` clears the entries, the identifier index, and the
-//! entry count together. Storage is reached only through `ReportBufferBackend`,
+//! Invariants a caller relies on: `isOverflow` reports the entries lost while
+//! the control block was enabled, a full buffer setting it when it loses an
+//! entry not yet formatted for transmission; a full buffer evicts its oldest
+//! entry unless the configured strategy rejects the new one instead; and
+//! `purge` clears the entries, the identifier index, and the entry count
+//! together. The `BufOvfl = true` of the first report after each enable comes
+//! from the control block, not from this flag (IEC 61850-7-2 §17.2.3.2.2.8),
+//! so the two rules hold side by side. Storage is reached only through `ReportBufferBackend`,
 //! so another backend can be substituted without touching the callers.
 
 use bytes::Bytes;
