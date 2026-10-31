@@ -129,17 +129,22 @@ impl GoCBHandle {
     /// Qualifies a data set reference with this control block's domain, so it
     /// reads `<LD>/<LN>$<dsName>` (IEC 61850-8-1 §8.1.3.2.2).
     ///
-    /// A reference that already names a domain, a VMD-scope reference
-    /// `/<name>` and an association-scope reference `@<name>` are kept; one in
-    /// the form `<LN>$<dsName>` gains the domain, and a bare data set name gains
-    /// the domain and this control block's logical node.
+    /// An empty reference, a reference that already names a domain, a
+    /// VMD-scope reference `/<name>` and an association-scope reference
+    /// `@<name>` are kept; one in the form `<LN>$<dsName>` gains the domain,
+    /// and a bare data set name gains the domain and this control block's
+    /// logical node.
     pub fn qualify_data_set_ref(&self, data_set_ref: &str) -> String {
-        if data_set_ref.contains('/') || data_set_ref.starts_with('@') {
-            data_set_ref.to_string()
-        } else if data_set_ref.contains('$') {
-            format!("{}/{}", self.ld, data_set_ref)
+        let bare = !data_set_ref.is_empty()
+            && !data_set_ref.contains(['/', '$'])
+            && !data_set_ref.starts_with('@');
+        if bare {
+            crate::mapping::qualified_object_reference(
+                &self.ld,
+                &format!("{}${}", self.ln, data_set_ref),
+            )
         } else {
-            format!("{}/{}${}", self.ld, self.ln, data_set_ref)
+            crate::mapping::qualified_object_reference(&self.ld, data_set_ref)
         }
     }
 }
@@ -1039,6 +1044,8 @@ mod tests {
         assert_eq!(h.qualify_data_set_ref("@ds1"), "@ds1");
         assert_eq!(h.qualify_data_set_ref("/ds1"), "/ds1");
         assert_eq!(h.qualify_data_set_ref("LLN0$ds1"), "IED1LD0/LLN0$ds1");
+        assert_eq!(h.qualify_data_set_ref("ds1"), "IED1LD0/LLN0$ds1");
+        assert_eq!(h.qualify_data_set_ref(""), "");
     }
 
     #[test]

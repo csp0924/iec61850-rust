@@ -91,6 +91,8 @@ use crate::handler::HandlerRegistry;
 use crate::logging::{
     new_log_control_registry, LogControl, LogControlRegistry, LogEntryId, LogStorageError,
 };
+#[cfg(feature = "logging")]
+use crate::mapping::qualified_object_reference;
 use crate::mapping::MmsDeviceModel;
 use crate::policy::WriteAccessPolicies;
 #[cfg(feature = "reporting")]
@@ -2063,20 +2065,6 @@ struct RcbTarget<'a> {
     mms_path: String,
     field: Option<crate::reporting::service::RcbField>,
     is_buffered: bool,
-}
-
-/// Returns `name` as the fully qualified MMS name a control block attribute
-/// carries, per IEC 61850-8-1 §8.1.3.2.2: a name in the form `<LN>$<object>`
-/// becomes `<domain>/<LN>$<object>`. An empty name, an association-specific
-/// name (`@<object>`), and a name that already has a scope (`<domain>/...` or
-/// `/<object>`) are returned unchanged.
-#[cfg(any(feature = "reporting", feature = "logging"))]
-pub(crate) fn qualified_object_reference(domain: &str, name: &str) -> String {
-    if name.is_empty() || name.starts_with('@') || name.contains('/') || domain.is_empty() {
-        name.to_string()
-    } else {
-        format!("{domain}/{name}")
-    }
 }
 
 /// Parses a domain-specific object name as a report control block target.
@@ -5419,19 +5407,6 @@ mod brcb_structure_tests {
     use crate::reporting::brcb::{Brcb, BufferedReportControl};
     use crate::reporting::buffer::testing::CountingBuffer;
     use iec61850_mms::mms::pdu::common::MmsData;
-
-    /// A data set name without a scope is qualified with the domain; every other
-    /// form of IEC 61850-8-1 §8.1.3.2.2 is kept as it is.
-    #[test]
-    fn object_reference_is_qualified_only_when_it_has_no_scope() {
-        assert_eq!(
-            qualified_object_reference("IED1LD0", "LLN0$ds1"),
-            "IED1LD0/LLN0$ds1"
-        );
-        for kept in ["", "IED1LD1/LLN0$ds1", "@ds1", "/ds1"] {
-            assert_eq!(qualified_object_reference("IED1LD0", kept), kept);
-        }
-    }
 
     /// A whole GetBRCBValues takes EntryID and TimeofEntry from one look at the
     /// buffer, even when a newer entry is enqueued while the structure is read.

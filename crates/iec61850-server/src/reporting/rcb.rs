@@ -366,7 +366,7 @@ impl RcbState {
 /// control block, per IEC 61850-8-1 §8.1.3.2.2.
 pub(crate) fn qualified_dat_set(mms_path: &str, dat_set: &str) -> String {
     let domain = mms_path.split_once('/').map_or("", |(domain, _)| domain);
-    crate::service::qualified_object_reference(domain, dat_set)
+    crate::mapping::qualified_object_reference(domain, dat_set)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

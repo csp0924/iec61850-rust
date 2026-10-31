@@ -697,6 +697,20 @@ fn leaf_member(name: &str, leaf: MmsLeafType) -> NamedVariableSpec {
     }
 }
 
+/// Returns `name` as the fully qualified MMS name a control block attribute
+/// carries, per IEC 61850-8-1 §8.1.3.2.2: a name in the form `<LN>$<object>`
+/// becomes `<domain>/<LN>$<object>`. An empty name, an association-specific
+/// name (`@<object>`), and a name that already has a scope (`<domain>/...` or
+/// `/<object>`) are returned unchanged.
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
+pub(crate) fn qualified_object_reference(domain: &str, name: &str) -> String {
+    if name.is_empty() || name.starts_with('@') || name.contains('/') || domain.is_empty() {
+        name.to_string()
+    } else {
+        format!("{domain}/{name}")
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Control blocks registered at run time
 // ─────────────────────────────────────────────────────────────────────────────
@@ -902,6 +916,20 @@ pub(crate) fn flat_paths(prefix: &str, spec: &MmsTypeSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A data set name without a scope is qualified with the domain; every other
+    /// form of IEC 61850-8-1 §8.1.3.2.2 is kept as it is.
+    #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
+    #[test]
+    fn object_reference_is_qualified_only_when_it_has_no_scope() {
+        assert_eq!(
+            qualified_object_reference("IED1LD0", "LLN0$ds1"),
+            "IED1LD0/LLN0$ds1"
+        );
+        for kept in ["", "IED1LD1/LLN0$ds1", "@ds1", "/ds1"] {
+            assert_eq!(qualified_object_reference("IED1LD0", kept), kept);
+        }
+    }
     use iec61850_model::{
         DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder, MmsValue, TrgOps,
     };
