@@ -10,7 +10,7 @@
 //! | Field | Condition for a write to be accepted |
 //! |---|---|
 //! | Resv = true | not reserved by another client, and RptEna is false |
-//! | Resv = false | reserved by the writer, and RptEna is false |
+//! | Resv = false | unreserved, or reserved by the writer, and RptEna is false |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | unreserved or reserved by the writer, and RptEna is false; the write does not reserve |
 //! | RptEna = true | reserved by the writer, or unreserved, in which case the write reserves it for the writer |
 //! | RptEna = false | unreserved or reserved by the writer; the reservation is kept |
