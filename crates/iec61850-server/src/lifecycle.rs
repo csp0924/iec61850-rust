@@ -1585,21 +1585,28 @@ mod tests {
         assert_eq!(server.connection_count(), 0);
     }
 
-    /// A connection that sends nothing is closed at its setup deadline, and not
-    /// before; its slot is freed.
+    /// A connection that sends nothing holds its slot until its setup deadline,
+    /// is closed then and not before, and frees its slot.
     #[tokio::test(start_paused = true)]
     async fn silent_connection_is_closed_at_the_setup_deadline() {
         let server = build_server(IedServerConfig::default());
         let start = Instant::now();
         let (mut client, task) =
             spawn_connection_until(&server, 4096, start + Duration::from_millis(300));
+        assert_eq!(server.open_socket_count(), 1);
+        tokio::time::advance(Duration::from_millis(299)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "still open before the deadline");
+        assert_eq!(server.open_socket_count(), 1, "the slot is held");
 
-        tokio::time::timeout(Duration::from_millis(301), task)
+        tokio::time::timeout(Duration::from_millis(2), task)
             .await
             .expect("a silent connection must be closed at the setup deadline")
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(300));
-        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.open_socket_count(), 0, "the slot is freed");
         let mut buf = [0u8; 16];
         assert_eq!(
             tokio::io::AsyncReadExt::read(&mut client, &mut buf)
@@ -1611,7 +1618,8 @@ mod tests {
     }
 
     /// A connection that completes the COTP handshake and then stops before
-    /// the Session connect is closed at its setup deadline, and not before.
+    /// the Session connect holds its slot until its setup deadline, is closed
+    /// then and not before, and frees its slot.
     #[tokio::test(start_paused = true)]
     async fn setup_stalled_after_the_cotp_handshake_is_closed_at_the_deadline() {
         let server = build_server(IedServerConfig::default());
@@ -1622,13 +1630,19 @@ mod tests {
             .await
             .expect("the COTP handshake completes before the deadline");
         assert!(start.elapsed() < Duration::from_millis(300));
+        tokio::time::advance(Duration::from_millis(299) - start.elapsed()).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "still open before the deadline");
+        assert_eq!(server.open_socket_count(), 1, "the slot is held");
 
-        tokio::time::timeout(Duration::from_millis(301), task)
+        tokio::time::timeout(Duration::from_millis(2), task)
             .await
             .expect("a stalled setup must be closed at the setup deadline")
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(300));
-        assert_eq!(server.connection_count(), 0);
+        assert_eq!(server.open_socket_count(), 0, "the slot is freed");
         assert!(cotp.recv_data().await.is_err(), "the server side is closed");
     }
 
