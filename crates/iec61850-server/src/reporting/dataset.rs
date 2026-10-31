@@ -351,6 +351,13 @@ impl DatasetEntry {
         Some(value)
     }
 
+    /// Returns whether the leaf whose value lock is `cell` is part of the
+    /// member.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn holds_cell(&self, cell: &Arc<RwLock<MmsValue>>) -> bool {
+        self.leaves().iter().any(|l| Arc::ptr_eq(&l.value, cell))
+    }
+
     /// Returns the value of the member with the leaf whose value lock is
     /// `cell` replaced by `new_value`, starting from `held` as
     /// [`DatasetEntry::value_with`] does. `None` also when the leaf is not

@@ -793,6 +793,7 @@ impl ReportingEngine {
                     attr_ref,
                     &new_value,
                     flag,
+                    &BatchValues::NONE,
                     &mut pending.inclusion_flags,
                     &mut pending.snapshot,
                 );
@@ -2012,15 +2013,30 @@ impl ReportingEngine {
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
         now_ms: u64,
     ) {
+        self.on_values_updated_with(updates, &[], now_ms);
+    }
+
+    /// Reports a batch of updates as [`ReportingEngine::on_values_updated`]
+    /// does, with `context`, the values the same batch gave attributes that
+    /// raised nothing. A member naming a data object or a constructed
+    /// attribute takes the values of `context` and `updates` beneath it over
+    /// the values it reads from the model, so it holds the state the batch
+    /// left rather than one a concurrent writer made since.
+    pub(crate) fn on_values_updated_with(
+        &self,
+        updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+        context: &[(DataAttributeRef, MmsValue)],
+        now_ms: u64,
+    ) {
         let updates = merge_updates(updates);
         let mut to_drop: Vec<ConnectionId> = Vec::new();
         for (rc_arc, members) in group_by_watcher(&updates, &self.watch_map) {
-            if let Some(c) = self.trigger_urcb_batch(&rc_arc, &updates, &members, now_ms) {
+            if let Some(c) = self.trigger_urcb_batch(&rc_arc, &updates, &members, context, now_ms) {
                 to_drop.push(c);
             }
         }
         for (brcb_arc, members) in group_by_watcher(&updates, &self.brcb_watch_map) {
-            self.trigger_brcb_batch(&brcb_arc, &updates, &members, now_ms);
+            self.trigger_brcb_batch(&brcb_arc, &updates, &members, context, now_ms);
         }
         for c in to_drop {
             self.on_connection_dropped(c);
@@ -2034,6 +2050,7 @@ impl ReportingEngine {
         rc_arc: &Arc<Mutex<ReportControl>>,
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
         members: &[usize],
+        context: &[(DataAttributeRef, MmsValue)],
         now_ms: u64,
     ) -> Option<ConnectionId> {
         let Ok(rc_guard) = rc_arc.lock() else {
@@ -2107,6 +2124,7 @@ impl ReportingEngine {
             return dropped;
         };
         let pending = pending.get_or_insert_with(|| PendingReport::new_empty(ds.len(), now_ms));
+        let batch = BatchValues { updates, context };
         for (idx, flag, attr_ref, value) in slots {
             fill_member(
                 ds,
@@ -2114,6 +2132,7 @@ impl ReportingEngine {
                 attr_ref,
                 value,
                 flag,
+                &batch,
                 &mut pending.inclusion_flags,
                 &mut pending.snapshot,
             );
@@ -2136,6 +2155,7 @@ impl ReportingEngine {
         brcb_arc: &Arc<BufferedReportControl>,
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
         members: &[usize],
+        context: &[(DataAttributeRef, MmsValue)],
         now_ms: u64,
     ) {
         let mms_path = &brcb_arc.mms_path;
@@ -2170,6 +2190,7 @@ impl ReportingEngine {
         if slots.is_empty() {
             return;
         }
+        let batch = BatchValues { updates, context };
         let fill = |snap: &mut EnqueuedSnapshot| {
             for (idx, flag, attr_ref, value) in &slots {
                 fill_member(
@@ -2178,6 +2199,7 @@ impl ReportingEngine {
                     attr_ref,
                     value,
                     *flag,
+                    &batch,
                     &mut snap.inclusion_flags,
                     &mut snap.values,
                 );
@@ -2293,7 +2315,16 @@ impl ReportingEngine {
         }
         let fill = |flags: &mut [InclusionFlag], values: &mut [Option<MmsValue>]| {
             for &idx in &idxs {
-                fill_member(ds, idx, attr_ref, new_value, flag, flags, values);
+                fill_member(
+                    ds,
+                    idx,
+                    attr_ref,
+                    new_value,
+                    flag,
+                    &BatchValues::NONE,
+                    flags,
+                    values,
+                );
             }
         };
 
@@ -2423,6 +2454,28 @@ fn unwatch_leaves<T>(
     }
 }
 
+/// The values one batch gave attributes: those that raised a trigger and
+/// those that raised nothing.
+struct BatchValues<'a> {
+    updates: &'a [(DataAttributeRef, MmsValue, InclusionFlag)],
+    context: &'a [(DataAttributeRef, MmsValue)],
+}
+
+impl BatchValues<'_> {
+    /// No batch: a single update.
+    const NONE: BatchValues<'static> = BatchValues {
+        updates: &[],
+        context: &[],
+    };
+
+    fn values(&self) -> impl Iterator<Item = (&str, &MmsValue)> {
+        self.context
+            .iter()
+            .map(|(r, v)| (r.as_str(), v))
+            .chain(self.updates.iter().map(|(r, v, _)| (r.as_str(), v)))
+    }
+}
+
 /// Records a trigger of the attribute `leaf_ref` in the slot of member `idx`
 /// of `ds`.
 ///
@@ -2430,14 +2483,17 @@ fn unwatch_leaves<T>(
 /// data object or a constructed attribute above it adds `flag` to the reasons
 /// it holds and takes its value with the attribute's part set to `value`,
 /// starting from the value it holds, or from its current value when it holds
-/// none, so the triggers of several attributes beneath one member accumulate
-/// in one value.
+/// none, with the parts of the other attributes of `batch` beneath it set to
+/// their batch values, so the triggers of several attributes beneath one
+/// member accumulate in one value of the state the batch left.
+#[allow(clippy::too_many_arguments)]
 fn fill_member(
     ds: &Dataset,
     idx: usize,
     leaf_ref: &str,
     value: &MmsValue,
     flag: InclusionFlag,
+    batch: &BatchValues<'_>,
     flags: &mut [InclusionFlag],
     values: &mut [Option<MmsValue>],
 ) {
@@ -2451,7 +2507,11 @@ fn fill_member(
         *slot = Some(value.clone());
     } else {
         *f = f.union(flag);
-        *slot = entry.value_with(slot.take(), leaf_ref, value);
+        let mut held = slot.take().or_else(|| entry.read_value());
+        for (r, v) in batch.values() {
+            held = entry.value_with(held, r, v);
+        }
+        *slot = entry.value_with(held, leaf_ref, value);
     }
 }
 

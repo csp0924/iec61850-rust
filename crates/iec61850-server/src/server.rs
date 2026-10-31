@@ -688,19 +688,20 @@ impl IedServer {
     /// stored, as one batch, or defers them while the data model is locked.
     /// Each leaf raises the triggers its trigger options declare for the
     /// change from its old value to its new one, as an `update_*` call would.
+    ///
+    /// A leaf that raises nothing goes along with no reason, so a member
+    /// naming a data object or a constructed attribute takes every value the
+    /// request wrote rather than one another client wrote in the meantime.
     fn raise_written(&self, leaves: &[WrittenLeaf]) {
         let triggers: Vec<PendingTrigger> = leaves
             .iter()
-            .filter_map(|leaf| {
-                let flag = update_triggers(leaf.trg_ops, &leaf.old, &leaf.new);
-                flag.has_trigger().then(|| PendingTrigger {
-                    cell: Arc::clone(&leaf.value),
-                    value: leaf.new.clone(),
-                    flag,
-                })
+            .map(|leaf| PendingTrigger {
+                cell: Arc::clone(&leaf.value),
+                value: leaf.new.clone(),
+                flag: update_triggers(leaf.trg_ops, &leaf.old, &leaf.new),
             })
             .collect();
-        if triggers.is_empty() {
+        if !triggers.iter().any(|t| t.flag.has_trigger()) {
             return;
         }
         {
@@ -718,10 +719,11 @@ impl IedServer {
     /// Raises the log and report triggers of attribute updates.
     ///
     /// Every attribute is looked up in the report indexes before the reporting
-    /// engine is locked, and the engine then takes all of them at once.
+    /// engine is locked, and the engine then takes all of them at once. An
+    /// update with no reason only lends its value to the members above it.
     fn raise_triggers(&self, triggers: &[PendingTrigger]) {
         self.log_updates(triggers);
-        let updates: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> = {
+        let indexed: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> = {
             let index = self.inner.attr_ref_index.read().ok();
             triggers
                 .iter()
@@ -737,17 +739,22 @@ impl IedServer {
                 })
                 .collect()
         };
+        let (updates, context): (Vec<_>, Vec<_>) = indexed
+            .into_iter()
+            .partition(|(_, _, flag)| flag.has_trigger());
         // An attribute in no data set has no index entry, which is the ordinary
         // case and needs no report.
         if updates.is_empty() {
             return;
         }
+        let context: Vec<(DataAttributeRef, MmsValue)> =
+            context.into_iter().map(|(r, v, _)| (r, v)).collect();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         match self.inner.reporting_engine.lock() {
-            Ok(engine) => engine.on_values_updated(&updates, now_ms),
+            Ok(engine) => engine.on_values_updated_with(&updates, &context, now_ms),
             Err(_) => tracing::warn!(
                 updates = updates.len(),
                 "the reporting engine lock is poisoned, the update triggered no report"
@@ -798,7 +805,9 @@ impl IedServer {
             let Some(ds) = self.log_data_set(&lc, data_set) else {
                 continue;
             };
-            // Member position to its value and reason code, over the batch.
+            // Member position to its value and reason code, over the batch. A
+            // member takes every value of the batch beneath it, the values of
+            // updates with no reason included, the first time it is reached.
             let mut members: Vec<(usize, MmsValue, u8)> = Vec::new();
             for t in triggers {
                 let reason_code = log_reason(t.flag, trg_ops);
@@ -806,18 +815,27 @@ impl IedServer {
                     continue;
                 }
                 for (idx, entry) in ds.entries.iter().enumerate() {
-                    let slot = members.iter().position(|(i, ..)| *i == idx);
-                    let held = slot.map(|s| members[s].1.clone());
-                    let Some((_, value)) = entry.value_with_cell(held, &t.cell, &t.value) else {
+                    if !entry.holds_cell(&t.cell) {
+                        continue;
+                    }
+                    if let Some(s) = members.iter().position(|(i, ..)| *i == idx) {
+                        members[s].2 |= reason_code;
+                        continue;
+                    }
+                    let mut value = entry.read_value();
+                    for b in triggers {
+                        if entry.holds_cell(&b.cell) {
+                            value = value.and_then(|v| {
+                                entry
+                                    .value_with_cell(Some(v), &b.cell, &b.value)
+                                    .map(|(_, v)| v)
+                            });
+                        }
+                    }
+                    let Some(value) = value else {
                         continue;
                     };
-                    match slot {
-                        Some(s) => {
-                            members[s].1 = value;
-                            members[s].2 |= reason_code;
-                        }
-                        None => members.push((idx, value, reason_code)),
-                    }
+                    members.push((idx, value, reason_code));
                 }
             }
             if members.is_empty() {
@@ -1496,6 +1514,7 @@ fn leaf_index_entries(ds: &Dataset) -> Vec<(usize, DataAttributeRef)> {
 }
 
 /// An attribute update whose report and log triggers are still to be raised.
+/// One with no reason carries only its value, for the members above it.
 struct PendingTrigger {
     /// The shared value of the attribute, which identifies it.
     cell: Arc<RwLock<MmsValue>>,
@@ -2396,5 +2415,123 @@ mod tests {
             !result,
             "an unknown connection id must report nothing marked"
         );
+    }
+}
+
+#[cfg(test)]
+mod write_context_tests {
+    use super::*;
+    use crate::logging::storage::CollectingVisitor;
+    use crate::logging::{InMemoryLogStorage, LogControl, LogControlBlock};
+    use crate::reporting::{DatasetEntry, Rcb};
+    use crate::service::write::WrittenLeaf;
+    use iec61850_model::{
+        DataAttributeType, DataObject, DoChild, IedModelBuilder, LogicalDeviceBuilder,
+        LogicalNodeBuilder, FC,
+    };
+
+    /// A server whose URCB, enabled without a client so its report stays
+    /// pending, and whose log control block both observe the FCD
+    /// `GGIO1$SP$Lim`, holding `lo` and `hi`, which declare dchg.
+    fn server() -> (IedServer, Arc<dyn crate::logging::LogStorage>) {
+        let limit = |name: &str, v: i64| {
+            DoChild::Da(DataAttribute::new(
+                name,
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::DCHG,
+                MmsValue::Integer(v),
+            ))
+        };
+        let lim = DataObject::new("Lim", vec![limit("lo", 1), limit("hi", 9)]);
+        let ggio = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![lim]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        let model = Arc::new(
+            IedModelBuilder::new("IED1")
+                .add_ld(ld)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let server = IedServer::builder()
+            .model(model.clone())
+            .bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .build()
+            .unwrap();
+        let mut ds = Dataset::new("LLN0$dsLim");
+        ds.push(DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$SP$Lim").unwrap());
+        let rcb = Rcb::new("urcbA", "LLN0$dsLim").with_trg_ops(TriggerOptions::DATA_CHANGED);
+        server
+            .register_urcb(ReportControl::new("IED1LD0/LLN0$RP$urcbA", rcb), ds)
+            .unwrap();
+        {
+            let engine = server.inner.reporting_engine.lock().unwrap();
+            let rc = engine.get_rcb("IED1LD0/LLN0$RP$urcbA").unwrap();
+            rc.lock().unwrap().state.lock().unwrap().rpt_ena = true;
+        }
+        let storage: Arc<dyn crate::logging::LogStorage> = Arc::new(InMemoryLogStorage::new());
+        let block = LogControlBlock::new("evlog")
+            .with_dataset("LLN0$dsLim")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_log_ref("IED1LD0/LLN0$EventLog");
+        let lc = LogControl::new("IED1LD0/LLN0$LG$evlog", block).with_storage(Arc::clone(&storage));
+        server.register_log_control("IED1LD0", "LLN0$LG$evlog", Arc::new(lc));
+        (server, storage)
+    }
+
+    fn cell(server: &IedServer, name: &str) -> Arc<RwLock<MmsValue>> {
+        let model = server.model();
+        let r =
+            iec61850_model::ObjectRef::parse_mms(&format!("IED1LD0/GGIO1$SP$Lim${name}")).unwrap();
+        let Some(iec61850_model::NodeRef::Da(da)) = model.node_by_object_ref(&r) else {
+            panic!("{name} is a data attribute");
+        };
+        Arc::clone(&da.value)
+    }
+
+    /// A write of `Lim` = {5, 9} whose triggers are raised after another
+    /// client has already written {6, 10}: the report and the log entry of
+    /// the first write carry {5, 9}, the state it left, and not the mix
+    /// {5, 10} of its changed leaf and the other client's value of `hi`,
+    /// which the first write left unchanged and so raised nothing for.
+    #[test]
+    fn a_write_reports_its_own_values_after_a_concurrent_write() {
+        let (server, storage) = server();
+        let (lo, hi) = (cell(&server, "lo"), cell(&server, "hi"));
+        *lo.write().unwrap() = MmsValue::Integer(6);
+        *hi.write().unwrap() = MmsValue::Integer(10);
+
+        server.raise_written(&[
+            WrittenLeaf {
+                value: Arc::clone(&lo),
+                trg_ops: TrgOps::DCHG,
+                old: MmsValue::Integer(1),
+                new: MmsValue::Integer(5),
+            },
+            WrittenLeaf {
+                value: Arc::clone(&hi),
+                trg_ops: TrgOps::DCHG,
+                old: MmsValue::Integer(9),
+                new: MmsValue::Integer(9),
+            },
+        ]);
+
+        let written = MmsValue::Structure(vec![MmsValue::Integer(5), MmsValue::Integer(9)]);
+        {
+            let engine = server.inner.reporting_engine.lock().unwrap();
+            let rc = engine.get_rcb("IED1LD0/LLN0$RP$urcbA").unwrap();
+            let rc = rc.lock().unwrap();
+            let state = rc.state.lock().unwrap();
+            let pending = state.pending.as_ref().expect("a pending report");
+            assert_eq!(pending.snapshot[0], Some(written.clone()), "report");
+        }
+        let mut v = CollectingVisitor::new();
+        storage.query_by_time(0, u64::MAX / 2, &mut v).unwrap();
+        assert_eq!(v.entries.len(), 1);
+        assert_eq!(v.entries[0].variables[0].value, written, "log entry");
     }
 }
