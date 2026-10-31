@@ -28,6 +28,14 @@
 //! an access error rather than emitted as a reference the client cannot
 //! resolve.
 //!
+//! A member naming an element of an array holds the reference reports carry,
+//! the index after the array name, `<LN>$<FC>$...$<array>(<n>)[$<component>...]`
+//! (IEC 61850-8-1 §8.1.3.2.4). It is listed as the variable that names the
+//! array, with an alternate access selecting the index and then each component,
+//! the form IEC 61850-8-1 §7.3.3, §7.3.4 and §24.2.2.4.1.3 Table 140 give the
+//! reference of an array element. A member naming a whole array is listed by
+//! its name alone.
+//!
 //! ## Response size
 //!
 //! The member list grows with the data set, so a response can outgrow the
@@ -46,7 +54,7 @@ use iec61850_mms::mms::pdu::{
         subcode::{access, resource},
         ErrorClass,
     },
-    ListOfVariableEntry, ObjectName,
+    AlternateAccess, ListOfVariableEntry, ObjectName,
 };
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
 
@@ -119,12 +127,10 @@ pub(crate) fn handle_get_named_variable_list_attributes(
 
     let mut list_of_variable = Vec::with_capacity(dataset.entries.len());
     for entry in &dataset.entries {
-        match split_attr_ref(&entry.attr_ref) {
-            Some((member_domain, item_id)) => {
-                list_of_variable.push(ListOfVariableEntry::name(ObjectName::DomainSpecific {
-                    domain_id: member_domain,
-                    item_id,
-                }));
+        match member_variable(&entry.attr_ref) {
+            Some((name, None)) => list_of_variable.push(ListOfVariableEntry::name(name)),
+            Some((name, Some(alt_access))) => {
+                list_of_variable.push(ListOfVariableEntry::with_alt_access(name, alt_access));
             }
             None => {
                 tracing::warn!(
@@ -160,6 +166,42 @@ pub(crate) fn handle_get_named_variable_list_attributes(
     ConfirmedResponse::Response(buf.freeze())
 }
 
+/// The MMS variable a data set member reference names, and the alternate
+/// access selecting the array element it names, if any.
+///
+/// `"<domain>/<item>"` with no index names `<item>` itself.
+/// `"<domain>/<array>(<n>)"` names `<array>` with an alternate access of index
+/// `n`, and `"<domain>/<array>(<n>)$<c1>$<c2>..."` adds the components after
+/// the index. A reference whose index does not parse, or that holds a second
+/// index, names the item verbatim. Returns `None` when the domain separator is
+/// missing or either part is empty.
+pub(crate) fn member_variable(attr_ref: &str) -> Option<(ObjectName, Option<AlternateAccess>)> {
+    let (domain_id, item_id) = split_attr_ref(attr_ref)?;
+    let element = item_id.split_once('(').and_then(|(array, rest)| {
+        let (index, components) = rest.split_once(')')?;
+        let index: u32 = index.parse().ok()?;
+        if array.is_empty() || components.contains(['(', ')']) {
+            return None;
+        }
+        let alt_access = match components.strip_prefix('$') {
+            None if components.is_empty() => AlternateAccess::index(index),
+            Some(path) => AlternateAccess::index_component(index, path).ok()?,
+            None => return None,
+        };
+        Some((array.to_string(), alt_access))
+    });
+    Some(match element {
+        Some((array, alt_access)) => (
+            ObjectName::DomainSpecific {
+                domain_id,
+                item_id: array,
+            },
+            Some(alt_access),
+        ),
+        None => (ObjectName::DomainSpecific { domain_id, item_id }, None),
+    })
+}
+
 /// Splits `"<domain>/<item>"` into its two parts.
 ///
 /// Returns `None` when the separator is missing or either part is empty.
@@ -174,6 +216,43 @@ pub(crate) fn split_attr_ref(attr_ref: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An element reference names its array with an alternate access of the
+    /// index and then the components; other references name themselves.
+    #[test]
+    fn a_member_reference_names_a_variable_and_its_element() {
+        let named = |item: &str| ObjectName::DomainSpecific {
+            domain_id: "LD".into(),
+            item_id: item.into(),
+        };
+        assert_eq!(
+            member_variable("LD/MHAI1$MX$HA$phsAHar(7)$cVal$mag$f"),
+            Some((
+                named("MHAI1$MX$HA$phsAHar"),
+                Some(AlternateAccess::index_component(7, "cVal$mag$f").unwrap())
+            ))
+        );
+        assert_eq!(
+            member_variable("LD/GGIO1$ST$Arr$hstVal(1)"),
+            Some((
+                named("GGIO1$ST$Arr$hstVal"),
+                Some(AlternateAccess::index(1))
+            ))
+        );
+        for item in [
+            "GGIO1$ST$Ind1$stVal",
+            "GGIO1$ST$Arr$hstVal(x)",
+            "GGIO1$ST$Arr(1)$v(2)",
+            "GGIO1$ST$Arr(1)v",
+        ] {
+            assert_eq!(
+                member_variable(&format!("LD/{item}")),
+                Some((named(item), None)),
+                "{item}"
+            );
+        }
+        assert_eq!(member_variable("GGIO1$ST$Ind1"), None);
+    }
 
     #[test]
     fn attr_ref_splits_on_the_first_separator() {

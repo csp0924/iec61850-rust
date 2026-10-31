@@ -1250,3 +1250,83 @@ fn model_data_set_members_naming_no_element_fail_the_registration() {
         );
     }
 }
+
+/// GetDataSetDirectory lists a member naming an array element as the variable
+/// naming the array with an alternate access of the index and then each
+/// component (IEC 61850-8-1 §24.2.2.4.1.3 Table 140), and a member naming a
+/// whole array by its name alone; the client maps both back to IEC
+/// references.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_set_directory_names_array_elements_by_alternate_access() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (handle, mut client) = serve_with(model(), |server| {
+            server.register_from_model().expect("register_from_model");
+        })
+        .await;
+        let named = |item: &str| ObjectName::DomainSpecific {
+            domain_id: DOMAIN.into(),
+            item_id: item.into(),
+        };
+
+        let dir = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_named_variable_list_attributes(DOMAIN, "LLN0$Harm"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetNamedVariableListAttributes");
+        assert_eq!(
+            dir.list_of_variable,
+            vec![
+                ListOfVariableEntry::with_alt_access(
+                    named("MHAI1$MX$HA$phsAHar"),
+                    AlternateAccess::index_component(3, "cVal$mag$f").unwrap()
+                ),
+                ListOfVariableEntry::with_alt_access(
+                    named("GGIO1$ST$Arr$hstVal"),
+                    AlternateAccess::index(1)
+                ),
+                ListOfVariableEntry::name(named("GGIO1$SP$Arr$cfg$lims")),
+                ListOfVariableEntry::name(named("MHAI1$MX$HA$phsAHar")),
+            ]
+        );
+
+        let conn = iec61850_client::IedConnection::with_mms_client(
+            MmsClientBuilder::new()
+                .connect_timeout_ms(3_000)
+                .request_timeout_ms(3_000)
+                .build(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.connect("127.0.0.1", handle.bound_addr.port()),
+        )
+        .await
+        .expect("timeout")
+        .expect("connect");
+        let dir = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.get_data_set_directory(&format!("{DOMAIN}/LLN0.Harm")),
+        )
+        .await
+        .expect("timeout")
+        .expect("get_data_set_directory");
+        let members: Vec<(String, FC)> = dir
+            .members
+            .iter()
+            .map(|m| (m.reference.clone(), m.fc))
+            .collect();
+        assert_eq!(
+            members,
+            vec![
+                (format!("{DOMAIN}/MHAI1.HA.phsAHar(3).cVal.mag.f"), FC::Mx),
+                (format!("{DOMAIN}/GGIO1.Arr.hstVal(1)"), FC::St),
+                (format!("{DOMAIN}/GGIO1.Arr.cfg.lims"), FC::Sp),
+                (format!("{DOMAIN}/MHAI1.HA.phsAHar"), FC::Mx),
+            ]
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
