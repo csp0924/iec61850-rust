@@ -32,6 +32,7 @@ use crate::sync::Mutex;
 /// The field order follows IEC 61850-7-2 §13, which is the order a server
 /// encodes them into the returned structure.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GoCBValues {
     /// Object reference of the control block itself.
     pub go_cb_ref: String,
@@ -69,6 +70,7 @@ pub struct PhyComAddress {
 /// A partial GoCB write: an attribute is written when it is `Some` and left
 /// untouched when it is `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct GoCBValuesWrite {
     /// GoEna: `true` starts publishing, `false` stops it.
     pub go_ena: Option<bool>,

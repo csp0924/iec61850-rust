@@ -40,6 +40,7 @@ impl OriginValue {
 /// documents the standard name and its wire value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ControlAddCause {
     /// `Unknown` (0): the cause is not known; a value the standard does not
     /// define also maps here.
@@ -157,6 +158,7 @@ impl ControlAddCause {
 /// IEC 61850-8-1; the AddCause carries the cause of the failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ControlLastApplError {
     /// `No Error` (0): no internal error; the AddCause reports why the
     /// command was refused.
@@ -199,6 +201,7 @@ pub enum SboClass {
 
 /// Application-level outcome of a control command.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlOutcome {
     /// The command succeeded: the confirmed response in a normal model, or a
     /// positive command termination in an enhanced one.
@@ -213,6 +216,7 @@ pub enum ControlOutcome {
 ///
 /// A negative termination carries a LastApplError alongside the Oper structure.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CommandTerminationParsed {
     /// `<LD>/<LN>$CO$<DO>$Oper`, taken from the report's variable list.
     pub object_ref_oper: String,
@@ -223,6 +227,7 @@ pub struct CommandTerminationParsed {
 /// The five-element LastApplError structure, reported ahead of the negative
 /// response to a refused command or inside a negative command termination.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LastApplError {
     /// Control attribute the command addressed, such as
     /// `<LD>/<LN>$CO$<DO>$Oper`.

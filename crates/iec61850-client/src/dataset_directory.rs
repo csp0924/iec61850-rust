@@ -27,6 +27,7 @@ use iec61850_model::FC;
 /// The members of a data set, together with whether the server allows it to be
 /// deleted.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DataSetDirectory {
     /// `mmsDeletable`: true only for a data set created at runtime through
     /// CreateDataSet. A configured data set is not deletable.

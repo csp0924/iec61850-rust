@@ -22,6 +22,7 @@ use iec61850_model::FC;
 /// `reference` is accepted in IEC or MMS notation, and `fc` must match the
 /// functional constraint of the data attribute on the server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DataSetMember {
     /// Object reference of the member, in IEC or MMS notation.
     pub reference: String,

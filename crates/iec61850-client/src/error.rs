@@ -17,6 +17,7 @@ use crate::report::ReportParseError;
 /// a `DataAccessError` keeps its typed form, everything else is flattened
 /// into `Mms`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// The `rpt_id` argument is longer than the 128-byte MMS object-name limit.
     #[error("invalid rptId: length {len} exceeds upper bound 128")]

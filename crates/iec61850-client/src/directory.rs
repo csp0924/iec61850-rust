@@ -31,6 +31,7 @@ use crate::prelude::{format, String, ToString, Vec};
 
 /// The MMS named variables of one logical device, as cached.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IcLogicalDevice {
     /// Name of the logical device, which is also its MMS domain id.
     pub name: String,
@@ -41,6 +42,7 @@ pub struct IcLogicalDevice {
 
 /// Cached object tree of a whole server.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DeviceModel {
     /// Every logical device the server reported, with its variables.
     pub logical_devices: Vec<IcLogicalDevice>,
@@ -56,6 +58,7 @@ impl DeviceModel {
 /// ACSI class selector for [`IedConnection::get_logical_node_directory`], as
 /// defined in IEC 61850-7-2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcsiClass {
     /// Data objects, resolved from the cached variable tree.
     DataObject,

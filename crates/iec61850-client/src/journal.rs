@@ -39,6 +39,7 @@ impl ClientJournalEntryId {
 
 /// One journal entry as returned by a server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientJournalEntry {
     /// Identifier of this entry, unique within the log.
     pub entry_id: ClientJournalEntryId,
@@ -51,6 +52,7 @@ pub struct ClientJournalEntry {
 
 /// One data point inside a journal entry.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientJournalEntryData {
     /// Object reference of the logged data attribute.
     pub data_ref: String,
@@ -67,6 +69,7 @@ pub struct ClientJournalEntryData {
 ///
 /// Either a time range, or everything after a given entry.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum JournalQuery {
     /// Entries within a time range.
     TimeRange {

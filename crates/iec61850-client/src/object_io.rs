@@ -30,6 +30,7 @@ use crate::prelude::{format, String, ToString, Vec};
 
 /// An MMS variable address: domain, item id, and an optional array element.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IecObjectPath {
     /// MMS domain, the IED name and logical device instance, such as
     /// `simpleIOGenericIO`.
@@ -42,11 +43,40 @@ pub struct IecObjectPath {
 
 /// An array element: `Ind1(0).stVal` gives index 0 and component `stVal`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ArrayElement {
     /// Zero-based index of the element within the array.
     pub index: u32,
     /// Sub-component addressed inside the element, if any.
     pub component: Option<String>,
+}
+
+impl IecObjectPath {
+    /// Creates the address of the item `item_id` in `domain`, with no array
+    /// element.
+    pub fn new(domain: impl Into<String>, item_id: impl Into<String>) -> Self {
+        Self {
+            domain: domain.into(),
+            item_id: item_id.into(),
+            array: None,
+        }
+    }
+
+    /// Sets the addressed array element.
+    pub fn with_array(mut self, element: ArrayElement) -> Self {
+        self.array = Some(element);
+        self
+    }
+}
+
+impl ArrayElement {
+    /// Creates the element at `index`, with no sub-component.
+    pub fn new(index: u32) -> Self {
+        Self {
+            index,
+            component: None,
+        }
+    }
 }
 
 /// Resolves an object reference and a functional constraint into an MMS

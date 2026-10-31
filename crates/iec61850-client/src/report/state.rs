@@ -18,6 +18,7 @@ use iec61850_model::value::MmsValue;
 /// One `ClientReport` belongs to one registered RCB reference and callback;
 /// each incoming report is folded into it by `apply_report`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientReport {
     /// RCB object reference the handler was installed for.
     pub rcb_reference: String,
@@ -95,6 +96,7 @@ impl ClientReport {
 
 /// Failure reported by `apply_report`.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StateError {
     /// A report carries a different number of data set members than the first
     /// one did.

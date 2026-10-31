@@ -23,6 +23,7 @@
 //! match spc.operate(MmsValue::Boolean(true)).await? {
 //!     ControlOutcome::Success => println!("operate ok"),
 //!     ControlOutcome::Failure(c) => println!("operate failed: {c:?}"),
+//!     other => println!("operate ended with {other:?}"),
 //! }
 //! # Ok(()) }
 //! ```

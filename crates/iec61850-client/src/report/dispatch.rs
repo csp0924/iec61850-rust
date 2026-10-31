@@ -49,6 +49,7 @@ struct ReportEntry {
 ///
 /// Currently only the member count, checked against every report.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DatasetDirectory {
     /// Expected number of data set members. If `Some(n)`, a report whose
     /// inclusion bitstring has another length is rejected with
@@ -185,6 +186,7 @@ impl Default for ReportRegistry {
 
 /// Failure reported by `handle_report`, from either the parse or the apply step.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DispatchError {
     /// The report could not be parsed.
     #[error("parse failed: {0}")]

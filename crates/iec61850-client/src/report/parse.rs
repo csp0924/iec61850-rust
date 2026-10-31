@@ -134,6 +134,7 @@ impl ReasonForInclusion {
 /// Borrows nothing from the source value, so it can be held across a lock or
 /// an await point.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ParsedReport {
     /// RptId, always present; the key a handler is matched on.
     pub rpt_id: String,
@@ -180,6 +181,7 @@ pub struct ParsedReport {
 
 /// Segmentation header of a report that is split across several PDUs.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Segmentation {
     /// Position of this PDU in the report, counted from zero.
     pub sub_seq_num: u16,
@@ -191,6 +193,7 @@ pub struct Segmentation {
 
 /// Failure reported by `parse_report`.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReportParseError {
     /// The value is neither an `MmsValue::Array` nor a `Structure`.
     #[error(
