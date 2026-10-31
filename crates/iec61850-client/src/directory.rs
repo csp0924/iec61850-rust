@@ -95,14 +95,15 @@ pub const DEFAULT_MAX_NAME_LIST_NAMES: usize = 1_000_000;
 /// Calls GetNameList repeatedly until the server reports no more names.
 ///
 /// `domain` selects the scope: `Some(name)` is domain-specific, `None` is
-/// VMD-specific. Each continuation must move past the previous one, and the
-/// walk stops at the connection's name limit, so a server that keeps
-/// reporting more cannot hold the client in the loop.
+/// VMD-specific. The names come in alphabetical order, so a page that
+/// reports more names must end on a name ordered after the continuation it
+/// was asked for. The walk stops at the connection's name limit, so a server
+/// that keeps reporting more cannot hold the client in the loop.
 ///
 /// # Errors
 ///
 /// `NotConnected` if the association is not established, `Mms` if a page that
-/// reports more names ends on the name the previous page ended on,
+/// reports more names does not end past the name the previous page ended on,
 /// `NameListLimit` if the walk exceeds the connection's name limit, and the
 /// error the MMS layer reports.
 async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
@@ -134,7 +135,10 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
         if let Some(last) = page.last().cloned() {
             all.extend(page);
             if more {
-                if continue_after.as_deref() == Some(last.as_str()) {
+                if continue_after
+                    .as_deref()
+                    .is_some_and(|previous| last.as_str() <= previous)
+                {
                     tracing::warn!(
                         ?object_class,
                         domain,

@@ -71,6 +71,19 @@ fn script_for(domain: &'static str) -> Arc<support::Script> {
                     names(&["GGIO1", "GGIO1$ST"]),
                     seq < REPEATED_PAGES,
                 )),
+                // Two pages in order.
+                "PAGED" => match req.continue_after.as_deref() {
+                    None => Some(name_list(invoke_id, names(&["GGIO1", "GGIO1$ST"]), true)),
+                    Some(_) => Some(name_list(invoke_id, names(&["LLN0"]), false)),
+                },
+                // A second page that goes back before the first one.
+                "BACK" => match req.continue_after.as_deref() {
+                    None => Some(name_list(invoke_id, names(&["LLN0", "LLN0$SP"]), true)),
+                    Some("LLN0$SP") => {
+                        Some(name_list(invoke_id, names(&["GGIO1", "GGIO1$ST"]), true))
+                    }
+                    Some(_) => Some(name_list(invoke_id, names(&["MMXU1"]), false)),
+                },
                 // A new page of names every time, past the client's limit.
                 "ENDLESS" => {
                     let page = seq as usize;
@@ -132,6 +145,23 @@ async fn name_list_walk_that_does_not_advance_is_an_error() {
     let conn = connect("REPEAT").await;
     let r = conn.get_server_directory(false).await;
     assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_that_goes_back_is_an_error() {
+    let conn = connect("BACK").await;
+    let r = conn.get_server_directory(false).await;
+    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_over_ordered_pages_completes() {
+    let conn = connect("PAGED").await;
+    let lns = conn
+        .get_logical_device_directory("PAGED")
+        .await
+        .expect("ld directory");
+    assert_eq!(lns, vec!["GGIO1".to_string(), "LLN0".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
