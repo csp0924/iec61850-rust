@@ -14,18 +14,26 @@
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | unreserved or reserved by the writer, and RptEna is false; the write does not reserve |
 //! | RptEna = true | reserved by the writer, or unreserved, in which case the write reserves it for the writer |
 //! | RptEna = false | unreserved or reserved by the writer; the reservation is kept |
-//! | GI = true | unreserved or reserved by the writer; acted on only while enabled and trgOps includes GI |
+//! | GI = true | unreserved or reserved by the writer, and RptEna is true; acted on only when trgOps includes GI |
 //! | ConfRev, SqNum, Owner | never writable; answered with ObjectAccessDenied |
 //!
-//! A refused enable-time write is answered with TemporarilyUnavailable, a write
-//! to a URCB another client has reserved with ObjectAccessDenied. A single
-//! Write request that configures an unreserved URCB and ends with RptEna = true
-//! therefore succeeds as a whole: the attributes take effect in request order
-//! and the enable that follows reserves the URCB for the writer.
+//! A refused enable-time write, and GI = true on a disabled control block, are
+//! answered with TemporarilyUnavailable, a write to a URCB another client has
+//! reserved with ObjectAccessDenied. A single Write request that configures an
+//! unreserved URCB and ends with RptEna = true therefore succeeds as a whole:
+//! the attributes take effect in request order and the enable that follows
+//! reserves the URCB for the writer.
 //!
 //! BRCB: the rules of IEC 61850-8-1 Table 72, documented on
 //! `handle_set_brcb_field`; ConfRev, SqNum, TimeOfEntry and Owner are never
 //! writable.
+//!
+//! GI = true on a disabled URCB or BRCB is the general interrogation request
+//! that IEC 61850-7-2 refuses in its NO GI ALLOWED state: the write is answered
+//! negatively and GI is set to FALSE. The refusal is an access not allowed in
+//! the current state, which IEC 61850-8-1 Table 27 maps to
+//! TemporarilyUnavailable. Within one Write request a GI = true that follows a
+//! successful RptEna = true finds the control block enabled and is accepted.
 //!
 //! A DatSet write must name a data set the server knows; a name it does not
 //! know is refused with ObjectValueInvalid. An accepted DatSet write binds the
@@ -158,7 +166,8 @@ pub enum RcbWriteValue {
 /// non-writable field or a URCB reserved by another client gives
 /// `ObjectAccessDenied`, a wrong value type gives `TypeInconsistent`, a DatSet
 /// naming no known data set gives `ObjectValueInvalid`, an enabled control block
-/// gives `TemporarilyUnavailable`, and a poisoned mutex gives `HardwareFault`.
+/// gives `TemporarilyUnavailable`, so does GI = true on a disabled control
+/// block, and a poisoned mutex gives `HardwareFault`.
 pub fn handle_set_rcb_field(
     engine: &Arc<Mutex<ReportingEngine>>,
     mms_path: &str,
@@ -340,7 +349,8 @@ pub fn handle_set_rcb_field(
         return Err(DataAccessError::TemporarilyUnavailable);
     }
 
-    // GI = true requires an enabled control block whose trgOps includes GI.
+    // GI = true is refused on a disabled control block, which sets GI to FALSE,
+    // and ignored on an enabled one whose trgOps does not include GI.
     if field == RcbField::Gi {
         let v = match value {
             RcbWriteValue::Bool(b) => b,
@@ -350,16 +360,17 @@ pub fn handle_set_rcb_field(
             if !state.rpt_ena {
                 tracing::warn!(
                     mms_path,
-                    "SetURCBValues GI=true: the control block is not enabled"
+                    "SetURCBValues GI=true: the control block is not enabled, answering TemporarilyUnavailable"
                 );
-                return Ok(()); // silently ignored, per the GI conditions of IEC 61850-7-2
+                state.gi = false;
+                return Err(DataAccessError::TemporarilyUnavailable);
             }
             if !state.trg_ops.contains(crate::flags::TriggerOptions::GI) {
                 tracing::warn!(
                     mms_path,
                     "SetURCBValues GI=true: trgOps does not include GI"
                 );
-                return Ok(()); // silently ignored
+                return Ok(());
             }
             state.gi = true;
         }
@@ -552,6 +563,8 @@ use iec61850_mms::binary_time6_from_epoch_ms;
 /// - DatSet, OptFlds, TrgOps, IntgPd, BufTm, RptID, EntryID, and PurgeBuf are
 ///   refused with TemporarilyUnavailable while RptEna is true, per
 ///   IEC 61850-8-1 Table 72
+/// - GI = true is refused with TemporarilyUnavailable while RptEna is false,
+///   which sets GI to FALSE, and ignored while trgOps does not include GI
 /// - an accepted change to one of those fields purges the report buffer, through
 ///   `BufferedReportControl::set_config_field`; of them only DatSet increments
 ///   ConfRev, and an OptFlds change does neither
@@ -1057,8 +1070,12 @@ fn set_brcb_gi(
         Err(_) => return Some(Err(DataAccessError::HardwareFault)),
     };
     if !state.rpt_ena {
-        tracing::warn!(mms_path = %brcb.mms_path, "SetBRCBValues GI=true: the control block is not enabled");
-        return Some(Ok(()));
+        tracing::warn!(
+            mms_path = %brcb.mms_path,
+            "SetBRCBValues GI=true: the control block is not enabled, answering TemporarilyUnavailable"
+        );
+        state.gi = false;
+        return Some(Err(DataAccessError::TemporarilyUnavailable));
     }
     if !state.trg_ops.contains(TriggerOptions::GI) {
         tracing::warn!(
@@ -1985,7 +2002,7 @@ mod tests {
         for (field, value) in [
             (RcbField::RptEna, RcbWriteValue::Bool(false)),
             (RcbField::BufTm, RcbWriteValue::Unsigned(250)),
-            (RcbField::Gi, RcbWriteValue::Bool(true)),
+            (RcbField::Gi, RcbWriteValue::Bool(false)),
         ] {
             assert_eq!(
                 handle_set_rcb_field(&engine, &path, field, value, 1),
@@ -2121,7 +2138,34 @@ mod tests {
         assert_eq!(res, Err(DataAccessError::TemporarilyUnavailable));
     }
 
-    // ── GI = true is silently ignored unless its conditions hold ─────────────
+    // ── GI = true ─────────────────────────────────────────────────────────────
+
+    /// GI = true on a disabled URCB is refused and leaves GI FALSE, also when
+    /// GI was left set; GI = false is accepted.
+    #[test]
+    fn gi_true_on_a_disabled_urcb_is_refused() {
+        let (engine, path) =
+            make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED | TriggerOptions::GI);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        {
+            let rc_arc = engine.lock().unwrap().get_rcb(&path).unwrap();
+            let rc = rc_arc.lock().unwrap();
+            rc.state.lock().unwrap().gi = true;
+        }
+        assert_eq!(
+            handle_set_rcb_field(&engine, &path, RcbField::Gi, RcbWriteValue::Bool(true), 1),
+            Err(DataAccessError::TemporarilyUnavailable)
+        );
+        {
+            let rc_arc = engine.lock().unwrap().get_rcb(&path).unwrap();
+            let rc = rc_arc.lock().unwrap();
+            assert!(!rc.state.lock().unwrap().gi);
+        }
+        assert_eq!(
+            handle_set_rcb_field(&engine, &path, RcbField::Gi, RcbWriteValue::Bool(false), 1),
+            Ok(())
+        );
+    }
 
     #[test]
     fn gi_true_without_gi_trg_ops_silently_ignored() {
@@ -2513,6 +2557,25 @@ mod tests {
         drop(eng);
         let s = brcb.state.lock().unwrap();
         assert!(s.gi);
+    }
+
+    /// GI = true on a disabled BRCB is refused and leaves GI FALSE, also when
+    /// GI was left set; GI = false is accepted.
+    #[test]
+    fn brcb_set_gi_true_while_disabled_is_refused() {
+        let (engine, path) =
+            make_engine_with_brcb("10", TriggerOptions::DATA_CHANGED | TriggerOptions::GI);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        brcb.state.lock().unwrap().gi = true;
+        assert_eq!(
+            handle_set_brcb_field(&engine, &path, RcbField::Gi, RcbWriteValue::Bool(true), 1),
+            Some(Err(DataAccessError::TemporarilyUnavailable))
+        );
+        assert!(!brcb.state.lock().unwrap().gi);
+        assert_eq!(
+            handle_set_brcb_field(&engine, &path, RcbField::Gi, RcbWriteValue::Bool(false), 1),
+            Some(Ok(()))
+        );
     }
 
     /// A BRCB ignores GI = true when trgOps does not include GI.

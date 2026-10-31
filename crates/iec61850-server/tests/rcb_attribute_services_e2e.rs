@@ -470,6 +470,81 @@ async fn urcb_configured_and_enabled_in_one_write_request() {
     );
 }
 
+/// A URCB and a BRCB refuse GI = TRUE while disabled, with GI reading back
+/// FALSE, and accept it once enabled, which sends a general interrogation
+/// report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gi_is_refused_until_the_control_block_is_enabled() {
+    let f = start().await;
+    let mut urcb = f.connect().await;
+    let mut brcb = f.connect().await;
+    let trg_ops = trg_ops_data(TriggerOptions::DATA_CHANGED | TriggerOptions::GI);
+
+    write_urcb(&mut urcb, "Resv", MmsData::Boolean(true))
+        .await
+        .expect("reserve the URCB");
+    write_urcb(&mut urcb, "TrgOps", trg_ops.clone())
+        .await
+        .expect("configure the URCB");
+    assert_refused_with(
+        write_urcb(&mut urcb, "GI", MmsData::Boolean(true)).await,
+        DataAccessError::TemporarilyUnavailable,
+    );
+    assert_eq!(read_urcb(&mut urcb, "GI").await, MmsData::Boolean(false));
+    write_urcb(&mut urcb, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the URCB");
+    write_urcb(&mut urcb, "GI", MmsData::Boolean(true))
+        .await
+        .expect("interrogate the enabled URCB");
+    let report = next_report(&mut urcb).await;
+    assert_eq!(report.rpt_id, URCB_PATH);
+    assert_eq!(report.reasons, vec![ReasonForInclusion::GI]);
+
+    write_brcb(&mut brcb, "TrgOps", trg_ops)
+        .await
+        .expect("configure the BRCB");
+    assert_refused_with(
+        write_brcb(&mut brcb, "GI", MmsData::Boolean(true)).await,
+        DataAccessError::TemporarilyUnavailable,
+    );
+    assert_eq!(read_brcb(&mut brcb, "GI").await, MmsData::Boolean(false));
+    write_brcb(&mut brcb, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+    write_brcb(&mut brcb, "GI", MmsData::Boolean(true))
+        .await
+        .expect("interrogate the enabled BRCB");
+    let report = next_report(&mut brcb).await;
+    assert_eq!(report.rpt_id, BRCB_PATH);
+    assert_eq!(report.reasons, vec![ReasonForInclusion::GI]);
+}
+
+/// One Write request that configures an unreserved URCB, enables it and then
+/// asks for a general interrogation succeeds as a whole: GI follows the enable,
+/// so it is accepted, and the general interrogation report is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn urcb_configured_enabled_and_interrogated_in_one_write_request() {
+    let f = start().await;
+    let mut writer = f.raw_connect().await;
+    let outcomes = write_urcb_fields(
+        &mut writer,
+        &[
+            (
+                "TrgOps",
+                trg_ops_data(TriggerOptions::DATA_CHANGED | TriggerOptions::GI),
+            ),
+            ("RptEna", MmsData::Boolean(true)),
+            ("GI", MmsData::Boolean(true)),
+        ],
+    )
+    .await;
+    assert_eq!(outcomes, vec![WriteOutcome::Success; 3]);
+    let report = next_raw_report(&mut writer).await;
+    assert_eq!(report.rpt_id, URCB_PATH);
+    assert_eq!(report.reasons, vec![ReasonForInclusion::GI]);
+}
+
 /// A disabled BRCB keeps its ConfRev and its buffer when OptFlds is written; a
 /// write of BufTm purges the buffer, so the exposed EntryID returns to all
 /// zeros, and still leaves ConfRev alone. A DatSet write counts in ConfRev.
