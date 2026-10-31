@@ -1101,6 +1101,9 @@ fn dispatch_read(
             use crate::service::convert::mms_value_to_mms_data;
             let mut remaining_budget = read_results_budget(&req, negotiated_max_pdu_size);
             let mut results: Vec<AccessResult> = Vec::with_capacity(dataset.entries.len());
+            // All members are taken under one shared value lock, so the data set
+            // sees a concurrent write of several leaves whole or not at all.
+            let _values = crate::compat::rwlock_read(mms_model.value_lock());
             for entry in &dataset.entries {
                 let baseline = match entry.read_value() {
                     Some(v) => AccessResult::Success(mms_value_to_mms_data(&v)),
@@ -1242,7 +1245,10 @@ fn dispatch_read(
             gocb_registry,
             #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
             &route,
-            (handler_registry, conn_id),
+            crate::service::read::ReadServices {
+                mms_model,
+                handlers: Some((handler_registry, conn_id)),
+            },
             &entry_name,
             entry_alt_access,
             remaining_budget,
@@ -1320,7 +1326,7 @@ type ReadRoute<'a> = dyn Fn(
 /// gives GetVariableAccessAttributes. Each control block is read through its
 /// own route, so its value is the one a read of the block alone returns, and a
 /// control block that fails to read fails the whole entry. The data objects
-/// pass through the read handlers of `handlers` on the association it names.
+/// pass through the read handlers of `services`, under its value lock.
 ///
 /// `None` means the entry names something below a group, or carries an
 /// alternate access, which the ordinary routes handle.
@@ -1339,7 +1345,7 @@ fn read_ln_with_control_blocks(
     #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
     #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
     route: &ReadRoute<'_>,
-    handlers: (&HandlerRegistry, u64),
+    services: crate::service::read::ReadServices<'_>,
     name: &iec61850_mms::mms::pdu::common::ObjectName,
     alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
     remaining_budget: Option<usize>,
@@ -1406,7 +1412,7 @@ fn read_ln_with_control_blocks(
         domain,
         item_id,
         &mut leading,
-        Some(handlers),
+        services,
         remaining_budget,
     )? {
         LookupResult::Result(r) => Some(ReadRoutingOutcome::Result(r)),
@@ -1430,7 +1436,7 @@ fn dispatch_read(
     invoke_id: u32,
     body: &Bytes,
     ied_model: &IedModel,
-    _mms_model: &MmsDeviceModel,
+    mms_model: &MmsDeviceModel,
     handler_registry: &HandlerRegistry,
     conn_id: u64,
     negotiated_max_pdu_size: Option<u32>,
@@ -1469,7 +1475,10 @@ fn dispatch_read(
             &entry_name,
             entry_alt_access,
             remaining,
-            Some((handler_registry, conn_id)),
+            crate::service::read::ReadServices {
+                mms_model,
+                handlers: Some((handler_registry, conn_id)),
+            },
         ) {
             LookupResult::Result(r) => {
                 if let Some(b) = remaining.as_mut() {
@@ -2807,7 +2816,7 @@ fn extract_co_target(
 #[allow(clippy::too_many_arguments)]
 fn handle_read_with_co_routing(
     ied_model: &IedModel,
-    _mms_model: &MmsDeviceModel,
+    mms_model: &MmsDeviceModel,
     #[cfg(feature = "control")] control_objects: &ControlObjectsRegistry,
     handler_registry: &HandlerRegistry,
     conn_id: u64,
@@ -2901,7 +2910,10 @@ fn handle_read_with_co_routing(
         name,
         alt_access,
         remaining_budget,
-        Some((handler_registry, conn_id)),
+        crate::service::read::ReadServices {
+            mms_model,
+            handlers: Some((handler_registry, conn_id)),
+        },
     ) {
         LookupResult::Result(r) => ReadRoutingOutcome::Result(r),
         LookupResult::OverBudget => ReadRoutingOutcome::OverBudget,
@@ -5418,5 +5430,113 @@ mod brcb_structure_tests {
                 iec61850_mms::binary_time6_from_epoch_ms(entry.time_of_entry_ms).to_vec()
             )
         );
+    }
+}
+
+#[cfg(all(test, feature = "reporting"))]
+mod data_set_read_tests {
+    use super::*;
+    use iec61850_mms::mms::pdu::common::{MmsData, VariableAccessSpecification};
+    use iec61850_mms::mms::pdu::read::{decode_confirmed_read_response, ReadRequest};
+    use iec61850_model::{
+        DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder,
+        LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
+    };
+
+    /// GetDataSetValues takes the values of all members under the shared
+    /// value lock: while the read is held up at the second member, no write
+    /// can take the lock, so none can store some leaves in the middle of it.
+    #[test]
+    fn data_set_read_takes_its_values_under_the_value_lock() {
+        let leaf = |name: &str| {
+            DoChild::Da(DataAttribute::new(
+                name,
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::default(),
+                MmsValue::Integer(0),
+            ))
+        };
+        let set = DataObject::new("Set", vec![leaf("a"), leaf("b")]);
+        let ggio = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![set]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = Arc::new(MmsDeviceModel::from_ied_model(&model).unwrap());
+        let dispatcher = Arc::new(MmsModelDispatcher::new(
+            Arc::new(model),
+            Arc::clone(&mms_model),
+            Arc::new(WriteAccessPolicies::default()),
+        ));
+        crate::reporting::DynamicDatasetOps::add_dynamic(
+            &dispatcher.dataset_registry,
+            &dispatcher.model,
+            "IED1LD0",
+            "GGIO1$dsSet",
+            vec![
+                ("IED1LD0".into(), "GGIO1$SP$Set$a".into()),
+                ("IED1LD0".into(), "GGIO1$SP$Set$b".into()),
+            ],
+        )
+        .unwrap();
+        let r = iec61850_model::ObjectRef::parse_mms("IED1LD0/GGIO1$SP$Set$b").unwrap();
+        let Some(iec61850_model::NodeRef::Da(b)) = dispatcher.model.node_by_object_ref(&r) else {
+            panic!("b is a data attribute");
+        };
+        let b = Arc::clone(&b.value);
+        let hold = b.write().unwrap();
+
+        let reader = std::thread::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            move || {
+                let mut body = BytesMut::new();
+                ReadRequest {
+                    specification_with_result: false,
+                    variable_access_spec: VariableAccessSpecification::VariableListName(
+                        iec61850_mms::ObjectName::DomainSpecific {
+                            domain_id: "IED1LD0".into(),
+                            item_id: "GGIO1$dsSet".into(),
+                        },
+                    ),
+                }
+                .encode(&mut body);
+                let req = ConfirmedRequest {
+                    invoke_id: 5,
+                    service_body: body.freeze(),
+                };
+                dispatcher.dispatch(&MmsServerConnection::new(), req)
+            }
+        });
+
+        // The read takes the value lock, then waits on the held member.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while mms_model.value_lock().try_write().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the data set read never takes the value lock"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(hold);
+        let ConfirmedResponse::Response(bytes) = reader.join().unwrap() else {
+            panic!("GetDataSetValues answers with a response");
+        };
+        let (_, resp) = decode_confirmed_read_response(&bytes).unwrap();
+        assert_eq!(
+            resp.list_of_access_result,
+            vec![
+                AccessResult::Success(MmsData::Integer(0)),
+                AccessResult::Success(MmsData::Integer(0)),
+            ]
+        );
+        assert!(mms_model.value_lock().try_write().is_ok());
     }
 }

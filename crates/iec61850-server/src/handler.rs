@@ -163,6 +163,13 @@ pub enum WriteOutcome {
 pub trait ReadHandler: Send + Sync + core::fmt::Debug {
     /// Answers a read that covers the node this handler is registered
     /// against, `ctx.path`; the client named `ctx.requested`.
+    ///
+    /// The server calls this while it holds the lock that keeps a read from
+    /// seeing part of a concurrent write, shared. The handler must not read or
+    /// write the model through the server, such as by calling
+    /// `handle_single_read`, `handle_single_read_with_budget` or
+    /// `handle_single_write`, from here: taking that lock again on the same
+    /// thread can deadlock.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
 }
 

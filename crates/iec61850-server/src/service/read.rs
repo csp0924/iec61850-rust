@@ -180,6 +180,25 @@ pub(crate) fn resolve_node_path<'m>(
 // Read handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What a read consults beside the model: the MMS view, whose value lock it
+/// holds while it takes values, and the read handlers of an association.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadServices<'a> {
+    pub(crate) mms_model: &'a MmsDeviceModel,
+    /// The handler registry and the association the read arrived on; `None`
+    /// consults no handler.
+    pub(crate) handlers: Option<(&'a HandlerRegistry, u64)>,
+}
+
+impl ReadServices<'_> {
+    fn scope(&self, item_id: &str) -> ReadHandlerScope {
+        match self.handlers {
+            Some((registry, conn_id)) => ReadHandlerScope::around(registry, item_id, conn_id),
+            None => ReadHandlerScope::none(),
+        }
+    }
+}
+
 /// The read handlers one read consults, looked up once: those on the path
 /// read, on the nodes above it and on the nodes below it.
 pub(crate) struct ReadHandlerScope {
@@ -1014,7 +1033,7 @@ pub(crate) fn read_ln_with_leading_members(
     domain: &str,
     item_id: &str,
     leading: &mut LeadingMembers<'_>,
-    handlers: Option<(&HandlerRegistry, u64)>,
+    services: ReadServices<'_>,
     budget: Option<usize>,
 ) -> Option<LookupResult> {
     let mut parts = item_id.split('$');
@@ -1033,10 +1052,7 @@ pub(crate) fn read_ln_with_leading_members(
         return Some(not_found());
     };
 
-    let scope = match handlers {
-        Some((registry, conn_id)) => ReadHandlerScope::around(registry, item_id, conn_id),
-        None => ReadHandlerScope::none(),
-    };
+    let scope = services.scope(item_id);
     let mut guard = BudgetGuard::new(budget);
     let mut group = |fc: FC, guard: &mut BudgetGuard| -> Result<Option<MmsData>, LookupResult> {
         let lead = leading(ln, fc).map_err(|e| LookupResult::Result(AccessResult::Failure(e)))?;
@@ -1045,6 +1061,9 @@ pub(crate) fn read_ln_with_leading_members(
                 return Err(LookupResult::OverBudget);
             }
         }
+        // The leading members are read by their own routes before the values
+        // of the group are taken under the value lock.
+        let _values = crate::compat::rwlock_read(services.mms_model.value_lock());
         expand_ln_for_fc(ln, fc, lead, &scope, guard).map_err(Halt::into_lookup)
     };
 
@@ -1119,31 +1138,34 @@ pub fn handle_single_read(
 /// No read handler is consulted.
 pub fn handle_single_read_with_budget(
     ied_model: &IedModel,
-    _mms_model: &MmsDeviceModel,
+    mms_model: &MmsDeviceModel,
     name: &ObjectName,
     alt_access: Option<&AlternateAccess>,
     budget: Option<usize>,
 ) -> LookupResult {
-    read_with_handlers(ied_model, name, alt_access, budget, None)
+    let services = ReadServices {
+        mms_model,
+        handlers: None,
+    };
+    read_with_handlers(ied_model, name, alt_access, budget, services)
 }
 
 /// Reads one object name under a PDU byte budget, as the Read service does:
-/// once the path resolves, the read handlers of `handlers` that bear on it
-/// have their say on the association `conn_id`, per the module rules.
+/// once the path resolves, the read handlers of `services` that bear on it
+/// have their say, per the module rules. The values are taken under the
+/// shared value lock, so a concurrent write is seen whole or not at all.
 pub(crate) fn read_with_handlers(
     ied_model: &IedModel,
     name: &ObjectName,
     alt_access: Option<&AlternateAccess>,
     budget: Option<usize>,
-    handlers: Option<(&HandlerRegistry, u64)>,
+    services: ReadServices<'_>,
 ) -> LookupResult {
     let mut guard = BudgetGuard::new(budget);
     match name {
         ObjectName::DomainSpecific { domain_id, item_id } => {
-            let scope = match handlers {
-                Some((registry, conn_id)) => ReadHandlerScope::around(registry, item_id, conn_id),
-                None => ReadHandlerScope::none(),
-            };
+            let scope = services.scope(item_id);
+            let _values = crate::compat::rwlock_read(services.mms_model.value_lock());
             lookup_domain_specific_value(
                 ied_model, domain_id, item_id, alt_access, &scope, &mut guard,
             )
@@ -2197,7 +2219,12 @@ mod tests {
             domain_id: "IED1LD0".to_string(),
             item_id: item_id.to_string(),
         };
-        match read_with_handlers(model, &name, None, None, Some((registry, 7))) {
+        let mms_model = MmsDeviceModel::from_ied_model(model).unwrap();
+        let services = ReadServices {
+            mms_model: &mms_model,
+            handlers: Some((registry, 7)),
+        };
+        match read_with_handlers(model, &name, None, None, services) {
             LookupResult::Result(r) => r,
             LookupResult::OverBudget => panic!("no budget was set"),
         }
@@ -2395,7 +2422,16 @@ mod tests {
     #[test]
     fn handler_value_is_charged_to_the_budget() {
         let model = build_handler_model();
+        let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
+        let bare = ReadServices {
+            mms_model: &mms_model,
+            handlers: None,
+        };
         let registry = HandlerRegistry::new();
+        let with = ReadServices {
+            mms_model: &mms_model,
+            handlers: Some((&registry, 7)),
+        };
         registry
             .install_read_handler(
                 "MMXU1$MX$A$phsA$cVal",
@@ -2410,7 +2446,7 @@ mod tests {
                 item_id: item_id.to_string(),
             };
             let LookupResult::Result(AccessResult::Success(model_value)) =
-                read_with_handlers(&model, &name, None, None, None)
+                read_with_handlers(&model, &name, None, None, bare)
             else {
                 panic!("a model value for {item_id}");
             };
@@ -2418,12 +2454,12 @@ mod tests {
             // replaces, so the exact budget of the model value is too small.
             let exact = model_value.estimated_encoded_size();
             assert_eq!(
-                read_with_handlers(&model, &name, None, Some(exact), Some((&registry, 7))),
+                read_with_handlers(&model, &name, None, Some(exact), with),
                 LookupResult::OverBudget,
                 "{item_id}"
             );
             assert!(matches!(
-                read_with_handlers(&model, &name, None, Some(exact + 4), Some((&registry, 7))),
+                read_with_handlers(&model, &name, None, Some(exact + 4), with),
                 LookupResult::Result(AccessResult::Success(_))
             ));
         }
@@ -2532,5 +2568,52 @@ mod tests {
                 ("MMXU1$MX$A$q".to_string(), "MMXU1$MX$A$q".to_string()),
             ]
         );
+    }
+
+    /// A read of a data object takes its values under the shared value lock:
+    /// while its snapshot of a leaf is held up, no write can take the lock,
+    /// so none can store some leaves of the object in the middle of the read.
+    #[test]
+    fn read_takes_its_values_under_the_value_lock() {
+        let model = Arc::new(build_handler_model());
+        let mms_model = Arc::new(MmsDeviceModel::from_ied_model(&model).unwrap());
+        let r = iec61850_model::ObjectRef::parse_mms("IED1LD0/MMXU1$MX$A$q").unwrap();
+        let Some(iec61850_model::NodeRef::Da(q)) = model.node_by_object_ref(&r) else {
+            panic!("q is a data attribute");
+        };
+        let q = Arc::clone(&q.value);
+        let hold = q.write().unwrap();
+
+        let reader = std::thread::spawn({
+            let (model, mms_model) = (Arc::clone(&model), Arc::clone(&mms_model));
+            move || {
+                let name = ObjectName::DomainSpecific {
+                    domain_id: "IED1LD0".to_string(),
+                    item_id: "MMXU1$MX$A".to_string(),
+                };
+                let services = ReadServices {
+                    mms_model: &mms_model,
+                    handlers: None,
+                };
+                read_with_handlers(&model, &name, None, None, services)
+            }
+        });
+
+        // The reader takes the value lock, then waits on the held leaf.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while mms_model.value_lock().try_write().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never takes the value lock"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(hold);
+        assert!(matches!(
+            reader.join().unwrap(),
+            LookupResult::Result(AccessResult::Success(_))
+        ));
+        assert!(mms_model.value_lock().try_write().is_ok());
     }
 }

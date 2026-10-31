@@ -14,7 +14,7 @@
 //! - A domain name over 64 bytes is an error, never a truncation, and two
 //!   logical devices resolving to the same name are an error too.
 
-use crate::compat::HashMap;
+use crate::compat::{Arc, HashMap, RwLock};
 use crate::error::{Result, ServerError};
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -163,6 +163,10 @@ pub struct MmsDeviceModel {
     domains: Vec<DomainView>,
     /// Name to position, so a lookup costs constant time.
     domain_index: HashMap<String, usize>,
+    /// Held shared while a read takes the values of several attributes, and
+    /// exclusively while a write stores them, so a read sees a write of a data
+    /// object or a constructed attribute whole or not at all.
+    value_lock: Arc<RwLock<()>>,
 }
 
 impl MmsDeviceModel {
@@ -192,7 +196,13 @@ impl MmsDeviceModel {
         Ok(Self {
             domains,
             domain_index,
+            value_lock: Arc::new(RwLock::new(())),
         })
+    }
+
+    /// The lock that keeps a read from seeing part of a write; see the field.
+    pub(crate) fn value_lock(&self) -> &RwLock<()> {
+        &self.value_lock
     }
 
     /// Lists every domain name.

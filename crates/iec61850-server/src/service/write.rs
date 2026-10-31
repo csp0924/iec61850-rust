@@ -31,8 +31,10 @@
 //! GetVariableAccessAttributes describes them; another member count answers
 //! `TypeInconsistent`. Every leaf beneath the target is written: all leaves are
 //! checked, and every handler on the way has its say, before any cached value
-//! changes, so a refused write leaves every leaf as it was (§11.4.3.4). A
-//! concurrent read may still observe some leaves written and others not.
+//! changes, so a refused write leaves every leaf as it was (§11.4.3.4). The
+//! leaves are stored under the exclusive value lock of the MMS view, which a
+//! read holds shared while it takes values, so a read sees a write whole or
+//! not at all, and two writes do not interleave their leaves.
 //!
 //! Each leaf takes a value of the variant currently held in the model, else
 //! `ObjectValueInvalid`. The value must then lie within the type the attribute
@@ -463,6 +465,9 @@ fn write_to_target(
         i += 1;
     }
 
+    // Every leaf is stored under the exclusive value lock, so a read sees the
+    // whole write or none of it.
+    let _values = crate::compat::rwlock_write(mms_model.value_lock());
     for (leaf, new_value) in updates {
         if let Err(e) = store_value(leaf, new_value.clone()) {
             tracing::warn!(
@@ -2478,6 +2483,65 @@ mod tests {
                 "GGIO1$SP$PhSet$phsA$setCplx$f".to_string(),
                 "GGIO1$SP$PhSet$phsA".to_string()
             )]
+        );
+    }
+
+    /// The value handle of the data attribute `reference` names.
+    fn leaf_handle(
+        model: &iec61850_model::IedModel,
+        reference: &str,
+    ) -> Arc<std::sync::RwLock<MmsValue>> {
+        let r = iec61850_model::ObjectRef::parse_mms(reference).unwrap();
+        match model.node_by_object_ref(&r) {
+            Some(iec61850_model::NodeRef::Da(da)) => Arc::clone(&da.value),
+            other => panic!("{reference} must resolve to a data attribute, got {other:?}"),
+        }
+    }
+
+    /// An FCD write stores its leaves under the exclusive value lock: while
+    /// the store of its second leaf is held up, after the first leaf is
+    /// stored, no read can take the lock, so none sees the first leaf without
+    /// the second.
+    #[test]
+    fn write_stores_every_leaf_under_the_value_lock() {
+        let (model, mms_model) = build_sdo_write_model();
+        let (model, mms_model) = (Arc::new(model), Arc::new(mms_model));
+        let second = leaf_handle(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f");
+        let hold = second.read().unwrap();
+
+        let writer = std::thread::spawn({
+            let (model, mms_model) = (Arc::clone(&model), Arc::clone(&mms_model));
+            move || {
+                sdo_write(
+                    &model,
+                    &mms_model,
+                    &WriteAccessPolicies::default(),
+                    "GGIO1$SP$PhSet$phsA",
+                    phs_a_value(1.5, 2.5),
+                )
+            }
+        });
+
+        // The first leaf is stored, and the writer waits on the second.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag") != MmsValue::Float32(1.5) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first leaf is never stored"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            mms_model.value_lock().try_read().is_err(),
+            "the writer holds the value lock across its leaves"
+        );
+
+        drop(hold);
+        assert_eq!(writer.join().unwrap(), WriteOutcome::Success);
+        assert!(mms_model.value_lock().try_read().is_ok());
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f"),
+            MmsValue::Float32(2.5)
         );
     }
 }
