@@ -301,6 +301,15 @@ impl ClientError {
         Self::ConnectTimeout { timeout_ms }
     }
 
+    /// Builds a [`ClientError::TlsHandshake`] of `kind` carrying `message`,
+    /// the text of the TLS error.
+    pub fn tls_handshake(kind: TlsFailureKind, message: impl Into<String>) -> Self {
+        Self::TlsHandshake {
+            kind,
+            message: message.into(),
+        }
+    }
+
     /// Builds a [`ClientError::NotConnected`] for a call made in `state`.
     pub fn not_connected(state: impl Into<String>) -> Self {
         Self::NotConnected {

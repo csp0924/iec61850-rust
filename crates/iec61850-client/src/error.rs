@@ -384,17 +384,37 @@ mod tests {
         }
     }
 
-    /// The mapping from the MMS layer is exercised end to end by the TLS
-    /// tests of `own_server_matrix_e2e`; its variant is not constructible
-    /// outside that crate.
+    /// A failed TLS handshake keeps its kind and its text, for every kind,
+    /// and renders the text once.
     #[test]
-    fn a_failed_tls_handshake_renders_its_message_once() {
-        let error = ClientError::TlsHandshake {
-            kind: TlsFailureKind::AlertReceived,
-            message: "received fatal alert: ProtocolVersion".into(),
-        };
+    fn a_failed_tls_handshake_keeps_its_kind() {
+        for kind in [
+            TlsFailureKind::Verification,
+            TlsFailureKind::AlertReceived,
+            TlsFailureKind::VersionUnsupported,
+            TlsFailureKind::CipherUnsupported,
+            TlsFailureKind::Timeout,
+            TlsFailureKind::Io,
+            TlsFailureKind::Other,
+        ] {
+            assert_eq!(
+                map(M::tls_handshake(
+                    kind,
+                    "received fatal alert: ProtocolVersion"
+                )),
+                ClientError::TlsHandshake {
+                    kind,
+                    message: "received fatal alert: ProtocolVersion".into(),
+                },
+                "{kind:?}"
+            );
+        }
         assert_eq!(
-            error.to_string(),
+            map(M::tls_handshake(
+                TlsFailureKind::AlertReceived,
+                "received fatal alert: ProtocolVersion"
+            ))
+            .to_string(),
             "mms layer error: TLS handshake failed: received fatal alert: ProtocolVersion"
         );
     }
