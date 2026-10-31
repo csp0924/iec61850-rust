@@ -12,6 +12,10 @@ description = "TLS configuration and socket wrapper for IEC 61850 per IEC 62351-
 keywords = ["iec61850", "iec62351", "tls", "rustls", "scada"]
 categories = ["network-programming", "cryptography"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 iec61850-hal  = { workspace = true }
 thiserror     = { workspace = true }

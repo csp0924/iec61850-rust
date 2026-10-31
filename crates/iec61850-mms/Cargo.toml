@@ -12,6 +12,10 @@ description = "MMS protocol stack for IEC 61850: COTP, Session, Presentation, AC
 keywords = ["iec61850", "mms", "iso9506", "cotp", "acse"]
 categories = ["network-programming", "encoding", "no-std"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # Default: std plus the tokio backend.
 default = ["std"]

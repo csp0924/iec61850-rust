@@ -12,6 +12,10 @@ description = "IEC 61850 client: ACSI control, reporting, data sets and director
 keywords = ["iec61850", "client", "mms", "acsi", "scada"]
 categories = ["network-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 # The downstream crates are referenced by path with an explicit
 # `default-features = false` rather than through the workspace aliases: a

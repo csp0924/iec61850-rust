@@ -12,6 +12,10 @@ description = "Shared BER length codec and nesting guards for the IEC 61850 MMS,
 keywords = ["iec61850", "asn1", "ber", "mms", "no-std"]
 categories = ["encoding", "network-programming", "no-std"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # `std` is the default, so a desktop build is unaffected.
 # Embedded targets use `--no-default-features --features alloc` for the

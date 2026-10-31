@@ -12,6 +12,10 @@ description = "SCL parser for IEC 61850-6: reads ICD, CID and SCD files into an 
 keywords = ["iec61850", "scl", "scd", "icd", "substation"]
 categories = ["parser-implementations", "network-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 iec61850-model = { workspace = true }
 quick-xml      = { workspace = true }

@@ -12,6 +12,10 @@ description = "IEC 61850 data model: MmsValue, common data classes and the LD/LN
 keywords = ["iec61850", "scada", "mms", "substation", "no-std"]
 categories = ["network-programming", "data-structures", "no-std"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # `std` is the default, so a desktop build is unaffected.
 # Embedded targets use `--no-default-features --features embedded` for the

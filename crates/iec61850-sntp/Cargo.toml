@@ -12,6 +12,10 @@ description = "SNTPv4 (RFC 4330) client and server for IEC 61850 IED time synchr
 keywords = ["sntp", "ntp", "iec61850", "rfc4330", "scada"]
 categories = ["network-programming", "date-and-time"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 thiserror = { workspace = true }
 tracing   = { workspace = true }

@@ -12,6 +12,11 @@ description = "Platform abstraction for IEC 61850: raw Ethernet sockets, async t
 keywords = ["iec61850", "hal", "ethernet", "no-std", "embedded"]
 categories = ["network-programming", "hardware-support", "no-std"]
 
+[package.metadata.docs.rs]
+# docs.rs has no libpcap, so the pcap backends are left out.
+features = ["std", "ethernet", "ethernet-linux-afpacket", "transport-tokio", "transport-embassy"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # The default keeps ethernet + std enabled so that a plain `cargo build` on a
 # desktop target behaves as before.

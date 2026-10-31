@@ -12,6 +12,10 @@ description = "Sampled Values publisher and subscriber for IEC 61850-9-2"
 keywords = ["iec61850", "sampled-values", "substation", "ethernet", "scada"]
 categories = ["network-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 iec61850-hal   = { workspace = true }
 iec61850-asn1  = { workspace = true }
