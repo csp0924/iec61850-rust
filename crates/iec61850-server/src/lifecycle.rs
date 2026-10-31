@@ -165,11 +165,12 @@ impl IedServer {
     }
 }
 
-/// Drives the reporting engine on a 1 ms interval.
+/// Drives the periodic report triggers on a 1 ms interval.
 ///
 /// Every tick advances the buffer time, integrity period, and general
 /// interrogation timers of both the unbuffered and the buffered report control
-/// blocks. Once per second it also releases expired buffered-report and setting
+/// blocks. While the data model is locked these wait, so none of them sees part
+/// of a batch of updates. Once per second the tick also releases expired buffered-report and setting
 /// group reservations; an accumulated millisecond count carries that period, so
 /// jitter in the 1 ms interval cannot skip a sweep.
 ///
@@ -188,35 +189,38 @@ async fn run_tick_loop(server: IedServer, mut shutdown_rx: watch::Receiver<bool>
                 }
             }
             _ = interval.tick() => {
-                match server.reporting_engine().lock() {
-                    Ok(engine) => {
-                        let now = std::time::Instant::now();
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        engine.tick();
-                        engine.tick_brcb(now, now_ms);
-                        reservation_accum_ms = reservation_accum_ms.saturating_add(1);
-                        if reservation_accum_ms >= 1000 {
-                            reservation_accum_ms = 0;
-                            engine.tick_brcb_reservations();
-                            // The setting group registry takes its own write
-                            // lock, so the engine lock is released first rather
-                            // than nesting the two.
-                            drop(engine);
-                            let released = server.setting_groups().tick_reservations();
-                            for (domain, owner) in released {
-                                tracing::info!(
-                                    domain,
-                                    conn_id = owner,
-                                    "setting group reservation expired, releasing the edit session"
-                                );
-                            }
+                let now = std::time::Instant::now();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Some(_batch) = server.periodic_gate() {
+                    match server.reporting_engine().lock() {
+                        Ok(engine) => {
+                            engine.tick();
+                            engine.tick_brcb(now, now_ms);
+                        }
+                        Err(_) => {
+                            tracing::warn!("tick loop: the reporting engine lock is poisoned, skipping this tick");
                         }
                     }
-                    Err(_) => {
-                        tracing::warn!("tick loop: the reporting engine lock is poisoned, skipping this tick");
+                }
+                reservation_accum_ms = reservation_accum_ms.saturating_add(1);
+                if reservation_accum_ms >= 1000 {
+                    reservation_accum_ms = 0;
+                    if let Ok(engine) = server.reporting_engine().lock() {
+                        engine.tick_brcb_reservations();
+                    }
+                    // The setting group registry takes its own write lock, so
+                    // the engine lock is released first rather than nesting the
+                    // two.
+                    let released = server.setting_groups().tick_reservations();
+                    for (domain, owner) in released {
+                        tracing::info!(
+                            domain,
+                            conn_id = owner,
+                            "setting group reservation expired, releasing the edit session"
+                        );
                     }
                 }
             }

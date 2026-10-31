@@ -6,8 +6,10 @@
 //! value raises data-update for `dupd` and nothing else (IEC 61850-7-2 TrgOp,
 //! table 21).
 //! Report control blocks and log control blocks act on the same triggers,
-//! each on those its TrgOps enable. Reports are received on a raw MMS
-//! association and decoded without client-side report state.
+//! each on those its TrgOps enable. Under the data model lock the triggers
+//! are held back and raised as one batch when the lock is released. Reports
+//! are received on a raw MMS association and decoded without client-side
+//! report state.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,8 +27,10 @@ use iec61850_model::{
     LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, NodeRef, ObjectRef, TrgOps, FC,
 };
 use iec61850_server::logging::{InMemoryLogStorage, LogControl, LogControlBlock, LogStorage};
+use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{
-    Dataset, DatasetEntry, IedServer, OptFlds, Rcb, ReportControl, ServerHandle, TriggerOptions,
+    Dataset, DatasetEntry, IedServer, InclusionFlag, OptFlds, Rcb, ReportControl, ServerHandle,
+    TriggerOptions,
 };
 
 const DOM: &str = "TESTLD0";
@@ -37,6 +41,7 @@ const MAG: &str = "TESTLD0/GGIO1$MX$AnIn1$mag";
 const CNT: &str = "TESTLD0/GGIO1$ST$Cnt1$frVal";
 const DATA_SET: &str = "LLN0$dsAll";
 const URCB: &str = "LLN0$RP$urcb01";
+const BRCB: &str = "LLN0$BR$brcb01";
 const LCB: &str = "LLN0$LG$evlog";
 const LOG: &str = "LLN0$EventLog";
 
@@ -493,6 +498,268 @@ async fn a_leaf_of_a_structured_scl_attribute_declaring_dupd_reports_updates() {
     );
 }
 
+/// Three attributes updated under the data model lock arrive as one report
+/// once the lock is released, each with its last value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_under_the_data_model_lock_arrive_as_one_urcb_report() {
+    let mut f = start_urcb(TriggerOptions::DATA_CHANGED).await;
+
+    {
+        let _guard = f.srv.lock_data_model().unwrap();
+        f.srv.update_boolean(da(&f.m, 0), true).unwrap();
+        f.srv.update_boolean(da(&f.m, 1), true).unwrap();
+        f.srv.update_boolean(da(&f.m, 0), false).unwrap();
+        f.srv.update_boolean(da(&f.m, 0), true).unwrap();
+        f.srv.update_boolean(da(&f.m, 2), true).unwrap();
+    }
+    let batch = next_report(&mut f.mms).await;
+    assert_eq!(
+        members(&batch),
+        [
+            (
+                IND1,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+            (
+                IND2,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+            (
+                IND3,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+        ]
+    );
+
+    f.srv.update_boolean(da(&f.m, 1), false).unwrap();
+    let next = next_report(&mut f.mms).await;
+    assert_eq!(
+        members(&next),
+        [(
+            IND2,
+            ReasonForInclusion::DATA_CHANGE,
+            MmsValue::Boolean(false)
+        )],
+        "the batch sent a single report"
+    );
+}
+
+/// A BRCB with no buffer time buffers one entry for a batch, and sends it as
+/// one report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_under_the_data_model_lock_arrive_as_one_brcb_report() {
+    let m = model();
+    let srv = server(m.clone());
+    let brcb = Brcb::new("brcb01", DATA_SET)
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(opt_flds())
+        .with_buf_tm_ms(0);
+    srv.register_brcb(
+        BufferedReportControl::new(format!("{DOM}/{BRCB}"), brcb),
+        data_set(&m),
+    )
+    .expect("register_brcb");
+    let handle = srv.start().await.expect("start");
+    let mut mms = connect(&handle).await;
+    mms.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+
+    {
+        let _guard = srv.lock_data_model().unwrap();
+        srv.update_boolean(da(&m, 0), true).unwrap();
+        srv.update_boolean(da(&m, 1), true).unwrap();
+        srv.update_boolean(da(&m, 2), true).unwrap();
+    }
+    let batch = next_report(&mut mms).await;
+    assert_eq!(
+        members(&batch),
+        [
+            (
+                IND1,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+            (
+                IND2,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+            (
+                IND3,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+        ]
+    );
+
+    srv.update_boolean(da(&m, 2), false).unwrap();
+    let next = next_report(&mut mms).await;
+    assert_eq!(
+        members(&next),
+        [(
+            IND3,
+            ReasonForInclusion::DATA_CHANGE,
+            MmsValue::Boolean(false)
+        )],
+        "the batch buffered a single entry"
+    );
+}
+
+/// A batch that updates a member already in the pending report sends that
+/// report first, holding only the values from before the batch, and then the
+/// whole batch as one report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_over_a_pending_urcb_report_stays_whole() {
+    let mut f = start_urcb_with(TriggerOptions::DATA_CHANGED, 2_000).await;
+
+    f.srv.update_boolean(da(&f.m, 0), true).unwrap();
+    {
+        let _guard = f.srv.lock_data_model().unwrap();
+        f.srv.update_boolean(da(&f.m, 1), true).unwrap();
+        f.srv.update_boolean(da(&f.m, 0), false).unwrap();
+    }
+    let before = next_report(&mut f.mms).await;
+    assert_eq!(
+        members(&before),
+        [(
+            IND1,
+            ReasonForInclusion::DATA_CHANGE,
+            MmsValue::Boolean(true)
+        )],
+        "the pending report keeps only the value from before the batch"
+    );
+    let batch = next_report(&mut f.mms).await;
+    assert_eq!(
+        members(&batch),
+        [
+            (
+                IND1,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(false)
+            ),
+            (
+                IND2,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+        ]
+    );
+}
+
+/// A batch that updates a member already in the open buffer time window of a
+/// BRCB closes that window first and opens one holding the whole batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_over_an_open_brcb_window_stays_whole() {
+    let m = model();
+    let srv = server(m.clone());
+    let brcb = Brcb::new("brcb01", DATA_SET)
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(opt_flds())
+        .with_buf_tm_ms(2_000);
+    srv.register_brcb(
+        BufferedReportControl::new(format!("{DOM}/{BRCB}"), brcb),
+        data_set(&m),
+    )
+    .expect("register_brcb");
+    let handle = srv.start().await.expect("start");
+    let mut mms = connect(&handle).await;
+    mms.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+
+    srv.update_boolean(da(&m, 0), true).unwrap();
+    {
+        let _guard = srv.lock_data_model().unwrap();
+        srv.update_boolean(da(&m, 1), true).unwrap();
+        srv.update_boolean(da(&m, 0), false).unwrap();
+    }
+    let before = next_report(&mut mms).await;
+    assert_eq!(
+        members(&before),
+        [(
+            IND1,
+            ReasonForInclusion::DATA_CHANGE,
+            MmsValue::Boolean(true)
+        )],
+        "the open window keeps only the value from before the batch"
+    );
+    let batch = next_report(&mut mms).await;
+    assert_eq!(
+        members(&batch),
+        [
+            (
+                IND1,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(false)
+            ),
+            (
+                IND2,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+        ]
+    );
+}
+
+/// A reference given twice in one batch counts once, with its last value and
+/// the reasons of both elements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reference_given_twice_in_a_batch_counts_once() {
+    let mut f = start_urcb(TriggerOptions::DATA_CHANGED | TriggerOptions::DATA_UPDATE).await;
+    {
+        let engine = f.srv.reporting_engine();
+        let engine = engine.lock().unwrap();
+        engine.on_values_updated(
+            &[
+                (
+                    MAG.to_string(),
+                    MmsValue::Float32(2.0),
+                    InclusionFlag::VALUE_CHANGED,
+                ),
+                (
+                    IND2.to_string(),
+                    MmsValue::Boolean(true),
+                    InclusionFlag::VALUE_CHANGED,
+                ),
+                (
+                    MAG.to_string(),
+                    MmsValue::Float32(3.0),
+                    InclusionFlag::VALUE_UPDATE,
+                ),
+            ],
+            wall_ms(),
+        );
+    }
+    let report = next_report(&mut f.mms).await;
+    assert_eq!(
+        members(&report),
+        [
+            (
+                IND2,
+                ReasonForInclusion::DATA_CHANGE,
+                MmsValue::Boolean(true)
+            ),
+            (
+                MAG,
+                ReasonForInclusion::DATA_CHANGE | ReasonForInclusion::DATA_UPDATE,
+                MmsValue::Float32(3.0)
+            ),
+        ]
+    );
+}
+
+/// Milliseconds since the Unix epoch, by the wall clock.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 // ── Logs ────────────────────────────────────────────────────────────────────
 
 /// Registers the data set and a log control block over it whose LogEna is
@@ -569,4 +836,56 @@ async fn the_log_takes_the_triggers_the_reports_take() {
     );
     c.disconnect().await.ok();
     handle.stop().await;
+}
+
+/// Updates under the data model lock are logged when it is released, one
+/// entry per attribute with its last value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn updates_under_the_data_model_lock_are_logged_on_release() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage = register_lcb(&srv, &m, TriggerOptions::DATA_CHANGED, 0);
+    let handle = srv.start().await.unwrap();
+
+    {
+        let _guard = srv.lock_data_model().unwrap();
+        srv.update_boolean(da(&m, 0), true).unwrap();
+        srv.update_boolean(da(&m, 1), true).unwrap();
+        srv.update_boolean(da(&m, 1), false).unwrap();
+        srv.update_boolean(da(&m, 1), true).unwrap();
+        assert_eq!(storage.count(), 0, "nothing is logged under the lock");
+    }
+    assert_eq!(storage.count(), 2);
+
+    let mut c = connect(&handle).await;
+    let resp = read_journal(&mut c).await;
+    assert_eq!(journal(&resp), [vec![(IND1, 0x02)], vec![(IND2, 0x02)]]);
+    assert_eq!(resp.entries[1].variables[0].value, MmsData::Boolean(true));
+    c.disconnect().await.ok();
+    handle.stop().await;
+}
+
+/// A guard dropped while its thread unwinds still raises the deferred
+/// triggers, and the model can be locked again.
+#[test]
+fn a_guard_dropped_by_a_panic_still_logs_and_unlocks() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage = register_lcb(&srv, &m, TriggerOptions::DATA_CHANGED, 0);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = srv.lock_data_model().unwrap();
+        srv.update_boolean(da(&m, 0), true).unwrap();
+        panic!("the batch fails part way");
+    }));
+    assert!(result.is_err());
+    assert_eq!(storage.count(), 1, "the deferred update was logged");
+    assert!(!srv.is_data_model_locked());
+
+    let guard = srv
+        .lock_data_model()
+        .expect("the model can be locked again");
+    srv.update_boolean(da(&m, 1), true).unwrap();
+    drop(guard);
+    assert_eq!(storage.count(), 2);
 }

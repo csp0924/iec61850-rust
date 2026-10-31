@@ -765,129 +765,9 @@ impl ReportingEngine {
         let Some(weak_list) = self.brcb_watch_map.get(attr_ref) else {
             return;
         };
-
         for weak in weak_list {
-            let Some(brcb_arc) = weak.upgrade() else {
-                continue;
-            };
-
-            // Copy the fields needed, then release the state lock.
-            let (is_buffering, buf_tm_ms, trg_ops, mms_path, ds_len) = {
-                let Ok(state) = brcb_arc.state.lock() else {
-                    tracing::warn!(attr_ref = %attr_ref, "brcb state mutex poisoned, skipping trigger");
-                    continue;
-                };
-                let mms_path = brcb_arc.mms_path.clone();
-                let ds = match self.brcb_datasets.get(&mms_path) {
-                    Some(ds) => ds,
-                    None => continue,
-                };
-                (
-                    state.is_buffering,
-                    state.buf_tm_ms,
-                    state.trg_ops,
-                    mms_path,
-                    ds.len(),
-                )
-            };
-
-            // A BRCB with no valid data set does not buffer, so it takes no triggers.
-            if !is_buffering {
-                continue;
-            }
-            let flag = enabled_triggers(flag, trg_ops);
-            if !flag.has_trigger() {
-                tracing::trace!(
-                    mms_path = %mms_path,
-                    attr_ref = %attr_ref,
-                    "brcb trigger skipped: trgops does not cover this trigger class"
-                );
-                continue;
-            }
-
-            let idx = match self
-                .brcb_datasets
-                .get(&mms_path)
-                .and_then(|ds| ds.entries.iter().position(|e| &e.attr_ref == attr_ref))
-            {
-                Some(i) => i,
-                None => continue,
-            };
-
-            if buf_tm_ms == 0 {
-                // Single-trigger snapshot: the other data set slots stay `None`, so
-                // the encoded inclusion bitmap marks only this index.
-                let mut snap = EnqueuedSnapshot::new(ds_len);
-                if let Some(slot) = snap.inclusion_flags.get_mut(idx) {
-                    *slot = flag;
-                }
-                if let Some(slot) = snap.values.get_mut(idx) {
-                    *slot = Some(new_value.clone());
-                }
-                if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(now_ms, false, false, snap) {
-                    tracing::warn!(
-                        mms_path = %mms_path,
-                        attr_ref = %attr_ref,
-                        error = ?e,
-                        "brcb enqueue failed on the immediate path"
-                    );
-                }
-                continue;
-            }
-
-            // Buffer time set: accumulate until tick finds the window expired.
-            let completed = {
-                let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
-                    tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
-                    continue;
-                };
-                // A member that triggers again inside the window closes it: the
-                // accumulated entry is buffered at once and the new trigger opens
-                // the next window, per the BufTm rules of IEC 61850-7-2.
-                let retriggered = pending.get(&mms_path).is_some_and(|p| {
-                    p.snapshot
-                        .inclusion_flags
-                        .get(idx)
-                        .is_some_and(|f| f.has_trigger())
-                });
-                let completed = if retriggered {
-                    pending.remove(&mms_path)
-                } else {
-                    None
-                };
-                let entry = pending
-                    .entry(mms_path.clone())
-                    .or_insert_with(|| BrcbBufTmPending {
-                        first_trigger_ms: now_ms,
-                        due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
-                        snapshot: EnqueuedSnapshot::new(ds_len),
-                    });
-                if let Some(slot) = entry.snapshot.inclusion_flags.get_mut(idx) {
-                    *slot = flag;
-                }
-                if let Some(slot) = entry.snapshot.values.get_mut(idx) {
-                    *slot = Some(new_value.clone());
-                }
-                completed
-            };
-            if let Some(p) = completed {
-                tracing::debug!(
-                    mms_path = %mms_path,
-                    attr_ref = %attr_ref,
-                    "buffer-time bypass: member retriggered inside the buffer window, buffering the entry now"
-                );
-                if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(
-                    p.first_trigger_ms,
-                    false,
-                    false,
-                    p.snapshot,
-                ) {
-                    tracing::warn!(
-                        mms_path = %mms_path,
-                        error = ?e,
-                        "brcb buffer-time enqueue failed"
-                    );
-                }
+            if let Some(brcb_arc) = weak.upgrade() {
+                self.trigger_brcb(&brcb_arc, attr_ref, &new_value, flag, now_ms);
             }
         }
     }
@@ -1179,68 +1059,6 @@ impl ReportingEngine {
         // Every control block lock is released by now.
         for c in to_drop {
             self.on_connection_dropped(c);
-        }
-    }
-
-    /// Fills in the values of entries still marked NOT_UPDATED once the model is
-    /// unlocked, and marks the affected control blocks due.
-    ///
-    /// Implements the post-unlock value fill-in of IEC 61850-7-2.
-    pub fn flush_after_unlock(&self, now_ms: u64) {
-        for rc_arc in self.rcbs.values() {
-            let Ok(rc_guard) = rc_arc.lock() else {
-                continue;
-            };
-            let Ok(mut state) = rc_guard.state.lock() else {
-                continue;
-            };
-            if !state.rpt_ena {
-                continue;
-            }
-            if state.pending.is_none() {
-                continue;
-            }
-
-            // Collect the indices first: state cannot be borrowed mutably while the
-            // pending report is borrowed shared.
-            let not_updated_indices: Vec<usize> = state
-                .pending
-                .as_ref()
-                .map(|p| {
-                    p.inclusion_flags
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, f)| f.contains(InclusionFlag::NOT_UPDATED))
-                        .map(|(i, _)| i)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            for i in not_updated_indices {
-                let live_val = state
-                    .dataset
-                    .as_ref()
-                    .and_then(|ds| ds.entries.get(i))
-                    .and_then(|e| e.read_value());
-
-                if let Some(ref mut p) = state.pending {
-                    if let Some(snap_slot) = p.snapshot.get_mut(i) {
-                        *snap_slot = live_val;
-                    }
-                    if let Some(flag_slot) = p.inclusion_flags.get_mut(i) {
-                        *flag_slot = InclusionFlag::VALUE_CHANGED;
-                    }
-                }
-            }
-
-            // Mark the report due so the next tick picks it up.
-            if !state.triggered {
-                state.triggered = true;
-                state.report_due = Some(Instant::now());
-                if let Some(ref mut p) = state.pending {
-                    p.time_of_entry_ms = now_ms;
-                }
-            }
         }
     }
 
@@ -1733,6 +1551,427 @@ impl ReportingEngine {
             }
         }
     }
+
+    // ─── Batched triggers ─────────────────────────────────────────────────────
+
+    /// Reports several data attribute updates as one batch.
+    ///
+    /// Each element is an attribute reference, its new value, and the reasons
+    /// for inclusion the update raised, as `on_value_updated` takes them. A
+    /// reference given more than once counts once, with its last value and the
+    /// reasons of all its elements. Every URCB and every BRCB watching any of
+    /// the references takes all of them together: a URCB adds them to one
+    /// pending report, a BRCB with no buffer time buffers one entry holding all
+    /// of them, and a BRCB with a buffer time adds them to its open window.
+    /// When a member of the batch is already part of a control block's pending
+    /// report or open window, that report or window is closed first, once, so
+    /// it keeps only the values from before the batch and the batch stays
+    /// whole. Each control block keeps only the reasons its TrgOps enable.
+    pub fn on_values_updated(
+        &self,
+        updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+        now_ms: u64,
+    ) {
+        let updates = merge_updates(updates);
+        let mut to_drop: Vec<ConnectionId> = Vec::new();
+        for (rc_arc, members) in group_by_watcher(&updates, &self.watch_map) {
+            if let Some(c) = self.trigger_urcb_batch(&rc_arc, &updates, &members, now_ms) {
+                to_drop.push(c);
+            }
+        }
+        for (brcb_arc, members) in group_by_watcher(&updates, &self.brcb_watch_map) {
+            self.trigger_brcb_batch(&brcb_arc, &updates, &members, now_ms);
+        }
+        for c in to_drop {
+            self.on_connection_dropped(c);
+        }
+    }
+
+    /// Adds the batch members `members` of `updates` to one URCB; returns a
+    /// connection to drop when sending its earlier pending report failed.
+    fn trigger_urcb_batch(
+        &self,
+        rc_arc: &Arc<Mutex<ReportControl>>,
+        updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+        members: &[usize],
+        now_ms: u64,
+    ) -> Option<ConnectionId> {
+        let Ok(rc_guard) = rc_arc.lock() else {
+            tracing::warn!("report control mutex poisoned, skipping a batch of updates");
+            return None;
+        };
+        let Ok(mut state) = rc_guard.state.lock() else {
+            tracing::warn!(mms_path = %rc_guard.mms_path, "rcb state mutex poisoned, skipping a batch of updates");
+            return None;
+        };
+        if !state.rpt_ena {
+            return None;
+        }
+        let mut slots: Vec<(usize, InclusionFlag, &MmsValue)> = Vec::new();
+        for &u in members {
+            let (attr_ref, value, flag) = &updates[u];
+            let flag = enabled_triggers(*flag, state.trg_ops);
+            if !flag.has_trigger() {
+                rc_guard
+                    .metrics
+                    .skipped_trgops
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let idx = state
+                .dataset
+                .as_ref()
+                .and_then(|ds| ds.entries.iter().position(|e| &e.attr_ref == attr_ref));
+            if let Some(idx) = idx {
+                slots.push((idx, flag, value));
+            }
+        }
+        if slots.is_empty() {
+            return None;
+        }
+
+        // A batch member already in the pending report closes that report
+        // first, so the report keeps the values from before the batch.
+        let mut dropped = None;
+        let retriggered = state.pending.as_ref().is_some_and(|p| {
+            slots
+                .iter()
+                .any(|(idx, _, _)| p.inclusion_flags.get(*idx).is_some_and(|f| f.has_trigger()))
+        });
+        if let (true, Some(conn_id)) = (retriggered, state.client_conn_id) {
+            if let Some(pending) = state.pending.take() {
+                state.triggered = false;
+                state.report_due = None;
+                rc_guard
+                    .metrics
+                    .coalesced_buftm
+                    .fetch_add(1, Ordering::Relaxed);
+                // flush_pending takes the state lock itself.
+                drop(state);
+                dropped = self.flush_pending(&rc_guard, conn_id, pending, now_ms);
+                state = match rc_guard.state.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::warn!(mms_path = %rc_guard.mms_path, "rcb state mutex poisoned, skipping a batch of updates");
+                        return dropped;
+                    }
+                };
+                if !state.rpt_ena {
+                    return dropped;
+                }
+            }
+        }
+
+        let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
+        let pending = state
+            .pending
+            .get_or_insert_with(|| PendingReport::new_empty(ds_len, now_ms));
+        for (idx, flag, value) in slots {
+            if let Some(f) = pending.inclusion_flags.get_mut(idx) {
+                *f = flag;
+            }
+            if let Some(slot) = pending.snapshot.get_mut(idx) {
+                *slot = Some(value.clone());
+            }
+        }
+        if !state.triggered {
+            state.triggered = true;
+            let buf_tm = Duration::from_millis(state.buf_tm_ms as u64);
+            state.report_due = Some(Instant::now() + buf_tm);
+            if let Some(ref mut p) = state.pending {
+                p.time_of_entry_ms = now_ms;
+            }
+        }
+        dropped
+    }
+
+    /// Adds the batch members `members` of `updates` to one BRCB: one entry
+    /// with no buffer time, the open window otherwise.
+    fn trigger_brcb_batch(
+        &self,
+        brcb_arc: &Arc<BufferedReportControl>,
+        updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+        members: &[usize],
+        now_ms: u64,
+    ) {
+        let mms_path = &brcb_arc.mms_path;
+        let (is_buffering, buf_tm_ms, trg_ops) = {
+            let Ok(state) = brcb_arc.state.lock() else {
+                tracing::warn!(mms_path = %mms_path, "brcb state mutex poisoned, skipping a batch of updates");
+                return;
+            };
+            (state.is_buffering, state.buf_tm_ms, state.trg_ops)
+        };
+        // A BRCB with no valid data set does not buffer, so it takes no triggers.
+        if !is_buffering {
+            return;
+        }
+        let Some(ds) = self.brcb_datasets.get(mms_path) else {
+            return;
+        };
+        let slots: Vec<(usize, InclusionFlag, &MmsValue)> = members
+            .iter()
+            .filter_map(|&u| {
+                let (attr_ref, value, flag) = &updates[u];
+                let flag = enabled_triggers(*flag, trg_ops);
+                if !flag.has_trigger() {
+                    return None;
+                }
+                let idx = ds.entries.iter().position(|e| &e.attr_ref == attr_ref)?;
+                Some((idx, flag, value))
+            })
+            .collect();
+        if slots.is_empty() {
+            return;
+        }
+        let fill = |snap: &mut EnqueuedSnapshot| {
+            for (idx, flag, value) in &slots {
+                if let Some(slot) = snap.inclusion_flags.get_mut(*idx) {
+                    *slot = *flag;
+                }
+                if let Some(slot) = snap.values.get_mut(*idx) {
+                    *slot = Some((*value).clone());
+                }
+            }
+        };
+
+        if buf_tm_ms == 0 {
+            let mut snap = EnqueuedSnapshot::new(ds.len());
+            fill(&mut snap);
+            if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(now_ms, false, false, snap) {
+                tracing::warn!(
+                    mms_path = %mms_path,
+                    error = ?e,
+                    "brcb enqueue of a batch of updates failed"
+                );
+            }
+            return;
+        }
+
+        let completed = {
+            let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
+                tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
+                return;
+            };
+            // A batch member already in the open window closes it first, so the
+            // window keeps the values from before the batch.
+            let retriggered = pending.get(mms_path).is_some_and(|p| {
+                slots.iter().any(|(idx, _, _)| {
+                    p.snapshot
+                        .inclusion_flags
+                        .get(*idx)
+                        .is_some_and(|f| f.has_trigger())
+                })
+            });
+            let completed = if retriggered {
+                pending.remove(mms_path)
+            } else {
+                None
+            };
+            let entry = pending
+                .entry(mms_path.clone())
+                .or_insert_with(|| BrcbBufTmPending {
+                    first_trigger_ms: now_ms,
+                    due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
+                    snapshot: EnqueuedSnapshot::new(ds.len()),
+                });
+            fill(&mut entry.snapshot);
+            completed
+        };
+        if let Some(p) = completed {
+            if let Err(e) =
+                brcb_arc.enqueue_entry_with_snapshot(p.first_trigger_ms, false, false, p.snapshot)
+            {
+                tracing::warn!(
+                    mms_path = %mms_path,
+                    error = ?e,
+                    "brcb buffer-time enqueue failed"
+                );
+            }
+        }
+    }
+
+    /// Raises one trigger on one buffered report control block: the per-block
+    /// half of `on_brcb_value_updated`, which describes the steps.
+    fn trigger_brcb(
+        &self,
+        brcb_arc: &Arc<BufferedReportControl>,
+        attr_ref: &DataAttributeRef,
+        new_value: &MmsValue,
+        flag: InclusionFlag,
+        now_ms: u64,
+    ) {
+        // Copy the fields needed, then release the state lock.
+        let (is_buffering, buf_tm_ms, trg_ops, mms_path, ds_len) = {
+            let Ok(state) = brcb_arc.state.lock() else {
+                tracing::warn!(attr_ref = %attr_ref, "brcb state mutex poisoned, skipping trigger");
+                return;
+            };
+            let mms_path = brcb_arc.mms_path.clone();
+            let ds = match self.brcb_datasets.get(&mms_path) {
+                Some(ds) => ds,
+                None => return,
+            };
+            (
+                state.is_buffering,
+                state.buf_tm_ms,
+                state.trg_ops,
+                mms_path,
+                ds.len(),
+            )
+        };
+
+        // A BRCB with no valid data set does not buffer, so it takes no triggers.
+        if !is_buffering {
+            return;
+        }
+        let flag = enabled_triggers(flag, trg_ops);
+        if !flag.has_trigger() {
+            tracing::trace!(
+                mms_path = %mms_path,
+                attr_ref = %attr_ref,
+                "brcb trigger skipped: trgops does not cover this trigger class"
+            );
+            return;
+        }
+
+        let idx = match self
+            .brcb_datasets
+            .get(&mms_path)
+            .and_then(|ds| ds.entries.iter().position(|e| &e.attr_ref == attr_ref))
+        {
+            Some(i) => i,
+            None => return,
+        };
+
+        if buf_tm_ms == 0 {
+            // Single-trigger snapshot: the other data set slots stay `None`, so
+            // the encoded inclusion bitmap marks only this index.
+            let mut snap = EnqueuedSnapshot::new(ds_len);
+            if let Some(slot) = snap.inclusion_flags.get_mut(idx) {
+                *slot = flag;
+            }
+            if let Some(slot) = snap.values.get_mut(idx) {
+                *slot = Some(new_value.clone());
+            }
+            if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(now_ms, false, false, snap) {
+                tracing::warn!(
+                    mms_path = %mms_path,
+                    attr_ref = %attr_ref,
+                    error = ?e,
+                    "brcb enqueue failed on the immediate path"
+                );
+            }
+            return;
+        }
+
+        // Buffer time set: accumulate until tick finds the window expired.
+        let completed = {
+            let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
+                tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
+                return;
+            };
+            // A member that triggers again inside the window closes it: the
+            // accumulated entry is buffered at once and the new trigger opens
+            // the next window, per the BufTm rules of IEC 61850-7-2.
+            let retriggered = pending.get(&mms_path).is_some_and(|p| {
+                p.snapshot
+                    .inclusion_flags
+                    .get(idx)
+                    .is_some_and(|f| f.has_trigger())
+            });
+            let completed = if retriggered {
+                pending.remove(&mms_path)
+            } else {
+                None
+            };
+            let entry = pending
+                .entry(mms_path.clone())
+                .or_insert_with(|| BrcbBufTmPending {
+                    first_trigger_ms: now_ms,
+                    due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
+                    snapshot: EnqueuedSnapshot::new(ds_len),
+                });
+            if let Some(slot) = entry.snapshot.inclusion_flags.get_mut(idx) {
+                *slot = flag;
+            }
+            if let Some(slot) = entry.snapshot.values.get_mut(idx) {
+                *slot = Some(new_value.clone());
+            }
+            completed
+        };
+        if let Some(p) = completed {
+            tracing::debug!(
+                mms_path = %mms_path,
+                attr_ref = %attr_ref,
+                "buffer-time bypass: member retriggered inside the buffer window, buffering the entry now"
+            );
+            if let Err(e) =
+                brcb_arc.enqueue_entry_with_snapshot(p.first_trigger_ms, false, false, p.snapshot)
+            {
+                tracing::warn!(
+                    mms_path = %mms_path,
+                    error = ?e,
+                    "brcb buffer-time enqueue failed"
+                );
+            }
+        }
+    }
+}
+
+/// Merges the elements of a batch that name the same reference: the last
+/// value and the reasons of all of them, in the order references first appear.
+fn merge_updates(
+    updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+) -> Vec<(DataAttributeRef, MmsValue, InclusionFlag)> {
+    let mut merged: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> =
+        Vec::with_capacity(updates.len());
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (attr_ref, value, flag) in updates {
+        match index.get(attr_ref.as_str()) {
+            Some(&i) => {
+                merged[i].1 = value.clone();
+                merged[i].2 = merged[i].2.union(*flag);
+            }
+            None => {
+                index.insert(attr_ref.as_str(), merged.len());
+                merged.push((attr_ref.clone(), value.clone(), *flag));
+            }
+        }
+    }
+    merged
+}
+
+/// Groups the positions in `updates` by the control block watching them, in
+/// the order the control blocks are first met.
+fn group_by_watcher<T>(
+    updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+    watch_map: &HashMap<DataAttributeRef, Vec<Weak<T>>>,
+) -> Vec<(Arc<T>, Vec<usize>)> {
+    let mut groups: Vec<(Arc<T>, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<*const T, usize> = HashMap::new();
+    for (u, (attr_ref, _, _)) in updates.iter().enumerate() {
+        let Some(watchers) = watch_map.get(attr_ref) else {
+            continue;
+        };
+        for weak in watchers {
+            let Some(watcher) = weak.upgrade() else {
+                continue;
+            };
+            match index.get(&Arc::as_ptr(&watcher)) {
+                Some(&g) => {
+                    if !groups[g].1.contains(&u) {
+                        groups[g].1.push(u);
+                    }
+                }
+                None => {
+                    index.insert(Arc::as_ptr(&watcher), groups.len());
+                    groups.push((watcher, vec![u]));
+                }
+            }
+        }
+    }
+    groups
 }
 
 /// Returns the reasons of `flag` that `trg_ops` enable: data-change for

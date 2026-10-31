@@ -6,13 +6,12 @@
 //! an error where it cannot. A negotiated MMS PDU size is clamped to a floor of
 //! `MIN_PDU_SIZE`, enforced during Initiate negotiation in `iec61850-mms`.
 //!
-//! The data model lock is a mutex acquired without blocking. Robustness case
-//! Locking the model again from a thread that already holds it must not
-//! deadlock, so a reentrant [`IedServer::lock_data_model`] returns
-//! `Err(AlreadyLocked)` and the caller decides whether to wait or give up.
-//! While the lock is held an atomic flag tells observers to defer their events;
-//! releasing it triggers the pending GOOSE messages, then the pending reports,
-//! then clears the flag, and only then releases the mutex.
+//! The data model lock is a mutex acquired without blocking, so locking the
+//! model again from a thread that already holds it returns `Err(AlreadyLocked)`
+//! instead of deadlocking. While the lock is held, an update still writes its
+//! value at once, but the report and log triggers it raises are held back and
+//! raised together when the lock is released; the periodic report and log
+//! triggers wait for the release as well.
 
 use crate::config::IedServerConfig;
 use crate::connection::{ClientConnection, ConnectionId};
@@ -36,7 +35,9 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// IEC 61850 server runtime.
@@ -76,9 +77,18 @@ struct IedServerInner {
     /// that reentrancy is an error rather than a deadlock.
     data_model_lock_guard: Mutex<()>,
 
-    /// Set while the data model is locked, so observers defer their events
-    /// until the batch of updates is complete.
+    /// Set while the data model is locked.
     is_model_locked: AtomicBool,
+
+    /// Triggers raised while the data model is locked, raised when it is
+    /// released. Deferring a trigger and releasing the batch both happen under
+    /// this lock, so a batch is delivered before any update that follows it.
+    deferred: Mutex<DeferredTriggers>,
+
+    /// Held for writing while the data model is locked, and for reading by
+    /// each tick of the periodic report and log triggers, so a tick never runs
+    /// in the middle of a batch of updates.
+    batch_gate: RwLock<()>,
 
     /// Routes confirmed requests. The builder constructs a model-backed
     /// dispatcher unless the caller supplies one.
@@ -244,8 +254,8 @@ impl IedServer {
             .unwrap_or(false)
     }
 
-    /// Reports whether the data model is locked, which tells an observer to
-    /// defer its events.
+    /// Reports whether the data model is locked, in which case the report and
+    /// log triggers of an update are deferred until it is released.
     pub fn is_data_model_locked(&self) -> bool {
         self.inner.is_model_locked.load(Ordering::SeqCst)
     }
@@ -327,9 +337,27 @@ impl IedServer {
 
     /// Locks the data model for a batch of updates.
     ///
-    /// Dropping the returned guard triggers the pending GOOSE messages, then
-    /// the pending reports, then clears the lock flag, and only then releases
-    /// the mutex.
+    /// While the returned guard is held, every `update_*` call writes its value
+    /// at once, but the report and log triggers it raises are deferred.
+    /// Dropping the guard raises them together: an attribute updated more than
+    /// once counts once, with its last value and the reasons of all its
+    /// updates merged, and the reporting engine takes the whole batch at once,
+    /// so a report control block with no buffer time sends one report, and a
+    /// buffered one buffers one entry, holding every member the batch
+    /// triggered. The periodic triggers, buffer time expiry, integrity and
+    /// general interrogation reports, wait until the guard is dropped, so none
+    /// of them sees part of a batch. A client Read is not held back and can see
+    /// part of a batch.
+    ///
+    /// The server publishes no GOOSE message on its own, so the lock defers
+    /// none; an application that publishes GOOSE drives its publisher itself.
+    ///
+    /// A guard dropped while its thread unwinds from a panic still raises the
+    /// deferred triggers, so reports and log entries stay in step with the
+    /// values already written, and the model can be locked again afterwards.
+    ///
+    /// Acquiring the lock can wait for a tick of the periodic triggers that is
+    /// under way, which holds the lock off for no longer than that tick.
     ///
     /// # Errors
     ///
@@ -337,16 +365,53 @@ impl IedServer {
     /// the same thread: acquiring without blocking turns reentrancy into an
     /// error the caller can act on instead of a deadlock.
     pub fn lock_data_model(&self) -> Result<DataModelGuard<'_>> {
-        let mutex_guard = self
+        let mutex_guard = match self.inner.data_model_lock_guard.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(ServerError::AlreadyLocked),
+        };
+        let gate = self
             .inner
-            .data_model_lock_guard
-            .try_lock()
-            .map_err(|_| ServerError::AlreadyLocked)?;
+            .batch_gate
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.deferred().active = true;
         self.inner.is_model_locked.store(true, Ordering::SeqCst);
         Ok(DataModelGuard {
             server: self,
+            _gate: gate,
             _guard: mutex_guard,
         })
+    }
+
+    /// Holds off a data model lock for one tick of the periodic triggers, or
+    /// returns `None` while the model is locked, in which case the tick skips
+    /// them.
+    pub(crate) fn periodic_gate(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        match self.inner.batch_gate.try_read() {
+            Ok(g) => Some(g),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Returns the deferral state, recovered from a poisoned lock.
+    fn deferred(&self) -> MutexGuard<'_, DeferredTriggers> {
+        self.inner
+            .deferred
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends the deferral and raises the deferred triggers as one batch.
+    ///
+    /// The deferral lock is held until the batch is raised, so an update that
+    /// follows the release raises its triggers after the batch.
+    fn release_deferred(&self) {
+        let mut deferred = self.deferred();
+        let triggers = deferred.release();
+        self.raise_triggers(&triggers);
+        drop(deferred);
     }
 
     // ── Typed value updates ─────────────────────────────────────────────
@@ -574,14 +639,15 @@ impl IedServer {
     /// - an attribute that declares none of them raises nothing.
     ///
     /// Reports and log entries act on the same triggers, each control block on
-    /// those its TrgOps enable.
+    /// those its TrgOps enable. While the data model is locked the triggers are
+    /// deferred until it is released.
     fn update_with(
         &self,
         da: &DataAttribute,
         expected_name: &'static str,
         build: impl FnOnce(&MmsValue) -> Result<MmsValue>,
     ) -> Result<()> {
-        let (new_value, flag) = {
+        let trigger = {
             let mut guard = da.value.write().map_err(|_| {
                 ServerError::InvalidModel("DataAttribute value RwLock poisoned".into())
             })?;
@@ -596,50 +662,64 @@ impl IedServer {
             let new_value = build(&guard)?;
             let flag = update_triggers(da, &guard, &new_value);
             *guard = new_value.clone();
-            (new_value, flag)
+            PendingTrigger {
+                cell: Arc::clone(&da.value),
+                value: new_value,
+                flag,
+            }
         };
         // The write lock is released before any trigger is raised.
-        if flag.has_trigger() {
-            self.raise_triggers(&da.value, new_value, flag);
+        if !trigger.flag.has_trigger() {
+            return Ok(());
         }
+        {
+            let mut deferred = self.deferred();
+            if deferred.active {
+                deferred.merge(trigger);
+                return Ok(());
+            }
+        }
+        self.raise_triggers(std::slice::from_ref(&trigger));
         Ok(())
     }
 
-    /// Raises the log and report triggers of an attribute update.
+    /// Raises the log and report triggers of attribute updates.
     ///
-    /// The attribute is looked up in the report indexes before the reporting
-    /// engine is locked.
-    fn raise_triggers(&self, cell: &Arc<RwLock<MmsValue>>, value: MmsValue, flag: InclusionFlag) {
-        let ptr_key = Arc::as_ptr(cell) as usize;
-        self.log_update(ptr_key, flag, &value);
-        let attr_ref = self
-            .inner
-            .attr_ref_index
-            .read()
-            .ok()
-            .and_then(|g| g.get(&ptr_key).cloned())
-            // A member of a data set a control block was bound to over MMS is
-            // in the engine's index only, which is read without the engine
-            // lock.
-            .or_else(|| self.inner.value_index.attr_ref_for(cell));
+    /// Every attribute is looked up in the report indexes before the reporting
+    /// engine is locked, and the engine then takes all of them at once.
+    fn raise_triggers(&self, triggers: &[PendingTrigger]) {
+        for t in triggers {
+            self.log_update(t.key(), t.flag, &t.value);
+        }
+        let updates: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> = {
+            let index = self.inner.attr_ref_index.read().ok();
+            triggers
+                .iter()
+                .filter_map(|t| {
+                    index
+                        .as_ref()
+                        .and_then(|g| g.get(&t.key()).cloned())
+                        // A member of a data set a control block was bound to
+                        // over MMS is in the engine's index only, which is read
+                        // without the engine lock.
+                        .or_else(|| self.inner.value_index.attr_ref_for(&t.cell))
+                        .map(|attr_ref| (attr_ref, t.value.clone(), t.flag))
+                })
+                .collect()
+        };
         // An attribute in no data set has no index entry, which is the ordinary
         // case and needs no report.
-        let Some(attr_ref) = attr_ref else {
+        if updates.is_empty() {
             return;
-        };
+        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         match self.inner.reporting_engine.lock() {
-            Ok(engine) => {
-                engine.on_value_updated(&attr_ref, value.clone(), flag, now_ms);
-                // The buffered path is always tried too; it returns at once
-                // when no buffered control block watches the attribute.
-                engine.on_brcb_value_updated(&attr_ref, value, flag, now_ms);
-            }
+            Ok(engine) => engine.on_values_updated(&updates, now_ms),
             Err(_) => tracing::warn!(
-                attr_ref = %attr_ref,
+                updates = updates.len(),
                 "the reporting engine lock is poisoned, the update triggered no report"
             ),
         }
@@ -1266,6 +1346,59 @@ fn same_value(a: &MmsValue, b: &MmsValue) -> bool {
     }
 }
 
+/// An attribute update whose report and log triggers are still to be raised.
+struct PendingTrigger {
+    /// The shared value of the attribute, which identifies it.
+    cell: Arc<RwLock<MmsValue>>,
+    /// The value the update wrote.
+    value: MmsValue,
+    /// The reasons for inclusion the update raised.
+    flag: InclusionFlag,
+}
+
+impl PendingTrigger {
+    /// Identifies the attribute by the address of its shared value.
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.cell) as usize
+    }
+}
+
+/// The triggers deferred while the data model is locked, in the order their
+/// attributes were first updated.
+#[derive(Default)]
+struct DeferredTriggers {
+    /// Whether the data model is locked, so a new trigger is deferred.
+    active: bool,
+    triggers: Vec<PendingTrigger>,
+    /// Position in `triggers` of each attribute, by the address of its value.
+    index: HashMap<usize, usize>,
+}
+
+impl DeferredTriggers {
+    /// Adds a trigger; a later update of an attribute already held replaces
+    /// its value and adds its reasons.
+    fn merge(&mut self, trigger: PendingTrigger) {
+        match self.index.get(&trigger.key()) {
+            Some(&i) => {
+                let held = &mut self.triggers[i];
+                held.value = trigger.value;
+                held.flag = held.flag.union(trigger.flag);
+            }
+            None => {
+                self.index.insert(trigger.key(), self.triggers.len());
+                self.triggers.push(trigger);
+            }
+        }
+    }
+
+    /// Ends the deferral and takes the deferred triggers.
+    fn release(&mut self) -> Vec<PendingTrigger> {
+        self.active = false;
+        self.index.clear();
+        std::mem::take(&mut self.triggers)
+    }
+}
+
 /// Returns the bit count of the bit string an attribute currently holds.
 fn held_bit_string_len(da: &DataAttribute, current: &MmsValue) -> Result<usize> {
     let held = match current {
@@ -1312,10 +1445,14 @@ fn mms_value_variant_name(v: &iec61850_model::MmsValue) -> &'static str {
 // Data model lock guard
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Holds the data model lock; dropping it releases the lock in order.
+/// Holds the data model lock; dropping it raises the deferred triggers and
+/// releases the lock.
 pub struct DataModelGuard<'a> {
     server: &'a IedServer,
-    _guard: std::sync::MutexGuard<'a, ()>,
+    // Dropped in declaration order: the periodic triggers resume before the
+    // mutex is released.
+    _gate: RwLockWriteGuard<'a, ()>,
+    _guard: MutexGuard<'a, ()>,
 }
 
 impl<'a> std::fmt::Debug for DataModelGuard<'a> {
@@ -1328,10 +1465,9 @@ impl<'a> std::fmt::Debug for DataModelGuard<'a> {
 
 impl<'a> Drop for DataModelGuard<'a> {
     fn drop(&mut self) {
-        // Order matters: the pending GOOSE messages and reports are triggered
-        // first, then the flag is cleared, and the mutex is released last.
-        // Clearing the flag any earlier would let an observer conclude the
-        // batch is over while its events are still pending.
+        // The deferred triggers are raised before the flag is cleared, so an
+        // observer that sees the model unlocked also sees the batch delivered.
+        self.server.release_deferred();
         self.server
             .inner
             .is_model_locked
@@ -1562,6 +1698,8 @@ impl IedServerBuilder<Bound> {
                 running: AtomicBool::new(false),
                 data_model_lock_guard: Mutex::new(()),
                 is_model_locked: AtomicBool::new(false),
+                deferred: Mutex::new(DeferredTriggers::default()),
+                batch_gate: RwLock::new(()),
                 dispatcher,
                 connection_block_requests_default: AtomicBool::new(false),
                 control_objects,
@@ -1836,6 +1974,19 @@ mod tests {
         assert!(!server.is_data_model_locked());
     }
 
+    #[test]
+    fn periodic_triggers_wait_for_the_data_model_lock() {
+        let server = test_server();
+        assert!(server.periodic_gate().is_some());
+        let guard = server.lock_data_model().unwrap();
+        assert!(
+            server.periodic_gate().is_none(),
+            "a tick skips its periodic triggers while the model is locked"
+        );
+        drop(guard);
+        assert!(server.periodic_gate().is_some());
+    }
+
     // ── Update triggers ─────────────────────────────────────────────────
 
     #[test]
@@ -1889,6 +2040,45 @@ mod tests {
             &MmsValue::Float32(-0.0)
         ));
         assert!(same_value(&MmsValue::Float64(2.5), &MmsValue::Float64(2.5)));
+    }
+
+    #[test]
+    fn a_deferred_attribute_keeps_its_last_value_and_every_reason() {
+        let cell = Arc::new(RwLock::new(MmsValue::Integer(0)));
+        let other = Arc::new(RwLock::new(MmsValue::Integer(0)));
+        let mut deferred = DeferredTriggers {
+            active: true,
+            ..DeferredTriggers::default()
+        };
+        for (c, v, flag) in [
+            (&cell, 1, InclusionFlag::VALUE_CHANGED),
+            (&other, 5, InclusionFlag::VALUE_CHANGED),
+            (&cell, 1, InclusionFlag::VALUE_UPDATE),
+        ] {
+            deferred.merge(PendingTrigger {
+                cell: Arc::clone(c),
+                value: MmsValue::Integer(v),
+                flag,
+            });
+        }
+        let released = deferred.release();
+        assert!(!deferred.active);
+        let got: Vec<_> = released
+            .iter()
+            .map(|t| (Arc::ptr_eq(&t.cell, &cell), t.value.clone(), t.flag))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    true,
+                    MmsValue::Integer(1),
+                    InclusionFlag::VALUE_CHANGED.union(InclusionFlag::VALUE_UPDATE)
+                ),
+                (false, MmsValue::Integer(5), InclusionFlag::VALUE_CHANGED),
+            ]
+        );
+        assert!(deferred.release().is_empty());
     }
 
     #[test]

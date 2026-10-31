@@ -132,9 +132,8 @@ pub use iec61850_model::cb::OptFlds;
 /// Why one data set member is included in a report (IEC 61850-7-2 §15).
 ///
 /// 0 means nothing is pending. 1 is a data update, 2 a data change, and 4 a
-/// quality change, each matching the trigger option of the same name. 8 marks a
-/// member whose copy was deferred while the data model was locked; it is not a
-/// reason for inclusion and the value is copied once the lock is released.
+/// quality change, each matching the trigger option of the same name; an
+/// update can raise more than one of them.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct InclusionFlag(
     /// Bitmask of the reasons for inclusion.
@@ -150,16 +149,13 @@ impl InclusionFlag {
     pub const VALUE_CHANGED: Self = InclusionFlag(2);
     /// The quality of the member changed.
     pub const QUALITY_CHANGED: Self = InclusionFlag(4);
-    /// The copy was deferred while the data model was locked; not a reason for
-    /// inclusion.
-    pub const NOT_UPDATED: Self = InclusionFlag(8);
 
-    /// Reports whether nothing at all is pending, a deferred copy included.
+    /// Reports whether nothing is pending.
     pub const fn is_none(self) -> bool {
         self.0 == 0
     }
 
-    /// Reports whether any trigger is pending, ignoring a deferred copy.
+    /// Reports whether any reason for inclusion is set.
     pub const fn has_trigger(self) -> bool {
         (self.0 & 0x07) != 0
     }
@@ -370,7 +366,6 @@ mod tests {
         assert_eq!(InclusionFlag::VALUE_UPDATE.0, 1);
         assert_eq!(InclusionFlag::VALUE_CHANGED.0, 2);
         assert_eq!(InclusionFlag::QUALITY_CHANGED.0, 4);
-        assert_eq!(InclusionFlag::NOT_UPDATED.0, 8);
     }
 
     #[test]
@@ -379,8 +374,6 @@ mod tests {
         assert!(InclusionFlag::VALUE_CHANGED.has_trigger());
         assert!(InclusionFlag::VALUE_UPDATE.has_trigger());
         assert!(InclusionFlag::QUALITY_CHANGED.has_trigger());
-        // A deferred copy is not a reason for inclusion.
-        assert!(!InclusionFlag::NOT_UPDATED.has_trigger());
     }
 
     #[test]
