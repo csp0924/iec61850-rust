@@ -1261,11 +1261,13 @@ impl ReportingEngine {
     // ─── Association peers ────────────────────────────────────────────────────
 
     /// Records the peer address of association `conn_id`.
+    #[cfg(any(feature = "full-server", test))]
     pub(crate) fn register_peer(&mut self, conn_id: ConnectionId, peer: IpAddr) {
         self.peers.insert(conn_id, peer);
     }
 
     /// Forgets the peer address of association `conn_id`.
+    #[cfg(any(feature = "full-server", test))]
     pub(crate) fn deregister_peer(&mut self, conn_id: ConnectionId) {
         self.peers.remove(&conn_id);
     }
