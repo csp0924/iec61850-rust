@@ -259,12 +259,14 @@ async fn context_ids_chosen_by_the_client_are_used_for_every_pdu() {
     handle.stop().await;
 }
 
-/// What a Session REFUSE carried: its reason code, the provider-reason of the
-/// CPR inside it, and the context identifier and payload of the CPR user data.
+/// What a Session REFUSE carried: its reason code, the provider-reason and
+/// context results of the CPR inside it, and the context identifier and
+/// payload of the CPR user data.
 #[derive(Debug)]
 struct Refusal {
     reason_code: Option<u8>,
     provider_reason: Option<u8>,
+    results: Vec<u8>,
     user_data: Option<(u8, Vec<u8>)>,
 }
 
@@ -300,6 +302,7 @@ async fn expect_refusal(cotp: &mut CotpConnection<TcpStream>) -> Refusal {
     let refusal = Refusal {
         reason_code: info.reason_code,
         provider_reason: cpr.provider_reason,
+        results: cpr.context_result_list.clone(),
         user_data: (!ud.is_empty()).then(|| pdv(&fully_encoded_data(ud))),
     };
     assert!(
@@ -377,5 +380,101 @@ async fn aarq_without_an_initiate_is_refused_in_a_cpr_and_a_refuse() {
     let (ind, user_info) = acse.parse_message(&aare).expect("an AARE");
     assert_eq!(ind, AcseIndication::AssociateFailed);
     assert!(user_info.is_empty());
+    handle.stop().await;
+}
+
+const ACSE_OID: &[u8] = &[0x52, 0x01, 0x00, 0x01];
+const MMS_OID: &[u8] = &[0x28, 0xca, 0x22, 0x02, 0x01];
+const UNKNOWN_OID: &[u8] = &[0x2b, 0x06, 0x01];
+
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.extend_from_slice(&[0x81, len as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (len >> 8) as u8, len as u8]);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// Builds a CP proposing `contexts`, each a context identifier and an abstract
+/// syntax offered with BER, and carrying the default AARQ on context 1.
+fn cp_with_contexts(contexts: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut pcdl = Vec::new();
+    for (id, oid) in contexts {
+        let mut item = vec![0x02, 0x01, *id];
+        item.extend(tlv(0x06, oid));
+        item.extend(tlv(0x30, &tlv(0x06, &[0x51, 0x01])));
+        pcdl.extend(tlv(0x30, &item));
+    }
+    let mut aarq = BytesMut::new();
+    encode_aarq(
+        &initiate(&InitiateRequestPdu::default()),
+        None,
+        3,
+        &AarqAddressing::default(),
+        &mut aarq,
+    );
+    let mut pdv = vec![0x02, 0x01, 0x01];
+    pdv.extend(tlv(0xa0, &aarq));
+    let mut nmp = vec![0x81, 0x00, 0x82, 0x00];
+    nmp.extend(tlv(0xa4, &pcdl));
+    nmp.extend(tlv(0x61, &tlv(0x30, &pdv)));
+    let mut cp = vec![0xa0, 0x03, 0x80, 0x01, 0x01];
+    cp.extend(tlv(0xa2, &nmp));
+    tlv(0x31, &cp)
+}
+
+/// A context with an abstract syntax the server does not support is rejected
+/// in its own result of the CPA, in the order of the CP, and the association
+/// goes ahead on the ACSE and MMS contexts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_context_is_rejected_in_the_cpa_alone() {
+    let handle = start_server().await;
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp_with_contexts(&[
+        (1, ACSE_OID),
+        (5, UNKNOWN_OID),
+        (3, MMS_OID),
+    ])))
+    .await
+    .unwrap();
+    let (ind, cpa) = recv_spdu(&mut cotp).await.expect("an AC");
+    assert_eq!(ind, SessionIndication::Accept);
+    let accept = [0x30, 0x07, 0x80, 0x01, 0x00, 0x81, 0x02, 0x51, 0x01];
+    let mut results = vec![0xa5, 0x1a];
+    results.extend_from_slice(&accept);
+    results.extend_from_slice(&[0x30, 0x06, 0x80, 0x01, 0x02, 0x82, 0x01, 0x01]);
+    results.extend_from_slice(&accept);
+    assert!(
+        cpa.windows(results.len()).any(|w| w == results),
+        "the CPA answers each context in order: {cpa:02x?}"
+    );
+
+    send_on_context(&mut cotp, 3, &[0xa0, 0x05, 0x02, 0x01, 0x01, 0x82, 0x00]).await;
+    let (_, ud) = recv_spdu(&mut cotp).await.expect("an identify response");
+    assert_eq!(pdv(&ud).0, 3);
+    handle.stop().await;
+}
+
+/// A CP without an MMS context is refused by the presentation provider: a
+/// Session REFUSE carrying a CPR with provider-reason 0 and the result of the
+/// one context proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cp_without_an_mms_context_is_refused_by_the_provider() {
+    let handle = start_server().await;
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp_with_contexts(&[(1, ACSE_OID), (5, UNKNOWN_OID)])))
+        .await
+        .unwrap();
+    let refusal = expect_refusal(&mut cotp).await;
+    assert_eq!(refusal.reason_code, Some(2), "{refusal:?}");
+    assert_eq!(refusal.provider_reason, Some(0), "{refusal:?}");
+    assert_eq!(refusal.results, vec![0, 2], "{refusal:?}");
+    assert!(refusal.user_data.is_none(), "{refusal:?}");
     handle.stop().await;
 }

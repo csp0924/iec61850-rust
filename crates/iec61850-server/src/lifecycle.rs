@@ -18,6 +18,11 @@
 //! - A connection that has not completed the TLS handshake, if TLS is
 //!   configured, and association setup through the MMS Initiate response within
 //!   `association_setup_timeout_ms` is closed.
+//! - Each presentation context of the CP is answered in the CPA: accepted for
+//!   ACSE and MMS with the BER transfer syntax, provider-rejected otherwise. A
+//!   CP without an acceptable ACSE and MMS context is answered with a Session
+//!   REFUSE carrying a Presentation CPR, provider rejection, before the socket
+//!   closes.
 //! - An association the server refuses, for failed authentication, an AARQ
 //!   that carries no Initiate request or a refused Initiate, is answered with a
 //!   Session REFUSE carrying a Presentation CPR (user rejection) and an ACSE
@@ -79,6 +84,9 @@ use crate::connection::ClientConnection;
 
 /// Tag of the MMS Initiate-RequestPDU, the only PDU an AARQ may carry.
 const MMS_INITIATE_REQUEST_TAG: u8 = 0xa8;
+
+/// CPR provider-reason reason-not-specified.
+const PROVIDER_REASON_NOT_SPECIFIED: u8 = 0;
 
 /// Room a TSDU leaves around one MMS PDU for its Session, Presentation and
 /// ACSE envelope: the margin `DEFAULT_MAX_TSDU_SIZE` adds to the default
@@ -301,6 +309,8 @@ enum ConnError {
     Presentation(#[from] PresentationError),
     #[error("acse error: {0}")]
     Acse(#[from] AcseError),
+    #[error("the connect request proposed no acceptable acse and mms presentation contexts")]
+    PresentationRejected,
     #[error("acse association failed: authentication was refused or the result was non-zero")]
     AcseAssociationFailed,
     #[error("unexpected acse indication {0:?}: only associate is accepted while associating")]
@@ -455,6 +465,14 @@ where
 
     let mut pres = IsoPresentation::new();
     let cp_result = pres_parse_connect(&mut pres, cp_bytes)?;
+    if !pres.accepts_acse_and_mms() {
+        tracing::warn!(
+            conn_id,
+            "the connect request lacks an acceptable acse or mms presentation context, refusing"
+        );
+        send_presentation_reject(&mut cotp, &pres).await?;
+        return Err(ConnError::PresentationRejected);
+    }
     // Copied out so that the presentation state can be borrowed mutably below.
     let aarq_bytes = cp_result.payload(cp_bytes).to_vec();
 
@@ -1048,6 +1066,26 @@ where
             Err(ConnError::SendTimedOut)
         }
     }
+}
+
+/// Refuses the connection on behalf of the presentation provider: a CPR with
+/// provider-reason reason-not-specified and the result of each proposed
+/// context, inside a Session REFUSE in a COTP data TPDU.
+async fn send_presentation_reject<S>(
+    cotp: &mut CotpConnection<S>,
+    pres: &IsoPresentation,
+) -> std::result::Result<(), ConnError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut cpr = BytesMut::new();
+    encode_cpr(pres, Some(PROVIDER_REASON_NOT_SPECIFIED), None, &mut cpr);
+
+    let mut rf = BytesMut::new();
+    encode_refuse_with_user_data(&cpr, &mut rf)?;
+
+    cotp.send_data(&rf).await?;
+    Ok(())
 }
 
 /// Refuses the association on behalf of the ACSE user: the rejecting AARE the

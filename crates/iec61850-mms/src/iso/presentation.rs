@@ -12,10 +12,14 @@
 //! - A P-Selector longer than 16 bytes is warned about and rejected.
 //! - The Abort container carries outer tag 0xa0 rather than 0x31; the ISO 8823
 //!   Abort PPDU type it should carry is not verified against the standard.
-//! - A PCDL entry naming an unknown abstract-syntax OID is rejected.
+//! - Each PCDL entry is answered in the CPA result list, in the order of the
+//!   CP: acceptance for the ACSE and MMS abstract syntaxes offered with the
+//!   BER transfer syntax (OID 2.1.1, encoded 0x51 0x01), provider-rejection
+//!   for any other abstract syntax or for a transfer-syntax list without BER.
+//!   [`IsoPresentation::accepts_acse_and_mms`] tells whether the connection
+//!   can go ahead.
 //! - mode-selector must be normal-mode: both the inner tag and the value are
 //!   checked.
-//! - transfer-syntax must be BER (OID 2.1.1, encoded 0x51 0x01).
 //!
 //! Robustness cases covered:
 //! - A PDU carrying an unknown tag with length 0 is parsed in bounded
@@ -76,17 +80,9 @@ pub enum PresentationError {
     #[error("normal-mode-parameters is missing user-data (0x61)")]
     MissingUserData,
 
-    /// A PCDL entry names an abstract-syntax OID that is neither ACSE nor MMS.
-    #[error("pcdl entry contains an unknown abstract-syntax oid")]
-    UnknownAbstractSyntax,
-
     /// A PCDL entry carries no context-id (tag 0x02).
     #[error("pcdl entry is missing a context-id")]
     MissingContextId,
-
-    /// transfer-syntax is not BER (OID 2.1.1, encoded 0x51 0x01).
-    #[error("transfer-syntax is not ber (expected 0x51 0x01)")]
-    InvalidTransferSyntax,
 
     /// A P-Selector longer than the 16-byte maximum.
     ///
@@ -161,6 +157,21 @@ pub const MMS_CONTEXT_ID: u8 = 3;
 
 /// Maximum P-Selector length in bytes.
 const PSELECTOR_MAX_SIZE: usize = 16;
+
+/// presentation-context-definition-result-list `[5]` of a CPA or CPR.
+const TAG_RESULT_LIST: u8 = 0xa5;
+
+/// Result `provider-rejection` of one context-definition result.
+const RESULT_PROVIDER_REJECTION: u8 = 2;
+
+/// provider-reason `[2]` IMPLICIT inside one context-definition result.
+const TAG_RESULT_PROVIDER_REASON: u8 = 0x82;
+
+/// Context-definition provider-reason `abstract-syntax-not-supported`.
+const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u8 = 1;
+
+/// Context-definition provider-reason `proposed-transfer-syntaxes-not-supported`.
+const REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED: u8 = 2;
 
 /// CPR-type normal-mode-parameters, a SEQUENCE.
 const CPR_TAG_NORMAL_MODE: u8 = 0x30;
@@ -250,6 +261,9 @@ pub struct IsoPresentation {
     /// until a parsed CP PDU replaces it with the identifier the initiator chose.
     /// Every PDV this layer encodes for MMS carries it.
     pub mms_context_id: u8,
+    /// The contexts of the most recently parsed CP, in its order, with the
+    /// answer each receives.
+    proposed_contexts: Vec<ProposedContext>,
 }
 
 impl IsoPresentation {
@@ -261,8 +275,44 @@ impl IsoPresentation {
             next_context_id: 0,
             acse_context_id: ACSE_CONTEXT_ID,
             mms_context_id: MMS_CONTEXT_ID,
+            proposed_contexts: Vec::new(),
         }
     }
+
+    /// Returns whether the most recently parsed CP proposed an ACSE context and
+    /// an MMS context that this layer accepts, the two an MMS association
+    /// needs. Before any CP is parsed it returns false.
+    pub fn accepts_acse_and_mms(&self) -> bool {
+        let accepted = |syntax| {
+            self.proposed_contexts
+                .iter()
+                .any(|c| c.syntax == syntax && c.outcome == ContextOutcome::Accepted)
+        };
+        accepted(AbstractSyntax::Acse) && accepted(AbstractSyntax::Mms)
+    }
+}
+
+/// The abstract syntax a proposed presentation context names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbstractSyntax {
+    Acse,
+    Mms,
+    Other,
+}
+
+/// The answer to one proposed presentation context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextOutcome {
+    Accepted,
+    AbstractSyntaxNotSupported,
+    TransferSyntaxesNotSupported,
+}
+
+/// One entry of the presentation-context-definition-list of a CP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProposedContext {
+    syntax: AbstractSyntax,
+    outcome: ContextOutcome,
 }
 
 impl Default for IsoPresentation {
@@ -590,10 +640,12 @@ fn encode_context_item(ctx_id: u8, oid: &[u8], out: &mut BytesMut) {
 
 /// Encodes a CPA (Connect Presentation Accept) PDU, tag 0x31, into `out`.
 ///
-/// The responding-P-Selector is the fixed value `[0x00, 0x00, 0x00, 0x01]`.
+/// The responding-P-Selector is the fixed value `[0x00, 0x00, 0x00, 0x01]`. The
+/// result list answers each context of the parsed CP in its order; without a
+/// parsed CP it accepts two contexts, ACSE and MMS.
 pub fn encode_cpa(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
-    // context-definition-result-list (0xa5) is a fixed 18 bytes: two 9-byte results
-    const RESULT_LIST_LEN: usize = 18;
+    let mut result_list = BytesMut::new();
+    encode_result_list(pres, &mut result_list);
 
     // user-data (0x61) lengths, computed as in encode_connect
     let user_data_payload_len = payload.len();
@@ -605,10 +657,9 @@ pub fn encode_cpa(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
     const RESP_SEL_LEN: usize = 6;
 
     // normal-mode-parameters (0xa2) content
-    // = responding-P-Selector(6) + result-list(2 + RESULT_LIST_LEN) + user-data
+    // = responding-P-Selector(6) + result-list + user-data
     let nmp_content_len = RESP_SEL_LEN
-        + 2
-        + RESULT_LIST_LEN
+        + result_list.len()
         + 1
         + ber_length_size(user_data_61_content)
         + user_data_61_content;
@@ -631,11 +682,7 @@ pub fn encode_cpa(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
     out.extend_from_slice(&CALLED_P_SEL);
 
     // context-definition-result-list
-    out.extend_from_slice(&[0xa5, RESULT_LIST_LEN as u8]);
-    // result for ACSE
-    encode_accept_ber(out);
-    // result for MMS
-    encode_accept_ber(out);
+    out.extend_from_slice(&result_list);
 
     // user-data (0x61)
     write_tl(0x61, user_data_61_content, out);
@@ -651,6 +698,9 @@ pub fn encode_cpa(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
 /// Encodes a CPR (Connect Presentation Reject) PPDU in the normal mode, a
 /// SEQUENCE with tag 0x30, into `out`.
 ///
+/// The result list answers each context of the parsed CP in its order, and is
+/// left out when no CP was parsed.
+///
 /// - `provider_reason`: `Some` when the presentation provider refuses the
 ///   connection, written as provider-reason `[10]`; `None` when the
 ///   presentation user refuses it, which is the user rejection an ACSE AARE
@@ -664,6 +714,9 @@ pub fn encode_cpr(
     out: &mut BytesMut,
 ) {
     let mut body = BytesMut::new();
+    if !pres.proposed_contexts.is_empty() {
+        encode_result_list(pres, &mut body);
+    }
     if let Some(reason) = provider_reason {
         body.extend_from_slice(&[CPR_TAG_PROVIDER_REASON, 0x01, reason]);
     }
@@ -672,6 +725,48 @@ pub fn encode_cpr(
     }
     write_tl(CPR_TAG_NORMAL_MODE, body.len(), out);
     out.extend_from_slice(&body);
+}
+
+/// Writes the presentation-context-definition-result-list `[5]`: one result
+/// per context of the parsed CP, or two acceptances when none was parsed.
+fn encode_result_list(pres: &IsoPresentation, out: &mut BytesMut) {
+    let mut list = BytesMut::new();
+    if pres.proposed_contexts.is_empty() {
+        encode_accept_ber(&mut list);
+        encode_accept_ber(&mut list);
+    }
+    for context in &pres.proposed_contexts {
+        match context.outcome {
+            ContextOutcome::Accepted => encode_accept_ber(&mut list),
+            ContextOutcome::AbstractSyntaxNotSupported => {
+                encode_provider_rejection(REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED, &mut list)
+            }
+            ContextOutcome::TransferSyntaxesNotSupported => {
+                encode_provider_rejection(REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED, &mut list)
+            }
+        }
+    }
+    write_tl(TAG_RESULT_LIST, list.len(), out);
+    out.extend_from_slice(&list);
+}
+
+/// Writes one context-definition result that rejects the context:
+/// ```text
+/// 0x30 0x06
+///   0x80 0x01 0x02         result = provider-rejection (2)
+///   0x82 0x01 <reason>     provider-reason
+/// ```
+fn encode_provider_rejection(reason: u8, out: &mut BytesMut) {
+    out.extend_from_slice(&[
+        TAG_SEQUENCE,
+        0x06,
+        CPR_TAG_RESULT,
+        0x01,
+        RESULT_PROVIDER_REJECTION,
+        TAG_RESULT_PROVIDER_REASON,
+        0x01,
+        reason,
+    ]);
 }
 
 /// Writes one 9-byte context-definition result that accepts BER:
@@ -740,7 +835,10 @@ pub fn encode_abort(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) 
 ///
 /// On success `pres.acse_context_id`, `pres.mms_context_id`, `pres.calling_p_sel`
 /// and `pres.called_p_sel` are updated, and the position of the ACSE AARQ payload
-/// inside `buf` is returned.
+/// inside `buf` is returned. The answer to each proposed context is recorded for
+/// `encode_cpa` and `encode_cpr`; a context this layer does not support does not
+/// fail the parse, so the caller checks
+/// [`IsoPresentation::accepts_acse_and_mms`] before accepting the connection.
 ///
 /// # Errors
 ///
@@ -1045,7 +1143,8 @@ fn parse_normal_mode_parameters(
 
 /// Parses the presentation-context-definition-list (PCDL).
 ///
-/// Updates `pres.acse_context_id` and `pres.mms_context_id`.
+/// Records the answer to each entry and updates `pres.acse_context_id` and
+/// `pres.mms_context_id` from the accepted ones.
 fn parse_pcdl(
     pres: &mut IsoPresentation,
     buf: &[u8],
@@ -1053,6 +1152,7 @@ fn parse_pcdl(
     end: usize,
 ) -> Result<(), PresentationError> {
     let mut pos = start;
+    pres.proposed_contexts.clear();
 
     while pos < end {
         let tag = read_byte(buf, &mut pos, end)?;
@@ -1073,8 +1173,12 @@ fn parse_pcdl(
 
 /// Parses a single PCDL entry, a SEQUENCE.
 ///
-/// Reads the context-id (tag 0x02) and the abstract-syntax OID (tag 0x06), and
-/// updates `pres.acse_context_id` or `pres.mms_context_id` accordingly.
+/// Reads the context-id (tag 0x02), the abstract-syntax OID (tag 0x06) and the
+/// transfer-syntax-name list (tag 0x30), and records the answer: acceptance for
+/// the ACSE or MMS abstract syntax offered with BER, which also binds
+/// `pres.acse_context_id` or `pres.mms_context_id` to the identifier, and
+/// provider-rejection otherwise. An entry without a transfer-syntax list is
+/// taken to offer BER.
 fn parse_pcdl_entry(
     pres: &mut IsoPresentation,
     buf: &[u8],
@@ -1083,6 +1187,8 @@ fn parse_pcdl_entry(
 ) -> Result<(), PresentationError> {
     let mut pos = start;
     let mut context_id: Option<u8> = None;
+    let mut syntax = AbstractSyntax::Other;
+    let mut ber_offered = true;
 
     while pos < end {
         let tag = read_byte(buf, &mut pos, end)?;
@@ -1103,38 +1209,58 @@ fn parse_pcdl_entry(
                 let oid = buf
                     .get(pos..elem_end)
                     .ok_or(PresentationError::TooShort { len: buf.len() })?;
-                let ctx = context_id.ok_or(PresentationError::MissingContextId)?;
-                if oid == ASN_ID_ACSE {
-                    pres.acse_context_id = ctx;
+                syntax = if oid == ASN_ID_ACSE {
+                    AbstractSyntax::Acse
                 } else if oid == ASN_ID_MMS {
-                    pres.mms_context_id = ctx;
+                    AbstractSyntax::Mms
                 } else {
-                    // An unknown abstract syntax is rejected rather than ignored.
-                    warn!("pcdl entry names an unknown abstract-syntax oid, rejecting connection");
-                    return Err(PresentationError::UnknownAbstractSyntax);
-                }
+                    AbstractSyntax::Other
+                };
             }
-            // A list shorter than the OID it would carry has nothing to check.
-            0x30 if len >= 4 => {
-                // transfer-syntax-name list: the list is not decoded item by item,
-                // the leading 06 02 51 01 BER OID is checked directly.
-                let inner = buf
-                    .get(pos..pos + 4)
-                    .ok_or(PresentationError::TooShort { len: buf.len() })?;
-                if inner[0] == 0x06 && inner[1] == 0x02 && inner[2..4] != BER_ID {
-                    warn!("pcdl entry transfer-syntax is not ber");
-                    return Err(PresentationError::InvalidTransferSyntax);
+            0x30 => {
+                // transfer-syntax-name list, a SEQUENCE OF OBJECT IDENTIFIER
+                ber_offered = false;
+                let mut inner = pos;
+                while inner < elem_end {
+                    let item_tag = read_byte(buf, &mut inner, elem_end)?;
+                    let item_len = read_ber_length(buf, &mut inner, elem_end)?;
+                    if item_tag == 0x06 && buf[inner..inner + item_len] == BER_ID {
+                        ber_offered = true;
+                    }
+                    inner += item_len;
                 }
             }
             _ => {
-                // an unknown tag, and a transfer-syntax list too short to check,
-                // are both skipped
+                // an unknown tag is skipped
             }
         }
 
         pos = elem_end;
     }
 
+    let id = context_id.ok_or(PresentationError::MissingContextId)?;
+    let outcome = if syntax == AbstractSyntax::Other {
+        warn!(
+            context_id = id,
+            "pcdl entry names an abstract syntax other than acse and mms, rejecting the context"
+        );
+        ContextOutcome::AbstractSyntaxNotSupported
+    } else if !ber_offered {
+        warn!(
+            context_id = id,
+            "pcdl entry offers no ber transfer syntax, rejecting the context"
+        );
+        ContextOutcome::TransferSyntaxesNotSupported
+    } else {
+        match syntax {
+            AbstractSyntax::Acse => pres.acse_context_id = id,
+            AbstractSyntax::Mms => pres.mms_context_id = id,
+            AbstractSyntax::Other => {}
+        }
+        ContextOutcome::Accepted
+    };
+    pres.proposed_contexts
+        .push(ProposedContext { syntax, outcome });
     Ok(())
 }
 
@@ -1219,7 +1345,6 @@ fn parse_fully_encoded_data_inner(
 /// - `UserDataTooShort` when `buf` is shorter than 9 bytes.
 /// - `WrongTag` when the first tag is not 0x61.
 /// - `MissingAbstractSyntaxName` when the context-id is absent.
-/// - `InvalidTransferSyntax` when transfer-syntax is not BER.
 /// - `LengthOverflow` for a BER length that runs past the buffer.
 pub fn parse_user_data(
     pres: &mut IsoPresentation,
@@ -1734,6 +1859,124 @@ mod tests {
             found,
             "cpa must contain 0xa5 0x12 context-definition-result-list"
         );
+    }
+
+    // per-context results
+
+    /// One PCDL entry: context-id, abstract-syntax OID and transfer-syntax OIDs.
+    type Item<'a> = (u8, &'a [u8], &'a [&'a [u8]]);
+
+    /// Builds a CP whose PCDL holds `items`, with a two-byte payload on context 1.
+    fn cp_with_items(items: &[Item]) -> Vec<u8> {
+        let mut pcdl = BytesMut::new();
+        for (id, oid, transfer) in items {
+            let mut ts = BytesMut::new();
+            for t in *transfer {
+                write_tl(0x06, t.len(), &mut ts);
+                ts.extend_from_slice(t);
+            }
+            let mut item = BytesMut::new();
+            item.extend_from_slice(&[0x02, 0x01, *id]);
+            write_tl(0x06, oid.len(), &mut item);
+            item.extend_from_slice(oid);
+            write_tl(0x30, ts.len(), &mut item);
+            item.extend_from_slice(&ts);
+            write_tl(0x30, item.len(), &mut pcdl);
+            pcdl.extend_from_slice(&item);
+        }
+        let mut nmp = BytesMut::new();
+        nmp.extend_from_slice(&[0x81, 0x00, 0x82, 0x00]);
+        write_tl(0xa4, pcdl.len(), &mut nmp);
+        nmp.extend_from_slice(&pcdl);
+        encode_user_data_with_ctx(1, &[0x60, 0x00], &mut nmp);
+        let mut cp = BytesMut::new();
+        write_tl(
+            0x31,
+            5 + 1 + ber_length_size(nmp.len()) + nmp.len(),
+            &mut cp,
+        );
+        cp.extend_from_slice(&[0xa0, 0x03, 0x80, 0x01, 0x01]);
+        write_tl(0xa2, nmp.len(), &mut cp);
+        cp.extend_from_slice(&nmp);
+        cp.to_vec()
+    }
+
+    /// Returns the result-list field of an encoded CPA.
+    fn cpa_result_list(pres: &IsoPresentation) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        encode_cpa(pres, b"", &mut out);
+        let at = out.iter().position(|&b| b == TAG_RESULT_LIST).unwrap();
+        out[at..at + 2 + out[at + 1] as usize].to_vec()
+    }
+
+    const ACCEPT: [u8; 9] = [0x30, 0x07, 0x80, 0x01, 0x00, 0x81, 0x02, 0x51, 0x01];
+    const UNKNOWN_OID: [u8; 3] = [0x2b, 0x06, 0x01];
+
+    #[test]
+    fn unknown_abstract_syntax_is_rejected_in_its_result_only() {
+        let cp = cp_with_items(&[
+            (5, &UNKNOWN_OID, &[&BER_ID]),
+            (9, &ASN_ID_ACSE, &[&BER_ID]),
+            (7, &ASN_ID_MMS, &[&BER_ID]),
+        ]);
+        let mut pres = default_pres();
+        let result = parse_connect(&mut pres, &cp).expect("the CP parses");
+        assert_eq!(result.payload(&cp), &[0x60, 0x00]);
+        assert!(pres.accepts_acse_and_mms());
+        assert_eq!((pres.acse_context_id, pres.mms_context_id), (9, 7));
+
+        let mut expected = vec![0xa5, 0x1a, 0x30, 0x06, 0x80, 0x01, 0x02, 0x82, 0x01, 0x01];
+        expected.extend_from_slice(&ACCEPT);
+        expected.extend_from_slice(&ACCEPT);
+        assert_eq!(cpa_result_list(&pres), expected);
+    }
+
+    #[test]
+    fn context_without_ber_is_rejected_for_its_transfer_syntaxes() {
+        let cp = cp_with_items(&[
+            (1, &ASN_ID_ACSE, &[&BER_ID]),
+            (3, &ASN_ID_MMS, &[&[0x51, 0x02]]),
+        ]);
+        let mut pres = default_pres();
+        parse_connect(&mut pres, &cp).expect("the CP parses");
+        assert!(!pres.accepts_acse_and_mms());
+
+        let mut expected = vec![0xa5, 0x11];
+        expected.extend_from_slice(&ACCEPT);
+        expected.extend_from_slice(&[0x30, 0x06, 0x80, 0x01, 0x02, 0x82, 0x01, 0x02]);
+        assert_eq!(cpa_result_list(&pres), expected);
+    }
+
+    #[test]
+    fn ber_offered_after_another_transfer_syntax_is_accepted() {
+        let cp = cp_with_items(&[
+            (1, &ASN_ID_ACSE, &[&BER_ID]),
+            (3, &ASN_ID_MMS, &[&[0x51, 0x02], &BER_ID]),
+        ]);
+        let mut pres = default_pres();
+        parse_connect(&mut pres, &cp).expect("the CP parses");
+        assert!(pres.accepts_acse_and_mms());
+    }
+
+    #[test]
+    fn cp_without_an_mms_context_is_not_acceptable() {
+        let cp = cp_with_items(&[(1, &ASN_ID_ACSE, &[&BER_ID])]);
+        let mut pres = default_pres();
+        parse_connect(&mut pres, &cp).expect("the CP parses");
+        assert!(!pres.accepts_acse_and_mms());
+        assert!(!default_pres().accepts_acse_and_mms());
+    }
+
+    #[test]
+    fn cpr_after_a_parsed_cp_carries_the_result_list() {
+        let cp = cp_with_items(&[(1, &ASN_ID_ACSE, &[&BER_ID]), (3, &UNKNOWN_OID, &[&BER_ID])]);
+        let mut pres = default_pres();
+        parse_connect(&mut pres, &cp).expect("the CP parses");
+        let mut out = BytesMut::new();
+        encode_cpr(&pres, Some(0), None, &mut out);
+        let reject = parse_reject(&out).unwrap();
+        assert_eq!(reject.context_result_list, vec![0, 2]);
+        assert_eq!(reject.provider_reason, Some(0));
     }
 
     // CPR encoding
