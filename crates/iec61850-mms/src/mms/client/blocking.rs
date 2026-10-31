@@ -22,7 +22,9 @@
 
 use super::error::ClientError;
 use super::{ConnectionState, MmsClient, MmsClientBuilder, MmsValue};
-use crate::mms::pdu::{GetNamedVariableListAttributesResponse, ObjectClass, TypeSpecification};
+use crate::mms::pdu::{
+    GetNamedVariableListAttributesResponse, IdentifyResponse, ObjectClass, TypeSpecification,
+};
 
 /// Synchronous wrapper over [`MmsClient`], owning a private current-thread runtime.
 pub struct BlockingMmsClient {
@@ -104,6 +106,11 @@ impl BlockingMmsClient {
     /// Writes one MMS variable.
     pub fn write(&mut self, domain: &str, item: &str, value: MmsValue) -> Result<(), ClientError> {
         self.rt.block_on(self.inner.write(domain, item, value))
+    }
+
+    /// Asks the server to identify itself with the MMS Identify service.
+    pub fn identify(&mut self) -> Result<IdentifyResponse, ClientError> {
+        self.rt.block_on(self.inner.identify())
     }
 
     /// Retrieves a list of object names.

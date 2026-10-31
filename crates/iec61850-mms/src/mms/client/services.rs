@@ -1,5 +1,5 @@
-//! MMS confirmed services: Read, Write, GetNameList, GetVariableAccessAttributes
-//! and the named variable list services.
+//! MMS confirmed services: Read, Write, GetNameList, GetVariableAccessAttributes,
+//! Identify and the named variable list services.
 //!
 //! Every service function follows the same shape:
 //! 1. Take a fresh invokeID from the allocator.
@@ -42,18 +42,19 @@ use crate::mms::pdu::{
     decode_confirmed_delete_named_variable_list_response, decode_confirmed_error_inner,
     decode_confirmed_get_name_list_response,
     decode_confirmed_get_named_variable_list_attrs_response,
-    decode_confirmed_get_var_access_attrs_response, decode_confirmed_read_journal_response,
-    decode_confirmed_read_response, decode_confirmed_write_response,
-    encode_confirmed_define_named_variable_list_request,
+    decode_confirmed_get_var_access_attrs_response, decode_confirmed_identify_response,
+    decode_confirmed_read_journal_response, decode_confirmed_read_response,
+    decode_confirmed_write_response, encode_confirmed_define_named_variable_list_request,
     encode_confirmed_delete_named_variable_list_request, encode_confirmed_get_name_list_request,
     encode_confirmed_get_named_variable_list_attrs_request,
-    encode_confirmed_get_var_access_attrs_request, encode_confirmed_read_journal_request,
-    encode_confirmed_read_request, encode_confirmed_write_request, AccessResult, AlternateAccess,
-    DefineNamedVariableEntry, DefineNamedVariableListRequest, DeleteNamedVariableListRequest,
-    GetNameListRequest, GetNamedVariableListAttributesRequest,
-    GetNamedVariableListAttributesResponse, GetVariableAccessAttributesRequest,
-    ListOfVariableEntry, MmsData, MmsPdu, ObjectClass, ObjectName, ObjectScope, ReadJournalRequest,
-    ReadJournalResponse, ReadRequest, TypeSpecification, VariableAccessSpecification, WriteRequest,
+    encode_confirmed_get_var_access_attrs_request, encode_confirmed_identify_request,
+    encode_confirmed_read_journal_request, encode_confirmed_read_request,
+    encode_confirmed_write_request, AccessResult, AlternateAccess, DefineNamedVariableEntry,
+    DefineNamedVariableListRequest, DeleteNamedVariableListRequest, GetNameListRequest,
+    GetNamedVariableListAttributesRequest, GetNamedVariableListAttributesResponse,
+    GetVariableAccessAttributesRequest, IdentifyResponse, ListOfVariableEntry, MmsData, MmsPdu,
+    ObjectClass, ObjectName, ObjectScope, ReadJournalRequest, ReadJournalResponse, ReadRequest,
+    TypeSpecification, VariableAccessSpecification, WriteRequest,
 };
 use bytes::{Bytes, BytesMut};
 use iec61850_hal::time::Timer;
@@ -616,6 +617,48 @@ fn dispatch_get_named_variable_list_attrs_response(
     }
 }
 
+/// Asks the server to identify itself: vendor, model and revision, and
+/// optionally the abstract syntaxes it supports.
+///
+/// A confirmed error becomes `ClientError::ServiceError` and a reject
+/// `ClientError::RejectError`, which is how a server without the service
+/// answers.
+pub async fn identify<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    alloc: &mut InvokeIdAllocator,
+) -> Result<IdentifyResponse, ClientError> {
+    let invoke_id = alloc.allocate()?;
+
+    let mut full = BytesMut::new();
+    encode_confirmed_identify_request(invoke_id, &mut full);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
+    dispatch_identify_response(resp_pdu)
+}
+
+fn dispatch_identify_response(pdu: MmsPdu) -> Result<IdentifyResponse, ClientError> {
+    match pdu {
+        MmsPdu::ConfirmedResponse(inner) => {
+            let full = rewrap_response(0xa1, &inner);
+            let (_id, resp) = decode_confirmed_identify_response(&full).map_err(|e| {
+                warn!("identify response failed to decode: {e}");
+                ClientError::PduParse(format!("{e}"))
+            })?;
+            Ok(resp)
+        }
+        MmsPdu::ConfirmedError(inner) => Err(handle_confirmed_error(&inner)),
+        MmsPdu::Reject(reject) => {
+            warn!("identify received a reject pdu: {:?}", reject.reason);
+            Err(ClientError::RejectError {
+                reason: reject.reason,
+            })
+        }
+        other => Err(ClientError::PduParse(format!(
+            "unexpected PDU tag=0x{:02X}",
+            other.tag_byte()
+        ))),
+    }
+}
+
 fn dispatch_define_named_variable_list_response(pdu: MmsPdu) -> Result<(), ClientError> {
     match pdu {
         MmsPdu::ConfirmedResponse(inner) => {
@@ -915,6 +958,71 @@ mod tests {
     #[test]
     fn short_access_result_list_is_rejected() {
         let err = check_access_result_count(results(2), 3).expect_err("count is short");
+        assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
+    }
+
+    /// The content of a confirmed response PDU, outer `0xa1 <len>` removed.
+    fn response_content(full: &[u8]) -> Bytes {
+        assert!(full[1] < 0x80, "test PDUs use the short length form");
+        Bytes::copy_from_slice(&full[2..])
+    }
+
+    #[test]
+    fn identify_response_yields_the_three_strings() {
+        let mut full = BytesMut::new();
+        crate::mms::pdu::encode_confirmed_identify_response(
+            3,
+            &IdentifyResponse::new("vendor", "model", "1.0"),
+            &mut full,
+        );
+        let pdu = MmsPdu::ConfirmedResponse(response_content(&full));
+        let resp = dispatch_identify_response(pdu).expect("a well-formed response");
+        assert_eq!(resp.vendor_name, "vendor");
+        assert_eq!(resp.model_name, "model");
+        assert_eq!(resp.revision, "1.0");
+        assert!(resp.list_of_abstract_syntaxes.is_empty());
+    }
+
+    #[test]
+    fn identify_confirmed_error_becomes_service_error() {
+        use crate::mms::pdu::{encode_confirmed_error_pdu, ErrorClass, ServiceError};
+        let mut full = BytesMut::new();
+        encode_confirmed_error_pdu(3, &ServiceError::new(ErrorClass::Service(1)), &mut full);
+        let pdu = MmsPdu::ConfirmedError(response_content(&full));
+        let err = dispatch_identify_response(pdu).expect_err("a confirmed error");
+        assert!(
+            matches!(
+                err,
+                ClientError::ServiceError {
+                    error_class: ErrorClass::Service(1)
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn identify_reject_becomes_reject_error() {
+        use crate::mms::pdu::{ConfirmedRequestRejectReason, RejectPdu, RejectReason};
+        let reason =
+            RejectReason::ConfirmedRequest(ConfirmedRequestRejectReason::UnrecognizedService);
+        let pdu = MmsPdu::Reject(RejectPdu {
+            invoke_id: Some(3),
+            reason: reason.clone(),
+        });
+        let err = dispatch_identify_response(pdu).expect_err("a reject");
+        assert!(
+            matches!(&err, ClientError::RejectError { reason: r } if *r == reason),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn identify_response_of_another_service_is_a_parse_error() {
+        // a GetNameList response body under the identify invokeID
+        let content = Bytes::from_static(&[0x02, 0x01, 0x03, 0xa1, 0x03, 0xa0, 0x01, 0x00]);
+        let err = dispatch_identify_response(MmsPdu::ConfirmedResponse(content))
+            .expect_err("not an identify response");
         assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
     }
 

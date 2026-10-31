@@ -484,6 +484,16 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
         .await
     }
 
+    /// Asks the server to identify itself with the MMS Identify service.
+    ///
+    /// The response carries the vendor name, model name and revision, and the
+    /// abstract syntaxes the server lists, if any. A server that does not offer
+    /// the service answers with a reject, which becomes
+    /// `ClientError::RejectError`.
+    pub async fn identify(&mut self) -> Result<crate::mms::pdu::IdentifyResponse, ClientError> {
+        services::identify(&mut self.conn, &mut self.alloc).await
+    }
+
     /// Retrieves a list of object names.
     ///
     /// `object_class` selects the class to enumerate, such as `ObjectClass::NamedVariable`.
