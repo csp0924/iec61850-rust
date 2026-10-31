@@ -37,6 +37,11 @@
 //! A read of a logical node or a functional-constraint group asks the handlers
 //! of every data object in it the same way. A refused read carries the error
 //! and no part of the value.
+//!
+//! A value a handler supplies must have the shape of its node: one member per
+//! node beneath it, in model order, down to the leaves, else the read answers
+//! type-inconsistent; a bit string that does not fit its declared size answers
+//! object-value-invalid. The value is charged to the PDU budget as it is sent.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -265,7 +270,7 @@ impl ReadHandlerScope {
                 }
                 ReadOutcome::CacheHit(value) => {
                     let part = select_below(*ancestor, fc, &steps[depth..], value)
-                        .and_then(|part| handler_value(target, item_id, part));
+                        .and_then(|part| handler_value(target, fc, item_id, part));
                     return Some(part);
                 }
             }
@@ -283,7 +288,7 @@ impl ReadHandlerScope {
         value: MmsData,
     ) -> Result<MmsData, DataAccessError> {
         match self.consult(path, fc) {
-            Some(ReadOutcome::CacheHit(v)) => return handler_value(node, path, v),
+            Some(ReadOutcome::CacheHit(v)) => return handler_value(node, fc, path, v),
             Some(ReadOutcome::Error(e)) => {
                 tracing::warn!(path, ?e, "read: a read handler refused the read");
                 return Err(e);
@@ -309,7 +314,7 @@ impl ReadHandlerScope {
 
 /// Selects, in `value`, the value of `node`, the part the node `steps` names
 /// below `node` occupies. A value of another shape than the model is
-/// object-value-invalid.
+/// type-inconsistent.
 fn select_below(
     mut node: Node<'_>,
     fc: FC,
@@ -322,10 +327,10 @@ fn select_below(
             .enumerate()
             .find(|(_, child)| child.name() == *step);
         let (Some((index, child)), MmsValue::Structure(mut members)) = (found, value) else {
-            return Err(DataAccessError::ObjectValueInvalid);
+            return Err(DataAccessError::TypeInconsistent);
         };
         if index >= members.len() {
-            return Err(DataAccessError::ObjectValueInvalid);
+            return Err(DataAccessError::TypeInconsistent);
         }
         value = members.swap_remove(index);
         node = child;
@@ -333,22 +338,54 @@ fn select_below(
     Ok(value)
 }
 
-/// Turns a value a read handler supplies for `node` into wire data. A bit
-/// string that does not fit the declared size of a bit-string attribute is not
-/// sent; the read answers object-value-invalid.
-fn handler_value(node: Node<'_>, path: &str, value: MmsValue) -> Result<MmsData, DataAccessError> {
-    if let (Node::Attribute(da), MmsValue::BitString { padding, data }) = (node, &value) {
-        if let Some(size) = declared_bit_string_size(da.ty) {
-            if !bit_string_fits(size, data.len(), *padding) {
-                tracing::warn!(
-                    path,
-                    "read: the read handler returned a bit string that does not fit the data attribute, answering object-value-invalid"
-                );
-                return Err(DataAccessError::ObjectValueInvalid);
-            }
-        }
+/// Turns a value a read handler supplies for `node` under `fc` into wire data,
+/// once it has the shape of the node: a structure with one member per node
+/// beneath it, in model order, down to the leaves, else type-inconsistent. A
+/// bit string that does not fit the declared size of a bit-string attribute is
+/// not sent either; the read answers object-value-invalid.
+fn handler_value(
+    node: Node<'_>,
+    fc: FC,
+    path: &str,
+    value: MmsValue,
+) -> Result<MmsData, DataAccessError> {
+    if let Err(e) = check_handler_shape(node, fc, &value) {
+        tracing::warn!(
+            path,
+            ?e,
+            "read: the read handler returned a value that does not fit the node"
+        );
+        return Err(e);
     }
     Ok(mms_value_to_mms_data(&value))
+}
+
+/// Checks a handler value against the shape of `node` under `fc`.
+fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), DataAccessError> {
+    if node.is_leaf() {
+        if let (Node::Attribute(da), MmsValue::BitString { padding, data }) = (node, value) {
+            if let Some(size) = declared_bit_string_size(da.ty) {
+                if !bit_string_fits(size, data.len(), *padding) {
+                    return Err(DataAccessError::ObjectValueInvalid);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let MmsValue::Structure(members) = value else {
+        return Err(DataAccessError::TypeInconsistent);
+    };
+    let mut children = node.children(fc);
+    for member in members {
+        let Some(child) = children.next() else {
+            return Err(DataAccessError::TypeInconsistent);
+        };
+        check_handler_shape(child, fc, member)?;
+    }
+    if children.next().is_some() {
+        return Err(DataAccessError::TypeInconsistent);
+    }
+    Ok(())
 }
 
 /// Passes `baseline`, the model value of the data attribute or data object
@@ -478,6 +515,20 @@ impl BudgetGuard {
         }
     }
 
+    /// Charges `actual` bytes for a value whose first form was charged as
+    /// `charged` bytes: the difference is deducted, or given back when the
+    /// value shrank. Returns false, latching `exceeded`, when it no longer
+    /// fits.
+    fn recharge(&mut self, charged: usize, actual: usize) -> bool {
+        if actual >= charged {
+            return self.consume(actual - charged);
+        }
+        if let Some(r) = self.remaining.as_mut() {
+            *r += charged - actual;
+        }
+        true
+    }
+
     fn is_over(&self) -> bool {
         self.exceeded
     }
@@ -591,9 +642,13 @@ fn expand_ln_for_fc(
         if let Some(group_path) = &group_path {
             let do_path = format!("{group_path}${}", d.name);
             if scope.reaches(&do_path) {
+                let charged = do_struct.estimated_encoded_size();
                 do_struct = scope
                     .apply(Node::Object(d), fc, &do_path, do_struct)
                     .map_err(Halt::Refused)?;
+                if !budget.recharge(charged, do_struct.estimated_encoded_size()) {
+                    return Err(Halt::OverBudget);
+                }
             }
         }
         do_groups.push(do_struct);
@@ -748,7 +803,11 @@ fn lookup_domain_specific_value(
     // ── Three segments: one data object, sub-objects included ───────
     if parts.len() == 3 {
         return match expand_do_for_fc(do_node, target_fc, budget) {
-            Ok(Some(st)) => handled(scope.apply(Node::Object(do_node), target_fc, item_id, st)),
+            Ok(Some(st)) => {
+                let charged = st.estimated_encoded_size();
+                let decided = scope.apply(Node::Object(do_node), target_fc, item_id, st);
+                charged_verdict(decided, charged, budget)
+            }
             Ok(None) => {
                 tracing::warn!(
                     domain = domain,
@@ -828,10 +887,13 @@ fn lookup_domain_specific_value(
             }
             let target = Node::Object(current_do);
             if let Some(decided) = scope.decide_from_above(target_fc, item_id, &ancestors, target) {
-                return handled(decided);
+                return charged_verdict(decided, 0, budget);
             }
             return match expand_do_for_fc(current_do, target_fc, budget) {
-                Ok(Some(st)) => handled(scope.apply(target, target_fc, item_id, st)),
+                Ok(Some(st)) => {
+                    let charged = st.estimated_encoded_size();
+                    charged_verdict(scope.apply(target, target_fc, item_id, st), charged, budget)
+                }
                 Ok(None) => {
                     tracing::warn!(
                         domain = domain,
@@ -899,12 +961,23 @@ fn lookup_domain_specific_value(
     LookupResult::Result(access)
 }
 
-/// Turns the verdict of the read handlers into a lookup result.
-fn handled(decided: Result<MmsData, DataAccessError>) -> LookupResult {
-    LookupResult::Result(match decided {
-        Ok(data) => AccessResult::Success(data),
-        Err(e) => AccessResult::Failure(e),
-    })
+/// Turns the verdict of the read handlers into a lookup result, charging the
+/// decided value to the budget in place of the `charged` bytes its model
+/// value already cost.
+fn charged_verdict(
+    decided: Result<MmsData, DataAccessError>,
+    charged: usize,
+    budget: &mut BudgetGuard,
+) -> LookupResult {
+    match decided {
+        Ok(data) => {
+            if !budget.recharge(charged, data.estimated_encoded_size()) {
+                return LookupResult::OverBudget;
+            }
+            LookupResult::Result(AccessResult::Success(data))
+        }
+        Err(e) => LookupResult::Result(AccessResult::Failure(e)),
+    }
 }
 
 /// The members a group of a logical node holds ahead of its data objects, such
@@ -2258,10 +2331,11 @@ mod tests {
         assert_eq!(asked(&below), 0);
     }
 
-    /// A value from a handler above the target that does not follow the model,
-    /// or that holds a bit string too long for the target, is not sent.
+    /// A value from a handler above the target that does not follow the model
+    /// is type-inconsistent, and one that holds a bit string too long for the
+    /// target object-value-invalid; neither is sent.
     #[test]
-    fn misshapen_value_from_above_is_object_value_invalid() {
+    fn misshapen_value_from_above_is_not_sent() {
         let model = build_handler_model();
         let registry = HandlerRegistry::new();
         registry
@@ -2276,12 +2350,82 @@ mod tests {
                 ]))),
             )
             .unwrap();
-        for item_id in ["MMXU1$MX$A$phsA$cVal$mag", "MMXU1$MX$A$phsA$q"] {
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A$phsA$cVal$mag"),
+            AccessResult::Failure(DataAccessError::TypeInconsistent)
+        );
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A$phsA$q"),
+            AccessResult::Failure(DataAccessError::ObjectValueInvalid)
+        );
+    }
+
+    /// A value from a handler on a data object or a constructed attribute, or
+    /// below the target, that does not follow the model is type-inconsistent,
+    /// whichever read asks for it.
+    #[test]
+    fn misshapen_value_on_a_node_above_leaves_is_type_inconsistent() {
+        let model = build_handler_model();
+        let cases = [
+            ("MMXU1$MX$A$phsA$cVal", MmsValue::Float32(1.0)),
+            ("MMXU1$MX$A$phsA$cVal", MmsValue::Structure(Vec::new())),
+            (
+                "MMXU1$MX$A$phsA",
+                MmsValue::Structure(vec![MmsValue::Structure(vec![MmsValue::Float32(1.0)])]),
+            ),
+        ];
+        for (installed_on, value) in cases {
+            let registry = HandlerRegistry::new();
+            registry
+                .install_read_handler(installed_on, fixed(ReadOutcome::CacheHit(value.clone())))
+                .unwrap();
+            for item_id in [installed_on, "MMXU1$MX$A", "MMXU1"] {
+                assert_eq!(
+                    read_through(&model, &registry, item_id),
+                    AccessResult::Failure(DataAccessError::TypeInconsistent),
+                    "{installed_on} = {value:?}, read {item_id}"
+                );
+            }
+        }
+    }
+
+    /// A value a handler supplies below a sub-data-object, a data object or a
+    /// functional-constraint group is charged to the budget as it is sent, not
+    /// as the model value it replaces.
+    #[test]
+    fn handler_value_is_charged_to_the_budget() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_read_handler(
+                "MMXU1$MX$A$phsA$cVal",
+                fixed(ReadOutcome::CacheHit(MmsValue::Structure(vec![
+                    MmsValue::Float64(1.0),
+                ]))),
+            )
+            .unwrap();
+        for item_id in ["MMXU1$MX$A$phsA", "MMXU1$MX$A", "MMXU1$MX"] {
+            let name = ObjectName::DomainSpecific {
+                domain_id: "IED1LD0".to_string(),
+                item_id: item_id.to_string(),
+            };
+            let LookupResult::Result(AccessResult::Success(model_value)) =
+                read_with_handlers(&model, &name, None, None, None)
+            else {
+                panic!("a model value for {item_id}");
+            };
+            // A 64-bit float takes four more octets than the 32-bit one it
+            // replaces, so the exact budget of the model value is too small.
+            let exact = model_value.estimated_encoded_size();
             assert_eq!(
-                read_through(&model, &registry, item_id),
-                AccessResult::Failure(DataAccessError::ObjectValueInvalid),
+                read_with_handlers(&model, &name, None, Some(exact), Some((&registry, 7))),
+                LookupResult::OverBudget,
                 "{item_id}"
             );
+            assert!(matches!(
+                read_with_handlers(&model, &name, None, Some(exact + 4), Some((&registry, 7))),
+                LookupResult::Result(AccessResult::Success(_))
+            ));
         }
     }
 
