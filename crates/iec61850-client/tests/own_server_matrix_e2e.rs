@@ -42,7 +42,7 @@ fn long_text(tag: &str) -> String {
     format!("{tag}-{}", "0123456789".repeat(9))
 }
 
-/// The model: LLN0 with four data sets, report control blocks of both kinds
+/// The model: LLN0 with three data sets, report control blocks of both kinds
 /// (one indexed with two instances), a GOOSE control block, a log control
 /// block and two setting groups; GGIO1 with status points, five controllable
 /// points, a writable structure, a measured value and an array; LPHD1 and
@@ -428,7 +428,7 @@ async fn every_service_runs_on_one_server() {
         goose_control_block(&conn).await;
         log_and_journal(&server, &model, &conn).await;
         setting_groups(&conn).await;
-        release_abort_and_refusal(&handle, &conn).await;
+        release_abort_and_refusal(&server, &handle, &conn).await;
 
         handle.stop().await;
     })
@@ -654,7 +654,17 @@ async fn data_sets(conn: &IedConnection) {
         AccessResult::Success(iec61850_mms::MmsData::Integer(7))
     );
     assert_eq!(conn.delete_data_set(&dynamic).await, Ok(true));
-    assert!(conn.delete_data_set(&format!("{LD}/LLN0.dsStatus")).await != Ok(true));
+    assert_eq!(
+        conn.delete_data_set(&format!("{LD}/LLN0.dsStatus")).await,
+        Ok(false),
+        "a configured data set is not deleted"
+    );
+    assert_eq!(
+        conn.get_logical_node_directory(&format!("{LD}/LLN0"), AcsiClass::DataSet)
+            .await
+            .map(|names| names.contains(&"dsStatus".to_string())),
+        Ok(true)
+    );
 }
 
 fn operator() -> OriginValue {
@@ -781,10 +791,12 @@ async fn reports(server: &IedServer, model: &IedModel, conn: &IedConnection) {
 
     let mut purge = RcbHandle::new(&brcb).unwrap();
     purge.set_purge_buf(true);
-    assert!(
+    assert_eq!(
         conn.set_rcb_values(&purge, RcbWriteMask::PURGE_BUF, false)
-            .await
-            .is_err(),
+            .await,
+        Err(ClientError::DataAccessError(
+            DataAccessError::TemporarilyUnavailable
+        )),
         "PurgeBuf is refused while the BRCB is enabled"
     );
 
@@ -980,9 +992,14 @@ async fn setting_groups(conn: &IedConnection) {
 }
 
 /// With the connection limit at three, a third association is accepted and a
-/// fourth refused; the third is released, another aborted, and the first
-/// still answers.
-async fn release_abort_and_refusal(handle: &ServerHandle, conn: &IedConnection) {
+/// fourth refused; the third is released and the second aborted, after which
+/// the server holds the first alone, which still answers, and accepts a new
+/// association in a freed slot.
+async fn release_abort_and_refusal(
+    server: &IedServer,
+    handle: &ServerHandle,
+    conn: &IedConnection,
+) {
     let second = connect(handle, None).await;
     let third = connect(handle, None).await;
     let fourth = IedConnection::with_mms_client(
@@ -1001,9 +1018,20 @@ async fn release_abort_and_refusal(handle: &ServerHandle, conn: &IedConnection) 
     third.disconnect().await.expect("release");
     second.abort().await.expect("abort");
     assert!(!second.is_connected() && !third.is_connected());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.connection_count() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the server still holds {} associations",
+            server.connection_count()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     conn.get_server_status(false)
         .await
         .expect("the first association still answers");
+    let next = connect(handle, None).await;
+    next.disconnect().await.expect("release");
     conn.disconnect().await.expect("release");
 }
 
