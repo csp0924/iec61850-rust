@@ -37,7 +37,10 @@ buffer, never loop without bound, and never leave partial state behind.
 | A Read or Write request whose `alternateAccess` nests `selectAlternateAccess` without bound | `NestingLevelExceeded` before the next level is read, at the local limit of 32, or at the negotiated depth when the request is decoded with `decode_with_negotiated_cap` and that depth is smaller, so the stack cannot be exhausted | `alt_access_depth_bomb_rejected`, `alt_access_chain_one_past_depth_cap_rejected`, `alt_access_negotiated_cap_clamps_chain_depth` in `crates/iec61850-mms/src/mms/pdu/common.rs`; `read_request_negotiated_cap_bounds_alternate_access` in `crates/iec61850-mms/src/mms/pdu/read.rs`; `write_request_negotiated_cap_bounds_alternate_access` in `crates/iec61850-mms/src/mms/pdu/write.rs`; `read_request_alternate_access_depth_bomb_err` in `crates/iec61850-mms/tests/mms_read_roundtrip.rs` |
 | The indefinite BER length form inside an MMS PDU, including on a response tag | An error, not an unbounded scan | `indefinite_length_returns_err`, `indefinite_length_response_tag_returns_err` in `crates/iec61850-mms/tests/mms_pdu_core_roundtrip.rs` |
 | A Confirmed-RequestPDU arriving before the Initiate exchange completes, such as one carried in the AARQ user information in place of the Initiate-RequestPDU | Reject(pdu-error/invalid-pdu); the request never reaches the service dispatcher | `confirmed_request_before_initiate_rejected` in `crates/iec61850-mms/src/mms/server/dispatch.rs` |
-| An encoded PDU larger than the size negotiated for the association | `PduTooLarge`: the PDU is refused, never truncated | **Not pinned** — see [Cases with a gap](#cases-with-a-gap) |
+| An encoded PDU larger than the size negotiated for the association | `PduTooLarge`: the PDU is refused, never truncated; a PDU of exactly the negotiated size is sent | `pdu_at_the_negotiated_size_is_sent_and_one_above_is_refused` in `crates/iec61850-client/tests/mms_association_e2e.rs` |
+| A confirmed answer under an invokeID that matches no outstanding request, including the late answer to a request that timed out | Discarded with a warning; the request it does not belong to keeps waiting for its own answer, and the identifiers given up on are bounded at 64, the oldest forgotten first | `answer_under_another_invoke_id_is_discarded`, `unanswered_request_times_out_and_leaves_the_association_usable` in `crates/iec61850-mms/tests/mms_client_wire_e2e.rs`; `abandoned_invoke_ids_are_bounded_and_the_oldest_is_forgotten` in `crates/iec61850-mms/src/mms/client/connection.rs` |
+| Unconfirmed PDUs arriving faster than the application reads them while confirmed calls are in flight | Held up to `max_pending_unconfirmed`, 1024 by default; the oldest is dropped with a warning | `pending_unconfirmed_pdus_are_bounded` in `crates/iec61850-mms/tests/mms_client_wire_e2e.rs` |
+| An Unconfirmed PDU with no content (`a3 00`), which lacks the mandatory unconfirmedService | Discarded with a warning; it is neither stashed nor handed to the caller | `unconfirmed_pdu_without_content_is_discarded` in `crates/iec61850-mms/tests/mms_client_wire_e2e.rs` |
 
 ## `iec61850-goose`
 
@@ -45,6 +48,7 @@ buffer, never loop without bound, and never leave partial state behind.
 |---|---|---|
 | A TLV whose declared length reaches past the enclosing PDU | Rejected without reading past the buffer | `element_length_overflow_rejected` in `crates/iec61850-goose/src/pdu.rs`; `malformed_element_length_returns_err` in `crates/iec61850-goose/src/receiver.rs`; seeds in `crates/iec61850-goose/fuzz/bin/gen_corpus.rs`; fuzz target `goose_pdu_parse` |
 | An INTEGER or UNSIGNED element inside `allData` declaring more than 8 content bytes | Rejected, rather than truncated into an `i64` or `u64` | `reject_integer_too_long` in `crates/iec61850-goose/src/pdu.rs`; seed in `gen_corpus.rs`; fuzz target `goose_pdu_parse` |
+| A five-octet header INTEGER, such as an stNum, whose first octet is not `0x00` | Rejected with a warning, rather than truncated to its low 32 bits | `five_byte_integer_with_nonzero_lead_is_rejected` in `crates/iec61850-goose/tests/receive_path.rs` |
 | A BIT STRING with no padding-count byte | Rejected; content is only ever taken from a bounds-checked slice | `reject_invalid_bit_string_padding` in `crates/iec61850-goose/src/pdu.rs`; seed in `gen_corpus.rs`; fuzz target `goose_pdu_parse` |
 | The indefinite BER length form `0x80` | Rejected | `indefinite_length_rejected` in `crates/iec61850-goose/src/pdu.rs`; seed in `gen_corpus.rs`; fuzz target `goose_pdu_parse` |
 | `stNum` reaching the end of its range | `stNum` wraps to 1, never to 0, which subscribers read as an uninitialized publisher | `st_num_wraps_to_one_not_zero` in `crates/iec61850-goose/src/publisher.rs` |
@@ -86,39 +90,45 @@ buffer, never loop without bound, and never leave partial state behind.
 | Malformed input | Required outcome | Pinned by |
 |---|---|---|
 | A report handler removed while its own callback is still running | The callback receives an owned snapshot, so removing a handler mid-callback cannot invalidate what the callback is reading | `uaf_resistance_uninstall_during_callback`, `callback_signature_is_owned_snapshot` in `crates/iec61850-client/src/report/dispatch.rs` |
+| A report whose member count differs from the `DatasetDirectory` the handler was installed with | Rejected before it reaches the subscription state or the callback | `report_with_another_member_count_than_expected_is_rejected` in `crates/iec61850-client/src/report/dispatch.rs` |
+| A server that keeps reporting more names in GetNameList, repeating the same page or sending new names without end | The walk fails with an error when a page does not advance past the previous continuation, or past one million names | `name_list_walk_that_does_not_advance_is_an_error`, `name_list_walk_past_the_name_limit_is_an_error` in `crates/iec61850-client/tests/directory_scripted_e2e.rs` |
+
+## `iec61850-scl`
+
+| Malformed input | Required outcome | Pinned by |
+|---|---|---|
+| A DOType that reaches itself through its `<SDO>` chain, directly or through other DOTypes | `SemanticConflict` naming the cycle when the file is resolved, before any model is built, so the build cannot recurse without bound | `dotype_sdo_self_cycle_is_rejected`, `dotype_sdo_indirect_cycle_is_rejected` in `crates/iec61850-scl/tests/model_build_checks.rs` |
+| A DOType sub-object chain or a DAType nesting deeper than 32 levels | `SemanticConflict` when the file is resolved, so a deep but acyclic chain cannot exhaust the stack; 32 levels still build | `sdo_chain_of_1000_levels_is_rejected`, `da_type_chain_of_1000_levels_is_rejected`, `chains_at_the_bound_build` in `crates/iec61850-scl/tests/type_nesting.rs` |
+
+## `iec61850-sntp`
+
+| Malformed input | Required outcome | Pinned by |
+|---|---|---|
+| A datagram longer than the 48-octet header, such as a request with an authenticator or one larger than the receive buffer | The header is decoded and answered, or the datagram dropped; the server keeps serving | `request_with_an_authenticator_is_answered`, `datagram_longer_than_the_buffer_does_not_stop_the_server` in `crates/iec61850-sntp/tests/datagram_handling.rs` |
+| A receive error that concerns one datagram, such as the ICMP port unreachable a reply meets | Logged as a warning, and the server keeps serving; only a failure of the socket itself ends `run()` | `receive_loop_decision_follows_the_raw_os_error` in `crates/iec61850-sntp/src/server.rs` |
 
 ## `iec61850-tls`
 
 | Malformed input | Required outcome | Pinned by |
 |---|---|---|
-| A peer certificate absent from the allow-only-known list, and an allow list that is empty | Both rejected. An empty list rejects every peer rather than admitting all of them | `allow_only_known_empty_list_rejects`, `allow_only_known_peer_in_list_accepts`, `allow_only_known_peer_not_in_list_rejects`, `allow_only_known_disabled_passes_chain_only` in `crates/iec61850-tls/src/tests/allow_only_known.rs` |
-| An expired or not-yet-valid peer certificate while validity-time checking is switched off | Only the expiry error is downgraded, and the downgrade is reported through the event handler. Every other chain error, a bad signature included, is still rejected | `expired_cert_with_time_validation_rejects`, `expired_cert_with_time_validation_off_passes_with_warning`, `bad_signature_with_time_validation_off_still_rejects` in `crates/iec61850-tls/src/tests/validity_time_override.rs` |
-| A TLS 1.2 session running indefinitely on one key | A renegotiation interval bounds it | `renegotiation_interval` in `crates/iec61850-tls/src/config.rs`. **Partly implemented** — see below |
+| A peer certificate absent from the allow-only-known list, a certificate that differs from a listed one in a single byte, and an allow list that is empty | All rejected. An empty list rejects every peer rather than admitting all of them | `allow_only_known_empty_list_rejects`, `allow_only_known_peer_in_list_accepts`, `allow_only_known_peer_not_in_list_rejects`, `allow_only_known_disabled_passes_chain_only`, `allow_only_known_compares_every_byte_of_the_leaf` in `crates/iec61850-tls/src/tests/allow_only_known.rs` |
+| A client that presents no certificate to a server in allow-only-known mode | Refused during the handshake | `client_without_certificate_is_refused_when_only_known_peers_are_allowed` in `crates/iec61850-tls/tests/handshake.rs` |
+| An expired or not-yet-valid peer certificate while validity-time checking is switched off | Accepted only when it passes every other check at a time inside its validity period, and the downgrade is reported through the event handler. A certificate from an untrusted issuer, one outside the allow-only-known list, a bad signature, and an expiry error that carries no validity period are still rejected | `expired_cert_with_time_validation_rejects`, `expired_cert_with_time_validation_off_passes_with_warning`, `bad_signature_with_time_validation_off_still_rejects`, `expired_cert_from_an_untrusted_ca_with_time_validation_off_rejects`, `expiry_without_context_with_time_validation_off_rejects`, `chain_needing_three_verifications_with_time_validation_off_passes` in `crates/iec61850-tls/src/tests/validity_time_override.rs`; `client_with_time_validation_off_rejects_an_expired_certificate_from_an_untrusted_ca`, `expired_unknown_server_is_refused_in_allow_only_known_mode_with_time_validation_off` in `crates/iec61850-tls/tests/handshake.rs` |
+| A TLS 1.2 session running indefinitely on one key | A renegotiation interval bounds it | `renegotiation_interval` in `crates/iec61850-tls/src/config.rs`. **Not applied** — see below |
 
 ## Cases with a gap
 
-Two rows above do not fully meet the premise this document sets out in its
-opening paragraph. Both are recorded here rather than presented as satisfied.
+One row above does not fully meet the premise this document sets out in its
+opening paragraph. It is recorded here rather than presented as satisfied.
 
-**The renegotiation interval is not fully implemented.** The interval is
-accepted and recorded at `crates/iec61850-tls/src/config.rs`, but `rustls`
+**The renegotiation interval is not applied.** The interval is accepted at
+`crates/iec61850-tls/src/config.rs`, and building a configuration with it set
+logs a warning, but `rustls`
 offers no server-initiated renegotiation, so no HelloRequest is ever sent and a
 TLS 1.2 session is not in fact rekeyed on the interval. Bounding a session's
 lifetime therefore has to come from the application closing and reopening the
 association. TLS 1.3 replaces the mechanism with key updates and is not subject
 to the case.
-
-**The PDU-size refusal is implemented but not pinned by a test.** The guard is
-real: `send_mms_pdu` in `crates/iec61850-mms/src/mms/client/connection.rs`
-measures the encoded PDU against `negotiated_max_pdu_size`, logs a warning and
-returns `ClientError::PduTooLarge` before anything is sent. No test drives a PDU
-through that path, though. The one test on that error,
-`pdu_too_large_error_can_be_constructed` in
-`crates/iec61850-mms/tests/mms_client_integration.rs`, builds the error value
-and checks its `Display` text; it does not exercise the guard, so deleting the
-size check would not fail it. The segmentation half of the case is genuinely
-pinned. Closing this means driving an oversized PDU through `send_mms_pdu`
-against a negotiated size small enough to trip it.
 
 ## Fuzz targets
 

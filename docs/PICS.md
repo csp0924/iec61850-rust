@@ -52,7 +52,10 @@ constrained, the row says so.
 
 Raw-Ethernet backends for GOOSE and Sampled Values are supplied by
 `iec61850-hal`: `AF_PACKET` on Linux, and libpcap or the NPCAP runtime
-elsewhere. macOS and BSD backends are absent.
+elsewhere. macOS and BSD backends are absent. The `AF_PACKET` backend delivers
+received frames with their 802.1Q tag, and on Linux a frame sent with an
+all-zero source address carries the interface address instead; on Windows the
+source address is sent as the publisher sets it.
 
 ---
 
@@ -67,11 +70,11 @@ elsewhere. macOS and BSD backends are absent.
 | Setting group control | Y | partial | Server: full SGCB runtime. Client: driven through generic writes; no dedicated setting-group API |
 | Unbuffered reporting (URCB) | Y | Y | |
 | Buffered reporting (BRCB) | Y | Y | Includes buffer overflow indication, EntryID resynchronization and an optional persistent buffer |
-| Logging (LCB, journal) | partial | partial | Recording and ReadJournal retrieval are implemented; four LCB status attributes are not served (see 3.7) |
+| Logging (LCB, journal) | partial | partial | Recording on data-change and quality-change, LCB reads and ReadJournal retrieval are implemented; integrity and general-interrogation entries are not written, and SetLCBValues is not implemented (see 3.7) |
 | Control (DOns, SBOns, DOes, SBOes) | Y | Y | All four control models plus status-only |
 | GOOSE publish | Y | – | |
 | GOOSE subscribe | – | Y | |
-| GoCB access over MMS | partial | partial | Nine attributes readable; `GoEna` and `GoID` writable |
+| GoCB access over MMS | partial | partial | Nine attributes readable; `GoEna` writable, and `GoID` while `GoEna` is false |
 | Sampled Values publish | Y | – | |
 | Sampled Values subscribe | – | Y | |
 | SvCB (MSVCB / USVCB) access over MMS | N | N | Sampled Values control blocks are not exposed as MMS variables |
@@ -87,8 +90,8 @@ elsewhere. macOS and BSD backends are absent.
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
 | Associate | Y | Y | ACSE AARQ / AARE over Presentation, Session and COTP; MMS Initiate negotiated |
-| Abort | Y | Y | Both the peer-initiated ACSE abort and an immediate transport close |
-| Release | Y | Y | ACSE RLRQ / RLRE, with MMS Conclude and a Session FINISH timeout on the server |
+| Abort | Y | Y | The client sends an ACSE ABRT inside a Session AB; the server accepts both a peer-initiated ACSE abort and an immediate transport close |
+| Release | Y | Y | ACSE RLRQ / RLRE, with MMS Conclude and a Session FINISH timeout on the server; the client sends the RLRQ in a Session FINISH after the Conclude response |
 | Association authentication: none | Y | Y | Default |
 | Association gating on calling AP-title and AE-qualifier | N | – | The MMS layer decodes the calling application reference and can consult an authenticator, but `IedServer` installs none and exposes no hook, so every AARQ is accepted regardless of the calling AP-title |
 | Association authentication: ACSE password | N | N | The AARQ encoder can emit the charstring password mechanism, but the server skips `calling-authentication-value` and always invokes the authenticator with no credentials, and no client API exposes a password |
@@ -103,15 +106,15 @@ elsewhere. macOS and BSD backends are absent.
 | GetLogicalDeviceDirectory | Y | Y | |
 | GetLogicalNodeDirectory (DATA) | Y | Y | |
 | GetLogicalNodeDirectory (DATA-SET) | Y | Y | Always resolved against the server |
-| GetLogicalNodeDirectory (URCB / BRCB / GoCB / LCB / SGCB) | Y | Y | Control blocks registered at run time are merged into the domain name list |
-| GetLogicalNodeDirectory (LOG) | Y | Y | Journal object class; the server answers an empty list |
+| GetLogicalNodeDirectory (URCB / BRCB / GoCB / LCB / SGCB) | Y | Y | Control blocks registered at run time are merged into the domain name list; a report or log control block is listed with its group and its members. The SGCB is listed, and served, only in `LLN0` |
+| GetLogicalNodeDirectory (LOG) | Y | Y | Journal object class: the journals the `LogRef` of each registered log control block names, and the log instance names the application registered |
 | GetLogicalNodeDirectory (GsCB / MSVCB / USVCB) | N | N | The client refuses the request rather than returning a misleading empty list |
-| GetAllDataValues | Y | N | Server expands a whole logical node or one functional-constraint group under a PDU budget; the client has no single-call equivalent |
-| GetDataValues | Y | Y | Includes sub-data-object nesting to any depth; the client reads several variables with one MMS Read through `read_objects`, needing no temporary data set |
-| SetDataValues | Y | Y | Server-side writes are gated by a functional-constraint policy, `SP \| SV \| SE` by default; `DC`, `CF` and `BL` can be enabled |
+| GetAllDataValues | Y | N | Server expands a whole logical node or one functional-constraint group under a PDU budget, its registered report, log and setting group control blocks included; the client has no single-call equivalent |
+| GetDataValues | Y | Y | Includes sub-data-object nesting to any depth; an attribute resolves only under its own functional constraint. The client reads several variables with one MMS Read through `read_objects`, needing no temporary data set |
+| SetDataValues | Y | Y | Server-side writes are gated by a functional-constraint policy, `SP \| SV \| SE` by default; `DC`, `CF` and `BL` can be enabled. A leaf below a constructed attribute is writable by its own path, and a constructed attribute as a structure of its sub-attributes; the write handlers of the attributes above a leaf decide its write as well |
 | GetDataDirectory | Y | Y | |
 | GetDataDirectory by functional constraint | – | Y | Client convenience over the same wire service |
-| GetDataDefinition (GetVariableAccessAttributes) | Y | Y | Type specification including nested sub-data attributes; a specification that would exceed the negotiated maximum PDU size is answered with `resource other` |
+| GetDataDefinition (GetVariableAccessAttributes) | Y | Y | Type specification including nested sub-data attributes, and the registered report, log and setting group control blocks; GOOSE control blocks have none. A specification that would exceed the negotiated maximum PDU size is answered with `resource other` |
 | Single array element access, read | Y | Y | MMS `AlternateAccess` per IEC 61850-8-1 §17, index and index-with-component |
 | Single array element access, write | N | Y | The server answers `object-access-unsupported`: per-element storage is not materialized |
 
@@ -119,11 +122,11 @@ elsewhere. macOS and BSD backends are absent.
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results. A list of access results that would exceed the negotiated maximum PDU size is answered with `resource other` for the whole request, not truncated |
+| GetDataSetValues | Y | Y | MMS Read with a `VariableListName`; per-entry access results, each member read through its read handler. A data set that does not exist fails the service with `object-non-existent`. A list of access results that would exceed the negotiated maximum PDU size is answered with `resource other` for the whole request, not truncated |
 | SetDataSetValues | Y | Y | A value count that differs from the member count fails every entry with `type-inconsistent` |
 | GetDataSetDirectory | Y | Y | MMS GetNamedVariableListAttributes: the member list, each member as an IEC reference with its functional constraint, plus `mmsDeletable`. Enumerating the data set *names* of a logical node is a different service, GetLogicalNodeDirectory(DataSet), which maps onto MMS GetNameList. A member list that would exceed the negotiated maximum PDU size is answered with `resource other` |
-| CreateDataSet | Y | Y | MMS DefineNamedVariableList, domain scope; association scope is not implemented |
-| DeleteDataSet | Y | Y | MMS DeleteNamedVariableList; a statically configured data set is refused |
+| CreateDataSet | Y | Y | MMS DefineNamedVariableList, domain scope; association scope is not implemented. The name is `<LN>$<name>` of an existing logical node and each member a basic data attribute; a constructed attribute, and a data object or sub-data object as a whole, are refused. The response is the primitive NULL of ISO 9506-2 |
+| DeleteDataSet | Y | Y | MMS DeleteNamedVariableList; a statically configured data set is matched but not deleted. A request naming a data set created at run time that the DatSet of a report control block uses is refused with `service` object-constraint-conflict, and deletes none of its data sets |
 | GetDataSetAttributes (GetNamedVariableListAttributes) | Y | Y | The same MMS request as GetDataSetDirectory. The server answers from the data set registry, in registration order, and reports `mmsDeletable` true only for a data set created at runtime; an unknown name is answered with `object-non-existent`, and a response that would exceed the negotiated maximum PDU size with `resource other` |
 
 ### 3.4 Setting group control
@@ -150,7 +153,7 @@ elsewhere. macOS and BSD backends are absent.
 | Trigger option: general interrogation | Y | Y | |
 | Option field: sequence-number | Y | Y | |
 | Option field: report-time-stamp | Y | Y | |
-| Option field: reason-for-inclusion | Y | Y | |
+| Option field: reason-for-inclusion | Y | Y | The client accepts a ReasonCode longer than six bits and ignores the bits a report does not define |
 | Option field: data-set-name | Y | Y | |
 | Option field: data-reference | Y | Y | |
 | Option field: buffer-overflow | – | – | Forcibly cleared on an unbuffered control block before encoding |
@@ -164,8 +167,8 @@ elsewhere. macOS and BSD backends are absent.
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
 | Report | Y | Y | |
-| GetBRCBValues | partial | Y | Every attribute is readable individually, `RptID`, `RptEna`, `DatSet`, `ConfRev`, `OptFlds`, `BufTm`, `SqNum`, `TrgOps`, `IntgPd`, `GI`, `Owner`, `EntryID`, `PurgeBuf`, `TimeofEntry` and `ResvTms` included. A read that names the whole control block, and a read of `Resv`, answer `object-access-unsupported` |
-| SetBRCBValues | Y | Y | `ConfRev`, `SqNum` and `Owner` are refused as read-only; a configuration attribute is refused while `RptEna` is true |
+| GetBRCBValues | Y | Y | The whole control block, in the order of IEC 61850-8-1, or any attribute individually: `RptID`, `RptEna`, `DatSet`, `ConfRev`, `OptFlds`, `BufTm`, `SqNum`, `TrgOps`, `IntgPd`, `GI`, `PurgeBuf`, `EntryID`, `TimeofEntry`, `ResvTms` and `Owner`. A read of `Resv` answers `object-access-unsupported` |
+| SetBRCBValues | Y | Y | `ConfRev`, `SqNum` and `Owner` are refused as read-only; a configuration attribute is refused while `RptEna` is true. A `DatSet` write must name a known persistent data set or be empty, and binds the control block to its members |
 | EntryID resynchronization | Y | Y | An eight-octet EntryID; an unknown identifier is refused with `object-value-invalid` |
 | PurgeBuf | Y | Y | Purges while `RptEna` is false |
 | ResvTms | Y | Y | Edition 2 INT16 reservation, optional per control block |
@@ -177,12 +180,12 @@ elsewhere. macOS and BSD backends are absent.
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| Log (implicit recording on trigger) | Y | – | Entries are written to a `LogStorage` backend; an in-memory backend ships with the crate |
-| GetLCBValues | partial | N | `LogEna`, `LogRef`, `DatSet`, `TrgOps` and `IntgPd` are served, individually or as one structure. `OldEntrTm`, `NewEntrTm`, `OldEntr` and `NewEntr` answer `object-access-unsupported`: the storage trait exposes no accessor for them. The client has no dedicated LCB API |
+| Log (implicit recording on trigger) | partial | – | An attribute update writes an entry through each enabled log control block whose `TrgOps` hold data-change or quality-change and whose `DatSet` holds the attribute; integrity and general-interrogation entries are not written. Entries go to a `LogStorage` backend; an in-memory backend ships with the crate |
+| GetLCBValues | Y | N | The nine components `LogEna`, `LogRef`, `DatSet`, `OldEntrTm`, `NewEntrTm`, `OldEnt`, `NewEnt`, `TrgOps` and `IntgPd`, individually or as one structure; `OldEntr` and `NewEntr` are accepted for `OldEnt` and `NewEnt` when read individually. The client has no dedicated LCB API |
 | SetLCBValues | N | N | No write route resolves a log control block path |
-| GetLogStatusValues | N | N | The four journal status attributes above are not served |
-| QueryLogByTime | Y | Y | MMS ReadJournal with a time range |
-| QueryLogAfter | Y | Y | MMS ReadJournal with a starting time and entry identifier |
+| GetLogStatusValues | Y | N | `OldEntrTm`, `NewEntrTm`, `OldEnt` and `NewEnt` report the oldest and newest entry of the log, zero for an empty log |
+| QueryLogByTime | Y | Y | MMS ReadJournal with a time range. The journal is named by the `LogRef` of a log control block; a time is a six-octet TimeOfDay, and another length is refused |
+| QueryLogAfter | Y | Y | MMS ReadJournal with a starting time and entry identifier. The journal is named by the `LogRef` of a log control block |
 | ReadJournal pagination | Y | Y | Entries are added while they fit the negotiated PDU size; the response then sets `moreFollows` and the client resumes from the last entry it received |
 | WriteJournal | N | N | The server answers `object-access-unsupported` rather than rejecting the tag |
 
@@ -199,7 +202,7 @@ section 5.
 | SelectWithValue (SBOw) | Y | Y | |
 | Cancel | Y | Y | Accepted while selected and while waiting for an activation time; refused while a command is executing |
 | Operate | Y | Y | |
-| CommandTermination | Y | Y | Positive and negative, on the enhanced-security models only |
+| CommandTermination | Y | Y | Positive and negative, on the enhanced-security models only, and only for a command whose Operate was answered positively; a refused command has none. The client takes only the termination of the object and ctlNum it operated |
 | TimeActivatedOperate | partial | N | The server decodes the seven-element `Oper` structure and passes `operTm` to the application handler, but does not itself defer execution to the activation time. The client encodes the six-element form only |
 | Control model: status-only | Y | Y | |
 | Control model: direct-with-normal-security | Y | Y | |
@@ -208,8 +211,9 @@ section 5.
 | Control model: SBO-with-enhanced-security | Y | Y | |
 | `sboClass`: operate-once and operate-many | Y | – | |
 | Attributes `origin`, `ctlNum`, `T`, `Test`, `Check` | Y | Y | `Check` carries synchro-check and interlock-check |
-| LastApplError / AddCause | Y | Y | The add-cause values of IEC 61850-7-2 §20 are mapped onto MMS data access errors |
+| LastApplError / AddCause | Y | Y | Server: an InformationReport carrying only `LastApplError` precedes the negative response of SelectWithValue, Operate and Cancel, and the data access error of that response follows IEC 61850-8-1. Client: the AddCause of that report, or of a negative CommandTermination, is the cause of the failure, and `last_appl_error` returns the whole structure |
 | Select timeout | Y | – | Per control object |
+| Operate timeout (`operTimeout`) | Y | – | `ControlObject::set_oper_timeout_ms` bounds a running command, which then ends with `TimeLimitOver`; off by default |
 
 ### 3.9 GOOSE
 
@@ -218,17 +222,17 @@ section 5.
 | SendGOOSEMessage (publish) | Y | – | `GoosePublisher`; the frame header is prebuilt and the publish path does not allocate |
 | Retransmission profile | Y | – | Configurable intervals with a backoff after a state change |
 | Simulation (test) bit, `ndsCom`, VLAN tag and priority | Y | Y | |
-| GOOSE subscribe | – | Y | `GooseSubscriber` and `GooseReceiver`, with `stNum` and `sqNum` continuity tracking and time-allowed-to-live supervision |
+| GOOSE subscribe | – | Y | `GooseSubscriber` and `GooseReceiver`; every subscriber whose filters accept a frame receives it, with `stNum` and `sqNum` continuity tracked per gocbRef and time-allowed-to-live supervision, which any received frame restarts |
 | GetGoCBValues | partial | partial | Nine attributes: `GoCBRef`, `GoEna`, `GoID`, `DatSet`, `ConfRev`, `NdsCom`, `DstAddress`, `MinTime`, `MaxTime`, readable individually or as one structure |
-| SetGoCBValues | partial | partial | `GoEna` and `GoID` are writable; the other seven answer `object-access-denied`. A control block is written one attribute at a time |
+| SetGoCBValues | partial | partial | `GoEna` and `GoID` are writable, `GoID` only while `GoEna` is false (otherwise `temporarily-unavailable`); the other seven answer `object-access-denied`. A control block is written one attribute at a time |
 | GetGOOSEElementNumber, GetGoReference | N | N | Not implemented |
 
 ### 3.10 Sampled Values
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| SendMSVMessage (publish) | Y | – | `SvPublisher`; multi-ASDU frames, `smpCnt`, `smpSynch`, `smpRate`, `smpMod`, `refrTm` and `gmIdentity` |
-| Sampled Values subscribe | – | Y | `SvSubscriber` with per-`svID` filtering and sample continuity |
+| SendMSVMessage (publish) | Y | – | `SvPublisher`; multi-ASDU frames, `smpCnt`, `smpSynch`, `smpRate`, `smpMod` as a two-octet INT16U, `refrTm` and `gmIdentity` |
+| Sampled Values subscribe | – | Y | `SvSubscriber` with per-`svID` filtering and per-`svID` sample continuity, including the once-a-second `smpCnt` reset |
 | 9-2LE channel layout | Y | Y | Four current and four voltage channels with quality |
 | GetMSVCBValues / SetMSVCBValues | N | N | Sampled Values control blocks are not exposed as MMS variables |
 | GetUSVCBValues / SetUSVCBValues | N | N | Unicast Sampled Values are not implemented |
@@ -238,9 +242,9 @@ section 5.
 
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
-| SNTP server | Y | – | RFC 4330 SNTPv4 unicast, mode 3 to mode 4, stratum 1 |
-| SNTP client | – | Y | Queries an NTP or SNTP server with a receive timeout |
-| Time quality reporting | Y | Y | `leapSecondsKnown`, `clockFailure`, `clockNotSynchronized` and `timeAccuracy` per IEC 61850-7-2 §6.2.3.4 |
+| SNTP server | Y | – | RFC 4330 SNTPv4 unicast, mode 3 to mode 4 and mode 1 to mode 2, the poll copied from the request, stratum 1 |
+| SNTP client | – | Y | Queries an NTP or SNTP server with a receive timeout; a reply with a zero transmit timestamp is rejected, and timestamps follow the NTP era rule of RFC 4330 §3 |
+| Time quality reporting | Y | Y | `leapSecondsKnown`, `clockFailure`, `clockNotSynchronized` and `timeAccuracy` per IEC 61850-7-2 §6.2.3.4, from `IedServerConfig::time_quality`, which the `LActTm` of a setting group control block carries as well |
 | PTP / IEC 61588 | N | N | Not implemented |
 
 ### 3.12 File transfer
@@ -293,9 +297,10 @@ separately.
 | `access [7]` other | 0 | A request fails to decode, or a response fails to encode |
 | `access [7]` object-access-unsupported | 1 | The named object class or scope is not served, and for WriteJournal |
 | `access [7]` object-non-existent | 2 | The named domain, variable, data set or log control block does not exist |
-| `definition [2]` invalid-address | 2 | A data set member reference is malformed |
+| `definition [2]` invalid-address | 2 | A data set member reference, or the name of a data set a client defines, is malformed |
 | `definition [2]` object-exists | 5 | DefineNamedVariableList names a data set that is already defined |
 | `resource [3]` other | 0 | The response would exceed the negotiated maximum PDU size, or an internal lock is unusable |
+| `service [4]` object-constraint-conflict | 5 | DeleteNamedVariableList names a data set created at run time that a report control block uses; the error carries `numberDeleted` |
 
 The client decodes a Confirmed-ErrorPDU into the errorClass alternative and
 subcode the peer sent, so a refusal is distinguishable by cause.
@@ -380,17 +385,17 @@ carries a CPR PPDU, its provider-reason. The `Display` names the values ISO
 | TLS 1.2 | Y | The minimum version required by IEC 62351-3 Annex A, and the default floor |
 | TLS 1.3 | Y | |
 | TLS 1.0 / 1.1 | N | Not offered |
-| Cipher suite whitelist | Y | `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`. The list is fixed at compile time and cannot be extended through the API |
+| Cipher suite whitelist | Y | `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`. The list is fixed at compile time and cannot be extended through the API |
 | Finite-field DHE suites | N | The cryptographic provider in use implements none |
-| Server certificate validation | Y | Standard chain validation against a configured trust anchor set |
-| Mutual authentication (client certificate) | Y | Optional or required |
-| Pinned-certificate mode | Y | Only the listed leaf certificates are accepted; an empty list is refused rather than treated as "accept any" |
-| Relaxed validity-time mode | Y | Downgrades expiry errors only; every other chain error still fails |
-| Revocation checking: CRL | Y | Static CRL lists supplied by the operator as PEM or DER and installed on both the server and the client certificate verifier; the events `WrnCrlExpired` and `AlmCertRevoked` report the outcome. Distribution points are not fetched: the operator keeps the lists current |
+| Server certificate validation | Y | Standard chain validation against a configured trust anchor set. The name check can be skipped with `with_dangerous_no_sni_verify()` for IEDs whose certificates carry no matching subject alternative name; every other check still applies |
+| Mutual authentication (client certificate) | Y | Optional or required. `require_client_auth(true)` or the pinned-certificate mode makes the client certificate mandatory; otherwise a server with trust anchors requests one and validates it when presented, and a server without trust anchors does not request one |
+| Pinned-certificate mode | Y | Only the listed leaf certificates are accepted; an empty list is refused rather than treated as "accept any". On the server a client presenting no certificate is refused |
+| Relaxed validity-time mode | Y | An expired or not yet valid certificate is accepted only when every other check passes at a time inside its validity period; applies to server and client certificates alike |
+| Revocation checking: CRL | Y | Static CRL lists supplied by the operator as PEM or DER and installed on both the server and the client certificate verifier; the event `AlmCertRevoked` reports a revoked certificate. An expired CRL is still used, and `WrnCrlExpired` is not raised. Distribution points are not fetched: the operator keeps the lists current |
 | Revocation checking: OCSP | N | Neither stapling nor a responder query is implemented |
-| Session resumption | Y | Enabled by default; disableable, and the TLS 1.3 ticket lifetime is configurable on the server |
-| Session renegotiation | N | Never initiated, and not exposed through the API |
-| IEC 62351-3 event reporting | Y | The nineteen event codes of IEC 62351-3 §5, delivered to a caller-supplied handler |
+| Session resumption | Y | Enabled by default; disableable for TLS 1.2 and TLS 1.3 alike. The server-side lifetime of a resumable session is configurable; without it the server keeps up to 256 sessions with no time limit |
+| Session renegotiation | N | Never initiated; `renegotiation_interval` is accepted, ignored and logged as a warning |
+| IEC 62351-3 event reporting | partial | The nineteen event codes of IEC 62351-3 §5 are delivered to a caller-supplied handler. Certificate, session-establishment and handshake-failure events are raised; `SessionClosed`, `SessionRenegotiation`, `WrnCertExpiringSoon`, `WrnCrlExpired`, `AlmUnauthorizedAccess`, `AlmHandshakeTimeout` and `AlmConnectionAborted` are not |
 | IEC 62351-4 application-layer authentication | N | Peer authentication is performed by TLS alone; no ACSE authentication mechanism is negotiated (see 3.1) |
 | IEC 62351-6 GOOSE and SV authentication | N | Not implemented |
 
@@ -405,14 +410,14 @@ model from it. `iec61850-scl-build` generates the same model at compile time.
 |---|:---:|---|
 | `Header` | Y | |
 | `IED`, `AccessPoint`, `Server`, `LDevice`, `LN0`, `LN` | Y | |
-| `DOI`, `SDI`, `DAI`, `Val` | Y | Instance values, including nested sub-data instances |
+| `DOI`, `SDI`, `DAI`, `Val` | partial | Instance values, including nested sub-data instances. A `<Val>` on a DataTypeTemplates `DA` or `BDA` is the initial value. Octet strings are read as base64Binary and Timestamp as xs:dateTime. A `<Val>` on Quality or EntryID, which IEC 61850-6 does not provide for, and on Check, EntryTime, OptFlds, TrgOps and PhyComAddr is warned about and the default is kept. An `SDI` or `DAI` with `ix` is skipped with a warning |
 | `DataSet`, `FCDA` | Y | |
 | `ReportControl` with `TrgOps`, `OptFields` | Y | Buffered and unbuffered |
 | `LogControl` | Y | |
 | `SettingControl` | Y | |
-| `GSEControl` | Y | |
+| `GSEControl` | Y | The GoID is the `appID`, or the GoCBRef when the `appID` is empty |
 | `SampledValueControl` | Y | Parsed into the model; no MMS projection (see 3.10) |
-| `DataTypeTemplates`: `LNodeType`, `DOType`, `DAType`, `EnumType`, `DO`, `SDO`, `DA`, `BDA`, `EnumVal` | Y | Type references are resolved and cross-checked |
+| `DataTypeTemplates`: `LNodeType`, `DOType`, `DAType`, `EnumType`, `DO`, `SDO`, `DA`, `BDA`, `EnumVal` | partial | Type references are resolved and cross-checked; DOType and DAType cycles, and nesting deeper than 32 levels, are rejected. An Enum whose ordinals exceed integer(8) is declared as INT16 or INT32. `count` on a `DA`, `SDO` or `BDA` is warned about and the element is built as a single instance |
 | `Communication` (`SubNetwork`, `ConnectedAP`, `Address`, `GSE`, `SMV`) | N | The subtree is skipped with a warning; addressing parameters are supplied by the application |
 | `Substation` | N | The subtree is skipped with a warning |
 | `Inputs` / `ExtRef` | N | Skipped |
@@ -435,16 +440,14 @@ need before selecting this implementation.
    Values stream is configured through the publisher API.
 3. **TimeActivatedOperate is not scheduled by the server**; the activation time
    is passed to the application, which is responsible for honoring it.
-4. **Four log control block status attributes** (`OldEntrTm`, `NewEntrTm`,
-   `OldEntr`, `NewEntr`) are not served, so GetLogStatusValues has no complete
-   answer; SetLCBValues is not implemented at all.
+4. **Log control blocks cannot be written** (SetLCBValues is not
+   implemented), and integrity and general-interrogation log entries are not
+   written.
 5. **Writing a single array element is refused** by the server.
-6. **A whole-block read of a buffered report control block** answers
-   `object-access-unsupported`; the attributes must be read individually.
-7. **The Communication and Substation sections of an SCL file are not parsed**,
+6. **The Communication and Substation sections of an SCL file are not parsed**,
    so GOOSE and Sampled Values addressing is not taken from SCL.
-8. **No ACSE authentication mechanism is negotiated**: an association is
+7. **No ACSE authentication mechanism is negotiated**: an association is
    authenticated by TLS or not at all.
-9. **Revocation checking is CRL only**, from static lists the operator keeps
+8. **Revocation checking is CRL only**, from static lists the operator keeps
    current; there is no OCSP and no distribution-point fetching. No
    IEC 62351-6 signatures on GOOSE or Sampled Values.

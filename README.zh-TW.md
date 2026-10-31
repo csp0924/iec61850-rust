@@ -17,7 +17,7 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 - **未取得一致性認證。** 本實作未曾送交任何受認可的測試實驗室，也不存在對應的證書。
 - **GOOSE 與 Sampled Values 僅能在 Linux 上執行。** 兩者都直接跑在 Ethernet 之上，需要具備 `CAP_NET_RAW` 的 `AF_PACKET` socket。Windows 能編譯這些 crate，但無法執行其 publisher 與 subscriber；開發用途另有 libpcap 或 NPCAP backend 可用。
 - **未實作 MMS 檔案服務。** 沒有任何 handler 回應這類請求，`iec61850-server` 也不宣告任何聲稱支援它的 feature。
-- **GetNameList 探索依循執行期登錄表，而非 SCL 模型。** 資料集、報告控制區塊與 GOOSE 控制區塊一經登錄即會被列出。這些登錄表正是 Read 路徑解析的依據，因此列出的每個名稱都可讀取，而模型雖有宣告但未登錄者則不會列出。`Journal` 類別的請求會得到空清單，因此 log 是以名稱讀取，而非透過探索取得。
+- **GetNameList 探索依循執行期登錄表，而非 SCL 模型。** 資料集、報告控制區塊與 GOOSE 控制區塊一經登錄即會被列出。這些登錄表正是 Read 路徑解析的依據，因此列出的每個名稱都可讀取，而模型雖有宣告但未登錄者則不會列出。`Journal` 類別的請求會列出各已登錄 log 控制區塊的 `LogRef` 所指的 journal。
 - **未實作 MMS 之上的 SVCB 管理、R-GOOSE 與 R-SV。**
 
 ## Crate 組成
@@ -49,7 +49,7 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 
 **控制。** IEC 61850-7-2 的全部五種控制模型 —— status-only、direct-with-normal-security、SBO-with-normal-security、direct-with-enhanced-security 與 SBO-with-enhanced-security —— 含 Select、SelectWithValue、Operate、Cancel、命令終止，以及檢查與等待執行的 handler hook。
 
-**記錄。** log 控制區塊透過 `LogStorage` trait 寫入，client 端以 QueryLogByTime 與 QueryLogAfterEntry 經 ReadJournal 讀回。WriteJournal 未實作。
+**記錄。** log 控制區塊透過 `LogStorage` trait 寫入，client 端以 QueryLogByTime 與 QueryLogAfterEntry 經 ReadJournal 讀回。資料集成員在資料變化與品質變化時寫入 log。WriteJournal 未實作。
 
 **設定群組。** SGCB runtime 提供 `ActSG`、`EditSG` 與 `CnfEdit`，編輯 session 由單一 association 持有，並以保留期限釋放遭棄置的 session。
 
@@ -59,7 +59,7 @@ IEC 61850（MMS、GOOSE、Sampled Values、SCL）的獨立 Rust 實作，依公�
 
 **Client。** 以快取的裝置模型瀏覽目錄、以 IEC 表示法讀寫物件、動態資料集管理、RCB 讀寫並分派報告、控制、journal 查詢與 GoCB 存取。
 
-**資安。** `iec61850-tls` 建立的 `rustls` 設定已套用 IEC 62351-3 的限制：TLS 1.2 為下限、固定的密碼套件白名單、可選的僅允許已知憑證驗證，以及該 profile 的事件代碼。`iec61850-client` 與 `iec61850-server` 透過各自的 `tls` feature 使用它。
+**資安。** `iec61850-tls` 建立的 `rustls` 設定已套用 IEC 62351-3 的限制：TLS 1.2 為下限、固定的密碼套件白名單、可選或強制的 client 憑證認證、可選的僅允許已知憑證驗證，以及該 profile 的事件代碼。`iec61850-client` 與 `iec61850-server` 透過各自的 `tls` feature 使用它。
 
 ## 快速上手
 

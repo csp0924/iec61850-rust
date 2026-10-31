@@ -8,6 +8,587 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+### Security
+
+- **`iec61850-tls`** — With `time_validation(false)`, an expired or not yet
+  valid certificate is accepted only when it passes every other check at a
+  time inside its validity period. It used to be accepted whatever its issuer,
+  because the validity period is checked before the signature chain, and in
+  allow-only-known mode the known-peer list was skipped as well, so any
+  network peer could present a self-signed expired certificate and be taken
+  for the server. An expiry error that carries no validity period now rejects.
+  `iec61850-client` and `iec61850-server` are affected through their `tls`
+  feature; a configuration that keeps the default `time_validation(true)` is
+  not.
+- **`iec61850-tls`** — A server in allow-only-known mode refuses a client that
+  presents no certificate; it used to accept it, so the known-peer list did
+  not restrict who could associate. By default a server with trust anchors
+  still accepts a client that presents no certificate and reports it as
+  `WrnNoPeerCert`; call `require_client_auth(true)` or
+  `allow_only_known_peers(true)` to refuse it.
+
+### Changed
+
+- **`iec61850-mms`**, **`iec61850-server`** — The DefineNamedVariableList
+  response is the primitive NULL `8b 00` that ISO 9506-2 defines, and the
+  client accepts it as well as the constructed `ab 00` it used to require. A
+  client of version 0.3.2 or earlier reports a tag mismatch against a 0.3.3
+  server although the data set is created nonetheless; upgrade the client.
+- **`iec61850-mms`** — The end of the transport, a COTP disconnect, a Session
+  abort, finish or disconnect, and a Conclude request from the server close the
+  client and return `ConnectionLost`, and a TCP connect that times out returns
+  `ConnectTimeout`. These used to surface as `IsoError`, and a Conclude from
+  the server left the transport open. Code that matched `IsoError` to detect a
+  lost connection matches `ConnectionLost` instead.
+- **`iec61850-mms`** — An AARE without a result field is a rejection and
+  `connect` returns `AssociateFailed`; it used to be taken as an accepted
+  association.
+- **`iec61850-mms`** — The `ReasonCode` of a journal entry is sent and read
+  as the seven-bit BIT STRING of IEC 61850-8-1, bit `n` carried by mask
+  `1 << n` of the reason code byte, so data-change (`0x02`) reaches the wire
+  as bit 1. It used to be sent as the byte unchanged, which put data-change
+  on bit 6. Entries already stored keep their byte and need no migration, but
+  a 0.3.2 peer reading journals from a 0.3.3 one, or the reverse, decodes the
+  reasons of the other wrongly; upgrade both sides.
+- **`iec61850-mms`** — A journal time that is not a six-octet TimeOfDay is
+  refused; a four-octet one used to be taken as a time on 1970-01-01.
+- **`iec61850-client`** — `select_with_value`, `operate` and `cancel` return a
+  timeout, a lost connection, a Reject or any other MMS-layer error as `Err`;
+  only a data access error or a confirmed service error, the server refusing
+  the command, is `Ok(ControlOutcome::Failure)`. These errors used to be
+  reported as `Failure(Unknown)` although the command may have been executed;
+  a caller that only matched on `Ok` handles the `Err` as well.
+- **`iec61850-client`** — An enhanced-security Operate that is refused
+  concludes at the negative response instead of waiting up to 5 s for a
+  command termination a refused command never gets. A server of version 0.3.2,
+  which sends its cause only in such a termination, therefore yields
+  `Failure(Unknown)` where it used to yield the cause; upgrade the server.
+- **`iec61850-client`** — `DatasetDirectory::expected_size` is honored: a
+  report whose member count differs is rejected before it reaches the
+  subscription state or the callback. It used to be ignored. Leave it `None`
+  to accept any member count.
+- **`iec61850-server`** — A refused SelectWithValue, Operate or Cancel is
+  preceded by an InformationReport carrying only `LastApplError`, with the
+  origin and ctlNum of the request, as IEC 61850-8-1 defines, and a refused
+  Operate under enhanced security no longer sends a CommandTermination. A
+  client that waits for that termination, as `iec61850-client` 0.3.2 does,
+  waits until its own timeout; upgrade the client.
+- **`iec61850-server`** — Under normal security a positive Operate response
+  now only means the command was accepted: it is sent once the check and
+  wait-for-execution handlers pass, and no longer waits for the control
+  handler. A control handler that fails used to answer the Operate
+  negatively; the Operate is now answered positively and the failure is
+  logged. An application that needs the outcome of the command uses enhanced
+  security, whose CommandTermination reports it.
+- **`iec61850-server`** — `LastApplError` carries Error `No Error` for a
+  refusal by a check or a handler, even when its add cause is `Unknown`, and
+  `Unknown` only for an internal failure of the server; it used to carry a
+  fixed 3. A negative CommandTermination carries the origin and ctlNum of the
+  command, where it carried an empty origin and 0, and carries Error
+  `Operator Test Not OK` for a failed command with `Test` set, or
+  `Timeout Test Not OK` when that command was time activated. A SelectWithValue
+  on a selected object is refused with Object-already-selected whichever client
+  holds it, and with Command-already-in-execution while the command runs. The
+  negative write response of a control service answers
+  `temporarily-unavailable` for a selected, locked or executing object and
+  `object-access-denied` otherwise, `NotSupported` included, which used to
+  answer `object-access-unsupported`.
+- **`iec61850-server`** — A write of `Oper`, `SBOw` or `Cancel` whose value
+  does not have the type the model declares, or the structure of the service,
+  is refused with `type-inconsistent` before any handler runs; a structure that
+  failed to parse used to answer `object-access-denied`. `OperParams` no longer
+  truncates a ctlNum above 255 or defaults a missing `T` or `Check`,
+  `CancelParams` accepts the form carrying `operTm`, and a Cancel that does not
+  parse cancels nothing.
+- **`iec61850-server`** — An Operate on an object whose entry has no control
+  handler is refused with `NotSupported`; it used to report success, and under
+  enhanced security a positive CommandTermination. Install the control handler
+  on `ControlObjectEntry`.
+- **`iec61850-server`** — `ControlObject::set_check_handler`,
+  `set_wait_for_exec_handler` and `set_operate_handler`, which store a handler
+  the control services never call, and `ControlAction::set_add_cause` and
+  `set_error`, which a handler cannot reach, are documented as having no effect
+  and log a warning on their first call. Install handlers on
+  `ControlObjectEntry` and report a refusal by the `ControlAddCause` a handler
+  returns.
+- **`iec61850-server`** — SqNum, ConfRev and subSeqNum of a report are encoded
+  as BER integers, with a leading zero octet when the top bit of a value is
+  set; values of 128 and above used to be read as negative by a strict
+  decoder.
+- **`iec61850-server`** — A data set member that triggers again within the
+  buffer time no longer overwrites the value still pending: the pending report
+  is sent (URCB) or buffered (BRCB) at once, and the new trigger starts the
+  next buffer time.
+- **`iec61850-server`** — The members of a BRCB general interrogation or
+  integrity report carry only the general-interrogation or integrity reason;
+  they also carried data-change before.
+- **`iec61850-server`** — A BRCB report carries as TimeOfEntry the time its
+  entry entered the buffer, the same value `TimeofEntry` reads back, instead of
+  the time it was sent.
+- **`iec61850-server`** — A DatSet write on a URCB or BRCB must name a data set
+  the server knows, or be empty, and is refused with `object-value-invalid`
+  otherwise; a BRCB also refuses a non-persistent (`@`) data set. An accepted
+  write binds the control block to the members of that data set, including one
+  created with DefineNamedVariableList, so its reports carry those members;
+  before, only the name changed.
+- **`iec61850-server`** — DeleteNamedVariableList refuses to delete a data set
+  created at run time that the DatSet of a report control block names: it
+  deletes none of the requested data sets and answers with errorClass service
+  object-constraint-conflict, carrying numberDeleted as the service-specific
+  information. A configured data set is never deleted, whether or not a
+  control block names it, and is answered positively with numberDeleted 0 as
+  before.
+- **`iec61850-server`** — GetVariableAccessAttributes describes every
+  registered report and log control block, and GetNameList lists its group,
+  the block and each member, flattened like the data objects. A Read of a
+  logical node or of its RP, BR, LG or SP group carries the control blocks in
+  the same layout, and a buffered report control block reads as a whole, which
+  used to answer `object-access-unsupported`. The members of a log control
+  block are named `OldEnt` and `NewEnt`, the IEC 61850-8-1 component names;
+  `OldEntr` and `NewEntr` still resolve but are not listed.
+- **`iec61850-server`** — A whole read of a log control block answers its nine
+  MMS components, `LogEna`, `LogRef`, `DatSet`, `OldEntrTm`, `NewEntrTm`,
+  `OldEnt`, `NewEnt`, `TrgOps` and `IntgPd`, in that order; it used to answer
+  five. `OldEntrTm`, `NewEntrTm`, `OldEnt` and `NewEnt` report the oldest and
+  newest entry of the log, zero for an empty log, and are readable alone,
+  where they answered `object-access-unsupported`.
+- **`iec61850-server`** — The type description of a setting group control
+  block includes `ResvTms` when the block exposes it, and a Read of `LLN0$SP`
+  or `LLN0` includes the setting group control block, so the value matches its
+  type description. A setting group control block path under a logical node
+  other than LLN0 answers `object-non-existent` instead of reaching the control
+  block of the domain.
+- **`iec61850-server`** — A Read resolves a data attribute only under its own
+  functional constraint, as GetVariableAccessAttributes and Write already did;
+  a path naming another constraint answers `object-non-existent`.
+- **`iec61850-server`** — CreateDataSet refuses a constructed attribute as a
+  member, which used to read back as an empty structure, and refuses a data
+  set name that is not `<LN>$<name>` of an existing logical node: a malformed
+  name answers `invalid-address`, an unknown domain or logical node
+  `object-non-existent`.
+- **`iec61850-server`** — GetDataSetValues of a data set that does not exist
+  fails the service with `object-non-existent`, as GetDataSetDirectory does,
+  instead of answering one failed access result. A client that looked for that
+  access result sees a service error instead.
+- **`iec61850-server`** — `LActTm` carries the time quality of
+  `IedServerConfig::time_quality`, so with the default configuration it now
+  reports leapSecondsKnown, `0x8a`, where it carried `0x0a`.
+- **`iec61850-server`** — An attribute update writes a log entry through every
+  enabled log control block whose `TrgOps` hold the trigger of the update,
+  data-change or quality-change, and whose `DatSet` names a registered data set
+  that holds the attribute; the entry carries the member reference, the new
+  value and the reason code. Nothing used to be logged unless the application
+  called `LogControl::log_single_value` itself; an application that does so
+  for these members stops, or each update is logged twice. Integrity and
+  general interrogation entries are not written yet.
+- **`iec61850-server`** — Writing `GoID` while `GoEna` is true is refused with
+  `temporarily-unavailable` and leaves the publication unchanged, per
+  SetGoCBValues of IEC 61850-7-2. `GoEna` stays writable; disable the control
+  block before changing its `GoID`.
+- **`iec61850-tls`** — `with_dangerous_no_sni_verify()` skips the server name
+  check; it used to change nothing. Chain validation, revocation, validity
+  time and the allow-only-known list still apply. A configuration that calls it
+  now accepts any certificate that chains to a trust anchor, whatever name it
+  carries.
+- **`iec61850-tls`** — `build_server` applies `time_validation(false)` to
+  client certificates as well, through the new
+  `IgnoreValidityTimeClientVerifier`; a server so configured now accepts an
+  expired client certificate that passes every other check, where it rejected
+  it.
+- **`iec61850-tls`** — `session_resumption(false)` also stops TLS 1.2 session
+  resumption on the server, and takes precedence over
+  `session_resumption_lifetime`. `session_resumption_lifetime` bounds how long
+  a TLS 1.2 session or a TLS 1.3 ticket stays resumable, instead of setting the
+  number of tickets sent per handshake; a zero lifetime disables resumption.
+- **`iec61850-tls`** — `chain_validation(false)` and `renegotiation_interval()`
+  are documented as not applied, and building a configuration with either set
+  logs a warning.
+- **`iec61850-goose`** — A received frame is delivered to every subscriber
+  whose APPID, destination MAC and gocbRef filters accept it. Only the first
+  matching subscriber used to be notified, so an observer added first starved
+  every subscription on a specific gocbRef, and a gocbRef match could reach a
+  subscriber whose APPID or MAC filter rejected the frame. An application that
+  registers an observer next to specific subscriptions now sees a frame in
+  both.
+- **`iec61850-goose`** — The receiver decodes frames with
+  `GoosePdu::decode_ber`: a confRev, stNum, sqNum, timeAllowedToLive or
+  numDatSetEntries of 2^31 or more, as this crate's publisher sends it, is now
+  received; a PDU with stNum 0, a numDatSetEntries that disagrees with allData,
+  or a missing mandatory member, goID included, is dropped with a warning
+  instead of being delivered with zero or empty fields; an unknown member tag
+  is skipped.
+- **`iec61850-sv`** — smpMod is encoded in two octets, the INT16U of
+  IEC 61850-9-2 §8.5.2 Table 14, by both `encode_sav_pdu` and `SvPublisher`;
+  it used to be one octet. A received two-octet smpMod is decoded as an
+  INT16U, and a one-octet smpMod is still accepted as the same value and logged
+  once; a value above 255, which `SmpMod` cannot represent, drops the optional
+  field, also logged once. A 0.3.2 subscriber reads the new encoding, taking
+  its last octet; a third-party subscriber that requires one octet needs the
+  two-octet form.
+- **`iec61850-sntp`** — The server answers a symmetric-active request in
+  symmetric-passive mode and copies the poll field of every request, as
+  RFC 4330 §5 requires; `SntpServerConfig::poll` no longer has an effect.
+- **`iec61850-scl`** — A file that contradicts IEC 61850-6 in one of the
+  following ways now fails to load, where it used to load with a wrong value:
+  an integer `<Val>` outside the range of its bType (an INT8 of 300, an INT8U
+  of 256); a `<DA>` or `<FCDA>` `fc` that is not a data functional constraint
+  (`ALL`, `NONE`, `BR`, `RP`, `LG`, `GO`, `MS`, `US`); a `SettingControl` with
+  `numOfSGs` or `actSG` of 0 or an `actSG` above `numOfSGs`; a DataTypeTemplates
+  `<Val>` that does not parse as its bType; an Octet64 `<Val>` that is not
+  base64Binary or a Timestamp `<Val>` that is not an xs:dateTime; and an `FCDA`
+  naming an attribute the model does not have or one under another functional
+  constraint. Such a file has to be corrected to load.
+- **`iec61850-scl`** — A sub-object chain of DOTypes, or a nesting of DATypes,
+  deeper than 32 levels is rejected with `SemanticConflict`; a chain of about a
+  thousand levels used to overflow the stack and abort the process.
+- **`iec61850-scl`** — A `<Val>` on a `<DA>` of a DOType or a `<BDA>` of a
+  DAType is the initial value of every instance without a `<DAI>` override, and
+  `<Val>` values on Dbpos and Tcmd (the IEC 61850-7-3 value names), on Octet64
+  (base64Binary) and on Timestamp (xs:dateTime, UTC when no time zone is given)
+  are applied. They used to be ignored, so a `ctlModel` declared
+  `sbo-with-normal-security` read as `status-only` and an `sboTimeout` as 0;
+  models built from such files now start from the values the file declares. A
+  BOOLEAN `<Val>` accepts the xs:boolean literals `1` and `0`, and `TRUE` and
+  `FALSE`, as well as `true` and `false`.
+- **`iec61850-scl`** — The GoID of a GOOSE control block is the `appID` of its
+  `<GSEControl>`, or its GoCBRef, `<domain>/LLN0$GO$<name>`, when the `appID`
+  is empty; it used to be the control block name. A publisher configured from
+  the model now sends the GoID that subscribers set up from the same SCD
+  expect; a subscriber that was matched to the old GoID needs the `appID`.
+- **`iec61850-scl`** — An Enum attribute whose `EnumVal` ordinals do not all
+  fit integer(8) is built with `DataAttribute::ty` of
+  `DataAttributeType::Int16` or `DataAttributeType::Int32`, the smallest that
+  holds them, instead of `DataAttributeType::Enumerated`, and
+  GetVariableAccessAttributes declares it as integer(16) or integer(32)
+  instead of integer(8); code that branches on `ty` sees the new type. An Enum
+  whose ordinals fit integer(8) is unchanged.
+- **`iec61850-scl`** — The `daName` of an `<FCDA>` is split on `.` like the
+  `doName`, so `DataSetEntry::do_path` is `["TotW", "mag", "f"]` rather than
+  `["TotW", "mag.f"]`; an element index written into a name, as in
+  `phsAHar(9)`, becomes the entry's array index when `ix` is absent. Code that
+  reads `do_path` sees one segment per name.
+- **`iec61850-scl`** — An `<SDI>` or `<DAI>` carrying `ix` is skipped with a
+  warning, since the model holds an array as a single element; its value used
+  to be written into that element.
+- **`iec61850-model`** — `IedModelBuilder::build` resolves every segment of a
+  data set entry path, not only the data object, and requires the attribute it
+  names, or an attribute below the data object it names, to carry the entry's
+  functional constraint; any other entry is rejected with
+  `DataSetEntryUnresolved`, in a model built by hand as in one built from SCL.
+  A segment holding `.`-joined names, as in `["TotW", "mag.f"]`, is still
+  accepted.
+- **`iec61850-scl-build`** — Generated code calls a lookup of
+  `iec61850-scl` 0.3.3 to apply `<DAI>` values; build a crate generated by
+  `iec61850-scl-build` 0.3.3 against `iec61850-scl` 0.3.3 or later.
+- **`iec61850-server`** — GetBRCBValues reads `EntryID` and `TimeofEntry` as
+  IEC 61850-7-2 defines them: while `RptEna` is true, the last entry queued for
+  transmission; while it is false, the newest entry in the buffer, and the
+  all-zero EntryID once the buffer is empty. They used to read back the EntryID
+  a client last wrote, zero until one did, together with the time of the last
+  entry sent. Writing `EntryID` still sets where transmission resumes.
+- **`iec61850-scl`**, **`iec61850-scl-build`** — A `<DA>` declared with
+  `fc="SE"` is also an FC=SG data attribute of the same name and type, as
+  IEC 61850-6 defines, starting at the same template and `<DAI>` value and
+  holding a value of its own. A DOType that declares the setting with
+  `fc="SG"` itself keeps its own declaration. GetNameList, a read of a whole
+  logical node and GetVariableAccessAttributes include the FC=SG attributes;
+  a write under FC=SG is refused as before.
+- **`iec61850-server`** — Once a ConfirmEditSGValues of the active setting
+  group succeeds, every FC=SE value of the logical device is copied to the
+  FC=SG data attribute of the same name, so a read under FC=SG returns the
+  committed value. Committing another group, or selecting another active
+  group, leaves the FC=SG values to the application.
+- **`iec61850-goose`** — `GooseReceiver` drops a frame of another EtherType
+  with a trace event instead of two warnings; a GOOSE frame that fails to
+  decode is still reported with a warning.
+- **`iec61850-tls`** — A server built by `TlsConfigBuilder` sends no TLS 1.3
+  session ticket by default; it used to send two. A libiec61850 TLS client
+  built with mbedtls 3.6.0 closes the connection when it receives one, which
+  broke every TLS 1.3 association from such a client. TLS 1.3 sessions
+  therefore no longer resume by default, while TLS 1.2 session ID resumption
+  is unchanged. Call `tls13_session_tickets(2)` on the builder to restore the
+  previous behavior.
+
+### Added
+
+- **`iec61850-mms`** — `MmsClient::abort` aborts the association with an ACSE
+  ABRT from the service user inside a Session AB, then closes the transport.
+- **`iec61850-mms`** — `MmsClient::connected_flag` returns a flag that is true
+  exactly while the association is established and is updated on every state
+  change, including a transport loss found inside a service call.
+- **`iec61850-mms`** — `MmsClientBuilder::max_pending_unconfirmed` bounds the
+  Unconfirmed PDUs held for a later read while confirmed calls are in flight,
+  1024 by default; when the bound is reached the oldest is dropped with a
+  warning.
+- **`iec61850-client`** — `ControlObjectClient::last_appl_error` returns the
+  LastApplError the server reported for the most recent Select,
+  SelectWithValue, Operate or Cancel on the handle: the report a server sends
+  ahead of the negative response to a refused command, or the one inside a
+  negative command termination. It is cleared when the next command starts.
+- **`iec61850-server`** — `ControlObject::set_oper_timeout_ms` limits a running
+  command (`operTimeout`); on expiry the command ends with `TimeLimitOver`,
+  reported in a negative CommandTermination under enhanced security. The
+  default, 0, leaves it unlimited.
+- **`iec61850-server`** — `ReportingEngine::set_dataset_registry` installs the
+  data set registry that DatSet writes resolve against; `IedServer` shares its
+  own registry with the engine. A `ReportingEngine` used without it refuses
+  every DatSet write that names a data set.
+- **`iec61850-tls`** — `TlsConfigBuilder::require_client_auth` makes a client
+  certificate mandatory on the server; a client presenting none is refused.
+- **`iec61850-tls`** — `IgnoreValidityTimeClientVerifier`, the
+  client-certificate counterpart of `IgnoreValidityTimeServerVerifier`.
+- **`iec61850-tls`** — Configurations built by `TlsConfigBuilder` report each
+  certificate rejection to the event handler as `AlmCertRevoked`,
+  `AlmCertSanMismatch`, `AlmCertBadEncoding` or `AlmCertChainInvalid`.
+  `TlsAcceptor` and `TlsConnector` raise `SessionEstablished` on success,
+  `WrnNoPeerCert` when a client presents no certificate to a server that
+  requests one without requiring it, `AlmCertNotConfigured` when a required
+  client certificate is missing, and `AlmCipherNotAllowed`, `AlmVersionTooOld`
+  or `AlmUnexpectedAlert` for the matching handshake failures.
+  `SessionClosed`, `SessionRenegotiation`, `WrnCertExpiringSoon`,
+  `WrnCrlExpired`, `AlmUnauthorizedAccess`, `AlmHandshakeTimeout` and
+  `AlmConnectionAborted` are not raised by the crate.
+- **`iec61850-goose`** — `GooseReceiver::handle_message_at` and `tick_at`
+  take the arrival time and the time of the expiry check from the caller, and
+  `GooseSubscriber::is_valid_at` checks validity at a given instant, so
+  timeAllowedToLive supervision can be driven from the application's clock.
+- **`iec61850-goose`** — `GooseSubscriberBuilder::max_streams` bounds how many
+  publications an observer tracks, 64 by default.
+- **`iec61850-sv`** — `SvSubscriberBuilder::smp_cnt_limit` sets the value at
+  which smpCnt wraps to 0, and `SvSubscriberBuilder::max_streams` bounds how
+  many svIDs a subscriber follows, 64 by default.
+- **`iec61850-hal`** — `AfPacketSocket::hw_addr` and `PcapSocket::hw_addr`
+  return the address of the interface the socket is bound to.
+- **`iec61850-mms`** — `MmsClient::identify` and `BlockingMmsClient::identify`
+  issue the MMS Identify service and return an `IdentifyResponse` with the
+  vendor name, model name and revision of the server, and the abstract
+  syntaxes it lists, if any. The request and response PDUs are available as
+  `encode_confirmed_identify_request` and `decode_confirmed_identify_response`
+  with their counterparts.
+- **`iec61850-client`** — `IedConnection::get_server_identity` returns a
+  `ServerIdentity` carrying the vendor, model and revision a server reports
+  through the MMS Identify service, together with any abstract syntaxes it
+  lists.
+- **`iec61850-mms`** — `MmsClient::status` and `BlockingMmsClient::status`
+  issue the MMS Status service and return a `StatusResponse` with the logical
+  and physical status of the server and its local detail bits, if any. A
+  status value outside the ones ISO 9506-2 names is kept as the `Other`
+  variant of `VmdLogicalStatus` or `VmdPhysicalStatus`. The request and
+  response PDUs are available as `encode_confirmed_status_request` and
+  `decode_confirmed_status_response` with their counterparts.
+- **`iec61850-client`** — `IedConnection::get_server_status` returns a
+  `ServerStatus` carrying the logical and physical status a server reports
+  through the MMS Status service, together with any local detail bits.
+- **`iec61850-server`** — The server answers the MMS Status service with
+  `state-changes-allowed` and `operational`, and announces `status` in
+  `servicesSupportedCalled`.
+- **`iec61850-model`** — `DataObject::child_by_name_fc` and
+  `IedModel::node_by_object_ref_fc` find a data attribute under a given
+  functional constraint, telling apart the FC=SE and FC=SG data attributes of
+  one setting, which `child_by_name` and `node_by_object_ref` do not.
+- **`iec61850-tls`** — `TlsConfigBuilder::tls13_session_tickets` sets how many
+  TLS 1.3 session tickets a server sends after each handshake, 0 by default.
+  `session_resumption(false)` and a zero `session_resumption_lifetime` still
+  send no ticket whatever the count.
+
+### Fixed
+
+- **`iec61850-mms`** — A confirmed answer is bound to its request by invokeID.
+  A request without an answer within the request timeout returns
+  `ServiceTimeout` and leaves the association usable; its late answer, and an
+  answer under any other invokeID, is discarded instead of being returned to
+  the next request. A Read or Write answer must carry exactly one result.
+- **`iec61850-mms`** — Each receive is bounded by one timeout, so
+  `recv_unconfirmed_pdu_with_timeout` may wait longer than the request timeout
+  instead of failing when the request timeout passes.
+- **`iec61850-mms`** — `disconnect` releases the association with an ACSE RLRQ
+  in a Session FINISH after the Conclude response and waits for the RLRE in the
+  DISCONNECT. A Conclude-ErrorPDU returns `ConcludeRejected` and keeps the
+  association; an InformationReport received before the Conclude response is
+  kept for a later read.
+- **`iec61850-mms`** — The outbound size guard measures the MMS PDU itself, so
+  a PDU of exactly the negotiated size is sent, and the negotiated size never
+  exceeds the size the client proposed.
+- **`iec61850-mms`** — An Unconfirmed PDU with no content is discarded with a
+  warning instead of being handed to the caller.
+- **`iec61850-mms`** — `MmsClient::connect` resolves a host name and accepts an
+  IPv6 literal with or without brackets; it used to take an IP literal only.
+- **`iec61850-client`** — `IedConnection::is_connected` turns false as soon as
+  a service call finds the connection lost, and later calls return
+  `NotConnected`; `poll_reports` returns `NotConnected` when the connection is
+  lost while it waits, and `Ok(0)` for an idle wait longer than the request
+  timeout. The report dispatcher keeps running after a receive error that
+  leaves the association established.
+- **`iec61850-client`** — `IedConnection::abort` sends an ACSE abort before
+  closing the transport.
+- **`iec61850-client`** — A control command the server refuses reports, as the
+  cause of `ControlOutcome::Failure`, the AddCause of the `LastApplError`
+  InformationReport the server sends ahead of the negative response; it used
+  to report `Unknown` whatever the server sent. The report is taken when its
+  CntrlObj names the object and, for SelectWithValue, Operate and Cancel, its
+  ctlNum and origin are those of the command, so a late report of an earlier
+  command is not taken.
+- **`iec61850-client`** — An enhanced-security Operate, and
+  `try_recv_command_termination` and `wait_command_termination`, take only a
+  command termination of the object's `Oper` carrying the command's ctlNum. A
+  termination of another object, or a late one of an earlier command, is left
+  for the report dispatcher instead of being taken as the result.
+- **`iec61850-client`** — The directory services fail with an error when a
+  GetNameList page reports more names but does not advance past the previous
+  continuation, or when one walk passes one million names, instead of looping
+  without end.
+- **`iec61850-client`** — `get_logical_node_directory(_, AcsiClass::Sgcb)`
+  lists `SGCB` only for `LLN0`; it used to list it for every logical node of a
+  logical device that has one.
+- **`iec61850-server`** — Control commands no longer run inside the MMS
+  dispatcher. An Operate is answered once its wait-for-execution handler has
+  finished, negatively when it refuses and positively otherwise, after which
+  the control handler runs on its own task; the association keeps serving
+  requests meanwhile. Under enhanced security the outcome of the command
+  travels only in the CommandTermination. A control write on a
+  `current_thread` runtime no longer panics.
+- **`iec61850-server`** — An Operate under enhanced security in a write of
+  several variables, which is answered when it is accepted, is ended with a
+  negative CommandTermination when its wait-for-execution handler refuses it,
+  instead of never being terminated.
+- **`iec61850-server`** — A buffered report that carries ConfRev together with
+  BufOvfl or EntryID sends ConfRev after them, in the order of IEC 61850-8-1;
+  such reports could not be parsed before.
+- **`iec61850-server`** — A report larger than 65535 bytes is segmented instead
+  of overrunning the BER length, which in a debug build panicked in the tick
+  loop and stopped all reporting. Every report PDU stays within the smaller of
+  the server's maximum PDU size and 65535 bytes, and each segment carries as
+  many members as fit.
+- **`iec61850-server`** — GetDataSetValues applies the read handler of each
+  member, as a direct Read of the member does.
+- **`iec61850-server`** — A leaf below a constructed attribute, such as
+  `setMag$f` under SP or SE, is writable by its own path, and a constructed
+  attribute is writable as a structure with one member per sub-attribute;
+  both used to answer `object-access-unsupported`. A refused write leaves
+  every leaf unchanged. Such a write is decided by the
+  write handlers of the attributes above the leaf as well, outermost first, so
+  a handler on a constructed attribute also guards its leaves; one write can
+  therefore consult several handlers.
+- **`iec61850-server`** — GetNameList resumes at the first name after
+  `continueAfter` even when that name is no longer listed; it used to answer
+  `object-non-existent`.
+- **`iec61850-server`** — A Read that sets specificationWithResult gets its
+  variable access specification back, counted against the negotiated PDU size.
+- **`iec61850-server`** — The edit session reservation of a setting group
+  control block runs on the monotonic clock, so a step of the wall clock no
+  longer shortens or extends it.
+- **`iec61850-server`** — ReadJournal resolves the journal a log control
+  block's `LogRef` names, `<LD>/<LN>$<LogName>`, and GetNameList for the
+  Journal class lists the journals of a domain; the journal used to be
+  readable only under the key the control block was registered with, and the
+  list was always empty. A registration key still names its journal.
+- **`iec61850-server`** — A ReadJournal page stops reading the log once the
+  response is full, instead of copying every matching entry first.
+- **`iec61850-tls`** — A server with no trust anchor and no mandatory client
+  authentication builds and requests no client certificate; it used to fail to
+  build. Mandatory client authentication without a trust anchor fails with
+  `TlsError::Validation`.
+- **`iec61850-tls`** — The TLS 1.2 whitelist includes
+  `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` and
+  `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, so a peer with an ECDSA
+  certificate can negotiate TLS 1.2.
+- **`iec61850-goose`** — `Expired` is raised once timeAllowedToLive elapses
+  after the last frame even when that frame was out of sequence, such as a
+  repeated sqNum or an stNum that moved backwards; such a publication used to
+  never expire.
+- **`iec61850-goose`** — An observer keeps stNum, sqNum, confRev and expiry
+  per gocbRef, so interleaved publications no longer report false rollbacks,
+  state changes or confRev changes. The number of publications tracked is
+  bounded, and only the first eviction is logged.
+- **`iec61850-goose`** — A five-octet INTEGER whose first octet is not 0x00 is
+  rejected; it used to be truncated to its low 32 bits.
+- **`iec61850-sv`** — A smpCnt that wraps to 0 once a second, as a stream
+  synchronized per IEC 61850-9-2LE does, is no longer counted as 61536 missed
+  samples. The wrap point is the configured `smp_cnt_limit`, else the smpRate
+  of an ASDU sent with smpMod samples-per-second; without either, a smpCnt
+  below its predecessor is taken as that reset, so losing sample 0 at the
+  reset counts one missed sample rather than 61537.
+- **`iec61850-sv`** — A subscriber without an svID filter follows smpCnt
+  continuity per svID, so interleaved streams no longer count every ASDU as a
+  gap. The number of svIDs followed is bounded, and only the first eviction is
+  logged.
+- **`iec61850-hal`** — The `AF_PACKET` backend, and the pcap backend on Linux,
+  send a frame whose source address is all zero with the interface address in
+  its place; a GOOSE publisher without `src_mac` used to put a zero source
+  address on the wire. On Windows the source address is still sent as the
+  publisher sets it.
+- **`iec61850-hal`** — The `AF_PACKET` backend restores the 802.1Q tag the
+  kernel moves out of a received frame, so GOOSE and SV subscribers on Linux
+  see the VLAN of a tagged frame. Both backends drop a frame larger than the
+  receive buffer and report it, instead of returning it truncated; the GOOSE
+  and SV receive buffers hold 1522 bytes.
+- **`iec61850-sntp`** — The server keeps serving after a datagram longer than
+  48 octets, such as a request with an authenticator, and after a reply meets
+  an ICMP port unreachable; on Windows either one used to end `run()`. The
+  client and server read datagrams of up to 1024 octets and decode the
+  48-octet header.
+- **`iec61850-sntp`** — The client rejects a reply whose transmit timestamp is
+  zero and converts timestamps with the NTP era rule of RFC 4330 §3, so times
+  from 2036-02-07 on are correct. `SntpClient::new` has no panicking path.
+- **`iec61850-scl`** — A DOType that reaches itself through its `<SDO>` chain
+  is rejected with `SemanticConflict` when the file is resolved; building such
+  a model used to overflow the stack and abort the process.
+- **`iec61850-scl`** — A `<DA>`, `<SDO>` or `<BDA>` declared with `count` is
+  warned about; arrays are still built as a single element.
+- **`iec61850-scl-build`** — A `<DAI>` value below a constructed attribute,
+  such as `rangeC.min.f` or `units.SIUnit`, is applied by the generated model;
+  it used to be dropped silently, so the generated model kept the default
+  while the runtime model held the configured value.
+- **`iec61850-scl-build`** — A generated model starts every leaf from the same
+  value as the model built at run time; Dbpos and Tcmd used to start as an
+  integer, EntryTime as an empty binary time, and OptFlds, TrgOps, Currency and
+  PhyComAddr as empty octet strings.
+- **`iec61850-model`** — The default value of an EntryID, an 8-octet string,
+  is eight zero octets; it used to be empty, against the octet-string(8) the
+  server declares.
+- **`iec61850-client`** — `set_rcb_values` with `ENTRY_ID` writes the BRCB
+  component `EntryID`; it used to write `EntryId`, which every server refused
+  as nonexistent, so a client could not resynchronize a BRCB through it.
+- **`iec61850-model`** — `DataObjectBuilder::build` accepts one data attribute
+  under FC=SE and one of the same name, type and structure under FC=SG, as an
+  SCL file may declare a setting; it used to refuse the pair as a duplicate
+  name. A data set entry resolves the attribute that carries its own
+  functional constraint, so either one of the pair can be a member.
+- **`iec61850-server`** — CreateDataSet resolves a member to the data
+  attribute that carries the member's functional constraint, so the FC=SE and
+  the FC=SG attribute of one setting are both accepted.
+- **`iec61850-mms`** — `SERVER_SERVICES_SUPPORTED` no longer announces
+  `cancel`: the MMS layer rejects every Cancel-RequestPDU before a dispatcher
+  sees it. `iec61850-server` already withheld the bit.
+- **`iec61850-mms`** — The Initiate request of the client announces only the
+  services the client issues. `DEFAULT_SERVICES_SUPPORTED_CLIENT` used to set
+  `getDomainAttributes`, `kill`, `writeJournal`, `initializeJournal`,
+  `reportJournalStatus`, `getCapabilityList`, the file services,
+  `unsolicitedStatus` and `cancel`, none of which the client issues or
+  handles.
+- **`iec61850-server`** — A build with the `control` feature and without
+  `reporting` announces `informationReport` in `servicesSupportedCalled`. The
+  control subsystem sends `LastApplError` and command terminations as
+  InformationReport, and the bit used to follow the reporting subsystem alone.
+- **`iec61850-scl-build`** — `compile()` builds the run-time model of every IED
+  it generates code for, and an SCL file the run-time path rejects fails the
+  build script with `CompileError::ResolveScl`. Such a file used to generate a
+  `build_<X>_model` that panicked when called.
+- **`iec61850-tls`** — A server refusing a client that offers only RSA key
+  exchange or DHE cipher suites reports `AlmCipherNotAllowed`, and one refusing
+  a ClientHello without the signature_algorithms extension, as TLS 1.1 and
+  older clients send, reports `AlmVersionTooOld`; both refusals used to raise
+  no event.
+- **Documentation** — The feature descriptions of `iec61850-model`,
+  `iec61850-mms`, `iec61850-client` and `iec61850-hal` name the combinations
+  that build; the `iec61850-goose` README example compiles; `SECURITY.md`
+  lists `with_dangerous_no_sni_verify()` and `time_validation(false)` as the
+  TLS settings that weaken the profile; and the conformance statement gives
+  the URCB and BRCB attribute order as IEC 61850-8-1 Tables 73 and 72, lists
+  the capability-unavailable and service-other errors the server emits, marks
+  the SCL `Header` element as skipped, and states that a received ACSE
+  password reaches an installed authenticator.
+
 ## [0.3.2] - 2026-10-31
 
 ### Added

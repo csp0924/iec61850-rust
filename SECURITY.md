@@ -26,8 +26,8 @@ the advisory unless they ask not to be.
 
 | Version | Supported |
 |---|---|
-| `0.1.x` | yes |
-| earlier | none exist |
+| `0.3.x` | yes |
+| `0.2.x` and earlier | no |
 
 While the project is below `1.0`, only the latest published minor version
 receives security fixes. Older minor versions are not backported.

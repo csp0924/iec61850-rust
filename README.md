@@ -37,8 +37,8 @@ What this project does not claim:
   Data sets, report control blocks and GOOSE control blocks are listed once they
   are registered. Those registries are what the Read paths resolve against, so
   every listed name is readable, and one the model declares but nothing
-  registered is not listed. A `Journal`-class request is answered with an empty
-  list, so a log is read by name rather than discovered.
+  registered is not listed. A `Journal`-class request lists the journals the
+  `LogRef` of each registered log control block names.
 - **SVCB management over MMS, R-GOOSE and R-SV are not implemented.**
 
 ## Crates
@@ -89,7 +89,8 @@ wait-for-execution handler hooks.
 
 **Logging.** A log control block writing through a `LogStorage` trait, read
 back by a client with QueryLogByTime and QueryLogAfterEntry over ReadJournal.
-WriteJournal is not implemented.
+Data set members are logged on data-change and quality-change. WriteJournal is
+not implemented.
 
 **Setting groups.** An SGCB runtime with `ActSG`, `EditSG` and `CnfEdit`, an
 edit session owned by one association, and a reservation deadline that releases
@@ -110,8 +111,8 @@ report dispatch, control, journal queries and GoCB access.
 
 **Security.** `iec61850-tls` builds `rustls` configurations with the IEC
 62351-3 constraints already applied: TLS 1.2 as the floor, a fixed cipher suite
-whitelist, optional allow-only-known-certificate verification, and the profile's
-event codes. `iec61850-client` and `iec61850-server` reach it through their
+whitelist, optional or mandatory client authentication, optional
+allow-only-known-certificate verification, and the profile's event codes. `iec61850-client` and `iec61850-server` reach it through their
 `tls` features.
 
 ## Quick start
