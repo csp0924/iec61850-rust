@@ -147,7 +147,7 @@ impl IedServer {
     /// GOOSE or log control block of the model is already registered under
     /// the same reference, and `InvalidModel` when two of them, report control
     /// block instances included, have the same reference, when a data set member does not
-    /// resolve, names an array element, resolves to no attribute or to more
+    /// resolve, names an element past the end of its array, resolves to no attribute or to more
     /// than [`DatasetEntry::MAX_LEAVES`] attributes, when a
     /// control block names a data set of another logical device or one the
     /// server does not hold, or when a GOOSE control block names no data set.
@@ -532,7 +532,8 @@ fn log_reference(domain: &str, log_ref: &str) -> String {
 }
 
 /// Binds a data set member of the model to the node it names, an FCD or an
-/// FCDA of any type; the error says why it does not resolve.
+/// FCDA of any type, or an element of an array its index selects; the error
+/// says why it does not resolve.
 fn member_entry(
     model: &IedModel,
     owner: &LogicalDevice,
@@ -549,7 +550,7 @@ fn member_entry(
         }
         DatasetError::MemberNotFound { .. } => "does not resolve under its functional constraint",
         DatasetError::TooLarge { .. } => "holds more attributes than a member may",
-        _ if entry.array_index.is_some() => "names an array element, which is not supported",
+        _ if entry.array_index.is_some() => "names no element of an array on its path",
         _ => "is not a valid member path",
     })
 }

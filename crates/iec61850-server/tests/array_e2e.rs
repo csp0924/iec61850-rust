@@ -18,7 +18,7 @@ use iec61850_mms::mms::pdu::common::{
 use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
 use iec61850_mms::mms::pdu::type_specification::TypeSpecification;
 use iec61850_mms::mms::MmsData;
-use iec61850_model::{IedModel, MmsValue, NodeRef, ObjectRef};
+use iec61850_model::{IedModel, MmsValue, NodeRef, ObjectRef, FC};
 use iec61850_server::{
     AttributeAccessHandler, HandlerWriteOutcome as WriteOutcome, IedServer, IedServerConfig,
     ReadContext, ReadHandler, ReadOutcome, ServerHandle, WriteContext,
@@ -36,7 +36,18 @@ const SCL: &str = r#"<SCL>
     <AccessPoint name="AP1">
       <Server>
         <LDevice inst="LD0">
-          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T"/>
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+            <DataSet name="Harm">
+              <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA.phsAHar(3)" daName="cVal.mag.f" fc="MX"/>
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Arr" daName="hstVal" fc="ST" ix="1"/>
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Arr" daName="cfg.lims" fc="SP"/>
+              <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA.phsAHar" fc="MX"/>
+            </DataSet>
+            <ReportControl name="HarmRCB" datSet="Harm" rptID="Harm" buffered="true" indexed="false" confRev="1">
+              <TrgOps dchg="true"/>
+              <OptFields dataRef="true" reasonCode="true"/>
+            </ReportControl>
+          </LN0>
           <LN lnClass="GGIO" inst="1" lnType="GGIO_T">
             <DOI name="Arr">
               <DAI name="hstVal" ix="1"><Val>7</Val></DAI>
@@ -71,7 +82,7 @@ const SCL: &str = r#"<SCL>
       <DA name="hstVal" fc="ST" bType="INT32" count="3" dchg="true"/>
       <DA name="setVals" fc="SP" bType="INT32" count="4"/>
       <DA name="pts" fc="SP" bType="Struct" type="PT_T" count="3"/>
-      <DA name="cfg" fc="SP" bType="Struct" type="CFG_T"/>
+      <DA name="cfg" fc="SP" bType="Struct" type="CFG_T" dchg="true"/>
       <DA name="crvPts" fc="DC" bType="Struct" type="PT_T" count="maxPts"/>
       <DA name="maxPts" fc="CF" bType="INT16U"><Val>2</Val></DA>
     </DOType>
@@ -82,7 +93,7 @@ const SCL: &str = r#"<SCL>
       <DA name="numHar" fc="CF" bType="INT16U"><Val>4</Val></DA>
     </DOType>
     <DOType id="CMV_T" cdc="CMV">
-      <DA name="cVal" fc="MX" bType="Struct" type="VEC_T"/>
+      <DA name="cVal" fc="MX" bType="Struct" type="VEC_T" dchg="true"/>
       <DA name="q" fc="MX" bType="Quality"/>
       <DA name="t" fc="MX" bType="Timestamp"/>
     </DOType>
@@ -905,6 +916,15 @@ async fn connect_to(handle: &ServerHandle) -> MmsClient {
 /// The inclusion bitmap and the values of the next report; fails after four
 /// seconds without one.
 async fn next_report(client: &mut MmsClient) -> (Vec<bool>, Vec<MmsValue>) {
+    let (inclusion, _, values) = next_report_with_references(client).await;
+    (inclusion, values)
+}
+
+/// The inclusion bitmap, the data references and the values of the next
+/// report; fails after four seconds without one.
+async fn next_report_with_references(
+    client: &mut MmsClient,
+) -> (Vec<bool>, Vec<String>, Vec<MmsValue>) {
     use iec61850_client::mms_compat::mms_data_to_mms_value;
     use iec61850_client::report::parse::parse_report;
     use iec61850_mms::mms::pdu::information_report::{
@@ -935,7 +955,11 @@ async fn next_report(client: &mut MmsClient) -> (Vec<bool>, Vec<MmsValue>) {
             .map(mms_data_to_mms_value)
             .collect();
         let parsed = parse_report(&MmsValue::Array(elements)).expect("parse report");
-        return (parsed.inclusion_bits, parsed.data_values);
+        return (
+            parsed.inclusion_bits,
+            parsed.data_references,
+            parsed.data_values,
+        );
     }
 }
 
@@ -1069,4 +1093,160 @@ fn an_array_update_of_another_shape_changes_nothing() {
             ])
         );
     });
+}
+
+/// `register_from_model` binds a data set member that names an array element,
+/// by an index in its name or its `ix`, to that element, with the DataRef of
+/// IEC 61850-8-1 §8.1.3.2.4, the index after the array name; a member naming
+/// a whole array, of nested attributes or of sub-data-objects, is one member
+/// whose value is the MMS array, reported whole when any element changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_data_sets_bind_array_elements() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let server = IedServer::builder()
+            .model(model())
+            .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .build()
+            .expect("build server");
+        let summary = server.register_from_model().expect("register_from_model");
+        assert_eq!(summary.data_sets, 1);
+        let handle = server.start().await.expect("start");
+        let mut client = connect_to(&handle).await;
+
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$Harm"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(
+            values,
+            vec![
+                AccessResult::Success(MmsData::Float32(3.5)),
+                AccessResult::Success(MmsData::Integer(7)),
+                AccessResult::Success(ints(&[-3, 0, 0])),
+                AccessResult::Success(har_value(3.5)),
+            ]
+        );
+
+        write(
+            &mut client,
+            "LLN0$BR$HarmRCB$RptEna",
+            MmsData::Boolean(true),
+        )
+        .await
+        .expect("enable the control block");
+        with_hst_val(&server, |hst| {
+            server.update_array(
+                hst,
+                MmsValue::Array(vec![
+                    MmsValue::Integer(5),
+                    MmsValue::Integer(8),
+                    MmsValue::Integer(5),
+                ]),
+            )
+        })
+        .expect("update_array");
+        assert_eq!(
+            next_report_with_references(&mut client).await,
+            (
+                vec![false, true, false, false],
+                vec![format!("{DOMAIN}/GGIO1$ST$Arr$hstVal(1)")],
+                vec![MmsValue::Integer(8)],
+            )
+        );
+
+        let model = server.model();
+        let r = ObjectRef::parse(&format!("{DOMAIN}/MHAI1$MX$HA$phsAHar(3)$cVal$mag$f")).unwrap();
+        let Some(NodeRef::Da(f)) = model.node_by_object_ref(&r) else {
+            panic!("the element resolves to an attribute");
+        };
+        server.update_float32(f, 4.5).expect("update_float32");
+        let (inclusion, references, values) = next_report_with_references(&mut client).await;
+        assert_eq!(inclusion, vec![true, false, false, true]);
+        assert_eq!(
+            references,
+            vec![
+                format!("{DOMAIN}/MHAI1$MX$HA$phsAHar(3)$cVal$mag$f"),
+                format!("{DOMAIN}/MHAI1$MX$HA$phsAHar"),
+            ]
+        );
+        assert_eq!(values[0], MmsValue::Float32(4.5));
+        assert_eq!(
+            iec61850_client::mms_compat::mms_value_to_mms_data(&values[1]),
+            har_value(4.5)
+        );
+
+        // A member naming an array of nested attributes is reported whole.
+        let r = ObjectRef::parse(&format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(2)")).unwrap();
+        let Some(NodeRef::Da(lim)) = model.node_by_object_ref(&r) else {
+            panic!("the element resolves to an attribute");
+        };
+        server.update_int32(lim, 4).expect("update_int32");
+        assert_eq!(
+            next_report_with_references(&mut client).await,
+            (
+                vec![false, false, true, false],
+                vec![format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims")],
+                vec![MmsValue::Array(vec![
+                    MmsValue::Integer(-3),
+                    MmsValue::Integer(0),
+                    MmsValue::Integer(4)
+                ])],
+            )
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// The MX value of `MHAI1.HA.phsAHar`: four elements of `cVal`, `q` and `t`,
+/// the fourth with `cVal.mag.f` equal to `f`.
+fn har_value(f: f32) -> MmsData {
+    let element = |f: f32| {
+        MmsData::Structure(vec![
+            MmsData::Structure(vec![MmsData::Structure(vec![MmsData::Float32(f)])]),
+            MmsData::BitString {
+                padding: 3,
+                data: vec![0, 0],
+            },
+            MmsData::UtcTime([0; 8]),
+        ])
+    };
+    MmsData::Array(vec![element(0.0), element(0.0), element(0.0), element(f)])
+}
+
+/// A model data set member whose index is past the end of its array, or that
+/// carries an index on a path holding no array, fails the registration.
+#[test]
+fn model_data_set_members_naming_no_element_fail_the_registration() {
+    for (path, index) in [(vec!["Arr", "hstVal"], 3), (vec!["Arr", "cfg", "name"], 0)] {
+        let mut model = iec61850_scl::parse_scl(SCL)
+            .expect("parse")
+            .resolve()
+            .expect("resolve")
+            .build_model("Arrays")
+            .expect("build");
+        // The model builder refuses such a member; one placed in a built model
+        // reaches the check of the server.
+        let entry = &mut model.lds[0].lns[0].datasets[0].entries[1];
+        entry.do_path = path.iter().map(|s| s.to_string()).collect();
+        entry.fc = if path.len() == 2 { FC::St } else { FC::Sp };
+        entry.array_index = Some(index);
+        let server = IedServer::builder()
+            .model(Arc::new(model))
+            .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .build()
+            .expect("build server");
+        assert!(
+            matches!(
+                server.register_from_model(),
+                Err(iec61850_server::ServerError::InvalidModel(_))
+            ),
+            "{path:?}({index}) accepted"
+        );
+    }
 }

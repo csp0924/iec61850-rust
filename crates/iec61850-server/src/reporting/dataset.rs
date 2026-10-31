@@ -26,6 +26,11 @@
 //! same wire path `iec61850-model::ObjectRef` produces. The reference of a
 //! leaf is the key of the reporting engine's inverted index; the reference of
 //! a member is what a report, a log entry and GetDataSetDirectory carry.
+//!
+//! An array at or beneath a member is an MMS array of its elements, and the
+//! reference of an element carries its index after the array name, as the
+//! DataRef of IEC 61850-8-1 §8.1.3.2.4 does: `LD/LN$MX$HA$phsAHar(7)$cVal`.
+//! A member the model declares may name one element through its index.
 
 use iec61850_model::{IedModel, LogicalDevice, MmsValue, FC};
 use std::sync::{Arc, RwLock};
@@ -68,29 +73,34 @@ impl DatasetLeaf {
     }
 }
 
-/// The node a member names: a leaf, or a structure of nodes in member order.
+/// The node a member names: a leaf, a structure of nodes in member order, or
+/// an array of nodes in element order.
 #[derive(Debug, Clone)]
 enum MemberNode {
     Leaf(DatasetLeaf),
     Structure(Vec<MemberNode>),
+    Array(Vec<MemberNode>),
 }
 
 impl MemberNode {
     fn read_value(&self) -> Option<MmsValue> {
-        match self {
-            MemberNode::Leaf(leaf) => leaf.value.read().ok().map(|g| g.clone()),
-            MemberNode::Structure(children) => children
+        let members = |children: &[MemberNode]| {
+            children
                 .iter()
                 .map(MemberNode::read_value)
                 .collect::<Option<Vec<_>>>()
-                .map(MmsValue::Structure),
+        };
+        match self {
+            MemberNode::Leaf(leaf) => leaf.value.read().ok().map(|g| g.clone()),
+            MemberNode::Structure(children) => members(children).map(MmsValue::Structure),
+            MemberNode::Array(children) => members(children).map(MmsValue::Array),
         }
     }
 
     fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a DatasetLeaf>) {
         match self {
             MemberNode::Leaf(leaf) => out.push(leaf),
-            MemberNode::Structure(children) => {
+            MemberNode::Structure(children) | MemberNode::Array(children) => {
                 for child in children {
                     child.collect_leaves(out);
                 }
@@ -111,9 +121,11 @@ impl MemberNode {
                     false
                 }
             }
-            MemberNode::Structure(children) => {
-                let MmsValue::Structure(members) = value else {
-                    return false;
+            MemberNode::Structure(children) | MemberNode::Array(children) => {
+                let members = match (self, value) {
+                    (MemberNode::Structure(_), MmsValue::Structure(members))
+                    | (MemberNode::Array(_), MmsValue::Array(members)) => members,
+                    _ => return false,
                 };
                 children
                     .iter()
@@ -172,14 +184,32 @@ impl DatasetEntry {
     /// # Errors
     ///
     /// - [`DatasetError::MemberInvalidPath`] when the path has fewer than three
-    ///   segments or an empty segment, or names an array of data objects or a
-    ///   node holding one.
+    ///   segments or an empty segment, or names a member past an array, whose
+    ///   elements have no names.
     /// - [`DatasetError::MemberNotFound`] when the functional constraint is
     ///   unknown, a node on the path is not in the model, or the data object
     ///   holds no attribute of the functional constraint.
     /// - [`DatasetError::TooLarge`] when the node holds more than
     ///   [`DatasetEntry::MAX_LEAVES`] leaves.
     pub fn from_model(model: &IedModel, domain: &str, path: &str) -> Result<Self, DatasetError> {
+        Self::from_model_at(model, domain, path, None)
+    }
+
+    /// Resolves a member as [`DatasetEntry::from_model`] does, `index`
+    /// selecting an element of the first array on the path; the reference of
+    /// the member then carries the index after the array name.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`DatasetEntry::from_model`]; [`DatasetError::MemberInvalidPath`]
+    /// also when `index` is past the end of the array, or when the path holds
+    /// no array.
+    pub(crate) fn from_model_at(
+        model: &IedModel,
+        domain: &str,
+        path: &str,
+        mut index: Option<u32>,
+    ) -> Result<Self, DatasetError> {
         let reference = format!("{domain}/{path}");
         let invalid = || DatasetError::MemberInvalidPath {
             path: reference.clone(),
@@ -197,16 +227,20 @@ impl DatasetEntry {
             .ld_by_domain(domain)
             .and_then(|ld| ld.ln_by_name(parts[0]))
             .ok_or_else(not_found)?;
+        let mut segments: Vec<String> = parts.iter().map(|p| (*p).to_string()).collect();
         let mut node = Node::Object(ln.do_by_name(parts[2]).ok_or_else(not_found)?);
-        if is_array(node) {
-            return Err(invalid());
-        }
-        for seg in &parts[3..] {
-            node = node.child(fc, seg).ok_or_else(not_found)?;
-            if is_array(node) {
+        node = select_element(node, &mut index, &mut segments[2]).ok_or_else(invalid)?;
+        for (at, seg) in parts.iter().enumerate().skip(3) {
+            if node.is_array() {
                 return Err(invalid());
             }
+            node = node.child(fc, seg).ok_or_else(not_found)?;
+            node = select_element(node, &mut index, &mut segments[at]).ok_or_else(invalid)?;
         }
+        if index.is_some() {
+            return Err(invalid());
+        }
+        let reference = format!("{domain}/{}", segments.join("$"));
         if let Node::Object(obj) = node {
             if !crate::service::read::object_has_fc(obj, fc) {
                 return Err(not_found());
@@ -243,8 +277,9 @@ impl DatasetEntry {
     ///
     /// The errors of [`DatasetEntry::from_model`];
     /// [`DatasetError::MemberNotFound`] when `ld_inst` names no logical device
-    /// of the model, and [`DatasetError::MemberInvalidPath`] when the entry
-    /// carries an array index.
+    /// of the model. The array index of the entry selects an element of the
+    /// first array on its path; an index past the end of the array, or one on
+    /// a path holding no array, is [`DatasetError::MemberInvalidPath`].
     pub fn from_data_set_entry(
         model: &IedModel,
         owner: &LogicalDevice,
@@ -262,18 +297,18 @@ impl DatasetEntry {
                 path: entry.to_string(),
             });
         };
-        if entry.array_index.is_some() {
-            return Err(DatasetError::MemberInvalidPath {
-                path: entry.to_string(),
-            });
-        }
         let mut path = format!("{}${}", entry.ln_name, entry.fc.as_str());
         let component = entry.component.iter().flat_map(|c| c.split('.'));
         for seg in entry.do_path.iter().map(String::as_str).chain(component) {
             path.push('$');
             path.push_str(seg);
         }
-        Self::from_model(model, &ld.domain_name(&model.ied_name), &path)
+        Self::from_model_at(
+            model,
+            &ld.domain_name(&model.ied_name),
+            &path,
+            entry.array_index,
+        )
     }
 
     /// Returns whether the member names a single basic-type attribute.
@@ -295,7 +330,9 @@ impl DatasetEntry {
         fn count(node: &MemberNode) -> usize {
             match node {
                 MemberNode::Leaf(_) => 1,
-                MemberNode::Structure(children) => children.iter().map(count).sum(),
+                MemberNode::Structure(children) | MemberNode::Array(children) => {
+                    children.iter().map(count).sum()
+                }
             }
         }
         count(&self.node)
@@ -314,10 +351,10 @@ impl DatasetEntry {
     pub fn covers(&self, leaf_ref: &str) -> bool {
         match &self.node {
             MemberNode::Leaf(leaf) => leaf.attr_ref == leaf_ref,
-            MemberNode::Structure(_) => {
+            MemberNode::Structure(_) | MemberNode::Array(_) => {
                 leaf_ref
                     .strip_prefix(self.attr_ref.as_str())
-                    .is_some_and(|rest| rest.starts_with('$'))
+                    .is_some_and(|rest| rest.starts_with('$') || rest.starts_with('('))
                     && self.leaves().iter().any(|l| l.attr_ref == leaf_ref)
             }
         }
@@ -377,18 +414,40 @@ impl DatasetEntry {
     }
 }
 
-/// Reports whether `node` is an array of data objects, which a data set
-/// member does not reach.
-fn is_array(node: Node<'_>) -> bool {
-    matches!(node, Node::Object(obj) if obj.array_count.is_some())
+/// Selects element `index` of `node` when it is an array and `index` is still
+/// unused, consuming it and appending `(index)` to `segment`; any other node
+/// passes unchanged. `None` when the index is past the end of the array.
+fn select_element<'a>(
+    node: Node<'a>,
+    index: &mut Option<u32>,
+    segment: &mut String,
+) -> Option<Node<'a>> {
+    if !node.is_array() {
+        return Some(node);
+    }
+    let Some(i) = index.take() else {
+        return Some(node);
+    };
+    let element = node.element(i)?;
+    segment.push_str(&format!("({i})"));
+    Some(element)
 }
 
 /// Builds the member node for `node` under `fc`, counting its leaves into
 /// `leaves`. `None` when the node holds more than `DatasetEntry::MAX_LEAVES`
-/// leaves, an array of data objects, or no leaf at all.
+/// leaves, or no leaf at all. The elements of an array are named by their
+/// index after the array name.
 fn build_node(node: Node<'_>, fc: FC, reference: &str, leaves: &mut usize) -> Option<MemberNode> {
-    if is_array(node) {
-        return None;
+    if node.is_array() {
+        let elements = node
+            .children(fc)
+            .enumerate()
+            .map(|(i, element)| build_node(element, fc, &format!("{reference}({i})"), leaves))
+            .collect::<Option<Vec<_>>>()?;
+        if elements.is_empty() {
+            return None;
+        }
+        return Some(MemberNode::Array(elements));
     }
     if node.is_leaf() {
         let Node::Attribute(da) = node else {
@@ -789,6 +848,112 @@ mod tests {
         assert!(matches!(
             DatasetEntry::from_data_set_entry(&model, owner, &fcd),
             Err(DatasetError::MemberNotFound { .. })
+        ));
+    }
+
+    /// `GGIO1` of `IED1LD0` holding `Arr.vals`, an ST array of three INT32,
+    /// and `Har.h`, an array of two sub-objects holding the ST `v`.
+    fn array_model() -> IedModel {
+        let vals = DataAttribute::array(
+            leaf(
+                "vals",
+                FC::St,
+                DataAttributeType::Int32,
+                MmsValue::Integer(0),
+            ),
+            3,
+        )
+        .unwrap();
+        let element = DataObject::new(
+            "h",
+            vec![DoChild::Da(leaf(
+                "v",
+                FC::St,
+                DataAttributeType::Boolean,
+                MmsValue::Boolean(false),
+            ))],
+        );
+        let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(DataObject::new("Arr", vec![DoChild::Da(vals)]))
+            .add_do(DataObject::new(
+                "Har",
+                vec![DoChild::SubDo(DataObject::array(element, 2).unwrap())],
+            ))
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// An array at or beneath a member is an MMS array of its elements, each
+    /// leaf named by its index after the array name; an index selects one
+    /// element, and a name past an array or an index without one is refused.
+    #[test]
+    fn arrays_are_array_members_and_an_index_selects_an_element() {
+        let model = array_model();
+        let vals = DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$ST$Arr$vals").unwrap();
+        assert_eq!(
+            vals.read_value(),
+            Some(MmsValue::Array(vec![MmsValue::Integer(0); 3]))
+        );
+        let refs: Vec<&str> = vals.leaves().iter().map(|l| l.attr_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            [
+                "IED1LD0/GGIO1$ST$Arr$vals(0)",
+                "IED1LD0/GGIO1$ST$Arr$vals(1)",
+                "IED1LD0/GGIO1$ST$Arr$vals(2)"
+            ]
+        );
+        assert!(vals.covers("IED1LD0/GGIO1$ST$Arr$vals(1)"));
+        assert_eq!(
+            vals.value_with(None, "IED1LD0/GGIO1$ST$Arr$vals(1)", &MmsValue::Integer(5)),
+            Some(MmsValue::Array(vec![
+                MmsValue::Integer(0),
+                MmsValue::Integer(5),
+                MmsValue::Integer(0)
+            ]))
+        );
+
+        let har = DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$ST$Har").unwrap();
+        let one = MmsValue::Structure(vec![MmsValue::Boolean(false)]);
+        assert_eq!(
+            har.read_value(),
+            Some(MmsValue::Structure(vec![MmsValue::Array(vec![
+                one.clone(),
+                one
+            ])]))
+        );
+        assert_eq!(har.leaves()[1].attr_ref, "IED1LD0/GGIO1$ST$Har$h(1)$v");
+
+        let mut entry = iec61850_model::DataSetEntry::new(
+            "GGIO1",
+            FC::St,
+            vec!["Har".into(), "h".into(), "v".into()],
+        );
+        entry.ld_inst = "LD0".into();
+        entry.array_index = Some(1);
+        let element = DatasetEntry::from_data_set_entry(&model, &model.lds[0], &entry).unwrap();
+        assert_eq!(element.attr_ref, "IED1LD0/GGIO1$ST$Har$h(1)$v");
+        assert!(element.is_leaf());
+        for index in [Some(2), None] {
+            entry.array_index = index;
+            assert!(matches!(
+                DatasetEntry::from_data_set_entry(&model, &model.lds[0], &entry),
+                Err(DatasetError::MemberInvalidPath { .. })
+            ));
+        }
+        assert!(matches!(
+            DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$ST$Arr$vals$vals"),
+            Err(DatasetError::MemberInvalidPath { .. })
         ));
     }
 }
