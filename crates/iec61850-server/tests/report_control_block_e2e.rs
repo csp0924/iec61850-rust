@@ -747,3 +747,47 @@ async fn dynamic_data_set_no_longer_in_use_is_deleted() {
         .expect("delete");
     assert_eq!(deleted, (1, 1));
 }
+
+/// A configured data set is never deletable: deleting one that report control
+/// blocks use is answered positively with nothing deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_data_set_in_use_is_matched_but_not_deleted() {
+    let f = start(Cfg::default()).await;
+    let mut mms = f.connect().await;
+    let deleted = mms
+        .delete_named_variable_list(DOMAIN, "LLN0$dsPos")
+        .await
+        .expect("a positive response");
+    assert_eq!(deleted, (1, 0));
+    mms.get_named_variable_list_attributes(DOMAIN, "LLN0$dsPos")
+        .await
+        .expect("the data set still exists");
+}
+
+/// A data set created over MMS cannot be deleted while a BRCB refers to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_data_set_used_by_a_brcb_cannot_be_deleted() {
+    let f = start(Cfg::default()).await;
+    let mut mms = f.connect().await;
+    define_dyn_q(&mut mms).await;
+    write(
+        &mut mms,
+        &format!("{BRCB_ITEM}$DatSet"),
+        MmsData::VisibleString(format!("{DOMAIN}/{DYN_ITEM}")),
+    )
+    .await
+    .expect("DatSet");
+    let deleted = mms.delete_named_variable_list(DOMAIN, DYN_ITEM).await;
+    assert!(
+        matches!(
+            deleted,
+            Err(ClientError::ServiceError {
+                error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT)
+            })
+        ),
+        "{deleted:?}"
+    );
+    mms.get_named_variable_list_attributes(DOMAIN, DYN_ITEM)
+        .await
+        .expect("the data set still exists");
+}

@@ -9,12 +9,14 @@
 //! from registry and key set and counts towards both. An empty name list is
 //! answered with 0 matched and 0 deleted.
 //!
-//! A data set that the DatSet of a report control block names may not be
-//! deleted, per DeleteDataSet in IEC 61850-7-2: when any named data set is in
-//! use, no data set is deleted and the request is answered with the negative
-//! response of IEC 61850-8-1, a ConfirmedError whose ServiceError carries
-//! `Service(ObjectConstraintConflict)` and, as serviceSpecificInformation
-//! `deleteNamedVariableList`, the number of data sets deleted.
+//! A data set created at runtime that the DatSet of a report control block
+//! names may not be deleted, per DeleteDataSet in IEC 61850-7-2: when any such
+//! data set is named, no data set is deleted and the request is answered with
+//! the negative response of IEC 61850-8-1, a ConfirmedError whose ServiceError
+//! carries `Service(ObjectConstraintConflict)` and, as serviceSpecificInformation
+//! `deleteNamedVariableList`, the number of data sets deleted. A configured data
+//! set is never deletable, so it is answered positively as above whether or not
+//! a control block uses it.
 
 use bytes::BytesMut;
 use iec61850_asn1::encode_length;
@@ -85,7 +87,11 @@ pub(crate) fn handle_delete_named_variable_list(
     };
     for name in &req.list_of_variable_list_name {
         if let ObjectName::DomainSpecific { domain_id, item_id } = name {
-            if engine.dataset_in_use(domain_id, item_id) {
+            let is_dynamic = dynamic_keys
+                .lock()
+                .map(|g| g.contains(&(domain_id.clone(), item_id.clone())))
+                .unwrap_or(false);
+            if is_dynamic && engine.dataset_in_use(domain_id, item_id) {
                 tracing::warn!(
                     invoke_id,
                     domain = domain_id.as_str(),
@@ -278,6 +284,63 @@ mod tests {
     fn unknown_data_set_matches_nothing() {
         assert_eq!(delete_from_configured("GGIO1$dsGhost"), ((0, 0), true));
     }
+    /// Deletes `IED1LD0/GGIO1$ds` from a registry where that data set is
+    /// configured, or created at runtime when `dynamic`, while the DatSet of a
+    /// URCB names it.
+    fn delete_in_use(dynamic: bool) -> ConfirmedResponse {
+        use crate::reporting::{Dataset, NullReportSink, Rcb, ReportControl};
+        use crate::service::define_named_variable_list::new_dynamic_dataset_keys;
+        use std::sync::Arc;
+
+        let key = ("IED1LD0".to_string(), "GGIO1$ds".to_string());
+        let registry: DatasetRegistry = Default::default();
+        registry
+            .write()
+            .unwrap()
+            .insert(key.clone(), Arc::new(Dataset::new("GGIO1$ds")));
+        let keys = new_dynamic_dataset_keys();
+        if dynamic {
+            keys.lock().unwrap().insert(key.clone());
+        }
+        let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
+        engine
+            .register_rcb(
+                ReportControl::new("IED1LD0/GGIO1$RP$urcb01", Rcb::new("urcb01", "GGIO1$ds")),
+                Dataset::new("GGIO1$ds"),
+            )
+            .unwrap();
+        let mut body = BytesMut::new();
+        DeleteNamedVariableListRequest::specific_domain("IED1LD0", "GGIO1$ds").encode(&mut body);
+        let resp = handle_delete_named_variable_list(
+            9,
+            &body,
+            &registry,
+            &keys,
+            &DynamicDatasetQuota::default(),
+            &Mutex::new(engine),
+        );
+        assert!(
+            registry.read().unwrap().contains_key(&key),
+            "nothing is deleted"
+        );
+        resp
+    }
+
+    #[test]
+    fn configured_data_set_in_use_is_matched_but_not_deleted() {
+        use iec61850_mms::mms::pdu::delete_named_variable_list::decode_confirmed_delete_named_variable_list_response;
+        let ConfirmedResponse::Response(pdu) = delete_in_use(false) else {
+            panic!("a positive response");
+        };
+        let (_, resp) = decode_confirmed_delete_named_variable_list_response(&pdu).unwrap();
+        assert_eq!((resp.number_matched, resp.number_deleted), (1, 0));
+    }
+
+    #[test]
+    fn dynamic_data_set_in_use_is_refused() {
+        assert!(matches!(delete_in_use(true), ConfirmedResponse::Error(_)));
+    }
+
     #[test]
     fn in_use_response_carries_the_number_deleted() {
         let ConfirmedResponse::Error(pdu) = delete_error(
