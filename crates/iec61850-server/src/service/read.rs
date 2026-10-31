@@ -520,8 +520,8 @@ fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), D
 /// reading the model values as it goes; a result `has_value` rejects, a
 /// refusal or a value over the budget, stands as it is, as neither carries a
 /// value; otherwise the values of the first run are discarded and `run` runs
-/// again under the lock, taking the values and answered the recorded
-/// outcomes.
+/// again under the lock, taking the values and answering each consultation
+/// from the record.
 fn with_handlers_outside_the_value_lock<R>(
     mms_model: &MmsDeviceModel,
     scope: ReadHandlerScope,
