@@ -841,3 +841,44 @@ async fn component_alternate_access_reads_like_the_flattened_name() {
 
     handle.stop().await;
 }
+
+/// Enabling a GoCB whose ConfRev is 0 is refused with object-value-invalid,
+/// since IEC 61850-7-2 §18.2.1.3 treats it as an inconsistent configuration,
+/// and the publisher stays disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_a_gocb_with_conf_rev_zero_is_refused() {
+    use iec61850_mms::mms::client::error::ClientError;
+
+    let publisher = build_publisher();
+    publisher.lock().unwrap().set_conf_rev(0);
+    let (handle, publisher) = start_server_with(IedServerConfig::default(), publisher).await;
+    let mut client = connect(&handle).await;
+
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.write(
+            DOMAIN,
+            &format!("{GOCB_ITEM}$GoEna"),
+            MmsData::Boolean(true),
+        ),
+    )
+    .await
+    .expect("timeout");
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::DataAccessError(
+                DataAccessError::ObjectValueInvalid
+            ))
+        ),
+        "expected object-value-invalid, got {r:?}"
+    );
+    assert!(!publisher.lock().unwrap().enabled());
+    assert_eq!(
+        read(&mut client, &format!("{GOCB_ITEM}$GoEna")).await,
+        MmsData::Boolean(false)
+    );
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}

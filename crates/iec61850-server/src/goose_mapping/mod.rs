@@ -452,7 +452,10 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 
 /// Applies an MMS write to one GoCB component under the edition of `registry`.
 ///
-/// GoEna, a boolean, is always writable. Under `Edition::Ed2_1`, GoID and
+/// GoEna, a boolean, is writable in every edition; setting it TRUE is refused
+/// with `ObjectValueInvalid` while DatSet is empty or ConfRev is 0, the
+/// inconsistent configuration of IEC 61850-7-2 §18.2.1.3, and leaves the
+/// control block disabled. Under `Edition::Ed2_1`, GoID and
 /// DatSet are read-only and refused with `ObjectAccessDenied`
 /// (IEC 61850-8-1 §18.1.1.1.1 Table 83). Under `Ed2` and `Ed1`, GoID and
 /// DatSet, visible strings, are writable while the publisher is disabled, and
@@ -505,10 +508,19 @@ pub fn apply_gocb_write(
                 );
                 return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
             };
-            match lock_publisher(handle) {
-                Ok(p) => p.set_enabled(*b),
+            let p = match lock_publisher(handle) {
+                Ok(p) => p,
                 Err(e) => return WriteOutcome::Failure(e),
+            };
+            if *b && (p.data_set_ref().is_empty() || p.conf_rev() == 0) {
+                tracing::warn!(
+                    gocb = handle.go_cb_ref(),
+                    conf_rev = p.conf_rev(),
+                    "write GoEna=TRUE refused: DatSet is empty or ConfRev is 0"
+                );
+                return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
             }
+            p.set_enabled(*b);
             tracing::info!(gocb = handle.go_cb_ref(), go_ena = *b, "GoCB GoEna changed");
             WriteOutcome::Success
         }
@@ -859,6 +871,27 @@ mod tests {
         apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(false));
         assert!(!h.enabled());
         assert!(!h.publisher.lock().unwrap().enabled());
+    }
+
+    #[test]
+    fn enabling_with_conf_rev_zero_is_refused() {
+        let h = sample_handle();
+        h.publisher.lock().unwrap().set_conf_rev(0);
+        assert_eq!(
+            apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(true)),
+            WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
+        );
+        assert!(!h.enabled());
+        assert_eq!(
+            apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(false)),
+            WriteOutcome::Success
+        );
+        h.publisher.lock().unwrap().set_conf_rev(1);
+        assert_eq!(
+            apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(true)),
+            WriteOutcome::Success
+        );
+        assert!(h.enabled());
     }
 
     #[test]
