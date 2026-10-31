@@ -54,9 +54,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The wire tests (`*_e2e` binaries and the TLS handshake tests) again, with the
-  # TLS paths of the client and the MMS stack compiled in, so that a secure
-  # association runs end to end against the server of this workspace.
+  # The wire tests again (the `*_e2e` binaries, the TLS handshake tests of the
+  # server and the handshake tests of the TLS crate), with the TLS paths of the
+  # client and the MMS stack compiled in, so that a secure association runs end
+  # to end against the server of this workspace.
   e2e:
     name: e2e over TLS (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -79,7 +80,7 @@ jobs:
         run: >-
           cargo nextest run --workspace
           --features iec61850-client/tls,iec61850-mms/tls
-          -E "binary(/_e2e$/) | binary(/tls/)"
+          -E "binary(/_e2e$/) | binary(=server_tls_handshake) | binary(=tls_setup_timeout_event) | binary_id(=iec61850-tls::handshake)"
 
   # The raw Ethernet backends, and GOOSE and SV publishers and subscribers of
   # this workspace, over a veth pair. The tests need CAP_NET_RAW, so they are
@@ -109,10 +110,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A binary whose cfg gate leaves it empty would pass silently, so a
+          # binary that lists no ignored test fails the job.
           run_ignored() {
             cargo test --no-run --message-format=json "$@" \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
               | while read -r exe; do
+                  count=$("$exe" --list --ignored | grep -c ': test$' || true)
+                  if [ "$count" -eq 0 ]; then
+                    echo "$exe lists no ignored test" >&2
+                    exit 1
+                  fi
                   sudo IEC61850_VETH=vf0,vf1 "$exe" --ignored --test-threads=1
                 done
           }
