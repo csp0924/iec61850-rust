@@ -6,11 +6,10 @@
 //! the result, so a lookup table can never be right at run time and wrong in
 //! generated code.
 //!
-//! Default values are emitted as expressions evaluated inside the generated
-//! function body rather than as constants. Several `MmsValue` variants own a
-//! `Vec<u8>` or a `String`, and the model wraps them in `Arc<RwLock<_>>`, so no
-//! part of the chain is const; this mirrors the runtime
-//! `MmsValue::default_for(dat)`.
+//! Values are emitted as expressions evaluated inside the generated function
+//! body rather than as constants. Several `MmsValue` variants own a `Vec<u8>`
+//! or a `String`, and the model wraps them in `Arc<RwLock<_>>`, so no part of
+//! the chain is const.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -229,84 +228,13 @@ fn unsupported_dat(dat: DataAttributeType) -> TokenStream {
     quote! { ::core::compile_error!(#msg) }
 }
 
-/// Emits the zero value of a data attribute type as an expression.
-///
-/// Mirrors the runtime `MmsValue::default_for(dat)`, allocating a fresh `Vec`
-/// or `String` on each call, so generated and runtime models start from the
-/// same value.
-pub fn emit_default_mms_value(dat: DataAttributeType) -> TokenStream {
-    use DataAttributeType as T;
-    match dat {
-        T::Boolean => quote! { ::iec61850_scl::__private::MmsValue::Boolean(false) },
-        T::Int8 | T::Int16 | T::Int32 | T::Int64 | T::Int128 => {
-            quote! { ::iec61850_scl::__private::MmsValue::Integer(0) }
-        }
-        T::Int8U | T::Int16U | T::Int24U | T::Int32U => {
-            quote! { ::iec61850_scl::__private::MmsValue::Unsigned(0) }
-        }
-        T::Float32 => quote! { ::iec61850_scl::__private::MmsValue::Float32(0.0) },
-        T::Float64 => quote! { ::iec61850_scl::__private::MmsValue::Float64(0.0) },
-        T::Enumerated | T::CodedEnum => {
-            quote! { ::iec61850_scl::__private::MmsValue::Integer(0) }
-        }
-        T::OctetString(_) => {
-            quote! { ::iec61850_scl::__private::MmsValue::OctetString(::std::vec::Vec::new()) }
-        }
-        T::VisibleString(_) => {
-            quote! { ::iec61850_scl::__private::MmsValue::VisibleString(::std::string::String::new()) }
-        }
-        T::UnicodeString255 => {
-            quote! { ::iec61850_scl::__private::MmsValue::MmsString(::std::string::String::new()) }
-        }
-        T::Timestamp => {
-            quote! { ::iec61850_scl::__private::MmsValue::UtcTime([0u8; 8]) }
-        }
-        T::Quality => {
-            quote! {
-                ::iec61850_scl::__private::MmsValue::BitString {
-                    padding: 3,
-                    data: ::std::vec![0u8, 0u8],
-                }
-            }
-        }
-        T::Check => {
-            quote! {
-                ::iec61850_scl::__private::MmsValue::BitString {
-                    padding: 6,
-                    data: ::std::vec![0u8],
-                }
-            }
-        }
-        T::EntryTime => {
-            quote! { ::iec61850_scl::__private::MmsValue::BinaryTime(::std::vec::Vec::new()) }
-        }
-        // The rare basic types below have no dedicated representation: the
-        // runtime `default_for` falls back to an octet string for them, and the
-        // generated code follows.
-        T::PhyComAddr
-        | T::OptFlds
-        | T::TrgOpsBits
-        | T::Currency
-        | T::Constructed
-        | T::GenericBitString(_) => {
-            quote! { ::iec61850_scl::__private::MmsValue::OctetString(::std::vec::Vec::new()) }
-        }
-        _ => {
-            quote! { ::iec61850_scl::__private::MmsValue::OctetString(::std::vec::Vec::new()) }
-        }
-    }
-}
-
 /// Emits a concrete [`MmsValue`] as a literal expression.
 ///
-/// Used for DOI, SDI and DAI overrides: the build script parses the SCL `<Val>`
-/// text into an `MmsValue` with
-/// `iec61850_scl::__private::parse_val_for_b_type`, then emits it here,
-/// so the user's run time performs no string parsing.
-///
-/// Unlike [`emit_default_mms_value`], this emits the actual value, including the
-/// full `data` bytes of a bit string or the contents of a visible string,
-/// rather than an empty container.
+/// Used for the initial value of every leaf and for DOI, SDI and DAI
+/// overrides: the build script derives the value with the same helpers the
+/// run-time path uses, then emits it here, including the full `data` bytes of
+/// a bit string or the contents of a visible string, so the user's run time
+/// performs no string parsing.
 pub fn emit_mms_value(v: &MmsValue) -> TokenStream {
     match v {
         MmsValue::Boolean(b) => {
@@ -387,6 +315,74 @@ pub fn emit_mms_value(v: &MmsValue) -> TokenStream {
             quote! {
                 ::iec61850_scl::__private::MmsValue::Structure(::std::vec![ #( #inner ),* ])
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every basic type of IEC 61850-6 §9.5.4.2 that the run-time path maps
+    /// onto a data attribute type has a token, so a data attribute type added
+    /// without one fails here instead of in a user's build.
+    #[test]
+    fn every_schema_basic_type_has_a_token() {
+        let span = SourceSpan {
+            line: 0,
+            col: 0,
+            byte_offset: 0,
+        };
+        for b_type in [
+            "BOOLEAN",
+            "INT8",
+            "INT16",
+            "INT24",
+            "INT32",
+            "INT64",
+            "INT128",
+            "INT8U",
+            "INT16U",
+            "INT24U",
+            "INT32U",
+            "FLOAT32",
+            "FLOAT64",
+            "Enum",
+            "Dbpos",
+            "Tcmd",
+            "Quality",
+            "Timestamp",
+            "VisString32",
+            "VisString64",
+            "VisString65",
+            "VisString129",
+            "VisString255",
+            "Octet64",
+            "Unicode255",
+            "EntryTime",
+            "Check",
+            "ObjRef",
+            "Currency",
+            "PhyComAddr",
+            "TrgOps",
+            "OptFlds",
+            "SvOptFlds",
+            "LogOptFlds",
+            "EntryID",
+            "Octet6",
+            "Octet16",
+        ] {
+            let tokens = emit_dat(b_type, span, "test")
+                .unwrap_or_else(|e| panic!("{b_type}: {e}"))
+                .to_string();
+            assert!(!tokens.contains("compile_error"), "{b_type}: {tokens}");
+        }
+        for dat in [
+            DataAttributeType::Constructed,
+            DataAttributeType::GenericBitString(7),
+        ] {
+            let tokens = emit_dat_value(dat).to_string();
+            assert!(!tokens.contains("compile_error"), "{dat:?}: {tokens}");
         }
     }
 }
