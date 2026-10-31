@@ -558,7 +558,9 @@ pub fn encode_aarq(
 /// Serializes an AARE PDU, tag 0x61, into `out`.
 ///
 /// - `result`: 0 accepts, 1 rejects permanently, 2 rejects transiently.
-/// - `payload`: the MMS Initiate response; required when `result` is 0.
+/// - `payload`: the MMS PDU of the user-information: the Initiate response,
+///   required when `result` is 0, or the Initiate-ErrorPDU of a rejection.
+///   `None` or an empty payload leaves user-information out.
 /// - `next_reference`: the indirect-reference, the presentation context
 ///   identifier of MMS that the initiator chose.
 pub fn encode_aare(result: u32, payload: Option<&[u8]>, next_reference: u32, out: &mut BytesMut) {
@@ -571,7 +573,7 @@ pub fn encode_aare(result: u32, payload: Option<&[u8]>, next_reference: u32, out
     // result-source-diagnostic [3] EXPLICIT, fixed: a3 05 a1 03 02 01 00
     let diag_bytes: [u8; 7] = [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, 0x00];
 
-    // user-information is written only for result 0 with a non-empty payload
+    // user-information is written for a non-empty payload, whatever the result
     let user_info = match payload {
         Some(p) if !p.is_empty() => build_user_information(p, next_reference),
         _ => Vec::new(),

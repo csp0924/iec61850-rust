@@ -1,13 +1,13 @@
 //! The ISO upper layers of an association over real TCP: raw COTP, Session,
 //! Presentation and ACSE PDUs against the server, checking the presentation
-//! context identifiers it answers on.
+//! context identifiers it answers on and the PDUs that refuse an association.
 
 use bytes::BytesMut;
-use iec61850_mms::iso::acse::encode_aarq;
+use iec61850_mms::iso::acse::{encode_aarq, AcseConnection, AcseIndication};
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions};
 use iec61850_mms::iso::presentation::{
-    encode_connect as pres_encode_connect, encode_user_data, parse_user_data, IsoPresentation,
-    PresentationConnectionParameters,
+    encode_connect as pres_encode_connect, encode_user_data, parse_reject, parse_user_data,
+    IsoPresentation, PresentationConnectionParameters,
 };
 use iec61850_mms::iso::session::{
     encode_connect as sess_encode_connect, encode_data, IsoParameters, IsoSession,
@@ -78,15 +78,24 @@ async fn start_server() -> ServerHandle {
         .expect("start server")
 }
 
-/// Encodes the default CP carrying an AARQ with the default Initiate request.
-fn cp() -> Vec<u8> {
-    let mut initiate = BytesMut::new();
-    InitiateRequestPdu::default().encode(&mut initiate);
+/// Encodes the default CP carrying an AARQ whose user information is `mms`.
+fn cp_carrying(mms: &[u8]) -> Vec<u8> {
     let mut aarq = BytesMut::new();
-    encode_aarq(&initiate, None, 3, &AarqAddressing::default(), &mut aarq);
+    encode_aarq(mms, None, 3, &AarqAddressing::default(), &mut aarq);
     let mut cp = BytesMut::new();
     pres_encode_connect(&PresentationConnectionParameters::default(), &aarq, &mut cp);
     cp.to_vec()
+}
+
+fn initiate(req: &InitiateRequestPdu) -> Vec<u8> {
+    let mut initiate = BytesMut::new();
+    req.encode(&mut initiate);
+    initiate.to_vec()
+}
+
+/// Encodes the default CP carrying an AARQ with the default Initiate request.
+fn cp() -> Vec<u8> {
+    cp_carrying(&initiate(&InitiateRequestPdu::default()))
 }
 
 /// Replaces the single occurrence of `pattern` in `buf`, writing `value` at
@@ -247,5 +256,126 @@ async fn context_ids_chosen_by_the_client_are_used_for_every_pdu() {
             ))]
         );
     }
+    handle.stop().await;
+}
+
+/// What a Session REFUSE carried: its reason code, the provider-reason of the
+/// CPR inside it, and the context identifier and payload of the CPR user data.
+#[derive(Debug)]
+struct Refusal {
+    reason_code: Option<u8>,
+    provider_reason: Option<u8>,
+    user_data: Option<(u8, Vec<u8>)>,
+}
+
+/// Wraps the content of a CPR user-data field, its PDV list, back into a
+/// Fully-Encoded-Data PPDU.
+fn fully_encoded_data(pdv_list: &[u8]) -> Vec<u8> {
+    let len = pdv_list.len();
+    let mut out = vec![0x61];
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        out.extend_from_slice(&[0x82, (len >> 8) as u8, len as u8]);
+    }
+    out.extend_from_slice(pdv_list);
+    out
+}
+
+/// Reads the server's answer to a CN, expecting a Session REFUSE with a CPR as
+/// its user data, and then the end of the connection.
+async fn expect_refusal(cotp: &mut CotpConnection<TcpStream>) -> Refusal {
+    let raw = tokio::time::timeout(Duration::from_secs(5), cotp.recv_data())
+        .await
+        .expect("the server answers in time")
+        .expect("an answer to the CN");
+    let mut s = IsoSession::new();
+    let info = match s.parse_message(&raw).expect("the SPDU parses") {
+        SessionIndication::Refuse(info) => info,
+        other => panic!("expected a session REFUSE, got {other:?}: {raw:02x?}"),
+    };
+    let cpr_bytes = info.user_data(&raw).to_vec();
+    let cpr = parse_reject(&cpr_bytes).expect("the REFUSE carries a CPR");
+    let ud = cpr.user_data(&cpr_bytes);
+    let refusal = Refusal {
+        reason_code: info.reason_code,
+        provider_reason: cpr.provider_reason,
+        user_data: (!ud.is_empty()).then(|| pdv(&fully_encoded_data(ud))),
+    };
+    assert!(
+        recv_spdu(cotp).await.is_none(),
+        "the server closes the connection after the REFUSE"
+    );
+    refusal
+}
+
+/// An Initiate the server refuses, here proposing a 32-octet maximum PDU, is
+/// answered with a Session REFUSE carrying a CPR, user rejection, whose user
+/// data is an AARE with a rejected result and the Initiate-ErrorPDU as its user
+/// information. The same CN proposing 64 octets is accepted with an AC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_initiate_travels_in_an_aare_inside_a_cpr_and_a_refuse() {
+    let handle = start_server().await;
+    let refused = InitiateRequestPdu {
+        local_detail_calling: Some(32),
+        ..InitiateRequestPdu::default()
+    };
+    for mms in [3u8, 7] {
+        let mut cp = cp_carrying(&initiate(&refused));
+        patch(&mut cp, &MMS_ITEM, 2, mms);
+        let mut cotp = connect_cotp(&handle).await;
+        cotp.send_data(&cn(&cp)).await.unwrap();
+        let refusal = expect_refusal(&mut cotp).await;
+        assert_eq!(refusal.reason_code, Some(2), "{refusal:?}");
+        assert_eq!(
+            refusal.provider_reason, None,
+            "a user rejection: {refusal:?}"
+        );
+        let (ctx, aare) = refusal.user_data.expect("the CPR carries the AARE");
+        assert_eq!(ctx, 1, "the AARE travels on the ACSE context");
+        assert_eq!(
+            aare_indirect_reference(&aare),
+            Some(mms),
+            "the Initiate-ErrorPDU is named on the client's MMS context"
+        );
+        let mut acse = AcseConnection::new(None);
+        let (ind, user_info) = acse.parse_message(&aare).expect("an AARE");
+        assert_eq!(ind, AcseIndication::AssociateFailed);
+        assert_eq!(user_info, [0xaa, 0x05, 0xa0, 0x03, 0x88, 0x01, 0x00]);
+    }
+
+    let accepted = InitiateRequestPdu {
+        local_detail_calling: Some(64),
+        ..InitiateRequestPdu::default()
+    };
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp_carrying(&initiate(&accepted))))
+        .await
+        .unwrap();
+    let (ind, _) = recv_spdu(&mut cotp).await.expect("an AC");
+    assert_eq!(ind, SessionIndication::Accept);
+    handle.stop().await;
+}
+
+/// An AARQ whose user information is not an Initiate request is refused the
+/// same way, with an AARE that carries no user information.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aarq_without_an_initiate_is_refused_in_a_cpr_and_a_refuse() {
+    let handle = start_server().await;
+    // Identify, invokeID 1, in place of the Initiate request
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp_carrying(&[
+        0xa0, 0x05, 0x02, 0x01, 0x01, 0x82, 0x00,
+    ])))
+    .await
+    .unwrap();
+    let refusal = expect_refusal(&mut cotp).await;
+    assert_eq!(refusal.provider_reason, None, "{refusal:?}");
+    let (ctx, aare) = refusal.user_data.expect("the CPR carries the AARE");
+    assert_eq!(ctx, 1);
+    let mut acse = AcseConnection::new(None);
+    let (ind, user_info) = acse.parse_message(&aare).expect("an AARE");
+    assert_eq!(ind, AcseIndication::AssociateFailed);
+    assert!(user_info.is_empty());
     handle.stop().await;
 }

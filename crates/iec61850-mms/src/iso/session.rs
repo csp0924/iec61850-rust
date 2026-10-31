@@ -16,6 +16,8 @@
 //! - A CONNECT carries at most 512 octets of user data in the User Data PGI
 //!   (193) and more in the Extended User Data parameter (194). Both are read in
 //!   every SPDU that carries user data.
+//! - The user data of a REFUSE follows the reason code inside PI 50; a User
+//!   Data PGI is read as well.
 //! - SESSION_NOT_FINISHED (SPDU ID 8) is not reassembled and returns
 //!   `SessionError::UnsupportedSpdu`.
 //! - An unknown PGI is skipped by its declared length, never byte by byte.
@@ -72,6 +74,12 @@ const LI_LONG_MAX: usize = 65_535;
 /// Most user data a CONNECT carries in the User Data PGI; more goes in the
 /// Extended User Data parameter.
 const CONNECT_USER_DATA_MAX: usize = 512;
+
+/// Reason code of a REFUSE whose remaining PI 50 octets are SS-user data.
+const REFUSE_REASON_USER_DATA: u8 = 2;
+
+/// Transport disconnect value of a REFUSE: the transport connection is released.
+const REFUSE_TRANSPORT_RELEASED: u8 = 0x01;
 
 /// Number of octets the long form of LI occupies after the LI byte itself.
 const LI_LONG_FORM_OCTETS: usize = 2;
@@ -414,8 +422,9 @@ impl IsoSession {
     /// Parses an RF, REFUSE, SPDU and returns its parameters.
     ///
     /// The parameters recognized are the transport disconnect (PI 17), the
-    /// reason code (PI 50) and the user data (PGI 193 or PI 194). Any other
-    /// parameter is skipped by its declared length.
+    /// reason code (PI 50), whose octets after the first are the user data, and
+    /// the user data (PGI 193 or PI 194). Any other parameter is skipped by its
+    /// declared length.
     ///
     /// Two accommodations keep the parser usable against peers that encode the
     /// SPDU loosely, an RF being the last message of a failed association:
@@ -461,6 +470,10 @@ impl IsoSession {
                 }
                 PI_REASON_CODE if len >= 1 => {
                     info.reason_code = Some(msg[offset]);
+                    if len > 1 {
+                        info.user_data_start = offset + 1;
+                        info.user_data_len = len - 1;
+                    }
                 }
                 PGI_USER_DATA | PI_EXTENDED_USER_DATA => {
                     info.user_data_start = offset;
@@ -929,6 +942,42 @@ pub fn encode_refuse(reason: u8, out: &mut BytesMut) {
     out.put_u8(PI_REASON_CODE);
     out.put_u8(0x01); // PI length = 1
     out.put_u8(reason);
+}
+
+/// Encodes an RF, REFUSE, SPDU with ID 12 into `out`, refusing the connection
+/// on behalf of the SS-user and carrying `payload` as its user data.
+///
+/// The SPDU holds the transport disconnect parameter (PI 17), releasing the
+/// transport connection, and the reason code (PI 50) with the value 2,
+/// "rejection by called SS-user, user data", followed by `payload`.
+///
+/// # Errors
+///
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
+pub fn encode_refuse_with_user_data(
+    payload: &[u8],
+    out: &mut BytesMut,
+) -> Result<(), SessionError> {
+    let reason_len = 1 + payload.len();
+    let li = 3 + 1 + li_size(reason_len) + reason_len;
+    if li > LI_LONG_MAX {
+        return Err(SessionError::PayloadTooLarge {
+            size: payload.len(),
+        });
+    }
+    out.extend_from_slice(&[SPDU_ID_REFUSE]);
+    put_li(out, li);
+    out.extend_from_slice(&[
+        PI_TRANSPORT_DISCONNECT,
+        0x01, // PI length = 1
+        REFUSE_TRANSPORT_RELEASED,
+        PI_REASON_CODE,
+    ]);
+    put_li(out, reason_len);
+    out.extend_from_slice(&[REFUSE_REASON_USER_DATA]);
+    out.extend_from_slice(payload);
+    Ok(())
 }
 
 // Encoding helpers
@@ -1787,6 +1836,48 @@ mod tests {
         encode_abort(&payload, &mut ab).unwrap();
         assert_eq!(&ab[1..4], &[LI_LONG_FORM, 0x02, 0x5f]);
         assert_eq!(&ab[4..9], &[0x11, 0x01, 0x0b, PGI_USER_DATA, LI_LONG_FORM]);
+    }
+
+    // RF carrying user data
+
+    #[test]
+    fn rf_with_user_data_carries_it_after_reason_code_2() {
+        let cpr = [0x30, 0x03, 0x80, 0x01, 0x01];
+        let mut out = BytesMut::new();
+        encode_refuse_with_user_data(&cpr, &mut out).unwrap();
+        assert_eq!(
+            &out[..],
+            &[
+                SPDU_ID_REFUSE,
+                0x0B,
+                PI_TRANSPORT_DISCONNECT,
+                0x01,
+                0x01,
+                PI_REASON_CODE,
+                0x06,
+                0x02,
+                0x30,
+                0x03,
+                0x80,
+                0x01,
+                0x01
+            ]
+        );
+        let info = parse_refuse(&out);
+        assert_eq!(info.reason_code, Some(2));
+        assert_eq!(info.transport_disconnect, Some(1));
+        assert_eq!(info.user_data(&out), &cpr);
+    }
+
+    #[test]
+    fn rf_with_long_user_data_uses_the_long_form() {
+        let payload = vec![0x42; 300];
+        let mut out = BytesMut::new();
+        encode_refuse_with_user_data(&payload, &mut out).unwrap();
+        assert_eq!(out[1], LI_LONG_FORM);
+        let info = parse_refuse(&out);
+        assert_eq!(info.reason_code, Some(2));
+        assert_eq!(info.user_data(&out), &payload[..]);
     }
 
     #[test]

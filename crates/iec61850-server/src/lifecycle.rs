@@ -18,9 +18,11 @@
 //! - A connection that has not completed the TLS handshake, if TLS is
 //!   configured, and association setup through the MMS Initiate response within
 //!   `association_setup_timeout_ms` is closed.
-//! - An Initiate the server refuses is answered with an ACSE AARE reject before
-//!   the socket closes, so the client learns why rather than seeing a bare
-//!   disconnect.
+//! - An association the server refuses, for failed authentication, an AARQ
+//!   that carries no Initiate request or a refused Initiate, is answered with a
+//!   Session REFUSE carrying a Presentation CPR (user rejection) and an ACSE
+//!   AARE with a rejected result before the socket closes. The AARE of a
+//!   refused Initiate carries the Initiate-ErrorPDU as its user information.
 //! - An abort sends an ACSE A-ABORT, wrapped in a Session abort and a COTP data
 //!   TPDU, before the socket closes.
 //! - Once the Initiate exchange completes, a TSDU larger than the negotiated
@@ -31,8 +33,6 @@
 //!   10 000 ms by default, ends the connection without a further write.
 //! - After answering a Conclude the server waits for the Session finish for a
 //!   bounded time, 10 seconds by default, and then closes the socket itself.
-//! - An AARQ that fails authentication is answered with an AARE carrying a
-//!   rejected result.
 //! - However the connection ends, including a transport error, the
 //!   association's URCB reservations, control selects and setting group edit
 //!   session are released as the connection task ends. A BRCB the association
@@ -51,12 +51,13 @@ use iec61850_mms::iso::acse::{
 };
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions, DEFAULT_MAX_TSDU_SIZE};
 use iec61850_mms::iso::presentation::{
-    encode_abort as pres_encode_abort, encode_cpa, encode_user_data, encode_user_data_acse,
-    parse_connect as pres_parse_connect, parse_user_data, IsoPresentation, PresentationError,
+    encode_abort as pres_encode_abort, encode_cpa, encode_cpr, encode_user_data,
+    encode_user_data_acse, parse_connect as pres_parse_connect, parse_user_data, IsoPresentation,
+    PresentationError,
 };
 use iec61850_mms::iso::session::{
     encode_abort as sess_encode_abort, encode_accept as sess_encode_accept, encode_data,
-    encode_finish, IsoSession, SessionError, SessionIndication,
+    encode_finish, encode_refuse_with_user_data, IsoSession, SessionError, SessionIndication,
 };
 use iec61850_mms::mms::pdu::common::WriteOutcome;
 use iec61850_mms::mms::pdu::information_report::{
@@ -466,7 +467,7 @@ where
                 conn_id,
                 "acse authentication failed, sending a reject and closing the socket"
             );
-            send_acse_only(&mut cotp, &mut session, &mut pres, encode_associate_failed).await?;
+            send_association_reject(&mut cotp, &pres, encode_associate_failed).await?;
             return Err(ConnError::AcseAssociationFailed);
         }
         other => {
@@ -489,7 +490,7 @@ where
             first_byte = ?initiate_bytes.first(),
             "the acse user information is not an initiate-request, sending an associate reject and closing the socket"
         );
-        send_acse_only(&mut cotp, &mut session, &mut pres, encode_associate_failed).await?;
+        send_association_reject(&mut cotp, &pres, encode_associate_failed).await?;
         return Err(ConnError::InitiateRejected);
     }
     let mut mms_conn = MmsServerConnection::new();
@@ -530,16 +531,16 @@ where
             tracing::debug!(conn_id, "initiate negotiation complete");
         }
         MessageOutcome::SendInitiateErrorAndClose { error_bytes } => {
-            // The association never completed, so a Session accept would be out
-            // of order and the MMS InitiateError has no carrier. An ACSE AARE
-            // reject without user information is sent instead, which tells the
-            // client the association was refused rather than dropping it silently.
+            // The Initiate-ErrorPDU is the user information of the rejecting AARE.
             tracing::warn!(
                 conn_id,
                 initiate_error_len = error_bytes.len(),
                 "initiate refused, sending an associate reject and closing the socket"
             );
-            send_acse_only(&mut cotp, &mut session, &mut pres, encode_associate_failed).await?;
+            send_association_reject(&mut cotp, &pres, |out| {
+                encode_aare(1, Some(&error_bytes), pres.mms_context_id.into(), out)
+            })
+            .await?;
             return Err(ConnError::InitiateRejected);
         }
         other => {
@@ -1049,30 +1050,27 @@ where
     }
 }
 
-/// Encodes an ACSE PDU with the supplied callback and wraps it outwards through
-/// Presentation CPA, Session accept, and a COTP data TPDU.
-///
-/// This is the path a refused Initiate and a failed authentication take, both
-/// of which answer while the association is still being established.
-async fn send_acse_only<S>(
+/// Refuses the association on behalf of the ACSE user: the rejecting AARE the
+/// callback encodes travels in a Presentation CPR, user rejection, inside a
+/// Session REFUSE in a COTP data TPDU.
+async fn send_association_reject<S>(
     cotp: &mut CotpConnection<S>,
-    session: &mut IsoSession,
-    pres: &mut IsoPresentation,
-    encode_acse: impl FnOnce(&mut BytesMut),
+    pres: &IsoPresentation,
+    encode_aare_reject: impl FnOnce(&mut BytesMut),
 ) -> std::result::Result<(), ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut acse_buf = BytesMut::new();
-    encode_acse(&mut acse_buf);
+    let mut aare = BytesMut::new();
+    encode_aare_reject(&mut aare);
 
-    let mut cpa_buf = BytesMut::new();
-    encode_cpa(pres, &acse_buf, &mut cpa_buf);
+    let mut cpr = BytesMut::new();
+    encode_cpr(pres, None, Some(&aare), &mut cpr);
 
-    let mut sess_buf = BytesMut::new();
-    sess_encode_accept(session, &cpa_buf, &mut sess_buf)?;
+    let mut rf = BytesMut::new();
+    encode_refuse_with_user_data(&cpr, &mut rf)?;
 
-    cotp.send_data(&sess_buf).await?;
+    cotp.send_data(&rf).await?;
     Ok(())
 }
 

@@ -95,8 +95,8 @@ pub use mms::{
 // Presentation types used by ACSE and the MMS client
 pub use iso::presentation::{
     encode_abort as pres_encode_abort, encode_connect as pres_encode_connect,
-    encode_cpa as pres_encode_cpa, encode_user_data, encode_user_data_acse,
-    parse_accept as pres_parse_accept, parse_connect as pres_parse_connect,
+    encode_cpa as pres_encode_cpa, encode_cpr as pres_encode_cpr, encode_user_data,
+    encode_user_data_acse, parse_accept as pres_parse_accept, parse_connect as pres_parse_connect,
     parse_reject as pres_parse_reject, parse_user_data, provider_reason_name, ConnectResult,
     IsoPresentation, PSelector, PresentationConnectionParameters, PresentationError,
     PresentationReject, UserDataResult, ACSE_CONTEXT_ID, MMS_CONTEXT_ID,

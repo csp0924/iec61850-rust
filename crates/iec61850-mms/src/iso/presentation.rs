@@ -1,7 +1,8 @@
 //! ISO 8823 Presentation layer, restricted to the subset MMS requires.
 //!
-//! Encodes and decodes the CP (Connect Presentation, tag 0x31) and CPA
-//! (Connect Presentation Accept) PDUs, the Fully-Encoded-Data container
+//! Encodes and decodes the CP (Connect Presentation, tag 0x31), CPA (Connect
+//! Presentation Accept) and CPR (Connect Presentation Reject, normal mode, tag
+//! 0x30) PDUs, the Fully-Encoded-Data container
 //! (tag 0x61) that carries MMS and ACSE PDUs, and the Abort container
 //! (tag 0xa0) that wraps an ACSE ABRT PDU. No state machine and no transport
 //! live here: PDUs are serialized and parsed, and connection state stays with
@@ -645,6 +646,32 @@ pub fn encode_cpa(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
     // presentation-data (0xa0)
     write_tl(0xa0, user_data_payload_len, out);
     out.extend_from_slice(payload);
+}
+
+/// Encodes a CPR (Connect Presentation Reject) PPDU in the normal mode, a
+/// SEQUENCE with tag 0x30, into `out`.
+///
+/// - `provider_reason`: `Some` when the presentation provider refuses the
+///   connection, written as provider-reason `[10]`; `None` when the
+///   presentation user refuses it, which is the user rejection an ACSE AARE
+///   with a rejected result travels in.
+/// - `payload`: the user data, carried as Fully-Encoded-Data on
+///   `pres.acse_context_id`; `None` leaves the field out.
+pub fn encode_cpr(
+    pres: &IsoPresentation,
+    provider_reason: Option<u8>,
+    payload: Option<&[u8]>,
+    out: &mut BytesMut,
+) {
+    let mut body = BytesMut::new();
+    if let Some(reason) = provider_reason {
+        body.extend_from_slice(&[CPR_TAG_PROVIDER_REASON, 0x01, reason]);
+    }
+    if let Some(payload) = payload {
+        encode_user_data_with_ctx(pres.acse_context_id, payload, &mut body);
+    }
+    write_tl(CPR_TAG_NORMAL_MODE, body.len(), out);
+    out.extend_from_slice(&body);
 }
 
 /// Writes one 9-byte context-definition result that accepts BER:
@@ -1707,6 +1734,36 @@ mod tests {
             found,
             "cpa must contain 0xa5 0x12 context-definition-result-list"
         );
+    }
+
+    // CPR encoding
+
+    #[test]
+    fn cpr_for_a_user_rejection_carries_the_payload_on_the_acse_context() {
+        let mut pres = default_pres();
+        pres.acse_context_id = 5;
+        let mut out = BytesMut::new();
+        encode_cpr(&pres, None, Some(&[0x61, 0x00]), &mut out);
+        assert_eq!(
+            &out[..],
+            &[0x30, 0x0b, 0x61, 0x09, 0x30, 0x07, 0x02, 0x01, 0x05, 0xa0, 0x02, 0x61, 0x00]
+        );
+        let reject = parse_reject(&out).unwrap();
+        assert_eq!(reject.provider_reason, None);
+        assert_eq!(
+            reject.user_data(&out),
+            &[0x30, 0x07, 0x02, 0x01, 0x05, 0xa0, 0x02, 0x61, 0x00]
+        );
+    }
+
+    #[test]
+    fn cpr_for_a_provider_rejection_carries_the_reason() {
+        let mut out = BytesMut::new();
+        encode_cpr(&default_pres(), Some(0), None, &mut out);
+        assert_eq!(&out[..], &[0x30, 0x03, 0x8a, 0x01, 0x00]);
+        let reject = parse_reject(&out).unwrap();
+        assert_eq!(reject.provider_reason, Some(0));
+        assert_eq!(reject.user_data_len, 0);
     }
 
     // CP encoding structure: the PCDL is a fixed 35 bytes
