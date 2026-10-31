@@ -58,6 +58,7 @@ pub(crate) mod sync;
 // embedded; the struct fields and the remaining methods stay available.
 pub mod connection;
 pub mod directory;
+pub mod identity;
 pub mod object_io;
 
 #[cfg(feature = "control")]
@@ -95,6 +96,7 @@ pub use directory::{AcsiClass, DeviceModel, IcLogicalDevice};
 pub use error::ClientError;
 #[cfg(feature = "reporting")]
 pub use gocb::{GoCBValues, GoCBValuesWrite, PhyComAddress};
+pub use identity::ServerIdentity;
 // Re-exported so that the per-entry result of `read_objects` and
 // `get_data_set_values` can be named without depending on `iec61850-mms`
 // directly.
