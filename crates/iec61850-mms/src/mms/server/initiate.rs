@@ -578,13 +578,6 @@ mod tests {
         0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10,
     ];
 
-    /// `SERVER_SERVICES_SUPPORTED` must stay the server bitmap and must not be set to
-    /// `DEFAULT_SERVICES_SUPPORTED_CLIENT`: announcing services the server does not
-    /// implement makes peers issue requests it cannot answer.
-    ///
-    /// Feeding the golden request through `negotiate_initiate` must reproduce the
-    /// golden response byte for byte, so any change that echoes the client bitmap
-    /// back fails here.
     /// A Cancel-RequestPDU is rejected before any dispatcher sees it, so the
     /// baseline bitmap never announces cancel, while conclude stays announced.
     #[test]
@@ -593,6 +586,13 @@ mod tests {
         assert_eq!(SERVER_SERVICES_SUPPORTED[10] & 0x10, 0x10, "conclude");
     }
 
+    /// `SERVER_SERVICES_SUPPORTED` must stay the server bitmap and must not be set to
+    /// `DEFAULT_SERVICES_SUPPORTED_CLIENT`: announcing services the server does not
+    /// implement makes peers issue requests it cannot answer.
+    ///
+    /// Feeding the golden request through `negotiate_initiate` must reproduce the
+    /// golden response byte for byte, so any change that echoes the client bitmap
+    /// back fails here.
     #[test]
     fn server_services_supported_reproduces_golden_response() {
         let outcome = negotiate_initiate(WIRE_INITIATE_REQUEST, SERVER_SERVICES_SUPPORTED);
