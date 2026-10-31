@@ -120,21 +120,252 @@ tempfile       = { workspace = true }
 # dev-dependency cycle out of the publish graph.
 iec61850-client = { path = "../iec61850-client" }
 
-[[example]]
-name = "server_basic_io"
-path = "examples/server_basic_io.rs"
-
-[[example]]
-name = "server_with_reporting"
-path = "examples/server_with_reporting.rs"
+# Every example and most integration tests run the integrated IedServer, so
+# they build only with `full-server`; the subsets of the CI feature matrix skip
+# them. A test of one subsystem names that subsystem instead.
 
 # The smallest complete server: it loads examples/models/demo.cid, which ships
-# with this crate, and listens
-# on loopback. Paired with the min_client example.
+# with this crate, and listens on loopback. Paired with the min_client example.
 [[example]]
 name = "min_server"
-path = "examples/min_server.rs"
+required-features = ["full-server"]
+
+[[example]]
+name = "server_basic_io"
+required-features = ["full-server"]
+
+[[example]]
+name = "server_control_io"
+required-features = ["full-server"]
 
 [[example]]
 name = "server_from_scl"
-path = "examples/server_from_scl.rs"
+required-features = ["full-server"]
+
+[[example]]
+name = "server_with_log"
+required-features = ["full-server"]
+
+[[example]]
+name = "server_with_reporting"
+required-features = ["full-server"]
+
+[[test]]
+name = "control_direct_enhanced"
+required-features = ["control"]
+
+[[test]]
+name = "control_direct_normal"
+required-features = ["control"]
+
+[[test]]
+name = "control_sbo_enhanced"
+required-features = ["control"]
+
+[[test]]
+name = "control_sbo_normal"
+required-features = ["control"]
+
+[[test]]
+name = "dispatcher_control_routing"
+required-features = ["control"]
+
+[[test]]
+name = "brcb_overflow_dropped_counter_e2e"
+required-features = ["reporting"]
+
+[[test]]
+name = "brcb_reconnect_resync_e2e"
+required-features = ["reporting"]
+
+[[test]]
+name = "reporting_backpressure"
+required-features = ["reporting"]
+
+[[test]]
+name = "reporting_sink_routing"
+required-features = ["reporting"]
+
+[[test]]
+name = "array_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "association_lifecycle"
+required-features = ["full-server"]
+
+[[test]]
+name = "bit_string_length_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "bit_string_update"
+required-features = ["full-server"]
+
+[[test]]
+name = "brcb_buf_ovfl_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "brcb_enable_over_mms_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "brcb_get_entry_id_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "conformance_items"
+required-features = ["full-server"]
+
+[[test]]
+name = "control_from_model"
+required-features = ["full-server"]
+
+[[test]]
+name = "control_st_seld_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "control_wire_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "data_access_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "data_model_services_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "data_set_fcd_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "dispatcher_journal_routing"
+required-features = ["full-server"]
+
+[[test]]
+name = "dispatcher_rcb_routing"
+required-features = ["full-server"]
+
+[[test]]
+name = "end_to_end_handshake"
+required-features = ["full-server"]
+
+[[test]]
+name = "gocb_mms_structure_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "gocb_write_while_enabled"
+required-features = ["full-server"]
+
+[[test]]
+name = "goose_mapping_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "initiate_handshake"
+required-features = ["full-server"]
+
+[[test]]
+name = "iso_association_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "journal_query_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "lifecycle_brcb_tick"
+required-features = ["full-server"]
+
+[[test]]
+name = "log_service_pagination_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "log_service_server_segmentation_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "logging_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "name_list_directory_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "parallel_connections"
+required-features = ["full-server"]
+
+[[test]]
+name = "rcb_attribute_services_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "register_from_model_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "report_backpressure_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "report_control_block_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "report_member_inclusion_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "report_segmentation_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "reporting_update_hook"
+required-features = ["full-server"]
+
+[[test]]
+name = "scl_member_order_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "scl_setting_view_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "scl_values_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "sdo_nested_read_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "server_tls_handshake"
+required-features = ["full-server", "tls"]
+
+[[test]]
+name = "setting_group_values_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "setting_groups_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "tls_refusal_e2e"
+required-features = ["full-server", "tls"]
+
+[[test]]
+name = "tls_setup_timeout_event"
+required-features = ["full-server", "tls"]
+
+[[test]]
+name = "update_triggers_e2e"
+required-features = ["full-server"]

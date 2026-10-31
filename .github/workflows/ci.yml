@@ -39,12 +39,14 @@ jobs:
       # Every submodule of the server is optional, and the dispatcher compiles
       # without any of them. Each subset below drops a different set of routed
       # services, so an item reachable from an always-compiled path but defined
-      # behind a feature gate fails here rather than in a consumer's build.
-      - name: Check the server feature subsets
+      # behind a feature gate fails here rather than in a consumer's build. The
+      # tests and examples are linted too: each one names the features it needs
+      # in the crate manifest, and a subset that lacks them skips it.
+      - name: Clippy on the server feature subsets
         shell: bash
         run: |
           for features in minimal,std std,control std,logging std,setting-groups std,reporting; do
-            cargo check -p iec61850-server --no-default-features --features "$features"
+            cargo clippy -p iec61850-server --no-default-features --features "$features" --all-targets -- -D warnings
           done
 
       - name: Build the documentation

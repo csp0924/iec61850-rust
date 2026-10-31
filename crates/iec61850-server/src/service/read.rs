@@ -2548,6 +2548,7 @@ mod tests {
     }
 
     /// A data set member goes through the same rules as a read of its path.
+    #[cfg(feature = "reporting")]
     #[test]
     fn data_set_member_value_passes_the_handlers_above_it() {
         let model = build_handler_model();

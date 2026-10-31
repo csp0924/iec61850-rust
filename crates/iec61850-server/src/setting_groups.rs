@@ -1759,6 +1759,7 @@ mod tests {
         assert_eq!(bytes[7], 0x8a);
     }
 
+    #[cfg(feature = "full-server")]
     #[test]
     fn last_act_tm_carries_the_configured_time_quality() {
         let quality = crate::TimeQuality {

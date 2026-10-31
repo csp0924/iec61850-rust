@@ -1455,6 +1455,7 @@ fn read_ln_with_control_blocks(
     feature = "goose-mapping",
     feature = "logging"
 )))]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_read(
     invoke_id: u32,
     body: &Bytes,
@@ -1942,6 +1943,7 @@ fn dispatch_write(
     feature = "setting-groups",
     feature = "goose-mapping"
 )))]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_write(
     invoke_id: u32,
     body: &Bytes,

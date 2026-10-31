@@ -289,7 +289,7 @@ impl LogControl {
     /// Writes one entry holding `data`, each data set member with its own
     /// reason code, when the control block is enabled and has a storage bound;
     /// otherwise writes nothing and returns `Ok(None)`.
-    #[cfg(any(feature = "full-server", test))]
+    #[cfg(feature = "full-server")]
     pub(crate) fn write_members(
         &self,
         time_ms: u64,
