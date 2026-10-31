@@ -57,8 +57,11 @@ pub struct GooseSubscriberState {
     /// A publication that carries no `t` field leaves this zero and is logged,
     /// so a zero value is not a trustworthy timestamp.
     pub timestamp_raw: [u8; 8],
-    /// Simulation bit, called `test` in IEC 61850-8-1.
+    /// `simulation` member of the PDU, the Simulation parameter of SendGOOSE.
     pub simulation: bool,
+    /// S bit of Reserved1 in the frame header, which a conforming publisher
+    /// sets to the same value as `simulation` (IEC 61850-8-1 Annex C.2.5).
+    pub frame_simulation: bool,
     /// ndsCom, needs commissioning.
     pub nds_com: bool,
     /// Decoded data set values.
@@ -104,6 +107,37 @@ pub enum GooseEvent {
     },
 }
 
+/// Which publications a subscriber accepts by their Simulation flag.
+///
+/// IEC 61850-7-4 §5.3.2 lets a subscriber switch between original and
+/// simulated messages through LPHD.Sim, and IEC 61850-8-1 Annex C.2.5 places
+/// the S bit in the frame header for that purpose. The standard leaves the
+/// choice to the receiving application, so the default accepts both and the
+/// flag is reported in [`GooseSubscriberState`]. A publication counts as
+/// simulated when either the PDU `simulation` member or the S bit is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SimulationFilter {
+    /// Accepts original and simulated publications.
+    #[default]
+    Any,
+    /// Accepts only publications that are not simulated.
+    NonSimulated,
+    /// Accepts only simulated publications.
+    Simulated,
+}
+
+impl SimulationFilter {
+    /// Returns whether a publication with the given Simulation flag passes.
+    pub fn accepts(self, simulated: bool) -> bool {
+        match self {
+            SimulationFilter::Any => true,
+            SimulationFilter::NonSimulated => !simulated,
+            SimulationFilter::Simulated => simulated,
+        }
+    }
+}
+
 /// Builds a `GooseSubscriber`.
 ///
 /// Filters are fixed once `build` returns.
@@ -112,6 +146,7 @@ pub struct GooseSubscriberBuilder {
     gocb_ref: Option<String>,
     app_id: Option<u16>,
     dst_mac: Option<[u8; 6]>,
+    simulation: SimulationFilter,
     is_observer: bool,
     max_streams: Option<usize>,
     listener: Option<Box<dyn Fn(GooseEvent) + Send + Sync + 'static>>,
@@ -138,6 +173,13 @@ impl GooseSubscriberBuilder {
     /// Sets the destination MAC filter; leaving it unset accepts any address.
     pub fn dst_mac(mut self, mac: [u8; 6]) -> Self {
         self.dst_mac = Some(mac);
+        self
+    }
+
+    /// Sets which publications are accepted by their Simulation flag; the
+    /// default is [`SimulationFilter::Any`].
+    pub fn simulation(mut self, filter: SimulationFilter) -> Self {
+        self.simulation = filter;
         self
     }
 
@@ -174,6 +216,7 @@ impl GooseSubscriberBuilder {
             gocb_ref: self.gocb_ref.unwrap_or_default(),
             app_id: self.app_id,
             dst_mac: self.dst_mac,
+            simulation: self.simulation,
             is_observer,
             max_streams: self
                 .max_streams
@@ -198,6 +241,8 @@ pub struct GooseSubscriber {
     pub(crate) app_id: Option<u16>,
     /// Destination MAC filter; `None` accepts any address.
     pub(crate) dst_mac: Option<[u8; 6]>,
+    /// Simulation filter, applied after the PDU is decoded.
+    pub(crate) simulation: SimulationFilter,
     /// Observer mode, which bypasses every filter.
     pub(crate) is_observer: bool,
     /// Upper bound on `streams`.
@@ -232,6 +277,7 @@ impl std::fmt::Debug for GooseSubscriber {
             .field("gocb_ref", &self.gocb_ref)
             .field("app_id", &self.app_id)
             .field("dst_mac", &self.dst_mac)
+            .field("simulation", &self.simulation)
             .field("is_observer", &self.is_observer)
             .field("has_listener", &self.listener.is_some())
             .finish()
@@ -267,6 +313,11 @@ impl GooseSubscriber {
     /// Returns whether this is an observer subscription.
     pub fn is_observer(&self) -> bool {
         self.is_observer
+    }
+
+    /// Returns the Simulation filter.
+    pub fn simulation_filter(&self) -> SimulationFilter {
+        self.simulation
     }
 
     /// Sets the listener.
@@ -530,6 +581,7 @@ mod tests {
             conf_rev,
             timestamp_raw: [0u8; 8],
             simulation: false,
+            frame_simulation: false,
             nds_com: false,
             dataset_values: vec![],
             src_mac: [0u8; 6],
@@ -802,6 +854,22 @@ mod tests {
 
         let ev = events.lock().unwrap();
         assert_eq!(ev.as_slice(), &["new", "exp"]);
+    }
+
+    #[test]
+    fn simulation_filter_accepts() {
+        assert!(SimulationFilter::Any.accepts(false));
+        assert!(SimulationFilter::Any.accepts(true));
+        assert!(SimulationFilter::NonSimulated.accepts(false));
+        assert!(!SimulationFilter::NonSimulated.accepts(true));
+        assert!(!SimulationFilter::Simulated.accepts(false));
+        assert!(SimulationFilter::Simulated.accepts(true));
+        assert_eq!(SimulationFilter::default(), SimulationFilter::Any);
+        let sub = GooseSubscriberBuilder::new()
+            .gocb_ref("IED1/LLN0$GO$gcb")
+            .simulation(SimulationFilter::NonSimulated)
+            .build();
+        assert_eq!(sub.simulation_filter(), SimulationFilter::NonSimulated);
     }
 
     #[test]

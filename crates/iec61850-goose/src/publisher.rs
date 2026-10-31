@@ -18,7 +18,7 @@ use iec61850_model::MmsValue;
 use std::time::Instant;
 
 use crate::error::GooseError;
-use crate::frame::{GooseFrame, GooseFrameHeader, VlanPriority, VlanTag};
+use crate::frame::{GooseFrame, GooseFrameHeader, VlanPriority, VlanTag, RESERVED1_SIMULATION};
 use crate::pdu::GoosePdu;
 
 /// Maximum size of a GOOSE frame including the Ethernet header.
@@ -246,6 +246,7 @@ impl GoosePublisher {
             vlan: comm.vlan,
             app_id: comm.app_id,
             length: 8, // placeholder, patched per publication
+            simulation: false,
         };
 
         // Encoding an empty PDU yields exactly the header bytes.
@@ -334,9 +335,24 @@ impl GoosePublisher {
         &self.comm
     }
 
-    /// Sets the simulation bit, called `test` in IEC 61850-8-1.
+    /// Sets the Simulation parameter of SendGOOSE: the `simulation` member
+    /// of the PDU and, mirroring it, the S bit of Reserved1 in the frame
+    /// header (IEC 61850-8-1 Annex C.2.5).
     pub fn set_simulation(&mut self, v: bool) {
         self.simulation = v;
+        // Reserved1 follows the Length field.
+        let reserved1 = self.length_field_offset + 2;
+        let s_bit = (RESERVED1_SIMULATION >> 8) as u8;
+        if v {
+            self.frame_header_bytes[reserved1] |= s_bit;
+        } else {
+            self.frame_header_bytes[reserved1] &= !s_bit;
+        }
+    }
+
+    /// Returns the Simulation parameter.
+    pub fn simulation(&self) -> bool {
+        self.simulation
     }
 
     /// Sets the ndsCom flag.
@@ -901,6 +917,45 @@ mod tests {
         let goose_frame = GooseFrame::decode(&frame).unwrap();
         let pdu = GoosePdu::decode_ber(&goose_frame.pdu_bytes).unwrap();
         assert!(pdu.simulation);
+    }
+
+    #[test]
+    fn simulation_sets_the_s_bit_in_the_frame() {
+        let mut p = sample_publisher();
+        p.set_simulation(true);
+        let frame = p.publish(&sample_data()).unwrap();
+        assert_eq!(&frame[18..20], &[0x80, 0x00], "reserved1 carries the s bit");
+        let goose_frame = GooseFrame::decode(&frame).unwrap();
+        assert!(goose_frame.header.simulation);
+        let pdu = GoosePdu::decode_ber(&goose_frame.pdu_bytes).unwrap();
+        assert!(pdu.simulation);
+
+        p.set_simulation(false);
+        let frame = p.publish(&sample_data()).unwrap();
+        assert_eq!(&frame[18..20], &[0x00, 0x00]);
+        let goose_frame = GooseFrame::decode(&frame).unwrap();
+        assert!(!goose_frame.header.simulation);
+        assert!(
+            !GoosePdu::decode_ber(&goose_frame.pdu_bytes)
+                .unwrap()
+                .simulation
+        );
+    }
+
+    #[test]
+    fn simulation_s_bit_with_vlan_tag() {
+        let comm = sample_comm().with_vlan(VlanTag {
+            priority: VlanPriority::new(4).unwrap(),
+            vlan_id: 100,
+        });
+        let mut p = GoosePublisher::new(comm, "A/L$GO$gcb", None, "A/L$DS", 1).unwrap();
+        p.set_simulation(true);
+        let frame = p.publish(&sample_data()).unwrap();
+        assert_eq!(&frame[22..24], &[0x80, 0x00]);
+        assert_eq!(
+            u16::from_be_bytes([frame[20], frame[21]]) as usize,
+            frame.len() - 18
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!   [12..14] EtherType = 0x88B8
 //!   [14..16] APPID
 //!   [16..18] Length (APPID through end of PDU, including these 8 bytes)
-//!   [18..20] Reserved1 = 0x0000
+//!   [18..20] Reserved1, bit 15 = S (simulation), other bits 0
 //!   [20..22] Reserved2 = 0x0000
 //!   [22..]   IECGoosePdu
 //!
@@ -50,6 +50,10 @@ const ETHERNET_HEADER_WITH_VLAN: usize = 18;
 
 /// Size of APPID, Length, Reserved1, and Reserved2 together.
 const GOOSE_HEADER_SIZE: usize = 8;
+
+/// S (simulation) bit of Reserved1, the most significant bit of its first
+/// octet (IEC 61850-8-1 Annex C.2.5, Figure C.5).
+pub const RESERVED1_SIMULATION: u16 = 0x8000;
 
 /// VLAN priority code point, a 3-bit value in the range 0-7.
 ///
@@ -102,6 +106,11 @@ pub struct GooseFrameHeader {
     /// Length from the APPID field through the end of the PDU, including the
     /// 8 header bytes themselves.
     pub length: u16,
+    /// S bit of Reserved1, which mirrors the Simulation parameter carried in
+    /// the PDU so that a frame can be filtered at layer 2 (IEC 61850-8-1
+    /// Annex C.2.5). The other Reserved1 bits and Reserved2 are sent as zero
+    /// and ignored on receipt.
+    pub simulation: bool,
 }
 
 impl GooseFrameHeader {
@@ -115,6 +124,7 @@ impl GooseFrameHeader {
             vlan: None,
             app_id,
             length: 0,
+            simulation: false,
         }
     }
 }
@@ -163,8 +173,14 @@ impl GooseFrame {
         let length = (self.pdu_bytes.len() + GOOSE_HEADER_SIZE) as u16;
         buf.extend_from_slice(&length.to_be_bytes());
 
-        // Reserved1 and Reserved2, 2 bytes each, transmitted as zero.
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // Reserved1 carries only the S bit; Reserved2 is zero.
+        let reserved1 = if hdr.simulation {
+            RESERVED1_SIMULATION
+        } else {
+            0
+        };
+        buf.extend_from_slice(&reserved1.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x00]);
 
         buf.extend_from_slice(&self.pdu_bytes);
 
@@ -240,7 +256,10 @@ impl GooseFrame {
         let length = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
         pos += 2;
 
-        // Reserved1 and Reserved2 are not interpreted.
+        // Only the S bit of Reserved1 is interpreted; the reserved bits and
+        // Reserved2 are ignored.
+        let reserved1 = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let simulation = reserved1 & RESERVED1_SIMULATION != 0;
         pos += 4;
 
         let length_usize = length as usize;
@@ -273,6 +292,7 @@ impl GooseFrame {
             vlan,
             app_id,
             length,
+            simulation,
         };
 
         Ok(GooseFrame { header, pdu_bytes })
@@ -291,6 +311,7 @@ mod tests {
             vlan: None,
             app_id: 0x0001,
             length: 0, // recomputed by encode
+            simulation: false,
         }
     }
 
@@ -445,6 +466,59 @@ mod tests {
             GooseFrame::decode(&frame_bytes),
             Err(GooseError::EthernetFrameTooShort)
         ));
+    }
+
+    #[test]
+    fn simulation_sets_bit_15_of_reserved1() {
+        let mut header = sample_header_no_vlan();
+        header.simulation = true;
+        let mut buf = BytesMut::new();
+        GooseFrame::new(header, sample_pdu_bytes())
+            .encode(&mut buf)
+            .unwrap();
+        assert_eq!(&buf[18..22], &[0x80, 0x00, 0x00, 0x00]);
+        assert!(GooseFrame::decode(&buf).unwrap().header.simulation);
+    }
+
+    #[test]
+    fn simulation_off_leaves_reserved1_zero() {
+        let mut buf = BytesMut::new();
+        GooseFrame::new(sample_header_no_vlan(), sample_pdu_bytes())
+            .encode(&mut buf)
+            .unwrap();
+        assert_eq!(&buf[18..22], &[0x00, 0x00, 0x00, 0x00]);
+        assert!(!GooseFrame::decode(&buf).unwrap().header.simulation);
+    }
+
+    #[test]
+    fn simulation_bit_sits_after_the_vlan_tag() {
+        let mut header = sample_header_no_vlan();
+        header.vlan = Some(VlanTag {
+            priority: VlanPriority::new(4).unwrap(),
+            vlan_id: 0,
+        });
+        header.simulation = true;
+        let mut buf = BytesMut::new();
+        GooseFrame::new(header, sample_pdu_bytes())
+            .encode(&mut buf)
+            .unwrap();
+        assert_eq!(&buf[22..26], &[0x80, 0x00, 0x00, 0x00]);
+        assert!(GooseFrame::decode(&buf).unwrap().header.simulation);
+    }
+
+    #[test]
+    fn reserved_bits_other_than_s_are_ignored() {
+        let mut buf = BytesMut::new();
+        GooseFrame::new(sample_header_no_vlan(), sample_pdu_bytes())
+            .encode(&mut buf)
+            .unwrap();
+        buf[18] = 0x7F;
+        buf[19] = 0xFF;
+        buf[20] = 0xFF;
+        buf[21] = 0xFF;
+        let decoded = GooseFrame::decode(&buf).unwrap();
+        assert!(!decoded.header.simulation);
+        assert_eq!(decoded.pdu_bytes, sample_pdu_bytes());
     }
 
     #[test]

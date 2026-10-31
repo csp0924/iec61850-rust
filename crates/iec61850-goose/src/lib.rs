@@ -20,7 +20,9 @@ pub mod receiver;
 pub mod subscriber;
 
 pub use error::GooseError;
-pub use frame::{GooseFrame, GooseFrameHeader, VlanPriority, VlanTag, GOOSE_ETHER_TYPE};
+pub use frame::{
+    GooseFrame, GooseFrameHeader, VlanPriority, VlanTag, GOOSE_ETHER_TYPE, RESERVED1_SIMULATION,
+};
 pub use pdu::GoosePdu;
 pub use publisher::{
     CommParameters, GoosePublisher, PublishAction, RetransIntervals, RetransPhase,
@@ -28,5 +30,6 @@ pub use publisher::{
 };
 pub use receiver::{GooseReceiver, GooseReceiverHandle, Idle, Running, SharedReceiver};
 pub use subscriber::{
-    GooseEvent, GooseSubscriber, GooseSubscriberBuilder, GooseSubscriberState, GOOSE_STRING_MAX_LEN,
+    GooseEvent, GooseSubscriber, GooseSubscriberBuilder, GooseSubscriberState, SimulationFilter,
+    GOOSE_STRING_MAX_LEN,
 };

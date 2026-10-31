@@ -119,8 +119,9 @@ pub struct GoosePdu {
     /// 0 is valid here: the first frame after a reset or a state change carries
     /// sqNum 0 because the counter is incremented after encoding.
     pub sq_num: u32,
-    /// `[0x87]` simulation, the ASN.1 field name for the IEC 61850-8-1 test
-    /// bit.
+    /// `[0x87]` simulation, the Simulation parameter of SendGOOSE. It is
+    /// DEFAULT FALSE: the encoder always sends it and the decoder takes an
+    /// absent member as false.
     pub simulation: bool,
     /// `[0x88]` confRev, the configuration revision.
     pub conf_rev: u32,
@@ -604,13 +605,14 @@ impl GoosePdu {
         // [0x86] sqNum
         write_u32_tlv(&mut pdu, TAG_SQ_NUM, self.sq_num);
 
-        // [0x87] simulation, sent even when false; IEC 61850-8-1 §A.2 requires the field
+        // [0x87] simulation. The member is DEFAULT FALSE (IEC 61850-8-1
+        // Annex A); BER permits either form and FALSE is sent explicitly.
         write_bool_tlv(&mut pdu, TAG_SIMULATION, self.simulation);
 
         // [0x88] confRev
         write_u32_tlv(&mut pdu, TAG_CONF_REV, self.conf_rev);
 
-        // [0x89] ndsCom, sent even when false; IEC 61850-8-1 §A.2 requires the field
+        // [0x89] ndsCom, DEFAULT FALSE and likewise always sent.
         write_bool_tlv(&mut pdu, TAG_NDS_COM, self.nds_com);
 
         // [0x8a] numDatSetEntries
@@ -964,6 +966,43 @@ mod tests {
             GoosePdu::decode_ber(&buf),
             Err(GooseError::UnknownTag(TAG_GO_ID))
         );
+    }
+
+    #[test]
+    fn simulation_true_round_trip() {
+        let mut pdu = sample_pdu();
+        pdu.simulation = true;
+        let mut buf = BytesMut::new();
+        pdu.encode_ber(&mut buf).unwrap();
+        let bytes: &[u8] = &buf;
+        assert!(
+            bytes.windows(3).any(|w| w == [TAG_SIMULATION, 0x01, 0x01]),
+            "simulation true is encoded as 87 01 01"
+        );
+        assert!(GoosePdu::decode_ber(&buf).unwrap().simulation);
+    }
+
+    #[test]
+    fn absent_simulation_and_ndscom_decode_as_false() {
+        let mut pdu_inner = BytesMut::new();
+        write_string_tlv(&mut pdu_inner, TAG_GOCB_REF, "A/L$GO$gcb");
+        write_u32_tlv(&mut pdu_inner, TAG_TIME_ALLOWED, 2000);
+        write_string_tlv(&mut pdu_inner, TAG_DAT_SET, "A/L$DS");
+        write_string_tlv(&mut pdu_inner, TAG_GO_ID, "A/L$GO$gcb");
+        write_tlv(&mut pdu_inner, TAG_T, &[0u8; 8]);
+        write_u32_tlv(&mut pdu_inner, TAG_ST_NUM, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_SQ_NUM, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_CONF_REV, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_NUM_DATASET_ENTRIES, 0);
+        write_tlv(&mut pdu_inner, TAG_ALL_DATA, &[]);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[TAG_GOOSE_PDU]);
+        encode_length(pdu_inner.len(), &mut buf);
+        buf.extend_from_slice(&pdu_inner);
+
+        let decoded = GoosePdu::decode_ber(&buf).unwrap();
+        assert!(!decoded.simulation);
+        assert!(!decoded.nds_com);
     }
 
     #[test]

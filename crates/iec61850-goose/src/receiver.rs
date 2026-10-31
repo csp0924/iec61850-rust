@@ -220,6 +220,7 @@ impl GooseReceiver<Running> {
         let dst_mac = hdr.dst_mac;
         let src_mac = hdr.src_mac;
         let vlan = hdr.vlan;
+        let frame_simulation = hdr.simulation;
 
         let Self {
             subscribers,
@@ -265,6 +266,7 @@ impl GooseReceiver<Running> {
             conf_rev: parsed.conf_rev,
             timestamp_raw: parsed.t,
             simulation: parsed.simulation,
+            frame_simulation,
             nds_com: parsed.nds_com,
             dataset_values: parsed.all_data,
             src_mac,
@@ -274,9 +276,13 @@ impl GooseReceiver<Running> {
             state_valid: true,
         };
 
+        let simulated = state.simulation || state.frame_simulation;
         for idx in candidates() {
             if let Some(Some(sub)) = subscribers.get_mut(idx) {
-                if sub.matches_frame(app_id, &dst_mac) && sub.matches_gocb_ref(&state.gocb_ref) {
+                if sub.matches_frame(app_id, &dst_mac)
+                    && sub.matches_gocb_ref(&state.gocb_ref)
+                    && sub.simulation.accepts(simulated)
+                {
                     sub.update_and_dispatch(state.clone());
                 }
             }
@@ -399,7 +405,7 @@ mod tests {
     use crate::pdu::GoosePdu;
     use crate::publisher::{CommParameters, GoosePublisher};
     use crate::subscriber::GooseSubscriberBuilder;
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use iec61850_model::MmsValue;
     use std::sync::{Arc, Mutex};
 
@@ -420,6 +426,7 @@ mod tests {
             vlan: None,
             app_id,
             length: 0,
+            simulation: false,
         };
         let frame = GooseFrame::new(header, pdu_bytes);
         let mut buf = BytesMut::new();
@@ -774,6 +781,7 @@ mod tests {
             vlan: None,
             app_id: 0x0001,
             length: 0,
+            simulation: false,
         };
         let frame = GooseFrame::new(header, pdu_bytes);
         let mut buf = BytesMut::new();
@@ -844,6 +852,7 @@ mod tests {
             }),
             app_id: 0x0001,
             length: 0,
+            simulation: false,
         };
         let frame_obj = GooseFrame::new(header, pdu_bytes);
         let mut buf = BytesMut::new();
@@ -896,6 +905,92 @@ mod tests {
         assert_eq!(*received.lock().unwrap(), vec![1u32]);
     }
 
+    /// `(simulation, frame_simulation)` of each delivered state.
+    type SimulationLog = Arc<Mutex<Vec<(bool, bool)>>>;
+
+    /// Collects the Simulation flags each event reports.
+    fn simulation_recorder(
+        filter: crate::subscriber::SimulationFilter,
+    ) -> (GooseSubscriber, SimulationLog) {
+        let seen: SimulationLog = Arc::new(Mutex::new(vec![]));
+        let clone = seen.clone();
+        let sub = GooseSubscriberBuilder::new()
+            .gocb_ref("IED1/LLN0$GO$gcb")
+            .simulation(filter)
+            .listener(move |e| {
+                if let crate::subscriber::GooseEvent::NewState { state, .. }
+                | crate::subscriber::GooseEvent::Retransmission { state, .. } = e
+                {
+                    clone
+                        .lock()
+                        .unwrap()
+                        .push((state.simulation, state.frame_simulation));
+                }
+            })
+            .build();
+        (sub, seen)
+    }
+
+    /// Publishes sqNum 0 and 1 of one state, the first original and the
+    /// second simulated.
+    fn original_then_simulated() -> (Bytes, Bytes) {
+        let comm = CommParameters::new(0x0001, [0x01, 0x0C, 0xCD, 0x01, 0x00, 0x01])
+            .with_src_mac([0x00, 0x50, 0xC2, 0x12, 0x34, 0x56]);
+        let mut p = GoosePublisher::new(comm, "IED1/LLN0$GO$gcb", None, "IED1/LLN0$DS", 1).unwrap();
+        let original = p.publish(&[MmsValue::Boolean(true)]).unwrap();
+        p.set_simulation(true);
+        let simulated = p.publish(&[MmsValue::Boolean(true)]).unwrap();
+        (original, simulated)
+    }
+
+    #[test]
+    fn simulation_flags_reach_the_subscriber_state() {
+        let (sub, seen) = simulation_recorder(crate::subscriber::SimulationFilter::Any);
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.start();
+        let (original, simulated) = original_then_simulated();
+        running.handle_message(&original);
+        running.handle_message(&simulated);
+        assert_eq!(*seen.lock().unwrap(), vec![(false, false), (true, true)]);
+    }
+
+    #[test]
+    fn non_simulated_filter_drops_simulated_publications() {
+        let (sub, seen) = simulation_recorder(crate::subscriber::SimulationFilter::NonSimulated);
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.start();
+        let (original, simulated) = original_then_simulated();
+        running.handle_message(&original);
+        running.handle_message(&simulated);
+        assert_eq!(*seen.lock().unwrap(), vec![(false, false)]);
+    }
+
+    #[test]
+    fn simulated_filter_takes_either_flag() {
+        let (sub, seen) = simulation_recorder(crate::subscriber::SimulationFilter::Simulated);
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.start();
+
+        // Only the S bit, only the PDU member, then neither.
+        let mut pdu = make_pdu("IED1/LLN0$GO$gcb", 1, 0, 1);
+        let mut s_bit_only = encode_frame_with_pdu(&pdu, 0x0001, [0u8; 6]);
+        s_bit_only[18] = 0x80;
+        pdu.sq_num = 1;
+        pdu.simulation = true;
+        let member_only = encode_frame_with_pdu(&pdu, 0x0001, [0u8; 6]);
+        pdu.sq_num = 2;
+        pdu.simulation = false;
+        let neither = encode_frame_with_pdu(&pdu, 0x0001, [0u8; 6]);
+
+        running.handle_message(&s_bit_only);
+        running.handle_message(&member_only);
+        running.handle_message(&neither);
+        assert_eq!(*seen.lock().unwrap(), vec![(false, true), (true, false)]);
+    }
+
     #[test]
     fn typestate_idle_can_add_subscriber() {
         let mut rx = GooseReceiver::new();
@@ -937,6 +1032,7 @@ mod tests {
                 vlan: None,
                 app_id: 0x0001,
                 length: 0,
+                simulation: false,
             };
             let frame = GooseFrame::new(header, pdu_bytes.clone());
             let mut buf = BytesMut::new();
