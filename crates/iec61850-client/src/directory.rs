@@ -25,7 +25,7 @@ use iec61850_model::FC;
 use crate::connection::IedConnection;
 use crate::error::ClientError;
 use crate::object_io::parse_iec_object_path;
-use crate::prelude::{format, String, ToString, Vec};
+use crate::prelude::{format, Arc, String, ToString, Vec};
 
 // Types.
 
@@ -161,15 +161,17 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
 // Lazy loading of the device model.
 
 impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
-    /// Populates the device model cache if it is empty, by reading the whole
-    /// object tree from the server.
+    /// Returns the cached device model, reading the whole object tree from the
+    /// server first if nothing is cached.
     ///
-    /// Internal to the directory API; [`Self::get_device_model_from_server`] is
-    /// the public way to force a refresh.
-    pub(crate) async fn ensure_device_model(&self) -> Result<(), ClientError> {
-        // Already cached.
-        if self.device_model.lock().await.is_some() {
-            return Ok(());
+    /// The model read is returned directly rather than looked up again, so a
+    /// concurrent `invalidate_device_model_cache` or `disconnect` cannot leave
+    /// the caller without one. Internal to the directory API;
+    /// [`Self::get_device_model_from_server`] is the public way to force a
+    /// refresh.
+    pub(crate) async fn ensure_device_model(&self) -> Result<Arc<DeviceModel>, ClientError> {
+        if let Some(model) = self.device_model.lock().await.clone() {
+            return Ok(model);
         }
         // The logical device names are the VMD-scope domains.
         let ld_names = fetch_all_names(self, ObjectClass::Domain, None).await?;
@@ -184,44 +186,38 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         }
         // A concurrent caller may have filled the cache meanwhile; both results
         // describe the same server, so the later write simply wins.
-        *self.device_model.lock().await = Some(DeviceModel {
+        let model = Arc::new(DeviceModel {
             logical_devices: lds,
         });
-        Ok(())
+        *self.device_model.lock().await = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
+    /// Returns the variable list of one logical device from the device model,
+    /// reading the model from the server first if nothing is cached.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` if the server has no logical device of that name, and
+    /// the errors of reading the model.
+    async fn ld_variables(&self, ld_name: &str) -> Result<Vec<String>, ClientError> {
+        let model = self.ensure_device_model().await?;
+        let ld = model.find_ld(ld_name).ok_or_else(|| {
+            ClientError::InvalidArgument(format!("logical device `{ld_name}` not found on server"))
+        })?;
+        Ok(ld.variables.clone())
     }
 
     /// Returns a clone of the cached device model, or `None` if nothing has
     /// been cached yet.
     pub async fn cached_device_model(&self) -> Option<DeviceModel> {
-        self.device_model.lock().await.clone()
+        self.device_model.lock().await.as_deref().cloned()
     }
 
     /// Drops the cached device model, so the next directory call re-reads it.
     pub async fn invalidate_device_model_cache(&self) {
         *self.device_model.lock().await = None;
     }
-}
-
-// Cache lookup shared by the directory calls.
-
-/// Returns the cached variable list of one logical device.
-///
-/// The cache lock is held only long enough to clone the list, so a directory
-/// call does not block the others.
-///
-/// # Errors
-///
-/// `InvalidArgument` if the server has no logical device of that name.
-async fn cached_variables_for_ld<T: AsyncTransport, Tm: Timer>(
-    conn: &IedConnection<T, Tm>,
-    ld_name: &str,
-) -> Result<Vec<String>, ClientError> {
-    let guard = conn.device_model.lock().await;
-    let model = guard.as_ref().expect("device model must be cached by now");
-    let ld = model.find_ld(ld_name).ok_or_else(|| {
-        ClientError::InvalidArgument(format!("logical device `{ld_name}` not found on server"))
-    })?;
-    Ok(ld.variables.clone())
 }
 
 // (1) get_server_directory
@@ -243,17 +239,11 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
                     .to_string(),
             ));
         }
-        self.ensure_device_model().await?;
-        let model = self
-            .device_model
-            .lock()
-            .await
-            .clone()
-            .expect("device model must be cached by now");
+        let model = self.ensure_device_model().await?;
         Ok(model
             .logical_devices
-            .into_iter()
-            .map(|ld| ld.name)
+            .iter()
+            .map(|ld| ld.name.clone())
             .collect())
     }
 }
@@ -269,8 +259,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         &self,
         ld_name: &str,
     ) -> Result<Vec<String>, ClientError> {
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld_name).await?;
+        let vars = self.ld_variables(ld_name).await?;
         Ok(vars.into_iter().filter(|v| !v.contains('$')).collect())
     }
 }
@@ -386,69 +375,69 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     ) -> Result<Vec<String>, ClientError> {
         let (ld_name, ln_name) = split_ln_reference(ln_ref)?;
 
-        // Data sets and logs are never cached.
-        match class {
+        // Data sets and logs are read from the server; every other class is
+        // answered from the cache.
+        let fc = match class {
             AcsiClass::DataSet => {
-                let names =
-                    fetch_all_names(self, ObjectClass::NamedVariableList, Some(ld_name)).await?;
-                // A name is `<LN>$<dsName>`; keep the data set part of a matching LN.
-                let mut out = Vec::new();
-                for name in names {
-                    if let Some((var_ln, ds)) = name.split_once('$') {
-                        if var_ln == ln_name {
-                            out.push(ds.to_string());
-                        }
-                    }
-                }
-                return Ok(out);
+                return names_in_ln(self, ObjectClass::NamedVariableList, ld_name, ln_name).await;
             }
             AcsiClass::Log => {
-                let names = fetch_all_names(self, ObjectClass::Journal, Some(ld_name)).await?;
-                let mut out = Vec::new();
-                for name in names {
-                    if let Some((var_ln, log)) = name.split_once('$') {
-                        if var_ln == ln_name {
-                            out.push(log.to_string());
-                        }
-                    }
-                }
-                return Ok(out);
+                return names_in_ln(self, ObjectClass::Journal, ld_name, ln_name).await;
             }
-            _ => {}
-        }
-
-        // Every other class is answered from the cache.
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld_name).await?;
-        let mut out = Vec::new();
-
-        match class {
-            AcsiClass::DataObject => {
-                for var in &vars {
-                    if let Some(name) = data_object_of_variable(var, ln_name) {
-                        add_unique(&mut out, name.to_string());
-                    }
-                }
-            }
-            AcsiClass::Sgcb => {
-                // A logical device has at most one SGCB, and it lives in LLN0.
-                if ln_name == "LLN0" && vars.iter().any(|v| v == "LLN0$SP$SGCB") {
-                    out.push("SGCB".to_string());
-                }
-            }
-            AcsiClass::Brcb => add_variables_with_fc("BR", ln_name, &vars, &mut out),
-            AcsiClass::Urcb => add_variables_with_fc("RP", ln_name, &vars, &mut out),
-            AcsiClass::GoCb => add_variables_with_fc("GO", ln_name, &vars, &mut out),
-            AcsiClass::Lcb => add_variables_with_fc("LG", ln_name, &vars, &mut out),
             AcsiClass::GsCb | AcsiClass::Msvcb | AcsiClass::Usvcb => {
                 return Err(ClientError::InvalidArgument(format!(
                     "AcsiClass::{class:?} is not supported"
                 )));
             }
-            AcsiClass::DataSet | AcsiClass::Log => unreachable!("handled above"),
-        }
+            AcsiClass::DataObject => {
+                let vars = self.ld_variables(ld_name).await?;
+                let mut out = Vec::new();
+                for var in &vars {
+                    if let Some(name) = data_object_of_variable(var, ln_name) {
+                        add_unique(&mut out, name.to_string());
+                    }
+                }
+                return Ok(out);
+            }
+            AcsiClass::Sgcb => {
+                // A logical device has at most one SGCB, and it lives in LLN0.
+                let vars = self.ld_variables(ld_name).await?;
+                let mut out = Vec::new();
+                if ln_name == "LLN0" && vars.iter().any(|v| v == "LLN0$SP$SGCB") {
+                    out.push("SGCB".to_string());
+                }
+                return Ok(out);
+            }
+            AcsiClass::Brcb => "BR",
+            AcsiClass::Urcb => "RP",
+            AcsiClass::GoCb => "GO",
+            AcsiClass::Lcb => "LG",
+        };
+        let vars = self.ld_variables(ld_name).await?;
+        let mut out = Vec::new();
+        add_variables_with_fc(fc, ln_name, &vars, &mut out);
         Ok(out)
     }
+}
+
+/// Returns the objects of `object_class` named `<ln>$<name>` in one logical
+/// device, read from the server, as their `<name>` parts.
+async fn names_in_ln<T: AsyncTransport, Tm: Timer>(
+    conn: &IedConnection<T, Tm>,
+    object_class: ObjectClass,
+    ld_name: &str,
+    ln_name: &str,
+) -> Result<Vec<String>, ClientError> {
+    let names = fetch_all_names(conn, object_class, Some(ld_name)).await?;
+    let mut out = Vec::new();
+    for name in names {
+        if let Some((var_ln, rest)) = name.split_once('$') {
+            if var_ln == ln_name {
+                out.push(rest.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 // Every variable of a logical node, unfiltered.
@@ -464,8 +453,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         ln_ref: &str,
     ) -> Result<Vec<String>, ClientError> {
         let (ld_name, ln_name) = split_ln_reference(ln_ref)?;
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld_name).await?;
+        let vars = self.ld_variables(ld_name).await?;
         let mut out = Vec::new();
         for var in vars {
             if let Some((var_ln, rest)) = var.split_once('$') {
@@ -581,8 +569,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// into one entry; use [`Self::get_data_directory_fc`] to keep them apart.
     pub async fn get_data_directory(&self, data_ref: &str) -> Result<Vec<String>, ClientError> {
         let (ld, ln, data_part) = split_data_reference(data_ref)?;
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld).await?;
+        let vars = self.ld_variables(ld).await?;
         Ok(collect_data_children(&vars, ln, &data_part, None, false))
     }
 
@@ -590,8 +577,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// functional constraint, as in `stVal[ST]`.
     pub async fn get_data_directory_fc(&self, data_ref: &str) -> Result<Vec<String>, ClientError> {
         let (ld, ln, data_part) = split_data_reference(data_ref)?;
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld).await?;
+        let vars = self.ld_variables(ld).await?;
         Ok(collect_data_children(&vars, ln, &data_part, None, true))
     }
 
@@ -614,8 +600,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         }
         let fc_str = fc.as_str();
         let (ld, ln, data_part) = split_data_reference(data_ref)?;
-        self.ensure_device_model().await?;
-        let vars = cached_variables_for_ld(self, ld).await?;
+        let vars = self.ld_variables(ld).await?;
         Ok(collect_data_children(
             &vars,
             ln,
@@ -678,13 +663,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         }
         // Clearing the cache forces the lazy path to read from the server.
         *self.device_model.lock().await = None;
-        self.ensure_device_model().await?;
-        Ok(self
-            .device_model
-            .lock()
-            .await
-            .clone()
-            .expect("device model must be cached by now"))
+        let model = self.ensure_device_model().await?;
+        Ok(DeviceModel::clone(&model))
     }
 }
 
