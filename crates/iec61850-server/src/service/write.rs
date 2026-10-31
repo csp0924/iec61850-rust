@@ -417,7 +417,7 @@ fn write_to_target(
                 continue;
             };
             let merged = merged_value(*ancestor, fc, &object_path[depth + 1..], new_value.clone());
-            match consult_write_handler(handler, path, fc, conn_id, &merged) {
+            match consult_write_handler(handler, path, item_id, fc, conn_id, &merged) {
                 HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
                 // The handler takes the whole ancestor over, so no cached value
                 // of it changes.
@@ -448,7 +448,7 @@ fn write_to_target(
             .as_deref()
             .and_then(|path| Some((path, handler_at(&handlers, path)?)));
         if let Some((path, handler)) = handler {
-            match consult_write_handler(handler, path, fc, conn_id, node.value) {
+            match consult_write_handler(handler, path, item_id, fc, conn_id, node.value) {
                 HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
                 HandlerWriteOutcome::AcceptNoUpdate => {
                     i = node.end;
@@ -724,15 +724,17 @@ fn fit_bit_string(
     })
 }
 
-/// Gives `handler`, installed on `path`, its say on `new_value`.
+/// Gives `handler`, installed on `path`, its say on `new_value` in a write the
+/// client named `requested`.
 fn consult_write_handler(
     handler: &Arc<dyn AttributeAccessHandler>,
     path: &str,
+    requested: &str,
     fc: FC,
     conn_id: u64,
     new_value: &iec61850_model::MmsValue,
 ) -> HandlerWriteOutcome {
-    let ctx = WriteContext::new(path, fc, conn_id);
+    let ctx = WriteContext::new(path, fc, conn_id).with_requested(requested);
     let outcome = handler.on_write(&ctx, new_value);
     match &outcome {
         HandlerWriteOutcome::Reject(e) => tracing::warn!(
@@ -2414,6 +2416,68 @@ mod tests {
         assert_eq!(
             leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f"),
             MmsValue::Float32(9.0)
+        );
+    }
+
+    /// Records the path and the requested path of every write it is asked
+    /// about, and accepts.
+    #[derive(Debug, Default)]
+    struct Requested {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::handler::AttributeAccessHandler for Requested {
+        fn on_write(&self, ctx: &WriteContext<'_>, _value: &MmsValue) -> HandlerWriteOutcome {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ctx.path.to_string(), ctx.requested.to_string()));
+            HandlerWriteOutcome::Accept
+        }
+    }
+
+    /// Every write handler a write consults sees its own path and the path the
+    /// client named.
+    #[test]
+    fn write_handler_sees_the_requested_path() {
+        let (model, mms_model) = build_sdo_write_model();
+        let above = Arc::new(Requested::default());
+        let below = Arc::new(Requested::default());
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$PhSet", above.clone())
+            .unwrap();
+        registry
+            .install_write_access_handler("GGIO1$SP$PhSet$phsA$setCplx$f", below.clone())
+            .unwrap();
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SP$PhSet$phsA".to_string(),
+        };
+        let result = handle_single_write(
+            &model,
+            &mms_model,
+            &WriteAccessPolicies::default(),
+            Some(&registry),
+            None,
+            0,
+            &name,
+            &phs_a_value(1.0, 2.0),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *above.seen.lock().unwrap(),
+            [(
+                "GGIO1$SP$PhSet".to_string(),
+                "GGIO1$SP$PhSet$phsA".to_string()
+            )]
+        );
+        assert_eq!(
+            *below.seen.lock().unwrap(),
+            [(
+                "GGIO1$SP$PhSet$phsA$setCplx$f".to_string(),
+                "GGIO1$SP$PhSet$phsA".to_string()
+            )]
         );
     }
 }

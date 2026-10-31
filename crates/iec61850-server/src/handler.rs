@@ -33,24 +33,40 @@ use crate::error::{Result, ServerError};
 
 /// Context passed to [`ReadHandler::read`].
 ///
-/// The path arrives canonicalized, so a handler can compare it as a string
+/// The paths arrive canonicalized, so a handler can compare them as strings
 /// without trimming or changing case.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ReadContext<'a> {
-    /// Canonical attribute path, `LN$FC$DO[$DA]*`.
+    /// Canonical path the handler is registered against,
+    /// `LN$FC$DO[$SDO...][$DA[$SDA...]]`.
     pub path: &'a str,
     /// Functional constraint of the path, already parsed out of it.
     pub fc: FC,
     /// Association the request arrived on; 0 before one is established.
     pub conn_id: u64,
+    /// Path the client named: `path` itself, a node above it such as its data
+    /// object, its logical node `LN` or its group `LN$FC`, a node below it, or
+    /// the data set member being read.
+    pub requested: &'a str,
 }
 
 impl<'a> ReadContext<'a> {
     /// Creates the context of a read of `path` under `fc` on the association
-    /// `conn_id`.
+    /// `conn_id`, requested by that same path.
     pub fn new(path: &'a str, fc: FC, conn_id: u64) -> Self {
-        Self { path, fc, conn_id }
+        Self {
+            path,
+            fc,
+            conn_id,
+            requested: path,
+        }
+    }
+
+    /// Sets the path the client named.
+    pub fn with_requested(mut self, requested: &'a str) -> Self {
+        self.requested = requested;
+        self
     }
 }
 
@@ -58,19 +74,34 @@ impl<'a> ReadContext<'a> {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct WriteContext<'a> {
-    /// Canonical attribute path, `LN$FC$DO[$DA]*`.
+    /// Canonical path the handler is registered against,
+    /// `LN$FC$DO[$SDO...][$DA[$SDA...]]`.
     pub path: &'a str,
     /// Functional constraint of the path.
     pub fc: FC,
     /// Association the request arrived on.
     pub conn_id: u64,
+    /// Path the client named: `path` itself, a node above it, or a node below
+    /// it.
+    pub requested: &'a str,
 }
 
 impl<'a> WriteContext<'a> {
     /// Creates the context of a write of `path` under `fc` on the association
-    /// `conn_id`.
+    /// `conn_id`, requested by that same path.
     pub fn new(path: &'a str, fc: FC, conn_id: u64) -> Self {
-        Self { path, fc, conn_id }
+        Self {
+            path,
+            fc,
+            conn_id,
+            requested: path,
+        }
+    }
+
+    /// Sets the path the client named.
+    pub fn with_requested(mut self, requested: &'a str) -> Self {
+        self.requested = requested;
+        self
     }
 }
 
@@ -125,8 +156,13 @@ pub enum WriteOutcome {
 /// read replaces the part its own node occupies, and its error refuses the
 /// whole read, which then carries no part of the value. Handlers below one
 /// that answered with a value are not consulted.
+///
+/// [`ReadContext::requested`] tells a read of the node itself from a read
+/// that covers it; a handler meant for its own path only answers
+/// [`ReadOutcome::CacheMiss`] when the two differ.
 pub trait ReadHandler: Send + Sync + core::fmt::Debug {
-    /// Answers a read of the attribute this handler is registered against.
+    /// Answers a read that covers the node this handler is registered
+    /// against, `ctx.path`; the client named `ctx.requested`.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
 }
 
@@ -137,8 +173,8 @@ pub trait ReadHandler: Send + Sync + core::fmt::Debug {
 /// consulted, so the handler never sees a value the server would have refused
 /// on its own. Only an `Accept` reaches the cached value.
 pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
-    /// Decides what happens to a value written to the attribute this handler is
-    /// registered against.
+    /// Decides what happens to a value written to the node this handler is
+    /// registered against, `ctx.path`; the client named `ctx.requested`.
     ///
     /// One write can consult several handlers: those of the nodes above the
     /// written one, up to its data object, and, for a data object or a
@@ -146,16 +182,18 @@ pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
     /// data object therefore decides every write that reaches the object
     /// under the functional constraint of its path.
     ///
+    /// The write fails as a whole when any of those handlers refuses, after
+    /// the earlier ones may already have answered `Accept` or
+    /// `AcceptNoUpdate`. No cached value changes in that case, but a handler
+    /// that applies a value itself on `AcceptNoUpdate` sees no notice of the
+    /// failure, so it should tolerate a write that ends up refused.
+    ///
     /// A handler above the written node receives that node's value merged
     /// into the current values of its siblings, read when the write is
-    /// checked. Nothing holds those siblings until the leaves are stored, so a
-    /// concurrent write of a sibling leaf can make the merged value differ from
-    /// the final state by that leaf; the decision the handler makes still
-    /// applies to this write only. The write fails as a whole when any of them refuses, after
-    /// the earlier ones may already have answered `Accept` or `AcceptNoUpdate`.
-    /// No cached value changes in that case, but a handler that applies a value
-    /// itself on `AcceptNoUpdate` sees no notice of the failure, so it should
-    /// tolerate a write that ends up refused.
+    /// checked. A concurrent write of a sibling leaf can land between that
+    /// read and the store, so the merged value may differ from the final state
+    /// by that leaf; the decision the handler makes still applies to this
+    /// write only.
     fn on_write(&self, ctx: &WriteContext<'_>, value: &MmsValue) -> WriteOutcome;
 }
 
@@ -479,11 +517,7 @@ mod tests {
         let h = DenyAllReadHandler {
             error: DataAccessError::ObjectAccessDenied,
         };
-        let ctx = ReadContext {
-            path: "MMXU1$MX$TotW$mag",
-            fc: FC::Mx,
-            conn_id: 1,
-        };
+        let ctx = ReadContext::new("MMXU1$MX$TotW$mag", FC::Mx, 1);
         match h.read(&ctx) {
             ReadOutcome::Error(DataAccessError::ObjectAccessDenied) => {}
             other => {
@@ -495,11 +529,7 @@ mod tests {
     #[test]
     fn silent_read_handler_returns_cache_miss() {
         let h = SilentReadHandler;
-        let ctx = ReadContext {
-            path: "MMXU1$MX$TotW$mag",
-            fc: FC::Mx,
-            conn_id: 1,
-        };
+        let ctx = ReadContext::new("MMXU1$MX$TotW$mag", FC::Mx, 1);
         assert!(matches!(h.read(&ctx), ReadOutcome::CacheMiss));
     }
 
@@ -578,11 +608,7 @@ mod tests {
         reg.install_write_access_handler("GGIO1$CF$Mod$ctlModel", h.clone())
             .unwrap();
         let found = reg.lookup_write("GGIO1$CF$Mod$ctlModel").unwrap();
-        let ctx = WriteContext {
-            path: "GGIO1$CF$Mod$ctlModel",
-            fc: FC::Cf,
-            conn_id: 0,
-        };
+        let ctx = WriteContext::new("GGIO1$CF$Mod$ctlModel", FC::Cf, 0);
         let _ = found.on_write(&ctx, &MmsValue::Integer(2));
         assert_eq!(h.count.load(Ordering::SeqCst), 1);
     }

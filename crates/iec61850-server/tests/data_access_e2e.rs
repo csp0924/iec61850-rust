@@ -734,3 +734,48 @@ async fn data_set_member_beneath_a_sub_data_object() {
     .await
     .expect("timed out");
 }
+
+/// Refuses a read of its own path and lets every read that covers it pass, by
+/// comparing the path the client named with its own.
+#[derive(Debug)]
+struct OwnPathOnly;
+
+impl ReadHandler for OwnPathOnly {
+    fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome {
+        if ctx.requested != ctx.path {
+            return ReadOutcome::CacheMiss;
+        }
+        ReadOutcome::Error(DataAccessError::ObjectAccessDenied)
+    }
+}
+
+/// A handler that compares the requested path with its own guards only its
+/// own path: the data object and the logical node above it still read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_handler_can_guard_its_own_path_only() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        server
+            .handler_registry()
+            .install_read_handler("GGIO1$ST$Ind$stVal", Arc::new(OwnPathOnly))
+            .unwrap();
+
+        assert_eq!(
+            access_error(client.read(DOMAIN, "GGIO1$ST$Ind$stVal").await),
+            DataAccessError::ObjectAccessDenied
+        );
+        client
+            .read(DOMAIN, "GGIO1$ST$Ind")
+            .await
+            .expect("the data object reads");
+        client
+            .read(DOMAIN, "GGIO1")
+            .await
+            .expect("the logical node reads");
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}

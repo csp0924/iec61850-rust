@@ -180,6 +180,8 @@ pub(crate) fn resolve_node_path<'m>(
 pub(crate) struct ReadHandlerScope {
     handlers: Vec<(String, Arc<dyn ReadHandler>)>,
     conn_id: u64,
+    /// The path the client named, passed to every handler.
+    requested: String,
 }
 
 impl ReadHandlerScope {
@@ -188,6 +190,7 @@ impl ReadHandlerScope {
         Self {
             handlers: Vec::new(),
             conn_id: 0,
+            requested: String::new(),
         }
     }
 
@@ -197,9 +200,16 @@ impl ReadHandlerScope {
         if registry.ignore_read_access() {
             return Self::none();
         }
+        let handlers = registry.read_handlers_around(item_id);
+        let requested = if handlers.is_empty() {
+            String::new()
+        } else {
+            item_id.to_string()
+        };
         Self {
-            handlers: registry.read_handlers_around(item_id),
+            handlers,
             conn_id,
+            requested,
         }
     }
 
@@ -222,7 +232,8 @@ impl ReadHandlerScope {
     /// Asks the handler on `path`, if there is one.
     fn consult(&self, path: &str, fc: FC) -> Option<ReadOutcome> {
         let (_, handler) = self.handlers.iter().find(|(key, _)| key == path)?;
-        Some(handler.read(&ReadContext::new(path, fc, self.conn_id)))
+        let ctx = ReadContext::new(path, fc, self.conn_id).with_requested(&self.requested);
+        Some(handler.read(&ctx))
     }
 
     /// Asks the handlers above the target, `ancestors[i]` naming the first
@@ -2323,6 +2334,59 @@ mod tests {
                 AccessResult::Success(quality()),
             ),
             AccessResult::Success(quality())
+        );
+    }
+
+    /// Records the path and the requested path of every read it is asked
+    /// about, and answers only a read of its own path: with an error, so a
+    /// read that covers its node passes through on a miss.
+    #[derive(Debug, Default)]
+    struct OwnPathOnly {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ReadHandler for OwnPathOnly {
+        fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ctx.path.to_string(), ctx.requested.to_string()));
+            if ctx.requested != ctx.path {
+                return ReadOutcome::CacheMiss;
+            }
+            ReadOutcome::Error(DataAccessError::ObjectAccessDenied)
+        }
+    }
+
+    /// A handler sees its own path and the path the client named, so one meant
+    /// for its own path only can let the reads that cover it pass.
+    #[test]
+    fn handler_tells_its_own_path_from_the_requested_one() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        let leaf = Arc::new(OwnPathOnly::default());
+        registry
+            .install_read_handler("MMXU1$MX$A$q", leaf.clone())
+            .unwrap();
+        assert!(matches!(
+            read_through(&model, &registry, "MMXU1$MX$A"),
+            AccessResult::Success(_)
+        ));
+        assert!(matches!(
+            read_through(&model, &registry, "MMXU1"),
+            AccessResult::Success(_)
+        ));
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A$q"),
+            AccessResult::Failure(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            *leaf.seen.lock().unwrap(),
+            [
+                ("MMXU1$MX$A$q".to_string(), "MMXU1$MX$A".to_string()),
+                ("MMXU1$MX$A$q".to_string(), "MMXU1".to_string()),
+                ("MMXU1$MX$A$q".to_string(), "MMXU1$MX$A$q".to_string()),
+            ]
         );
     }
 }
