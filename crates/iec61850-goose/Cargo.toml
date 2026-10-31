@@ -36,9 +36,10 @@ libc = "0.2"
 # The goose_publisher_live example drives the AF_PACKET backend of the hal.
 iec61850-hal = { workspace = true, features = ["ethernet-linux-afpacket"] }
 
-# On Windows and macOS the pcap backend must be requested explicitly:
-#   cargo build -p iec61850-goose --example goose_publisher_live \
-#       --features iec61850-hal/ethernet-pcap
+# goose_publisher_live opens its socket with iec61850_hal::ethernet::open_socket.
+# Outside Linux the pcap backend must be requested explicitly:
+#   cargo run -p iec61850-goose --example goose_publisher_live \
+#       --features iec61850-hal/ethernet-pcap -- <interface>
 # The NPCAP or libpcap SDK is supplied by the user. It is deliberately not a
 # dev-dependency, so that a default test build does not fail to link for want
-# of wpcap.lib.
+# of wpcap.lib; without a backend the example prints a hint and exits.

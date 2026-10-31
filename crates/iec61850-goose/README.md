@@ -13,9 +13,10 @@ GOOSE header layers, `publisher` the state machine and retransmission timing,
 `subscriber` the per-GoCB state and event dispatch, and `receiver` the
 typestate that owns the L2 source and fans frames out to subscribers. The
 publisher owns no socket: the caller drives the retransmission schedule and
-sends the frames it hands back. Publishing and subscribing need an
-`AF_PACKET` socket with `CAP_NET_RAW`, so the runtime path is Linux only; a
-libpcap or NPCAP backend is available for development.
+sends the frames it hands back. On Linux, publishing and subscribing use an
+`AF_PACKET` socket and need `CAP_NET_RAW`; elsewhere the libpcap or NPCAP
+backend of `iec61850-hal` (`ethernet-pcap`, `ethernet-windows-npcap`) serves
+development and testing.
 
 Part of [iec61850-rust](https://github.com/csp0924/iec61850-rust), an
 independent Rust implementation of IEC 61850 (MMS, GOOSE, Sampled Values,
