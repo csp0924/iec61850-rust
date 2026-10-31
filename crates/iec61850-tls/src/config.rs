@@ -384,8 +384,9 @@ impl TlsConfigBuilder {
 
     /// Sets how long the server keeps a session resumable after storing it.
     ///
-    /// Applies to TLS 1.2 session IDs and TLS 1.3 tickets alike; resuming an
-    /// older session falls back to a full handshake. A zero lifetime disables
+    /// Applies to TLS 1.2 session IDs and TLS 1.3 tickets alike, the latter
+    /// only when the server sends tickets, see [`Self::tls13_session_tickets`];
+    /// resuming an older session falls back to a full handshake. A zero lifetime disables
     /// resumption on the server. Without this setting the server keeps up to
     /// 256 sessions with no time limit. Has no effect on `build_client`.
     pub fn session_resumption_lifetime(mut self, d: Duration) -> Self {

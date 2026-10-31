@@ -351,9 +351,8 @@ fn report_validity_time_findings(
 /// valid yet is verified again at a time inside its validity period. It is
 /// accepted, with a warning event, only when that verification passes, so a
 /// bad signature, a revoked certificate, an unknown CA or a peer outside the
-/// allow-only-known list still rejects. That is what IEC 62351-3 requires:
-/// switching validity-time checking off relaxes the expiry check and nothing
-/// else. An inner verifier that reports expiry without the `*Context`
+/// allow-only-known list still rejects: switching validity-time checking
+/// off relaxes the expiry check and nothing else. An inner verifier that reports expiry without the `*Context`
 /// variants gives no validity period to verify in, so its error rejects.
 pub struct IgnoreValidityTimeServerVerifier {
     inner: Arc<dyn ServerCertVerifier>,
