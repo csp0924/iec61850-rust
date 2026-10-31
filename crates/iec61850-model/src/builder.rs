@@ -228,7 +228,7 @@ fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
     };
     for seg in names {
         let next = match node {
-            PathNode::Do(d) => match d.child_by_name(seg) {
+            PathNode::Do(d) => match d.child_by_name_fc(seg, fc) {
                 Some(DoChild::SubDo(s)) => PathNode::Do(s),
                 Some(DoChild::Da(a)) => PathNode::Da(a),
                 None => return false,
@@ -515,17 +515,17 @@ impl DataObjectBuilder {
                 reason: "data object name is empty".into(),
             });
         }
-        // Data attributes and sub-objects share one namespace.
-        let mut seen = HashSet::new();
-        for c in &self.children {
-            let n = match c {
-                DoChild::Da(da) => &da.name,
-                DoChild::SubDo(sd) => &sd.name,
-            };
-            if !seen.insert(n.clone()) {
+        // Data attributes and sub-objects share one namespace, except that a
+        // setting may appear once under FC=SE and once under FC=SG
+        // (IEC 61850-6, DA fc attribute).
+        for (i, c) in self.children.iter().enumerate() {
+            let clash = self.children[..i].iter().find(|earlier| {
+                child_name(earlier) == child_name(c) && !is_setting_pair(earlier, c)
+            });
+            if clash.is_some() {
                 return Err(ModelError::DuplicateName {
                     kind: "DO child",
-                    name: n.clone(),
+                    name: child_name(c).to_string(),
                     parent: self.name,
                 });
             }
@@ -536,6 +536,34 @@ impl DataObjectBuilder {
             children: self.children,
         })
     }
+}
+
+fn child_name(c: &DoChild) -> &str {
+    match c {
+        DoChild::Da(da) => &da.name,
+        DoChild::SubDo(sd) => &sd.name,
+    }
+}
+
+/// Whether two children are the FC=SE and FC=SG data attributes of one
+/// setting, which share their type and structure.
+fn is_setting_pair(a: &DoChild, b: &DoChild) -> bool {
+    matches!(
+        (a, b),
+        (DoChild::Da(x), DoChild::Da(y))
+            if matches!((x.fc, y.fc), (FC::Se, FC::Sg) | (FC::Sg, FC::Se)) && same_shape(x, y)
+    )
+}
+
+/// Whether two data attributes have the same type and, recursively, the same
+/// sub-attributes in the same order.
+fn same_shape(x: &DataAttribute, y: &DataAttribute) -> bool {
+    x.ty == y.ty
+        && x.children.len() == y.children.len()
+        && x.children
+            .iter()
+            .zip(&y.children)
+            .all(|(a, b)| a.name == b.name && same_shape(a, b))
 }
 
 #[cfg(test)]
@@ -668,6 +696,124 @@ mod tests {
             )
             .build();
         assert!(matches!(r, Err(ModelError::DuplicateName { .. })));
+    }
+
+    #[test]
+    fn setting_under_se_and_sg_accepted() {
+        let leaf = |fc| {
+            DataAttribute::new(
+                "setVal",
+                fc,
+                DataAttributeType::Int32,
+                TrgOps::NONE,
+                MmsValue::Integer(0),
+            )
+        };
+        let d = DataObjectBuilder::scalar("Spt")
+            .add_da_node(leaf(FC::Se))
+            .add_da_node(leaf(FC::Sg))
+            .build()
+            .unwrap();
+        assert_eq!(d.children_with_fc(FC::Se).count(), 1);
+        assert_eq!(d.children_with_fc(FC::Sg).count(), 1);
+
+        for (a, b) in [(FC::Se, FC::Se), (FC::Sg, FC::Sg), (FC::Se, FC::Cf)] {
+            let r = DataObjectBuilder::scalar("Spt")
+                .add_da_node(leaf(a))
+                .add_da_node(leaf(b))
+                .build();
+            assert!(
+                matches!(r, Err(ModelError::DuplicateName { .. })),
+                "{a:?} and {b:?}"
+            );
+        }
+        let r = DataObjectBuilder::scalar("Spt")
+            .add_da_node(leaf(FC::Se))
+            .add_sub_do(DataObjectBuilder::scalar("setVal").build().unwrap())
+            .build();
+        assert!(matches!(r, Err(ModelError::DuplicateName { .. })));
+    }
+
+    #[test]
+    fn setting_under_se_and_sg_of_another_shape_rejected() {
+        let int32 = DataAttribute::new(
+            "setVal",
+            FC::Sg,
+            DataAttributeType::Int32,
+            TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        let int64 = DataAttribute::new(
+            "setVal",
+            FC::Se,
+            DataAttributeType::Int64,
+            TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        let r = DataObjectBuilder::scalar("Spt")
+            .add_da_node(int32)
+            .add_da_node(int64)
+            .build();
+        assert!(matches!(r, Err(ModelError::DuplicateName { .. })));
+
+        let mag = |fc, member: &str| {
+            DataAttribute::constructed(
+                "setMag",
+                fc,
+                vec![DataAttribute::new(
+                    member,
+                    fc,
+                    DataAttributeType::Float32,
+                    TrgOps::NONE,
+                    MmsValue::Float32(0.0),
+                )],
+            )
+        };
+        let same = DataObjectBuilder::scalar("Spt")
+            .add_da_node(mag(FC::Se, "f"))
+            .add_da_node(mag(FC::Sg, "f"))
+            .build();
+        assert!(same.is_ok());
+        let other = DataObjectBuilder::scalar("Spt")
+            .add_da_node(mag(FC::Se, "f"))
+            .add_da_node(mag(FC::Sg, "i"))
+            .build();
+        assert!(matches!(other, Err(ModelError::DuplicateName { .. })));
+    }
+
+    #[test]
+    fn data_set_entry_resolves_the_setting_under_its_constraint() {
+        let leaf = |fc| {
+            DataAttribute::new(
+                "setVal",
+                fc,
+                DataAttributeType::Int32,
+                TrgOps::NONE,
+                MmsValue::Integer(0),
+            )
+        };
+        let spt = || {
+            DataObjectBuilder::scalar("Spt")
+                .add_da_node(leaf(FC::Se))
+                .add_da_node(leaf(FC::Sg))
+                .build()
+                .unwrap()
+        };
+        let ln = LogicalNodeBuilder::new("", "PTOC", "1")
+            .add_do(spt())
+            .build()
+            .unwrap();
+        for fc in [FC::Se, FC::Sg] {
+            assert!(
+                entry_resolves(&ln, &["Spt".into(), "setVal".into()], fc),
+                "{fc:?}"
+            );
+        }
+        assert!(!entry_resolves(
+            &ln,
+            &["Spt".into(), "setVal".into()],
+            FC::Cf
+        ));
     }
 
     #[test]

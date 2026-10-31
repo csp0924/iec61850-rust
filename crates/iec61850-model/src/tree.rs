@@ -75,7 +75,27 @@ impl IedModel {
     ///
     /// Returns `None` when nothing matches. An over-long reference is rejected
     /// earlier, by the `ObjectRef` parser, so no lookup silently overflows.
+    ///
+    /// An object reference carries no functional constraint, so of the FC=SE
+    /// and FC=SG data attributes of one setting the one declared first is
+    /// returned; [`node_by_object_ref_fc`](Self::node_by_object_ref_fc) selects
+    /// by constraint.
     pub fn node_by_object_ref(&self, r: &ObjectRef) -> Option<NodeRef<'_>> {
+        self.resolve_object_ref(r, None)
+    }
+
+    /// Resolves an object reference as
+    /// [`node_by_object_ref`](Self::node_by_object_ref) does, except that a
+    /// data attribute named right below a data object or sub-object is the one
+    /// carrying `fc`.
+    ///
+    /// Returns `None` when the attribute the path names does not carry `fc`. A
+    /// path ending at a data object or logical node resolves whatever `fc` is.
+    pub fn node_by_object_ref_fc(&self, r: &ObjectRef, fc: FC) -> Option<NodeRef<'_>> {
+        self.resolve_object_ref(r, Some(fc))
+    }
+
+    fn resolve_object_ref(&self, r: &ObjectRef, fc: Option<FC>) -> Option<NodeRef<'_>> {
         let ld = self.ld_by_domain(&r.domain)?;
         let ln = ld.ln_by_name(&r.ln)?;
 
@@ -108,7 +128,11 @@ impl IedModel {
                 }
                 Segment::Name(name) => {
                     // Look the name up among the data object's children.
-                    match current_do.child_by_name(name) {
+                    let child = match fc {
+                        Some(fc) => current_do.child_by_name_fc(name, fc),
+                        None => current_do.child_by_name(name),
+                    };
+                    match child {
                         Some(DoChild::SubDo(sd)) => {
                             current_do = sd;
                             idx += 1;
@@ -300,9 +324,23 @@ pub struct DataObject {
 
 impl DataObject {
     /// Finds a direct child by name, one level only.
+    ///
+    /// Of the FC=SE and FC=SG data attributes of one setting, which share a
+    /// name, the one declared first is returned;
+    /// [`child_by_name_fc`](Self::child_by_name_fc) selects by constraint.
     pub fn child_by_name(&self, name: &str) -> Option<&DoChild> {
         self.children.iter().find(|c| match c {
             DoChild::Da(da) => da.name == name,
+            DoChild::SubDo(sd) => sd.name == name,
+        })
+    }
+
+    /// Finds a direct child named `name` on a path under the functional
+    /// constraint `fc`: the sub-object of that name, or the data attribute of
+    /// that name carrying `fc`.
+    pub fn child_by_name_fc(&self, name: &str, fc: FC) -> Option<&DoChild> {
+        self.children.iter().find(|c| match c {
+            DoChild::Da(da) => da.name == name && da.fc == fc,
             DoChild::SubDo(sd) => sd.name == name,
         })
     }
@@ -801,6 +839,72 @@ mod tests {
         assert_eq!(d.children_with_fc(FC::St).count(), 2);
         assert_eq!(d.children_with_fc(FC::Cf).count(), 1);
         assert_eq!(d.children_with_fc(FC::Mx).count(), 0);
+    }
+
+    /// Of the FC=SE and FC=SG data attributes of one setting, the
+    /// constraint-aware lookups select by constraint and the plain ones return
+    /// the one declared first.
+    #[test]
+    fn setting_lookup_by_constraint() {
+        let setting = |fc, v| {
+            da(
+                "setVal",
+                fc,
+                DataAttributeType::Int32,
+                TrgOps::NONE,
+                MmsValue::Integer(v),
+            )
+        };
+        let spt = DataObject {
+            name: "Spt".into(),
+            array_count: None,
+            children: vec![
+                DoChild::Da(setting(FC::Sg, 1)),
+                DoChild::Da(setting(FC::Se, 2)),
+            ],
+        };
+        let fc_of = |c: Option<&DoChild>| match c {
+            Some(DoChild::Da(d)) => Some(d.fc),
+            _ => None,
+        };
+        assert_eq!(fc_of(spt.child_by_name("setVal")), Some(FC::Sg));
+        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Se)), Some(FC::Se));
+        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Sg)), Some(FC::Sg));
+        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Cf)), None);
+
+        let ln = LogicalNode {
+            prefix: String::new(),
+            class: "PTOC".into(),
+            inst: "1".into(),
+            dos: vec![spt],
+            datasets: vec![],
+            rcbs: vec![],
+            gocbs: vec![],
+            svcbs: vec![],
+            lcbs: vec![],
+            sgcb: None,
+        };
+        let ld = LogicalDevice {
+            inst: "LD0".into(),
+            ld_name: None,
+            lns: vec![ln],
+        };
+        let m = IedModel::from_parts("IED1".into(), vec![ld]);
+        let r = ObjectRef::parse_iec("IED1LD0/PTOC1.Spt.setVal").unwrap();
+        let value = |n: Option<NodeRef<'_>>| match n {
+            Some(NodeRef::Da(d)) => Some(d.snapshot()),
+            _ => None,
+        };
+        assert_eq!(value(m.node_by_object_ref(&r)), Some(MmsValue::Integer(1)));
+        assert_eq!(
+            value(m.node_by_object_ref_fc(&r, FC::Se)),
+            Some(MmsValue::Integer(2))
+        );
+        assert_eq!(
+            value(m.node_by_object_ref_fc(&r, FC::Sg)),
+            Some(MmsValue::Integer(1))
+        );
+        assert_eq!(value(m.node_by_object_ref_fc(&r, FC::St)), None);
     }
 
     // store and snapshot
