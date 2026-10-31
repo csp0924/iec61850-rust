@@ -132,8 +132,8 @@ pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
     /// registered against.
     ///
     /// One write can consult several handlers: those of the attributes above
-    /// the written one, and, for a constructed attribute, those of the nodes
-    /// beneath it. The write fails as a whole when any of them refuses, after
+    /// the written node, and, for a data object or a constructed attribute,
+    /// those of the nodes beneath it. The write fails as a whole when any of them refuses, after
     /// the earlier ones may already have answered `Accept` or `AcceptNoUpdate`.
     /// No cached value changes in that case, but a handler that applies a value
     /// itself on `AcceptNoUpdate` sees no notice of the failure, so it should
@@ -244,6 +244,18 @@ pub(crate) fn fc_from_canonical_path(path: &str) -> Option<FC> {
     FC::parse(fc_str).ok()
 }
 
+/// Reports whether canonical path `below` names a node beneath the node `above`
+/// names.
+pub(crate) fn is_below(below: &str, above: &str) -> bool {
+    below.len() > above.len() && below.starts_with(above) && below.as_bytes()[above.len()] == b'$'
+}
+
+/// Reports whether two canonical paths name the same node, or one names a node
+/// beneath the other.
+fn on_the_same_branch(a: &str, b: &str) -> bool {
+    a == b || is_below(a, b) || is_below(b, a)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HandlerRegistry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +347,22 @@ impl HandlerRegistry {
         let key = canonicalize_attr_path(path).ok()?;
         let g = crate::compat::rwlock_read(&self.write)?;
         g.get(&key).cloned()
+    }
+
+    /// Returns the write handlers installed on the canonical path `path`, on
+    /// the nodes above it and on the nodes below it, so one write looks the
+    /// registry up once.
+    pub(crate) fn write_handlers_around(
+        &self,
+        path: &str,
+    ) -> Vec<(String, Arc<dyn AttributeAccessHandler>)> {
+        let Some(g) = crate::compat::rwlock_read(&self.write) else {
+            return Vec::new();
+        };
+        g.iter()
+            .filter(|(key, _)| on_the_same_branch(key, path))
+            .map(|(key, handler)| (key.clone(), Arc::clone(handler)))
+            .collect()
     }
 
     // ─── Read handler bypass ────────────────────────────────────────────

@@ -8,27 +8,34 @@
 //!    written here, and refused with `ObjectAccessUnsupported` if they reach
 //!    this handler.
 //! 3. CF, DC, SP, SV, BL: subject to the `WriteAccessPolicies` bitmask; a
-//!    refusal is `ObjectAccessDenied`, otherwise the type is checked and the
-//!    value written.
+//!    refusal is `ObjectAccessDenied`, otherwise the value is checked and
+//!    written.
 //! 4. SE: the same bitmask, plus the setting-group edit session gate.
 //!
-//! The type check compares the variant of the decoded wire value against the
-//! variant currently held in the model and answers `ObjectValueInvalid` on a
-//! mismatch. The value must then lie within the type the attribute declares in
-//! GetVariableAccessAttributes (IEC 61850-8-1 §8.1.1, table 15): an integer
-//! outside the range of its width, and a visible, Unicode or octet string longer
-//! than its maximum length, or of another length than a fixed one, answer
-//! `ObjectValueInvalid` (§8.1.2.1). A bit string whose length does not fit the
-//! declared size of the attribute answers `TypeInconsistent`. A path is served down to a data
-//! attribute or any sub-attribute beneath it, `LN$FC$DO[$SDO...]$DA[$SDA...]`,
-//! crossing any depth of sub-data-objects on the way. A path that stops on a
-//! data object answers `ObjectAccessUnsupported`.
+//! A path names functional-constrained data (FCD), `LN$FC$DO[$SDO...]`, or a
+//! functional-constrained data attribute (FCDA),
+//! `LN$FC$DO[$SDO...]$DA[$SDA...]`, crossing any depth of sub-data-objects, as
+//! IEC 61850-7-2 §11.4.3.2.1 allows SetDataValues to reference either. A path
+//! naming only a logical node or a functional-constraint group answers
+//! `ObjectAccessUnsupported`.
 //!
-//! The value of a constructed attribute lives in its leaves. Writing one takes
-//! a structure with one member per sub-attribute, in model order, and writes
-//! every leaf beneath it: all leaves are checked, and every handler on the way
-//! has its say, before any cached value changes, so a refused write leaves the
-//! cached value of the whole attribute as it was.
+//! The value of a data object or a constructed attribute lives in its leaves.
+//! Writing an FCD takes a structure with one member per attribute or
+//! sub-object the data object holds under the constraint, and writing a
+//! constructed attribute one member per sub-attribute, both in model order, as
+//! GetVariableAccessAttributes describes them; another member count answers
+//! `TypeInconsistent`. Every leaf beneath the target is written: all leaves are
+//! checked, and every handler on the way has its say, before any cached value
+//! changes, so a refused write leaves every leaf as it was (§11.4.3.4). A
+//! concurrent read may still observe some leaves written and others not.
+//!
+//! Each leaf takes a value of the variant currently held in the model, else
+//! `ObjectValueInvalid`. The value must then lie within the type the attribute
+//! declares in GetVariableAccessAttributes (IEC 61850-8-1 §8.1.1, table 15): an
+//! integer outside the range of its width, and a visible, Unicode or octet
+//! string longer than its maximum length, or of another length than a fixed
+//! one, answer `ObjectValueInvalid` (§8.1.2.1). A bit string that does not fit
+//! the declared size answers `TypeInconsistent`.
 //!
 //! A write below a data attribute is also a write of each attribute above it.
 //! The handler of every such ancestor, outermost first, decides the write with
@@ -44,19 +51,18 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::compat::Arc;
 use crate::handler::{
-    canonicalize_attr_path, HandlerRegistry, WriteContext, WriteOutcome as HandlerWriteOutcome,
+    AttributeAccessHandler, HandlerRegistry, WriteContext, WriteOutcome as HandlerWriteOutcome,
 };
-use crate::mapping::{
-    bit_string_fits, declared_bit_string_size, MmsDeviceModel, MmsLeafType, MmsTypeSpec, StringSize,
-};
+use crate::mapping::{bit_string_fits, MmsDeviceModel, MmsLeafType, MmsTypeSpec, StringSize};
 use crate::policy::WriteAccessPolicies;
-use crate::service::convert::{mms_data_to_mms_value, same_data_variant};
+use crate::service::convert::{bit_string_bytes, mms_data_to_mms_value, same_data_variant};
 // Writing under FC SE belongs to the setting-group subsystem.
 #[cfg(feature = "setting-groups")]
 use crate::setting_groups::SettingGroupRegistry;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName, WriteOutcome};
-use iec61850_model::{DataAttribute, DataAttributeType, DoChild, IedModel, FC};
+use iec61850_model::{DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, FC};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Functional-constraint routing
@@ -118,8 +124,7 @@ fn classify_fc(fc_str: &str) -> Option<FcWriteRoute> {
 /// When `handler_registry` is supplied and the path matches a registered
 /// handler, the order is: classify the constraint, check the type, apply the
 /// policy, call the handler, then update the cached value. See
-/// [`AttributeAccessHandler`](crate::handler::AttributeAccessHandler). A `None`
-/// registry writes straight to the cache.
+/// [`AttributeAccessHandler`]. A `None` registry writes straight to the cache.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_single_write(
     ied_model: &IedModel,
@@ -145,12 +150,13 @@ pub fn handle_single_write(
 
     let parts: Vec<&str> = item_id.split('$').collect();
 
-    // A write targets exactly one data attribute, so the path must name one.
-    if parts.len() < 4 {
+    // A write targets one data object or data attribute, so the path must
+    // name at least a data object.
+    if parts.len() < 3 {
         tracing::warn!(
             domain = domain,
             item_id = item_id,
-            "write: item id names no data attribute, four segments are required"
+            "write: item id names no data object, three segments are required"
         );
         return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
     }
@@ -158,8 +164,7 @@ pub fn handle_single_write(
     let ln_name = parts[0];
     let fc_str = parts[1];
     // Everything from the data object down; how far it descends is a question
-    // only the model can answer, so the shape verdict is left to `write_to_da`
-    // alongside the other path-resolution verdicts.
+    // only the model can answer.
     let object_path = &parts[2..];
 
     let route = match classify_fc(fc_str) {
@@ -204,7 +209,7 @@ pub fn handle_single_write(
                 );
                 return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
             }
-            write_to_da(
+            write_to_target(
                 ied_model,
                 mms_model,
                 domain,
@@ -260,7 +265,7 @@ pub fn handle_single_write(
                 );
                 return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
             }
-            write_to_da(
+            write_to_target(
                 ied_model,
                 mms_model,
                 domain,
@@ -276,10 +281,10 @@ pub fn handle_single_write(
     }
 }
 
-/// Resolves the data attribute, checks the type, gives any registered handler
-/// its say, and updates the cached value.
+/// Resolves the target, checks the value, gives every handler concerned its
+/// say, and updates the cached values.
 #[allow(clippy::too_many_arguments)]
-fn write_to_da(
+fn write_to_target(
     ied_model: &IedModel,
     mms_model: &MmsDeviceModel,
     domain: &str,
@@ -291,7 +296,7 @@ fn write_to_da(
     conn_id: u64,
     item_id: &str,
 ) -> WriteOutcome {
-    // The caller guarantees at least a data object and one name below it.
+    // The caller guarantees a data object at least.
     let do_name = object_path[0];
     let ld = match ied_model.ld_by_domain(domain) {
         Some(ld) => ld,
@@ -324,77 +329,46 @@ fn write_to_da(
 
     // A sub-data-object may nest to any depth before the path reaches a data
     // attribute, as WYE holds CMV in IEC 61850-7-3. The attribute must match
-    // both by name and by functional constraint, so the constraint filter
-    // applies at the step that leaves the data-object tree: a name that matches
-    // an attribute under a different constraint does not resolve.
-    let mut current_do = do_node;
-    let mut next = 1;
-    let mut reached_da: Option<&DataAttribute> = None;
-    'walk: while next < object_path.len() {
-        let step = object_path[next];
-        for child in &current_do.children {
-            match child {
-                DoChild::SubDo(sub) if sub.name == step => {
-                    current_do = sub;
-                    next += 1;
-                    continue 'walk;
-                }
-                DoChild::Da(da) if da.name == step && da.fc == fc => {
-                    reached_da = Some(da);
-                    next += 1;
-                    break 'walk;
-                }
-                _ => {}
-            }
-        }
-        tracing::warn!(
-            domain = domain,
-            ln = ln_name,
-            item_id = item_id,
-            step = step,
-            "write: no data attribute of that name under this functional constraint"
-        );
-        return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
-    }
-
-    let da = match reached_da {
-        Some(da) => da,
-        None => {
-            // The path names a data object or a sub-data-object: the node
-            // exists, but its value lives in the attributes below it, so there
-            // is no value here to write. That is access-unsupported rather than
-            // non-existent, and it is the answer a path naming no attribute at
-            // all already gets.
+    // both by name and by functional constraint, so a name that matches an
+    // attribute under a different constraint does not resolve; sub-attributes
+    // carry the constraint of their attribute and descend by name alone. The
+    // nodes passed on the way, the data object first, are the ancestors of the
+    // target.
+    let mut ancestors: Vec<Node<'_>> = Vec::with_capacity(object_path.len());
+    let mut target = Node::Object(do_node);
+    for step in &object_path[1..] {
+        let child = match target {
+            Node::Object(obj) => obj.children.iter().find_map(|c| match c {
+                DoChild::SubDo(sub) if sub.name == *step => Some(Node::Object(sub)),
+                DoChild::Da(da) if da.name == *step && da.fc == fc => Some(Node::Attribute(da)),
+                _ => None,
+            }),
+            Node::Attribute(da) => da.child_by_name(step).map(Node::Attribute),
+        };
+        let Some(child) = child else {
             tracing::warn!(
                 domain = domain,
-                ln = ln_name,
                 item_id = item_id,
-                "write: the path names a data object, not a data attribute"
+                step = *step,
+                "write: no node of that name under this functional constraint"
             );
-            return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
-        }
-    };
-
-    // Sub-attributes carry the functional constraint of their attribute, so
-    // the rest of the path descends by name alone. The attributes passed on the
-    // way, the data attribute first, are the ancestors of the target.
-    let steps = &object_path[next..];
-    let mut ancestors: Vec<&DataAttribute> = Vec::with_capacity(steps.len());
-    let mut target = da;
-    for step in steps {
-        ancestors.push(target);
-        target = match target.child_by_name(step) {
-            Some(child) => child,
-            None => {
-                tracing::warn!(
-                    domain = domain,
-                    item_id = item_id,
-                    step = *step,
-                    "write: no such sub-attribute"
-                );
-                return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
-            }
+            return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
         };
+        ancestors.push(target);
+        target = child;
+    }
+
+    // A data object holds a value under a functional constraint only through
+    // the attributes it carries under that constraint.
+    if let Node::Object(obj) = target {
+        if !object_has_fc(obj, fc) {
+            tracing::warn!(
+                domain = domain,
+                item_id = item_id,
+                "write: the data object has no attribute under this functional constraint"
+            );
+            return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
+        }
     }
 
     // The declared type of the target, as GetVariableAccessAttributes reports
@@ -404,71 +378,90 @@ fn write_to_da(
         tracing::warn!(
             domain = domain,
             item_id = item_id,
-            "write: the data attribute has no type description"
+            "write: the target has no type description"
         );
         return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
     };
 
-    // Every node the write reaches, in pre-order: the target first, then, for a
-    // constructed target, each sub-attribute down to the leaves.
-    let mut nodes: Vec<NodeWrite<'_>> = Vec::new();
-    if let Err(e) = collect_node_writes(target, spec, data, item_id.to_string(), &mut nodes) {
-        tracing::warn!(
-            domain = domain,
-            item_id = item_id,
-            ?e,
-            "write: the value does not match the data attribute"
-        );
-        return WriteOutcome::Failure(e);
-    }
+    // Every leaf is checked, and its value fixed, before any handler runs.
+    let new_value = match check_value(target, fc, spec, data) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                domain = domain,
+                item_id = item_id,
+                ?e,
+                "write: the value does not match the declared type"
+            );
+            return WriteOutcome::Failure(e);
+        }
+    };
+
+    let handlers = handler_registry
+        .map(|r| r.write_handlers_around(item_id))
+        .unwrap_or_default();
 
     // A handler on an ancestor of the target decides the write as it decides a
     // write of the whole ancestor: it sees the ancestor's current value with
     // the target replaced by the written one, outermost ancestor first.
-    let item_segments: Vec<&str> = item_id.split('$').collect();
-    let da_depth = item_segments.len() - steps.len();
-    for (depth, ancestor) in ancestors.iter().enumerate() {
-        let path = item_segments[..da_depth + depth].join("$");
-        let merged = merged_value(ancestor, &steps[depth..], mms_data_to_mms_value(data));
-        match consult_write_handler(handler_registry, &path, fc, conn_id, &merged) {
-            HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
-            // The handler takes the whole ancestor over, so no cached value of
-            // it changes.
-            HandlerWriteOutcome::AcceptNoUpdate => return WriteOutcome::Success,
-            HandlerWriteOutcome::Accept => {}
+    if !handlers.is_empty() {
+        for (depth, ancestor) in ancestors.iter().enumerate() {
+            if !matches!(ancestor, Node::Attribute(_)) {
+                continue;
+            }
+            let path = leading_segments(item_id, depth + 3);
+            let Some(handler) = handler_at(&handlers, path) else {
+                continue;
+            };
+            let merged = merged_value(*ancestor, fc, &object_path[depth + 1..], new_value.clone());
+            match consult_write_handler(handler, path, fc, conn_id, &merged) {
+                HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
+                // The handler takes the whole ancestor over, so no cached value
+                // of it changes.
+                HandlerWriteOutcome::AcceptNoUpdate => return WriteOutcome::Success,
+                HandlerWriteOutcome::Accept => {}
+            }
         }
     }
 
-    // The handlers run only after the policy and type checks have passed, and
-    // before any cached value changes. A handler may accept and let the cache be
-    // updated, accept and take ownership of the value itself, which leaves the
-    // cache of the node and everything beneath it alone, or refuse with a
+    // Every node the write reaches, in pre-order: the target first, then each
+    // node beneath it down to the leaves. Paths are needed only to find
+    // handlers.
+    let mut nodes: Vec<NodeWrite<'_, '_>> = Vec::new();
+    let target_path = (!handlers.is_empty()).then(|| item_id.to_string());
+    collect_node_writes(target, fc, &new_value, target_path, &mut nodes);
+
+    // The handlers run only after the policy and value checks have passed, and
+    // before any cached value changes. A handler may accept and let the cache
+    // be updated, accept and take ownership of the value itself, which leaves
+    // the cache of the node and everything beneath it alone, or refuse with a
     // specific error, which refuses the whole write.
-    let mut updates: Vec<(&DataAttribute, iec61850_model::MmsValue)> = Vec::new();
-    let mut owned_prefix: Option<String> = None;
-    for node in nodes {
-        if let Some(prefix) = &owned_prefix {
-            if node.path.starts_with(prefix.as_str()) {
-                continue;
-            }
-            owned_prefix = None;
-        }
-        let new_value = mms_data_to_mms_value(node.data);
-        match consult_write_handler(handler_registry, &node.path, fc, conn_id, &new_value) {
-            HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
-            HandlerWriteOutcome::AcceptNoUpdate => {
-                owned_prefix = Some(format!("{}$", node.path));
-            }
-            HandlerWriteOutcome::Accept => {
-                if node.is_leaf {
-                    updates.push((node.da, new_value));
+    let mut updates: Vec<(&DataAttribute, &iec61850_model::MmsValue)> = Vec::new();
+    let mut i = 0;
+    while i < nodes.len() {
+        let node = &nodes[i];
+        let handler = node
+            .path
+            .as_deref()
+            .and_then(|path| Some((path, handler_at(&handlers, path)?)));
+        if let Some((path, handler)) = handler {
+            match consult_write_handler(handler, path, fc, conn_id, node.value) {
+                HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
+                HandlerWriteOutcome::AcceptNoUpdate => {
+                    i = node.end;
+                    continue;
                 }
+                HandlerWriteOutcome::Accept => {}
             }
         }
+        if let Some(leaf) = node.leaf {
+            updates.push((leaf, node.value));
+        }
+        i += 1;
     }
 
     for (leaf, new_value) in updates {
-        if let Err(e) = store_value(leaf, new_value) {
+        if let Err(e) = store_value(leaf, new_value.clone()) {
             tracing::warn!(
                 domain = domain,
                 da = leaf.name.as_str(),
@@ -487,10 +480,86 @@ fn write_to_da(
     WriteOutcome::Success
 }
 
-/// Returns the current value of `ancestor` with the node `steps` names below
-/// it replaced by `new_value`.
+/// A node of the model a write reaches: a data object or sub-data-object,
+/// seen under the functional constraint of the write, or a data attribute.
+#[derive(Debug, Clone, Copy)]
+enum Node<'a> {
+    Object(&'a DataObject),
+    Attribute(&'a DataAttribute),
+}
+
+impl<'a> Node<'a> {
+    fn name(self) -> &'a str {
+        match self {
+            Node::Object(obj) => &obj.name,
+            Node::Attribute(da) => &da.name,
+        }
+    }
+
+    /// Reports whether the node holds its value itself rather than in the
+    /// nodes beneath it.
+    fn is_leaf(self) -> bool {
+        match self {
+            Node::Object(_) => false,
+            Node::Attribute(da) => {
+                da.ty != DataAttributeType::Constructed && da.children.is_empty()
+            }
+        }
+    }
+
+    /// The nodes beneath this one under `fc`, in model order, which is the
+    /// member order of its MMS structure: for an object, its attributes of
+    /// `fc` and its sub-objects that hold one; for an attribute, its
+    /// sub-attributes.
+    fn children(self, fc: FC) -> impl Iterator<Item = Node<'a>> {
+        let (object_children, attribute_children): (&'a [DoChild], &'a [DataAttribute]) = match self
+        {
+            Node::Object(obj) => (&obj.children, &[]),
+            Node::Attribute(da) => (&[], &da.children),
+        };
+        object_children
+            .iter()
+            .filter_map(move |c| match c {
+                DoChild::Da(da) if da.fc == fc => Some(Node::Attribute(da)),
+                DoChild::SubDo(sub) if object_has_fc(sub, fc) => Some(Node::Object(sub)),
+                _ => None,
+            })
+            .chain(attribute_children.iter().map(Node::Attribute))
+    }
+
+    /// The current value of the node under `fc`.
+    fn snapshot(self, fc: FC) -> iec61850_model::MmsValue {
+        match self {
+            Node::Attribute(da) => da.snapshot(),
+            Node::Object(_) => iec61850_model::MmsValue::Structure(
+                self.children(fc).map(|c| c.snapshot(fc)).collect(),
+            ),
+        }
+    }
+}
+
+/// Reports whether a data object carries an attribute of `fc`, directly or in
+/// a sub-object.
+fn object_has_fc(obj: &DataObject, fc: FC) -> bool {
+    obj.children.iter().any(|c| match c {
+        DoChild::Da(da) => da.fc == fc,
+        DoChild::SubDo(sub) => object_has_fc(sub, fc),
+    })
+}
+
+/// Returns the first `n` `$`-separated segments of `path`.
+fn leading_segments(path: &str, n: usize) -> &str {
+    match path.match_indices('$').nth(n.saturating_sub(1)) {
+        Some((end, _)) if n > 0 => &path[..end],
+        _ => path,
+    }
+}
+
+/// Returns the current value of `node` with the node `steps` names below it
+/// replaced by `new_value`.
 fn merged_value(
-    ancestor: &DataAttribute,
+    node: Node<'_>,
+    fc: FC,
     steps: &[&str],
     new_value: iec61850_model::MmsValue,
 ) -> iec61850_model::MmsValue {
@@ -499,103 +568,125 @@ fn merged_value(
     };
     let mut new_value = Some(new_value);
     iec61850_model::MmsValue::Structure(
-        ancestor
-            .children
-            .iter()
-            .map(|child| match new_value.take_if(|_| child.name == *step) {
-                Some(v) => merged_value(child, rest, v),
-                None => child.snapshot(),
+        node.children(fc)
+            .map(|child| match new_value.take_if(|_| child.name() == *step) {
+                Some(v) => merged_value(child, fc, rest, v),
+                None => child.snapshot(fc),
             })
             .collect(),
     )
 }
 
-/// One node a write reaches: a leaf, whose cached value it replaces, or a
-/// constructed attribute, whose handler it consults.
-struct NodeWrite<'a> {
-    da: &'a DataAttribute,
-    data: &'a MmsData,
-    /// The MMS item id of the node, `LN$FC$DO[...]$DA[$SDA...]`.
-    path: String,
-    is_leaf: bool,
+/// One node a write reaches, with the value it is written: a leaf, whose
+/// cached value that replaces, or a node above leaves, whose handler it
+/// consults.
+struct NodeWrite<'a, 'v> {
+    leaf: Option<&'a DataAttribute>,
+    value: &'v iec61850_model::MmsValue,
+    /// The MMS item id of the node, when handlers are to be looked up.
+    path: Option<String>,
+    /// Index of the first node after the subtree of this one.
+    end: usize,
 }
 
-/// Checks `data` against the attribute `da` and appends the nodes the write
-/// reaches, `da` first.
-///
-/// A constructed attribute takes a structure with one member per sub-attribute;
-/// a different member count is type-inconsistent. A leaf takes a value of the
-/// variant it holds, else object-value-invalid, within the range or length of
-/// its declared type `spec`, else object-value-invalid, and a bit string must fit
-/// its declared size, else type-inconsistent.
-fn collect_node_writes<'a>(
-    da: &'a DataAttribute,
-    spec: &MmsTypeSpec,
-    data: &'a MmsData,
-    path: String,
-    out: &mut Vec<NodeWrite<'a>>,
-) -> Result<(), DataAccessError> {
-    if da.ty == DataAttributeType::Constructed || !da.children.is_empty() {
-        let MmsData::Structure(members) = data else {
-            return Err(DataAccessError::ObjectValueInvalid);
-        };
-        let MmsTypeSpec::Structure(member_specs) = spec else {
-            return Err(DataAccessError::TypeInconsistent);
-        };
-        if members.len() != da.children.len() || member_specs.len() != da.children.len() {
-            return Err(DataAccessError::TypeInconsistent);
-        }
-        out.push(NodeWrite {
-            da,
-            data,
-            path: path.clone(),
-            is_leaf: false,
-        });
-        for ((child, member_spec), member) in da.children.iter().zip(member_specs).zip(members) {
-            collect_node_writes(
-                child,
-                &member_spec.type_spec,
-                member,
-                format!("{path}${}", child.name),
-                out,
-            )?;
-        }
-        return Ok(());
-    }
-
-    if !same_data_variant(data, &da.snapshot()) {
-        return Err(DataAccessError::ObjectValueInvalid);
-    }
-    check_declared_type(spec, data)?;
-    // A bit string whose length does not fit the declared size of the
-    // attribute, such as 13 bits for a two-bit Dbpos, is refused and the
-    // attribute keeps its value.
-    if let MmsData::BitString { padding, data } | MmsData::BooleanArray { padding, data } = data {
-        if let Some(size) = declared_bit_string_size(da.ty) {
-            if !bit_string_fits(size, data.len(), *padding) {
-                return Err(DataAccessError::TypeInconsistent);
+/// Appends the nodes `value` writes, `node` first and then its subtree in
+/// pre-order; `value` has passed [`check_value`] against `node`.
+fn collect_node_writes<'a, 'v>(
+    node: Node<'a>,
+    fc: FC,
+    value: &'v iec61850_model::MmsValue,
+    path: Option<String>,
+    out: &mut Vec<NodeWrite<'a, 'v>>,
+) {
+    let index = out.len();
+    out.push(NodeWrite {
+        leaf: match node {
+            Node::Attribute(da) if node.is_leaf() => Some(da),
+            _ => None,
+        },
+        value,
+        path: path.clone(),
+        end: index + 1,
+    });
+    if !node.is_leaf() {
+        if let iec61850_model::MmsValue::Structure(members) = value {
+            for (child, member) in node.children(fc).zip(members) {
+                let child_path = path.as_ref().map(|p| format!("{p}${}", child.name()));
+                collect_node_writes(child, fc, member, child_path, out);
             }
         }
     }
-    out.push(NodeWrite {
-        da,
-        data,
-        path,
-        is_leaf: true,
-    });
-    Ok(())
+    out[index].end = out.len();
 }
 
-/// Checks a value of the right variant against the type its attribute declares:
-/// the range of an integer width, the length of a visible, Unicode or octet
-/// string, the octet count of a binary time, and, member by member, a structure
-/// that a scalar attribute such as PhyComAddr declares. Anything outside the
-/// declared type is object-value-invalid (IEC 61850-8-1 §8.1.2.1); a structure
-/// of another member count is type-inconsistent.
+/// Checks `data` against `node` and its declared type `spec`, and returns the
+/// value to store.
 ///
-/// The length of a Unicode string counts characters, as IEC 61850-8-1
-/// §8.1.2.6 sizes an MMSString. Bit strings are checked by the caller.
-fn check_declared_type(spec: &MmsTypeSpec, data: &MmsData) -> Result<(), DataAccessError> {
+/// A data object takes a structure with one member per node it holds under
+/// `fc`, and a constructed attribute one member per sub-attribute; another
+/// member count, or a scalar for a data object, is type-inconsistent, a scalar
+/// for a constructed attribute object-value-invalid. A leaf takes a value of
+/// the variant it holds, else object-value-invalid, then
+/// [`check_declared_type`] applies.
+fn check_value(
+    node: Node<'_>,
+    fc: FC,
+    spec: &MmsTypeSpec,
+    data: &MmsData,
+) -> Result<iec61850_model::MmsValue, DataAccessError> {
+    if let Node::Attribute(da) = node {
+        if node.is_leaf() {
+            if !same_data_variant(data, &da.snapshot()) {
+                return Err(DataAccessError::ObjectValueInvalid);
+            }
+            return check_declared_type(spec, data);
+        }
+    }
+    let MmsData::Structure(members) = data else {
+        return Err(match node {
+            Node::Object(_) => DataAccessError::TypeInconsistent,
+            Node::Attribute(_) => DataAccessError::ObjectValueInvalid,
+        });
+    };
+    let MmsTypeSpec::Structure(member_specs) = spec else {
+        // An array of data objects is not written through this path.
+        return Err(DataAccessError::ObjectAccessUnsupported);
+    };
+    if members.len() != member_specs.len() {
+        return Err(DataAccessError::TypeInconsistent);
+    }
+    let mut children = node.children(fc);
+    let mut values = Vec::with_capacity(members.len());
+    for (member_spec, member) in member_specs.iter().zip(members) {
+        let Some(child) = children.next() else {
+            return Err(DataAccessError::TypeInconsistent);
+        };
+        // The MMS view lists the members in the order the model holds them.
+        debug_assert_eq!(member_spec.name, child.name());
+        values.push(check_value(child, fc, &member_spec.type_spec, member)?);
+    }
+    if children.next().is_some() {
+        return Err(DataAccessError::TypeInconsistent);
+    }
+    Ok(iec61850_model::MmsValue::Structure(values))
+}
+
+/// Checks a value of the right variant against the type its attribute declares
+/// and returns the value to store.
+///
+/// The value must lie within the range of an integer width, the length of a
+/// visible, Unicode or octet string, and the octet count of a binary time; a
+/// structure that a scalar attribute such as PhyComAddr declares is checked
+/// member by member. Anything outside the declared type is object-value-invalid
+/// (IEC 61850-8-1 §8.1.2.1); a structure of another member count is
+/// type-inconsistent. The length of a Unicode string counts characters, as
+/// IEC 61850-8-1 §8.1.2.6 sizes an MMSString.
+///
+/// A bit string must fit its declared size, else type-inconsistent.
+fn check_declared_type(
+    spec: &MmsTypeSpec,
+    data: &MmsData,
+) -> Result<iec61850_model::MmsValue, DataAccessError> {
     let fits = match (spec, data) {
         (MmsTypeSpec::Leaf(MmsLeafType::Integer(bits)), MmsData::Integer(v)) => {
             fits_width(i128::from(*v), *bits, true)
@@ -621,19 +712,25 @@ fn check_declared_type(spec: &MmsTypeSpec, data: &MmsData) -> Result<(), DataAcc
         (MmsTypeSpec::Leaf(MmsLeafType::BinaryTime { size }), MmsData::BinaryTime(v)) => {
             v.len() == usize::from(*size)
         }
+        (
+            MmsTypeSpec::Leaf(MmsLeafType::BitString(size)),
+            MmsData::BitString { padding, data } | MmsData::BooleanArray { padding, data },
+        ) => return fit_bit_string(*size, *padding, data),
         (MmsTypeSpec::Structure(member_specs), MmsData::Structure(members)) => {
             if member_specs.len() != members.len() {
                 return Err(DataAccessError::TypeInconsistent);
             }
-            for (member_spec, member) in member_specs.iter().zip(members) {
-                check_declared_type(&member_spec.type_spec, member)?;
-            }
-            true
+            return member_specs
+                .iter()
+                .zip(members)
+                .map(|(member_spec, member)| check_declared_type(&member_spec.type_spec, member))
+                .collect::<Result<Vec<_>, _>>()
+                .map(iec61850_model::MmsValue::Structure);
         }
         _ => true,
     };
     if fits {
-        Ok(())
+        Ok(mms_data_to_mms_value(data))
     } else {
         Err(DataAccessError::ObjectValueInvalid)
     }
@@ -665,43 +762,56 @@ fn fits_length(size: StringSize, len: usize) -> bool {
     }
 }
 
-/// Gives the write handler installed on `item_id`, if any, its say on
-/// `new_value`; no handler accepts.
+/// Checks a bit string of `bytes` with `padding` unused bits against its
+/// declared size and returns the bit string to store, with the unused bits of
+/// the last byte cleared.
+fn fit_bit_string(
+    size: StringSize,
+    padding: u8,
+    bytes: &[u8],
+) -> Result<iec61850_model::MmsValue, DataAccessError> {
+    if !bit_string_fits(size, bytes.len(), padding) {
+        return Err(DataAccessError::TypeInconsistent);
+    }
+    Ok(iec61850_model::MmsValue::BitString {
+        padding,
+        data: bit_string_bytes(padding, bytes),
+    })
+}
+
+/// Gives `handler`, installed on `path`, its say on `new_value`.
 fn consult_write_handler(
-    handler_registry: Option<&HandlerRegistry>,
-    item_id: &str,
+    handler: &Arc<dyn AttributeAccessHandler>,
+    path: &str,
     fc: FC,
     conn_id: u64,
     new_value: &iec61850_model::MmsValue,
 ) -> HandlerWriteOutcome {
-    let Some(reg) = handler_registry else {
-        return HandlerWriteOutcome::Accept;
-    };
-    let Ok(canonical_path) = canonicalize_attr_path(item_id) else {
-        return HandlerWriteOutcome::Accept;
-    };
-    let Some(handler) = reg.lookup_write(&canonical_path) else {
-        return HandlerWriteOutcome::Accept;
-    };
-    let ctx = WriteContext {
-        path: &canonical_path,
-        fc,
-        conn_id,
-    };
+    let ctx = WriteContext::new(path, fc, conn_id);
     let outcome = handler.on_write(&ctx, new_value);
     match &outcome {
         HandlerWriteOutcome::Reject(e) => tracing::warn!(
-            path = %canonical_path,
+            path = path,
             ?e,
             "write: the attribute access handler refused the value"
         ),
         HandlerWriteOutcome::AcceptNoUpdate => tracing::debug!(
-            path = %canonical_path,
+            path = path,
             "write: the attribute access handler accepted the value without a cache update"
         ),
         HandlerWriteOutcome::Accept => {}
     }
     outcome
+}
+
+/// Returns the handler of `handlers` installed on `path`.
+fn handler_at<'h>(
+    handlers: &'h [(String, Arc<dyn AttributeAccessHandler>)],
+    path: &str,
+) -> Option<&'h Arc<dyn AttributeAccessHandler>> {
+    handlers
+        .iter()
+        .find_map(|(key, handler)| (key == path).then_some(handler))
 }
 
 /// Replaces the cached value of a leaf.
@@ -1295,11 +1405,19 @@ mod tests {
         );
     }
 
-    /// A path that stops on a sub-data-object names no attribute to write. The
-    /// answer is object-access-unsupported, matching a path that names only a
-    /// data object: the value of a constructed node lives in its leaves.
+    /// The value of `phsA` under SP: `setMag`, then `setCplx` with its `f`.
+    fn phs_a_value(set_mag: f32, f: f32) -> MmsData {
+        MmsData::Structure(vec![
+            MmsData::Float32(set_mag),
+            MmsData::Structure(vec![MmsData::Float32(f)]),
+        ])
+    }
+
+    /// A path that stops on a sub-data-object names functional-constrained
+    /// data: the structure of its attributes under the constraint writes every
+    /// leaf beneath it.
     #[test]
-    fn write_to_a_sub_data_object_itself_returns_unsupported() {
+    fn write_to_a_sub_data_object_writes_every_leaf_beneath_it() {
         let (model, mms_model) = build_sdo_write_model();
         let policies = WriteAccessPolicies::default();
         let result = sdo_write(
@@ -1307,11 +1425,184 @@ mod tests {
             &mms_model,
             &policies,
             "GGIO1$SP$PhSet$phsA",
-            MmsData::Structure(vec![MmsData::Float32(1.0)]),
+            phs_a_value(1.5, 2.5),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag"),
+            MmsValue::Float32(1.5)
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f"),
+            MmsValue::Float32(2.5)
+        );
+    }
+
+    /// A data object is written through every level of sub-objects it holds.
+    #[test]
+    fn write_to_a_data_object_crosses_its_sub_objects() {
+        let (model, mms_model) = build_sdo_write_model();
+        let policies = WriteAccessPolicies::default();
+        let result = sdo_write(
+            &model,
+            &mms_model,
+            &policies,
+            "GGIO1$SP$PhSet",
+            MmsData::Structure(vec![
+                phs_a_value(3.0, 4.0),
+                MmsData::Structure(vec![MmsData::Structure(vec![MmsData::Float32(5.0)])]),
+            ]),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f"),
+            MmsValue::Float32(4.0)
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsB$cmv$setDeep"),
+            MmsValue::Float32(5.0)
+        );
+    }
+
+    /// An FCD value whose shape does not follow the data object under the
+    /// constraint is type-inconsistent, a member outside its type fails as it
+    /// does on its own, and in every case no leaf changes, not even the ones
+    /// checked before the failing one.
+    #[test]
+    fn write_to_a_data_object_is_refused_whole() {
+        let (model, mms_model) = build_sdo_write_model();
+        let policies = WriteAccessPolicies::default();
+        let cases = [
+            (
+                MmsData::Structure(vec![MmsData::Float32(9.0)]),
+                DataAccessError::TypeInconsistent,
+            ),
+            (MmsData::Float32(9.0), DataAccessError::TypeInconsistent),
+            (
+                MmsData::Structure(vec![
+                    MmsData::Float32(9.0),
+                    MmsData::Structure(vec![MmsData::Float32(9.0), MmsData::Float32(9.0)]),
+                ]),
+                DataAccessError::TypeInconsistent,
+            ),
+            (
+                MmsData::Structure(vec![
+                    MmsData::Float32(9.0),
+                    MmsData::Structure(vec![MmsData::Boolean(true)]),
+                ]),
+                DataAccessError::ObjectValueInvalid,
+            ),
+        ];
+        for (data, expected) in cases {
+            assert_eq!(
+                sdo_write(&model, &mms_model, &policies, "GGIO1$SP$PhSet$phsA", data),
+                WriteOutcome::Failure(expected)
+            );
+        }
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag"),
+            MmsValue::Float32(0.0)
+        );
+    }
+
+    /// A data object that holds nothing under the constraint has nothing to
+    /// write, and a path naming only a functional-constraint group is not a
+    /// write target.
+    #[test]
+    fn write_to_a_data_object_without_the_constraint_or_above_it_is_refused() {
+        let (model, mms_model) = build_sdo_write_model();
+        let mut policies = WriteAccessPolicies::default();
+        policies.set(FC::Cf, true);
+        assert_eq!(
+            sdo_write(
+                &model,
+                &mms_model,
+                &policies,
+                "GGIO1$CF$PhSet",
+                MmsData::Structure(Vec::new()),
+            ),
+            WriteOutcome::Failure(DataAccessError::ObjectNonExistent)
+        );
+        assert_eq!(
+            sdo_write(
+                &model,
+                &mms_model,
+                &policies,
+                "GGIO1$SP",
+                MmsData::Structure(Vec::new()),
+            ),
+            WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported)
+        );
+    }
+
+    /// The handler of a leaf decides an FCD write as it decides a write of the
+    /// leaf: a refusal refuses the whole write and leaves every leaf alone.
+    #[test]
+    fn write_to_a_data_object_consults_the_leaf_handlers() {
+        let (model, mms_model) = build_sdo_write_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$PhSet$phsA$setCplx$f", Arc::new(Refuse))
+            .unwrap();
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SP$PhSet$phsA".to_string(),
+        };
+        let result = handle_single_write(
+            &model,
+            &mms_model,
+            &WriteAccessPolicies::default(),
+            Some(&registry),
+            None,
+            0,
+            &name,
+            &phs_a_value(6.0, 7.0),
         );
         assert_eq!(
             result,
-            WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported)
+            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag"),
+            MmsValue::Float32(0.0)
+        );
+    }
+
+    /// A handler on the written data object sees the whole value and may take
+    /// it over, which leaves every leaf beneath it alone.
+    #[test]
+    fn write_to_a_data_object_consults_its_own_handler() {
+        let (model, mms_model) = build_sdo_write_model();
+        let own = witness(HandlerWriteOutcome::AcceptNoUpdate);
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$PhSet$phsA", own.clone())
+            .unwrap();
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SP$PhSet$phsA".to_string(),
+        };
+        let result = handle_single_write(
+            &model,
+            &mms_model,
+            &WriteAccessPolicies::default(),
+            Some(&registry),
+            None,
+            0,
+            &name,
+            &phs_a_value(6.0, 7.0),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *own.seen.lock().unwrap(),
+            [MmsValue::Structure(vec![
+                MmsValue::Float32(6.0),
+                MmsValue::Structure(vec![MmsValue::Float32(7.0)]),
+            ])]
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag"),
+            MmsValue::Float32(0.0)
         );
     }
 

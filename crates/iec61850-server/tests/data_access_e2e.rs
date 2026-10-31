@@ -2,7 +2,9 @@
 //! through the full ISO stack.
 //!
 //! A write is held to the type each attribute declares, its integer range and
-//! its string length.
+//! its string length. A write may name a whole data object under one
+//! functional constraint (FCD): every leaf is checked, and every handler asked,
+//! before any of them changes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,7 +18,10 @@ use iec61850_model::{
     LogicalDeviceBuilder, LogicalNode, LogicalNodeBuilder, MmsValue, SettingGroupControlBlock,
     TrgOps, FC,
 };
-use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
+use iec61850_server::{
+    AttributeAccessHandler, HandlerWriteOutcome, IedServer, IedServerConfig, ServerHandle,
+    WriteContext,
+};
 
 const DOMAIN: &str = "IED1LD0";
 
@@ -24,7 +29,9 @@ fn da(name: &str, fc: FC, ty: DataAttributeType, value: MmsValue) -> DoChild {
     DoChild::Da(DataAttribute::new(name, fc, ty, TrgOps::default(), value))
 }
 
-/// `GGIO1.Lim` holds SP attributes with a declared range or length.
+/// `GGIO1.Lim` holds SP attributes with a declared range or length; `GGIO1.Pt`
+/// holds, under SP, a leaf, a constructed attribute and a sub-object, plus a
+/// status and a configuration attribute outside SP.
 fn build_model() -> Arc<IedModel> {
     let lim = DataObject::new(
         "Lim",
@@ -56,7 +63,50 @@ fn build_model() -> Arc<IedModel> {
             ),
         ],
     );
-    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim]);
+    let pt = DataObject::new(
+        "Pt",
+        vec![
+            da(
+                "stVal",
+                FC::St,
+                DataAttributeType::Boolean,
+                MmsValue::Boolean(false),
+            ),
+            da(
+                "setVal",
+                FC::Sp,
+                DataAttributeType::Int32,
+                MmsValue::Integer(0),
+            ),
+            DoChild::Da(DataAttribute::constructed(
+                "setMag",
+                FC::Sp,
+                vec![DataAttribute::new(
+                    "f",
+                    FC::Sp,
+                    DataAttributeType::Float32,
+                    TrgOps::default(),
+                    MmsValue::Float32(0.0),
+                )],
+            )),
+            DoChild::SubDo(DataObject::new(
+                "phsA",
+                vec![da(
+                    "lim",
+                    FC::Sp,
+                    DataAttributeType::Int8U,
+                    MmsValue::Unsigned(0),
+                )],
+            )),
+            da(
+                "cfgVal",
+                FC::Cf,
+                DataAttributeType::Int32,
+                MmsValue::Integer(0),
+            ),
+        ],
+    );
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt]);
     let lln0 = LogicalNodeBuilder::lln0()
         .set_sgcb({
             let mut sgcb = SettingGroupControlBlock::default();
@@ -158,6 +208,143 @@ async fn write_outside_the_declared_type_is_refused() {
             client.read(DOMAIN, "GGIO1$SP$Lim$u8").await.unwrap(),
             MmsData::Unsigned(255)
         );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// The SP value of `GGIO1.Pt`: `setVal`, `setMag`, then `phsA`.
+fn pt_value(set_val: i64, f: f32, lim: u64) -> MmsData {
+    MmsData::Structure(vec![
+        MmsData::Integer(set_val),
+        MmsData::Structure(vec![MmsData::Float32(f)]),
+        MmsData::Structure(vec![MmsData::Unsigned(lim)]),
+    ])
+}
+
+async fn pt_leaves(client: &mut MmsClient) -> (MmsData, MmsData, MmsData) {
+    (
+        client.read(DOMAIN, "GGIO1$SP$Pt$setVal").await.unwrap(),
+        client.read(DOMAIN, "GGIO1$SP$Pt$setMag$f").await.unwrap(),
+        client.read(DOMAIN, "GGIO1$SP$Pt$phsA$lim").await.unwrap(),
+    )
+}
+
+/// Refuses every write of the attribute it is installed on.
+#[derive(Debug)]
+struct Refuse;
+
+impl AttributeAccessHandler for Refuse {
+    fn on_write(&self, _ctx: &WriteContext<'_>, _value: &MmsValue) -> HandlerWriteOutcome {
+        HandlerWriteOutcome::Reject(DataAccessError::ObjectAccessDenied)
+    }
+}
+
+/// An FCD write stores every leaf the data object holds under the constraint,
+/// across its constructed attributes and sub-objects, and the whole data object
+/// reads back as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_of_a_data_object_updates_every_leaf() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_server, handle) = start().await;
+        let mut client = connect(&handle).await;
+
+        client
+            .write(DOMAIN, "GGIO1$SP$Pt", pt_value(7, 1.5, 200))
+            .await
+            .expect("an FCD write succeeds");
+        assert_eq!(
+            pt_leaves(&mut client).await,
+            (
+                MmsData::Integer(7),
+                MmsData::Float32(1.5),
+                MmsData::Unsigned(200)
+            )
+        );
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$SP$Pt").await.unwrap(),
+            pt_value(7, 1.5, 200)
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// An FCD write fails whole when one leaf fails: a value outside its type, a
+/// handler that refuses, a shape that does not follow the data object, or a
+/// functional constraint the policy refuses; no leaf changes in any case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_of_a_data_object_is_refused_whole() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        let unchanged = (
+            MmsData::Integer(0),
+            MmsData::Float32(0.0),
+            MmsData::Unsigned(0),
+        );
+
+        assert_eq!(
+            data_access_error(
+                client
+                    .write(DOMAIN, "GGIO1$SP$Pt", pt_value(7, 1.5, 256))
+                    .await
+            ),
+            DataAccessError::ObjectValueInvalid
+        );
+        assert_eq!(pt_leaves(&mut client).await, unchanged);
+
+        let short = MmsData::Structure(vec![MmsData::Integer(7)]);
+        assert_eq!(
+            data_access_error(client.write(DOMAIN, "GGIO1$SP$Pt", short).await),
+            DataAccessError::TypeInconsistent
+        );
+        assert_eq!(pt_leaves(&mut client).await, unchanged);
+
+        let MmsData::Structure(mut long) = pt_value(7, 1.5, 200) else {
+            unreachable!()
+        };
+        long.push(MmsData::Integer(1));
+        assert_eq!(
+            data_access_error(
+                client
+                    .write(DOMAIN, "GGIO1$SP$Pt", MmsData::Structure(long))
+                    .await
+            ),
+            DataAccessError::TypeInconsistent
+        );
+        assert_eq!(pt_leaves(&mut client).await, unchanged);
+
+        assert_eq!(
+            data_access_error(
+                client
+                    .write(
+                        DOMAIN,
+                        "GGIO1$CF$Pt",
+                        MmsData::Structure(vec![MmsData::Integer(1)]),
+                    )
+                    .await
+            ),
+            DataAccessError::ObjectAccessDenied
+        );
+
+        server
+            .handler_registry()
+            .install_write_access_handler("GGIO1$SP$Pt$phsA$lim", Arc::new(Refuse))
+            .unwrap();
+        assert_eq!(
+            data_access_error(
+                client
+                    .write(DOMAIN, "GGIO1$SP$Pt", pt_value(7, 1.5, 200))
+                    .await
+            ),
+            DataAccessError::ObjectAccessDenied
+        );
+        assert_eq!(pt_leaves(&mut client).await, unchanged);
 
         handle.stop().await;
     })

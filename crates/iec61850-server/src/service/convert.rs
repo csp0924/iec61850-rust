@@ -121,7 +121,7 @@ fn string_size_to_signed(size: StringSize) -> i32 {
 
 /// Returns the bytes of a bit string with the `padding` unused low-order bits
 /// of the last byte cleared; a padding above 7 leaves the bytes unchanged.
-fn bit_string_bytes(padding: u8, data: &[u8]) -> Vec<u8> {
+pub(crate) fn bit_string_bytes(padding: u8, data: &[u8]) -> Vec<u8> {
     let mut bytes = data.to_vec();
     if let (Some(last), Some(mask)) = (bytes.last_mut(), u8::MAX.checked_shl(u32::from(padding))) {
         *last &= mask;
