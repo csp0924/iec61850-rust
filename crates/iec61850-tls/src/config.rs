@@ -8,7 +8,7 @@
 //! authentication requested but not required when trust anchors are set,
 //! session resumption on with no TLS 1.3 session ticket sent, so only TLS 1.2
 //! sessions resume, and TLS 1.2 as the minimum version, which IEC 62351-3
-//! mandates. Chain validation always runs.
+//! mandates. Chain validation against the trust anchors always runs.
 //!
 //! Client authentication on the server is mandatory when
 //! [`TlsConfigBuilder::require_client_auth`] or
@@ -143,9 +143,6 @@ pub struct TlsConfigBuilder {
     require_client_auth: bool,
 
     // Verification settings
-    /// Requested chain validation setting. Not applied: chain validation
-    /// always runs.
-    chain_validation: bool,
     /// Checks certificate validity time. Defaults to true; false accepts an
     /// expired or not yet valid certificate whose chain is otherwise valid.
     time_validation: bool,
@@ -177,11 +174,6 @@ pub struct TlsConfigBuilder {
     /// TLS 1.3 tickets the server sends per handshake. Defaults to 0.
     tls13_session_tickets: usize,
 
-    // Renegotiation
-    /// Requested renegotiation interval in milliseconds. Not applied: no
-    /// renegotiation is ever initiated.
-    renegotiation_interval_ms: u64,
-
     // -- Event handler -------------------------------------------------------
     /// Event callback; `DefaultTracingHandler` by default.
     event_handler: Arc<dyn TlsEventHandler>,
@@ -203,7 +195,6 @@ impl TlsConfigBuilder {
             known_peer_certs: Vec::new(),
             allow_only_known_peers: false,
             require_client_auth: false,
-            chain_validation: true,
             time_validation: true,
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
@@ -213,7 +204,6 @@ impl TlsConfigBuilder {
             session_resumption_lifetime: None,
             session_clock: system_clock(),
             tls13_session_tickets: 0,
-            renegotiation_interval_ms: 0,
             event_handler: Arc::new(DefaultTracingHandler),
         }
     }
@@ -324,14 +314,6 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Records a chain validation setting. Not applied: chain validation
-    /// against the trust anchors always runs, and `false` only logs a warning
-    /// when the configuration is built.
-    pub fn chain_validation(mut self, v: bool) -> Self {
-        self.chain_validation = v;
-        self
-    }
-
     /// Enables or disables certificate validity-time checking on both sides.
     /// Defaults to true.
     ///
@@ -432,16 +414,6 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Records a renegotiation interval in milliseconds. Not applied.
-    ///
-    /// rustls supports no TLS 1.2 renegotiation, so no HelloRequest is ever
-    /// sent; a non-zero value only logs a warning when the configuration is
-    /// built.
-    pub fn renegotiation_interval(mut self, ms: u64) -> Self {
-        self.renegotiation_interval_ms = ms;
-        self
-    }
-
     /// Replaces the event callback.
     pub fn with_event_handler(mut self, handler: Arc<dyn TlsEventHandler>) -> Self {
         self.event_handler = handler;
@@ -465,7 +437,6 @@ impl TlsConfigBuilder {
                 self.min_version, self.max_version
             )));
         }
-        self.warn_unapplied_settings();
 
         let versions = build_version_list(self.min_version, self.max_version);
         // cipher_suites is a public field of CryptoProvider and is overwritten
@@ -564,7 +535,6 @@ impl TlsConfigBuilder {
                 self.min_version, self.max_version
             )));
         }
-        self.warn_unapplied_settings();
         // A server must present a certificate and a key.
         let key = self
             .private_key
@@ -655,19 +625,6 @@ impl TlsConfigBuilder {
             event_handler: self.event_handler,
             client_auth_optional,
         })
-    }
-
-    /// Logs the settings the builder records but does not apply.
-    fn warn_unapplied_settings(&self) {
-        if !self.chain_validation {
-            tracing::warn!("chain_validation(false) is not applied; chain validation still runs");
-        }
-        if self.renegotiation_interval_ms != 0 {
-            tracing::warn!(
-                "renegotiation_interval ({} ms) is not applied; no renegotiation is initiated",
-                self.renegotiation_interval_ms
-            );
-        }
     }
 }
 
