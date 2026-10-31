@@ -1581,7 +1581,7 @@ fn try_write_gocb(
                     DataAccessError::ObjectAccessUnsupported,
                 ))
             }
-            Some(da_name) => Some(apply_gocb_write(&handle, registry.edition(), da_name, data)),
+            Some(da_name) => Some(apply_gocb_write(registry, &handle, da_name, data)),
         },
         None => {
             tracing::warn!(

@@ -1426,8 +1426,17 @@ impl IedServerBuilder<Bound> {
             ),
         );
 
+        // A GoCB DatSet write checks its data set against the registry the
+        // dispatcher serves.
+        let gocb_data_sets = dataset_registry.clone();
         let gocb_registry: Arc<crate::goose_mapping::GoCBRegistry> = Arc::new(
-            crate::goose_mapping::GoCBRegistry::with_edition(self.config.edition),
+            crate::goose_mapping::GoCBRegistry::with_edition(self.config.edition)
+                .with_data_set_lookup(Arc::new(move |domain: &str, name: &str| {
+                    gocb_data_sets
+                        .read()
+                        .map(|sets| sets.contains_key(&(domain.to_string(), name.to_string())))
+                        .unwrap_or(false)
+                })),
         );
 
         let dispatcher: Arc<dyn MmsServiceDispatcher> = match self.dispatcher {

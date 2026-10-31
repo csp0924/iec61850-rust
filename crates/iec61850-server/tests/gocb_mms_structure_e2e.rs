@@ -29,6 +29,7 @@ use iec61850_model::{
 };
 use iec61850_server::goose_mapping::GoCBHandle;
 use iec61850_server::lifecycle::ServerHandle;
+use iec61850_server::reporting::Dataset;
 use iec61850_server::{IedServer, IedServerConfig};
 
 const DOMAIN: &str = "TESTLD0";
@@ -107,6 +108,9 @@ async fn start_server_with(
         .config(config)
         .build()
         .expect("build server");
+    for name in ["LLN0$ds1", "LLN0$ds2"] {
+        server.register_dataset(DOMAIN, Dataset::new(name));
+    }
     server.register_gocb(build_handle(publisher.clone()));
     (server.start().await.expect("start"), publisher)
 }
@@ -590,6 +594,37 @@ async fn dat_set_write_increments_conf_rev_even_when_unchanged() {
         "a DatSet write while enabled is refused, got {refused:?}"
     );
     assert_eq!(publisher.lock().unwrap().conf_rev(), 9);
+
+    conn.set_gocb_values(
+        "TESTLD0/LLN0.gcb01",
+        GoCBValuesWrite::new().with_go_ena(false),
+    )
+    .await
+    .expect("disable");
+    // A data set the server does not hold, and an association-scope one, are
+    // refused without touching the publication (IEC 61850-8-1 Table 83).
+    for refused in ["LLN0$nosuch", "@ds2"] {
+        let r = conn
+            .set_gocb_values(
+                "TESTLD0/LLN0.gcb01",
+                GoCBValuesWrite::new().with_dat_set(refused),
+            )
+            .await;
+        assert!(
+            matches!(
+                r,
+                Err(ClientError::DataAccessError(
+                    DataAccessError::ObjectValueInvalid
+                ))
+            ),
+            "{refused}: expected object-value-invalid, got {r:?}"
+        );
+    }
+    {
+        let p = publisher.lock().unwrap();
+        assert_eq!(p.data_set_ref(), "TESTLD0/LLN0$ds2");
+        assert_eq!(p.conf_rev(), 9);
+    }
 
     conn.disconnect().await.expect("disconnect");
     handle.stop().await;

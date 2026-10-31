@@ -129,11 +129,12 @@ impl GoCBHandle {
     /// Qualifies a data set reference with this control block's domain, so it
     /// reads `<LD>/<LN>$<dsName>` (IEC 61850-8-1 §8.1.3.2.2).
     ///
-    /// A reference that already names a domain is kept; one in the form
-    /// `<LN>$<dsName>` gains the domain, and a bare data set name gains the
-    /// domain and this control block's logical node.
+    /// A reference that already names a domain, a VMD-scope reference
+    /// `/<name>` and an association-scope reference `@<name>` are kept; one in
+    /// the form `<LN>$<dsName>` gains the domain, and a bare data set name gains
+    /// the domain and this control block's logical node.
     pub fn qualify_data_set_ref(&self, data_set_ref: &str) -> String {
-        if data_set_ref.contains('/') {
+        if data_set_ref.contains('/') || data_set_ref.starts_with('@') {
             data_set_ref.to_string()
         } else if data_set_ref.contains('$') {
             format!("{}/{}", self.ld, data_set_ref)
@@ -152,11 +153,26 @@ impl GoCBHandle {
 /// `IedServer` holds an `Arc<GoCBRegistry>` and the dispatcher shares that `Arc`.
 /// Entries are keyed by `(domain, item_base)`, for example
 /// `("IED1LD0", "LLN0$GO$gcb01")`. The registry carries the edition the server
-/// presents, which decides the writable components.
-#[derive(Debug)]
+/// presents, which decides the writable components, and the lookup a DatSet
+/// write checks its data set against.
 pub struct GoCBRegistry {
     inner: std::sync::RwLock<HashMap<(String, String), Arc<GoCBHandle>>>,
     edition: Edition,
+    data_sets: Option<DataSetLookup>,
+}
+
+/// Answers whether the server holds a data set, given its domain and its name
+/// within the domain; a VMD-scope data set has the empty domain.
+pub type DataSetLookup = Arc<dyn Fn(&str, &str) -> bool + Send + Sync + std::panic::RefUnwindSafe>;
+
+impl std::fmt::Debug for GoCBRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoCBRegistry")
+            .field("len", &self.len())
+            .field("edition", &self.edition)
+            .field("data_sets", &self.data_sets.is_some())
+            .finish()
+    }
 }
 
 impl Default for GoCBRegistry {
@@ -176,12 +192,32 @@ impl GoCBRegistry {
         Self {
             inner: std::sync::RwLock::default(),
             edition,
+            data_sets: None,
         }
+    }
+
+    /// Sets the lookup a DatSet write checks its data set against. Without one,
+    /// a DatSet write is checked for its form only.
+    pub fn with_data_set_lookup(mut self, lookup: DataSetLookup) -> Self {
+        self.data_sets = Some(lookup);
+        self
     }
 
     /// Returns the edition the registry's control blocks follow.
     pub fn edition(&self) -> Edition {
         self.edition
+    }
+
+    /// Whether the data set `data_set_ref` names exists: `true` when the
+    /// registry has no lookup. `data_set_ref` is `<domain>/<name>`, or
+    /// `/<name>` for a VMD-scope data set.
+    fn data_set_exists(&self, data_set_ref: &str) -> bool {
+        let Some(lookup) = &self.data_sets else {
+            return true;
+        };
+        data_set_ref
+            .split_once('/')
+            .is_some_and(|(domain, name)| lookup(domain, name))
     }
 
     /// Registers a GoCB. An entry with the same key is replaced, and the call then
@@ -414,7 +450,7 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 // Write service helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Applies an MMS write to one GoCB component under `edition`.
+/// Applies an MMS write to one GoCB component under the edition of `registry`.
 ///
 /// GoEna, a boolean, is always writable. Under `Edition::Ed2_1`, GoID and
 /// DatSet are read-only and refused with `ObjectAccessDenied`
@@ -424,22 +460,25 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 /// (IEC 61850-7-2 §18.2.2.6.3).
 ///
 /// A DatSet write takes a data set reference with or without its domain and
-/// stores it qualified with the control block's domain. Every accepted DatSet
+/// stores it qualified with the control block's domain. It must name a data
+/// set the registry's lookup knows, VMD or domain scope; a reference that is
+/// empty, longer than an ObjectReference's 129 characters, association scope
+/// (`@<name>`, IEC 61850-8-1 §18.1.1.1.1 Table 83 and §8.1.3.2.2) or unknown is
+/// refused with `ObjectValueInvalid` and changes nothing. Every accepted DatSet
 /// write increments ConfRev, also when the value is unchanged, skipping the
-/// reserved value 0 (IEC 61850-7-2 §18.2.1.6). A reference that is empty or
-/// longer than an ObjectReference's 129 characters is refused with
-/// `ObjectValueInvalid`.
+/// reserved value 0 (IEC 61850-7-2 §18.2.1.6).
 ///
 /// The other six components are read-only and are
 /// refused with `ObjectAccessDenied`, and so is a member below a component,
 /// such as `DstAddress$APPID`. An unknown component is refused with
 /// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
 pub fn apply_gocb_write(
+    registry: &GoCBRegistry,
     handle: &GoCBHandle,
-    edition: Edition,
     da_name: &str,
     value: &MmsData,
 ) -> WriteOutcome {
+    let edition = registry.edition();
     if da_name.contains('$') {
         return match encode_gocb_da(handle, da_name) {
             Ok(_) => {
@@ -506,11 +545,23 @@ pub fn apply_gocb_write(
                 return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
             };
             let qualified = handle.qualify_data_set_ref(s);
-            if s.is_empty() || qualified.len() > MAX_OBJECT_REFERENCE_LEN {
+            let association_scope = qualified
+                .split_once('/')
+                .map_or(qualified.as_str(), |(_, name)| name)
+                .starts_with('@');
+            if s.is_empty() || association_scope || qualified.len() > MAX_OBJECT_REFERENCE_LEN {
                 tracing::warn!(
                     da_name,
-                    len = qualified.len(),
-                    "write DatSet refused: not a data set reference"
+                    dat_set = %qualified,
+                    "write DatSet refused: not a VMD or domain scope data set reference"
+                );
+                return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
+            }
+            if !registry.data_set_exists(&qualified) {
+                tracing::warn!(
+                    da_name,
+                    dat_set = %qualified,
+                    "write DatSet refused: no such data set"
                 );
                 return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
             }
@@ -794,7 +845,7 @@ mod tests {
     fn write_go_ena_true_succeeds_and_publisher_enabled() {
         let h = sample_handle();
         assert!(!h.enabled());
-        let r = apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
+        let r = apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(true));
         assert_eq!(r, WriteOutcome::Success);
         assert!(h.enabled());
         assert!(h.publisher.lock().unwrap().enabled());
@@ -803,9 +854,9 @@ mod tests {
     #[test]
     fn write_go_ena_false_after_true_disables() {
         let h = sample_handle();
-        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
+        apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(true));
         assert!(h.enabled());
-        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(false));
+        apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(false));
         assert!(!h.enabled());
         assert!(!h.publisher.lock().unwrap().enabled());
     }
@@ -813,7 +864,7 @@ mod tests {
     #[test]
     fn write_go_ena_wrong_type_rejects() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Unsigned(1));
+        let r = apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Unsigned(1));
         assert_eq!(
             r,
             WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
@@ -824,8 +875,8 @@ mod tests {
     fn write_go_id_succeeds() {
         let h = sample_handle();
         let r = apply_gocb_write(
+            &GoCBRegistry::new(),
             &h,
-            Edition::Ed2,
             "GoID",
             &MmsData::VisibleString("MyGoID".into()),
         );
@@ -837,7 +888,7 @@ mod tests {
     #[test]
     fn write_go_id_wrong_type_rejects() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, Edition::Ed2, "GoID", &MmsData::Boolean(true));
+        let r = apply_gocb_write(&GoCBRegistry::new(), &h, "GoID", &MmsData::Boolean(true));
         assert_eq!(
             r,
             WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
@@ -855,7 +906,7 @@ mod tests {
             "MaxTime",
             "FixedOffs",
         ] {
-            let r = apply_gocb_write(&h, Edition::Ed2, da, &MmsData::Boolean(true));
+            let r = apply_gocb_write(&GoCBRegistry::new(), &h, da, &MmsData::Boolean(true));
             assert_eq!(
                 r,
                 WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
@@ -874,8 +925,8 @@ mod tests {
             ("IED1LD0/LLN0$ds3", "IED1LD0/LLN0$ds3", 8),
         ] {
             let r = apply_gocb_write(
+                &GoCBRegistry::new(),
                 &h,
-                Edition::Ed2,
                 "DatSet",
                 &MmsData::VisibleString(written.into()),
             );
@@ -885,13 +936,85 @@ mod tests {
         }
     }
 
+    /// A registry whose lookup knows `IED1LD0/LLN0$ds1`, `IED1LD0/LLN0$ds2`
+    /// and the VMD-scope `vmdds`.
+    fn registry_with_data_sets() -> GoCBRegistry {
+        GoCBRegistry::new().with_data_set_lookup(Arc::new(|domain: &str, name: &str| {
+            matches!(
+                (domain, name),
+                ("IED1LD0", "LLN0$ds1") | ("IED1LD0", "LLN0$ds2") | ("", "vmdds")
+            )
+        }))
+    }
+
+    #[test]
+    fn write_dat_set_must_name_a_known_data_set() {
+        let reg = registry_with_data_sets();
+        let h = sample_handle();
+        for refused in [
+            "IED1LD0/LLN0$nosuch",
+            "nosuch",
+            "/nosuch",
+            "@ds1",
+            "IED1LD0/@ds1",
+        ] {
+            assert_eq!(
+                apply_gocb_write(&reg, &h, "DatSet", &MmsData::VisibleString(refused.into())),
+                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid),
+                "{refused}"
+            );
+            assert_eq!(
+                read(&h, "DatSet"),
+                MmsData::VisibleString("IED1LD0/LLN0$ds1".into())
+            );
+            assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(5));
+        }
+        for (accepted, stored) in [("ds2", "IED1LD0/LLN0$ds2"), ("/vmdds", "/vmdds")] {
+            assert_eq!(
+                apply_gocb_write(&reg, &h, "DatSet", &MmsData::VisibleString(accepted.into())),
+                WriteOutcome::Success,
+                "{accepted}"
+            );
+            assert_eq!(read(&h, "DatSet"), MmsData::VisibleString(stored.into()));
+        }
+        assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(7));
+    }
+
+    /// Without a data set lookup only the form is checked, and an
+    /// association-scope reference is still refused.
+    #[test]
+    fn write_dat_set_refuses_association_scope_without_a_lookup() {
+        let h = sample_handle();
+        for refused in ["@ds1", "IED1LD0/@ds1"] {
+            assert_eq!(
+                apply_gocb_write(
+                    &GoCBRegistry::new(),
+                    &h,
+                    "DatSet",
+                    &MmsData::VisibleString(refused.into())
+                ),
+                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid),
+                "{refused}"
+            );
+        }
+        assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(5));
+    }
+
+    #[test]
+    fn qualify_keeps_vmd_and_association_scope_references() {
+        let h = sample_handle();
+        assert_eq!(h.qualify_data_set_ref("@ds1"), "@ds1");
+        assert_eq!(h.qualify_data_set_ref("/ds1"), "/ds1");
+        assert_eq!(h.qualify_data_set_ref("LLN0$ds1"), "IED1LD0/LLN0$ds1");
+    }
+
     #[test]
     fn write_dat_set_skips_the_reserved_conf_rev() {
         let h = sample_handle();
         h.publisher.lock().unwrap().set_conf_rev(u32::MAX);
         let r = apply_gocb_write(
+            &GoCBRegistry::new(),
             &h,
-            Edition::Ed2,
             "DatSet",
             &MmsData::VisibleString("ds2".into()),
         );
@@ -908,15 +1031,15 @@ mod tests {
             MmsData::VisibleString("x".repeat(130)),
         ] {
             assert_eq!(
-                apply_gocb_write(&h, Edition::Ed2, "DatSet", &bad),
+                apply_gocb_write(&GoCBRegistry::new(), &h, "DatSet", &bad),
                 WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
             );
         }
-        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
+        apply_gocb_write(&GoCBRegistry::new(), &h, "GoEna", &MmsData::Boolean(true));
         assert_eq!(
             apply_gocb_write(
+                &GoCBRegistry::new(),
                 &h,
-                Edition::Ed2,
                 "DatSet",
                 &MmsData::VisibleString("ds2".into())
             ),
@@ -937,7 +1060,7 @@ mod tests {
             ("DatSet", MmsData::VisibleString("ds2".into())),
         ] {
             assert_eq!(
-                apply_gocb_write(&h, Edition::Ed2_1, da, &value),
+                apply_gocb_write(&GoCBRegistry::with_edition(Edition::Ed2_1), &h, da, &value),
                 WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
                 "{da}"
             );
@@ -948,7 +1071,12 @@ mod tests {
         );
         assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(5));
         assert_eq!(
-            apply_gocb_write(&h, Edition::Ed2_1, "GoEna", &MmsData::Boolean(true)),
+            apply_gocb_write(
+                &GoCBRegistry::with_edition(Edition::Ed2_1),
+                &h,
+                "GoEna",
+                &MmsData::Boolean(true)
+            ),
             WriteOutcome::Success
         );
     }
@@ -958,8 +1086,8 @@ mod tests {
         let h = sample_handle();
         assert_eq!(
             apply_gocb_write(
+                &GoCBRegistry::with_edition(Edition::Ed1),
                 &h,
-                Edition::Ed1,
                 "GoID",
                 &MmsData::VisibleString("x".into())
             ),
@@ -980,7 +1108,7 @@ mod tests {
     fn write_unknown_da_returns_nonexistent() {
         let h = sample_handle();
         for da in ["NoSuchDA", "GoCBRef"] {
-            let r = apply_gocb_write(&h, Edition::Ed2, da, &MmsData::Boolean(true));
+            let r = apply_gocb_write(&GoCBRegistry::new(), &h, da, &MmsData::Boolean(true));
             assert_eq!(r, WriteOutcome::Failure(DataAccessError::ObjectNonExistent));
         }
     }
@@ -1040,11 +1168,21 @@ mod tests {
     fn write_member_of_dst_address_is_denied() {
         let h = sample_handle();
         assert_eq!(
-            apply_gocb_write(&h, Edition::Ed2, "DstAddress$APPID", &MmsData::Unsigned(1)),
+            apply_gocb_write(
+                &GoCBRegistry::new(),
+                &h,
+                "DstAddress$APPID",
+                &MmsData::Unsigned(1)
+            ),
             WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
         );
         assert_eq!(
-            apply_gocb_write(&h, Edition::Ed2, "DstAddress$Nope", &MmsData::Unsigned(1)),
+            apply_gocb_write(
+                &GoCBRegistry::new(),
+                &h,
+                "DstAddress$Nope",
+                &MmsData::Unsigned(1)
+            ),
             WriteOutcome::Failure(DataAccessError::ObjectNonExistent)
         );
     }
