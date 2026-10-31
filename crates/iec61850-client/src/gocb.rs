@@ -27,18 +27,19 @@ use crate::mms_compat::mms_value_to_mms_data;
 use crate::prelude::{format, Arc, String, ToString};
 use crate::sync::Mutex;
 
-/// A complete snapshot of the nine attributes of a GOOSE control block.
+/// A snapshot of the attributes of a GOOSE control block.
 ///
-/// The field order follows IEC 61850-7-2 §13, which is the order a server
-/// encodes them into the returned structure.
+/// The fields follow the components of the GoCB MMS structure of
+/// IEC 61850-8-1 §18.1.1.1.1 Table 83, in order. The control block reference
+/// is the name the block is read under, not a component. MinTime, MaxTime and
+/// FixedOffs are optional in Table 83 and are `None` when the server leaves
+/// them out.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct GoCBValues {
-    /// Object reference of the control block itself.
-    pub go_cb_ref: String,
     /// Whether the server is publishing this control block.
     pub go_ena: bool,
-    /// Identifier carried in the gocbRef field of every published frame.
+    /// Identifier carried in the goID field of every published frame.
     pub go_id: String,
     /// Reference of the data set the control block publishes.
     pub dat_set: String,
@@ -48,10 +49,13 @@ pub struct GoCBValues {
     pub nds_com: bool,
     /// Destination address, VLAN settings and application identifier.
     pub dst_address: PhyComAddress,
-    /// Shortest retransmission interval after an event, in milliseconds.
-    pub min_time_ms: u32,
-    /// Steady-state retransmission interval, in milliseconds.
-    pub max_time_ms: u32,
+    /// MinTime: the delay between the first transmission after a change and
+    /// its first repetition, in milliseconds.
+    pub min_time_ms: Option<u32>,
+    /// MaxTime: the longest repetition interval, in milliseconds.
+    pub max_time_ms: Option<u32>,
+    /// FixedOffs: whether the publication uses the fixed-offset encoding.
+    pub fixed_offs: Option<bool>,
 }
 
 /// The DstAddress attribute: the destination of the GOOSE publication.
@@ -150,37 +154,62 @@ pub(crate) fn parse_gocb_ref(reference: &str) -> Result<(String, String), Client
 
 // Decoding the structure a server returns.
 
-/// Decodes the nine-element structure a server returns into [`GoCBValues`].
+/// Number of mandatory components of the GoCB MMS structure.
+const GOCB_MANDATORY_COMPONENTS: usize = 6;
+
+/// Decodes the GoCB MMS structure a server returns into [`GoCBValues`].
+///
+/// The six mandatory components come first, in the order of
+/// IEC 61850-8-1 §18.1.1.1.1 Table 83. The optional components that follow
+/// are told apart by type, in table order: unsigned values are MinTime and
+/// then MaxTime, and a boolean is FixedOffs.
 ///
 /// # Errors
 ///
-/// `UnexpectedValueType` if the value is not a structure, and
-/// `InvalidArgument` if it has the wrong number of elements.
+/// `UnexpectedValueType` if the value is not a structure or a component has
+/// the wrong type, and `InvalidArgument` if a mandatory component is missing
+/// or a component is left over.
 pub(crate) fn parse_gocb_structure(data: &MmsData) -> Result<GoCBValues, ClientError> {
     let MmsData::Structure(items) = data else {
         return Err(ClientError::UnexpectedValueType {
-            expected: "Structure(9)",
+            expected: "GoCB Structure",
             got: variant_name(data),
         });
     };
-    if items.len() != 9 {
+    if items.len() < GOCB_MANDATORY_COMPONENTS {
         return Err(ClientError::InvalidArgument(format!(
-            "GoCBValues structure has {} elements, expected 9",
+            "GoCB structure has {} components, expected at least {GOCB_MANDATORY_COMPONENTS}",
             items.len()
         )));
     }
-    // Element order follows the attribute order a server publishes.
-    let go_cb_ref = expect_visible_string(&items[0], "GoCBRef")?;
-    let go_ena = expect_boolean(&items[1], "GoEna")?;
-    let go_id = expect_visible_string(&items[2], "GoID")?;
-    let dat_set = expect_visible_string(&items[3], "DatSet")?;
-    let conf_rev = expect_unsigned_u32(&items[4], "ConfRev")?;
-    let nds_com = expect_boolean(&items[5], "NdsCom")?;
-    let dst_address = parse_phy_com_address(&items[6])?;
-    let min_time_ms = expect_unsigned_u32(&items[7], "MinTime")?;
-    let max_time_ms = expect_unsigned_u32(&items[8], "MaxTime")?;
+    let go_ena = expect_boolean(&items[0], "GoEna")?;
+    let go_id = expect_visible_string(&items[1], "GoID")?;
+    let dat_set = expect_visible_string(&items[2], "DatSet")?;
+    let conf_rev = expect_unsigned_u32(&items[3], "ConfRev")?;
+    let nds_com = expect_boolean(&items[4], "NdsCom")?;
+    let dst_address = parse_phy_com_address(&items[5])?;
+
+    let mut optional = items[GOCB_MANDATORY_COMPONENTS..].iter().peekable();
+    let mut next_unsigned = || match optional.peek() {
+        Some(MmsData::Unsigned(_) | MmsData::Integer(_)) => optional
+            .next()
+            .map(|d| expect_unsigned_u32(d, "MinTime/MaxTime"))
+            .transpose(),
+        _ => Ok(None),
+    };
+    let min_time_ms = next_unsigned()?;
+    let max_time_ms = next_unsigned()?;
+    let fixed_offs = match optional.next() {
+        None => None,
+        Some(d) => Some(expect_boolean(d, "FixedOffs")?),
+    };
+    if optional.next().is_some() {
+        return Err(ClientError::InvalidArgument(format!(
+            "GoCB structure has {} components, more than Table 83 defines",
+            items.len()
+        )));
+    }
     Ok(GoCBValues {
-        go_cb_ref,
         go_ena,
         go_id,
         dat_set,
@@ -189,6 +218,7 @@ pub(crate) fn parse_gocb_structure(data: &MmsData) -> Result<GoCBValues, ClientE
         dst_address,
         min_time_ms,
         max_time_ms,
+        fixed_offs,
     })
 }
 
@@ -296,8 +326,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// # Errors
     ///
     /// `NotConnected` if the association is not established, `InvalidArgument`
-    /// for a malformed reference, and `UnexpectedValueType` if the server
-    /// answers with something other than a nine-element structure.
+    /// for a malformed reference, and `UnexpectedValueType` or
+    /// `InvalidArgument` if the server answers with something other than the
+    /// GoCB MMS structure.
     pub async fn get_gocb_values(&self, reference: &str) -> Result<GoCBValues, ClientError> {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
@@ -410,7 +441,6 @@ mod tests {
 
     fn sample_struct() -> MmsData {
         MmsData::Structure(vec![
-            MmsData::VisibleString("IED1LD0/LLN0$GO$gcb01".into()),
             MmsData::Boolean(true),
             MmsData::VisibleString("MyGoID".into()),
             MmsData::VisibleString("IED1LD0/LLN0$ds1".into()),
@@ -424,13 +454,20 @@ mod tests {
             ]),
             MmsData::Unsigned(10),
             MmsData::Unsigned(2000),
+            MmsData::Boolean(false),
         ])
+    }
+
+    fn sample_items() -> Vec<MmsData> {
+        match sample_struct() {
+            MmsData::Structure(items) => items,
+            _ => unreachable!(),
+        }
     }
 
     #[test]
     fn parse_full_structure() {
         let v = parse_gocb_structure(&sample_struct()).unwrap();
-        assert_eq!(v.go_cb_ref, "IED1LD0/LLN0$GO$gcb01");
         assert!(v.go_ena);
         assert_eq!(v.go_id, "MyGoID");
         assert_eq!(v.dat_set, "IED1LD0/LLN0$ds1");
@@ -440,8 +477,47 @@ mod tests {
         assert_eq!(v.dst_address.priority, 4);
         assert_eq!(v.dst_address.vlan_id, 100);
         assert_eq!(v.dst_address.app_id, 0x1000);
-        assert_eq!(v.min_time_ms, 10);
-        assert_eq!(v.max_time_ms, 2000);
+        assert_eq!(v.min_time_ms, Some(10));
+        assert_eq!(v.max_time_ms, Some(2000));
+        assert_eq!(v.fixed_offs, Some(false));
+    }
+
+    #[test]
+    fn parse_without_optional_components() {
+        let mut items = sample_items();
+        items.truncate(6);
+        let v = parse_gocb_structure(&MmsData::Structure(items)).unwrap();
+        assert_eq!(v.conf_rev, 7);
+        assert_eq!(v.min_time_ms, None);
+        assert_eq!(v.max_time_ms, None);
+        assert_eq!(v.fixed_offs, None);
+    }
+
+    #[test]
+    fn parse_fixed_offs_without_times() {
+        let mut items = sample_items();
+        items.drain(6..8);
+        let v = parse_gocb_structure(&MmsData::Structure(items)).unwrap();
+        assert_eq!(v.min_time_ms, None);
+        assert_eq!(v.max_time_ms, None);
+        assert_eq!(v.fixed_offs, Some(false));
+    }
+
+    #[test]
+    fn parse_rejects_a_leading_gocb_reference() {
+        let mut items = sample_items();
+        items.insert(0, MmsData::VisibleString("IED1LD0/LLN0$GO$gcb01".into()));
+        items.pop();
+        let r = parse_gocb_structure(&MmsData::Structure(items));
+        assert!(matches!(r, Err(ClientError::UnexpectedValueType { .. })));
+    }
+
+    #[test]
+    fn parse_rejects_a_trailing_extra_component() {
+        let mut items = sample_items();
+        items.push(MmsData::Boolean(true));
+        let r = parse_gocb_structure(&MmsData::Structure(items));
+        assert!(matches!(r, Err(ClientError::InvalidArgument(_))));
     }
 
     #[test]
@@ -458,12 +534,9 @@ mod tests {
 
     #[test]
     fn parse_dst_address_wrong_addr_len() {
-        let mut items = match sample_struct() {
-            MmsData::Structure(items) => items,
-            _ => unreachable!(),
-        };
+        let mut items = sample_items();
         // Shorten dst_address.addr to five bytes.
-        if let MmsData::Structure(inner) = &mut items[6] {
+        if let MmsData::Structure(inner) = &mut items[5] {
             inner[0] = MmsData::OctetString(vec![0; 5]);
         }
         let r = parse_gocb_structure(&MmsData::Structure(items));

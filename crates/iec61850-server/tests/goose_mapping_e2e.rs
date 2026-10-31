@@ -6,7 +6,7 @@
 //! reads back and reaches the publisher, that writing GoID takes effect, that
 //! the read-only fields ConfRev and DstAddress answer ObjectAccessDenied, that
 //! reading the whole control block returns its nine members, and that an
-//! unknown control block name answers ObjectNonExistent.
+//! unknown control block or component name answers ObjectNonExistent.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -129,15 +129,19 @@ async fn gocb_read_default_attributes() {
         .build();
     client.connect("127.0.0.1", port).await.expect("connect");
 
-    // GoCBRef → "TESTLD0/LLN0$GO$gcb01"
+    // The GoCB reference names the variable; it is not a component.
     let r = tokio::time::timeout(
         Duration::from_secs(5),
         client.read("TESTLD0", "LLN0$GO$gcb01$GoCBRef"),
     )
     .await
-    .expect("timeout")
-    .expect("read GoCBRef");
-    assert_eq!(r, MmsData::VisibleString("TESTLD0/LLN0$GO$gcb01".into()));
+    .expect("timeout");
+    match r {
+        Err(iec61850_mms::mms::client::error::ClientError::DataAccessError(
+            DataAccessError::ObjectNonExistent,
+        )) => {}
+        other => panic!("expected ObjectNonExistent for GoCBRef, got {other:?}"),
+    }
 
     // GoEna defaults to false.
     let r = tokio::time::timeout(
@@ -347,7 +351,6 @@ async fn client_get_gocb_values_round_trip() {
     .expect("timeout")
     .expect("get_gocb_values");
 
-    assert_eq!(v.go_cb_ref, "TESTLD0/LLN0$GO$gcb01");
     assert!(!v.go_ena);
     assert_eq!(v.dat_set, "TESTLD0/LLN0$ds1");
     assert_eq!(v.conf_rev, 7);
@@ -355,8 +358,9 @@ async fn client_get_gocb_values_round_trip() {
     assert_eq!(v.dst_address.priority, 4);
     assert_eq!(v.dst_address.vlan_id, 100);
     assert_eq!(v.dst_address.app_id, 0x1000);
-    assert_eq!(v.min_time_ms, 10);
-    assert_eq!(v.max_time_ms, 2000);
+    assert_eq!(v.min_time_ms, Some(10));
+    assert_eq!(v.max_time_ms, Some(2000));
+    assert_eq!(v.fixed_offs, Some(false));
 
     conn.disconnect().await.expect("disconnect");
     h.stop().await;

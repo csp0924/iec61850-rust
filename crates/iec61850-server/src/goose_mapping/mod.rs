@@ -4,11 +4,11 @@
 //! `<LD>/<LN>$GO$<gcbName>$<DA>`, so a client drives GetGoCBValues and
 //! SetGoCBValues through the ordinary MMS Read and Write services.
 //!
-//! The GoCB attributes of IEC 61850-7-2:
+//! The GoCB is the MMS structure of IEC 61850-8-1 §18.1.1.1.1 Table 83, with
+//! its components in this order:
 //!
-//! | DA | FC | Type | Access |
+//! | Component | FC | Type | Access |
 //! |---|---|---|---|
-//! | GoCBRef | GO | VisibleString | read |
 //! | GoEna | GO | BOOLEAN | read and write |
 //! | GoID | GO | VisibleString | read and write |
 //! | DatSet | GO | VisibleString | read |
@@ -17,6 +17,12 @@
 //! | DstAddress | GO | PhyComAddress structure | read |
 //! | MinTime | GO | UINT32, milliseconds | read |
 //! | MaxTime | GO | UINT32, milliseconds | read |
+//! | FixedOffs | GO | BOOLEAN | read |
+//!
+//! The GoCB reference is the name of the variable, not a component. MinTime,
+//! MaxTime and FixedOffs are optional in Table 83 and always present here.
+//! FixedOffs is always FALSE: the publisher encodes every value in its shortest
+//! form.
 //!
 //! Writing GoEna sets the publisher's enabled flag; it does not start or stop a
 //! publishing thread. A caller decides from `enabled()` whether to transmit, which
@@ -191,7 +197,7 @@ impl GoCBRegistry {
 
     /// Lists the MMS names of every GoCB in a domain, for GetNameList.
     ///
-    /// The result looks like `["LLN0$GO$gcb01$GoCBRef", "LLN0$GO$gcb01$GoEna", ...]`.
+    /// The result looks like `["LLN0$GO$gcb01", "LLN0$GO$gcb01$GoEna", ...]`.
     pub fn list_mms_names_in_domain(&self, domain: &str) -> Vec<String> {
         let Ok(g) = self.inner.read() else {
             return vec![];
@@ -224,9 +230,9 @@ impl GoCBRegistry {
     }
 }
 
-/// The nine GoCB attribute names of IEC 61850-7-2, in the order they are listed.
+/// The nine components of the GoCB MMS structure, in the order of
+/// IEC 61850-8-1 §18.1.1.1.1 Table 83.
 pub const GOCB_DA_NAMES: &[&str] = &[
-    "GoCBRef",
     "GoEna",
     "GoID",
     "DatSet",
@@ -235,6 +241,7 @@ pub const GOCB_DA_NAMES: &[&str] = &[
     "DstAddress",
     "MinTime",
     "MaxTime",
+    "FixedOffs",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,7 +267,6 @@ pub fn encode_gocb_structure(handle: &GoCBHandle) -> MmsData {
 /// spare the caller a second layer of matching.
 pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> MmsData {
     match da_name {
-        "GoCBRef" => MmsData::VisibleString(handle.go_cb_ref()),
         "GoEna" => MmsData::Boolean(handle.enabled()),
         "GoID" => {
             let go_id = handle
@@ -295,6 +301,7 @@ pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> MmsData {
         ]),
         "MinTime" => MmsData::Unsigned(handle.min_time_ms.unwrap_or(0) as u64),
         "MaxTime" => MmsData::Unsigned(handle.max_time_ms.unwrap_or(0) as u64),
+        "FixedOffs" => MmsData::Boolean(false),
         _ => {
             tracing::warn!(da_name, "encode_gocb_da: unknown GoCB attribute name");
             MmsData::VisibleString("<unknown>".into())
@@ -310,7 +317,7 @@ pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> MmsData {
 ///
 /// GoEna, a boolean, and GoID, a visible string, are writable; GoID only while
 /// the publisher is disabled, and otherwise it is refused with
-/// `TemporarilyUnavailable`. The other seven attributes are read-only and are
+/// `TemporarilyUnavailable`. The other seven components are read-only and are
 /// refused with `ObjectAccessDenied`. An unknown attribute is refused with
 /// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
 pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> WriteOutcome {
@@ -374,7 +381,7 @@ pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> 
             WriteOutcome::Success
         }
         // Read-only attributes.
-        "GoCBRef" | "DatSet" | "ConfRev" | "NdsCom" | "DstAddress" | "MinTime" | "MaxTime" => {
+        "DatSet" | "ConfRev" | "NdsCom" | "DstAddress" | "MinTime" | "MaxTime" | "FixedOffs" => {
             tracing::warn!(da_name, "write to a read-only GoCB attribute refused");
             WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
         }
@@ -507,10 +514,9 @@ mod tests {
     // ── encode_gocb_da ──────────────────────────────────────────────────────────
 
     #[test]
-    fn encode_go_cb_ref() {
+    fn encode_fixed_offs_is_false() {
         let h = sample_handle();
-        let v = encode_gocb_da(&h, "GoCBRef");
-        assert_eq!(v, MmsData::VisibleString("IED1LD0/LLN0$GO$gcb01".into()));
+        assert_eq!(encode_gocb_da(&h, "FixedOffs"), MmsData::Boolean(false));
     }
 
     #[test]
@@ -579,6 +585,8 @@ mod tests {
         match v {
             MmsData::Structure(items) => {
                 assert_eq!(items.len(), 9);
+                assert_eq!(items[0], MmsData::Boolean(false), "GoEna leads");
+                assert_eq!(items[8], MmsData::Boolean(false), "FixedOffs ends");
             }
             other => panic!("expected a Structure, got {:?}", other),
         }
@@ -639,13 +647,13 @@ mod tests {
     fn write_readonly_da_rejects() {
         let h = sample_handle();
         for da in [
-            "GoCBRef",
             "DatSet",
             "ConfRev",
             "NdsCom",
             "DstAddress",
             "MinTime",
             "MaxTime",
+            "FixedOffs",
         ] {
             let r = apply_gocb_write(&h, da, &MmsData::Boolean(true));
             assert_eq!(
@@ -659,8 +667,10 @@ mod tests {
     #[test]
     fn write_unknown_da_returns_nonexistent() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, "NoSuchDA", &MmsData::Boolean(true));
-        assert_eq!(r, WriteOutcome::Failure(DataAccessError::ObjectNonExistent));
+        for da in ["NoSuchDA", "GoCBRef"] {
+            let r = apply_gocb_write(&h, da, &MmsData::Boolean(true));
+            assert_eq!(r, WriteOutcome::Failure(DataAccessError::ObjectNonExistent));
+        }
     }
 
     // ── parse_go_item_id ────────────────────────────────────────────────────────
