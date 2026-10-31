@@ -51,11 +51,15 @@ Defaults enable the full desktop client.
   [iec61850-tls](https://crates.io/crates/iec61850-tls).
 - `reporting` / `control` / `datasets` - gate report dispatch together with
   the RCB, GoCB and journal APIs, the control API, and data set
-  administration. Each implies `std`.
-- `mms-core` - the three service groups above in one switch.
+  administration. Each needs `std` or `embedded` selected alongside it.
+- `mms-core` - the three service groups above in one switch, with the same
+  requirement.
 - `embedded` - `no_std` plus `alloc`, with the MMS and model crates on
-  their embedded paths. Only the error and MMS-compatibility surfaces are
-  exposed, because the async API needs a runtime.
+  their embedded paths. `IedConnection::new`, `connect` and `connect_tls`
+  need tokio and are absent: build an `MmsClient` over your own transport
+  and timer and wrap it with `IedConnection::with_mms_client`, after which
+  the async services are available. `poll_reports`,
+  `spawn_report_dispatcher` and the enhanced control models stay on `std`.
 - `minimal` - environment-neutral marker; the caller states `minimal,std`
   or `minimal,embedded`.
 

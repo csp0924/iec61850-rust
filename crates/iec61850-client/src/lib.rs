@@ -10,11 +10,17 @@
 //! - `std` (default): tokio runtime and `std::sync`; enables the async
 //!   `IedConnection` API.
 //! - `embedded`: `no_std` plus `alloc`, with `iec61850-mms` and
-//!   `iec61850-model` on their embedded paths. Only `error` and `mms_compat`
-//!   are exposed, because the async API needs a runtime.
+//!   `iec61850-model` on their embedded paths. `IedConnection::new`,
+//!   `connect` and `connect_tls` need tokio and are absent; a caller builds
+//!   an `MmsClient` over its own transport and timer, for example with
+//!   `MmsClient::from_transport_with_timer`, and wraps it with
+//!   `IedConnection::with_mms_client`, after which the async services are
+//!   available. `poll_reports`, `spawn_report_dispatcher` and the enhanced
+//!   control models stay on `std`.
 //! - `reporting` / `control` / `datasets`: gate report dispatch together with
 //!   the RCB, GoCB and journal APIs, the control API, and data set
-//!   administration and directory. Each implies `std`.
+//!   administration and directory. Each needs `std` or `embedded` selected
+//!   alongside it.
 //! - `minimal`: environment-neutral marker carrying no submodule feature; the
 //!   caller selects `minimal,std` or `minimal,embedded`.
 //!
