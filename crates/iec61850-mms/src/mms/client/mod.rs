@@ -88,7 +88,9 @@ impl MmsClientBuilder {
         Self::default()
     }
 
-    /// Sets the connect timeout in milliseconds.
+    /// Sets the connect timeout in milliseconds: one deadline for the TCP
+    /// connection, the TLS handshake when there is one, and the COTP CR and CC
+    /// together.
     pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
         self.connect_timeout_ms = Some(ms);
         self
@@ -219,9 +221,12 @@ impl MmsClient<TcpStream, TokioTimer> {
     ///
     /// `addr` is the server address, `connector` a `TlsConnector` already configured
     /// with the IEC 62351-3 cipher suites, and `server_name` the name used for SNI
-    /// and certificate validation. A failed handshake, or one that does not
-    /// complete within the connect timeout, returns `ClientError::TlsHandshake`
-    /// with its [`TlsFailureKind`].
+    /// and certificate validation. The TCP connection, the handshake and the
+    /// COTP CR and CC share one deadline of the connect timeout. A failed
+    /// handshake returns `ClientError::TlsHandshake` with its
+    /// [`TlsFailureKind`], and so does running out of the deadline during the
+    /// handshake, with the `Timeout` kind; running out of it during the TCP
+    /// connection or the COTP handshake returns `ConnectTimeout`.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,

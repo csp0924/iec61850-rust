@@ -40,9 +40,13 @@
 //! - An I/O error of the transport closes the connection and surfaces as
 //!   `Transport`, carrying the category and text the transport reported; a TLS
 //!   alert received after the handshake arrives this way.
+//! - Establishing the connection, the TCP connection, the TLS handshake and
+//!   the COTP CR and CC, is bounded by one `connect_timeout_ms` deadline for
+//!   all of these steps together. Running out of it during the TLS handshake
+//!   is a `TlsHandshake` of the `Timeout` kind, and during any other of these
+//!   steps `ConnectTimeout`.
 //! - A failed TLS handshake surfaces as `TlsHandshake`, carrying the kind of
-//!   failure; the handshake is bounded by `connect_timeout_ms`, and running
-//!   out of it is the `Timeout` kind.
+//!   failure.
 
 use super::error::ClientError;
 use crate::compat::prelude::*;
@@ -88,6 +92,14 @@ fn tls_failure_message(e: &TlsError) -> String {
         other => other.to_string(),
     }
 }
+
+/// Steps of a TLS connection establishment, as recorded while it runs.
+#[cfg(feature = "tls")]
+const STEP_TCP: u8 = 0;
+#[cfg(feature = "tls")]
+const STEP_TLS_HANDSHAKE: u8 = 1;
+#[cfg(feature = "tls")]
+const STEP_COTP: u8 = 2;
 
 /// Classifies a failed client handshake.
 #[cfg(feature = "tls")]
@@ -398,38 +410,57 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// ACSE AARQ and the MMS Initiate request, and the matching Session AC with
     /// Presentation CPA, ACSE AARE and the MMS Initiate response.
     ///
+    /// The TCP connection and the COTP CR and CC share one deadline of
+    /// `connect_timeout_ms`.
+    ///
     /// # Errors
     ///
-    /// - `ConnectTimeout` when no TCP connection is established within
-    ///   `connect_timeout_ms`.
+    /// - `ConnectTimeout` when the TCP connection and the COTP handshake do not
+    ///   complete within `connect_timeout_ms`.
     /// - `IsoError` when the name does not resolve or every address refuses.
-    /// - The errors of [`Self::connect_via`] for the association itself.
+    /// - The errors of [`Self::connect_via`] for the rest of the association.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
+        self.reset_association_state();
+        self.set_state(ConnectionState::Connecting);
         let timeout_ms = self.connect_timeout_ms;
-        let timer = self.timer;
-        let tcp = with_timeout(
-            &timer,
-            Duration::from_millis(timeout_ms),
-            connect_tcp(host, port),
-        )
-        .await
-        .map_err(|_| {
-            warn!(host, port, timeout_ms, "tcp connect timed out");
-            ClientError::ConnectTimeout { timeout_ms }
-        })??;
-        // disable Nagle to keep the latency of small PDUs down
-        let _ = tcp.set_nodelay(true);
-
-        // the rest of the sequence is transport generic
-        self.connect_via(tcp).await
+        let opts = cotp_options(&self.iso_parameters);
+        let established = with_timeout(&self.timer, Duration::from_millis(timeout_ms), async {
+            let tcp = connect_tcp(host, port).await?;
+            // disable Nagle to keep the latency of small PDUs down
+            let _ = tcp.set_nodelay(true);
+            CotpConnection::connect(tcp, opts)
+                .await
+                .map_err(|e| association_failed("cotp", e))
+        })
+        .await;
+        let cotp = match established {
+            Ok(Ok(cotp)) => cotp,
+            Ok(Err(e)) => {
+                self.set_state(ConnectionState::Closed);
+                return Err(e);
+            }
+            Err(_) => {
+                warn!(
+                    host,
+                    port, timeout_ms, "the connection was not established in time"
+                );
+                self.set_state(ConnectionState::Closed);
+                return Err(ClientError::ConnectTimeout { timeout_ms });
+            }
+        };
+        debug!("cotp connection established");
+        self.finish_association(cotp).await
     }
 
     /// Runs the association sequence over TLS.
     ///
     /// The TLS handshake is inserted after the TCP connection, and every later step
-    /// is identical to the plaintext path. On failure the connection is left
-    /// `Closed`; a failed handshake, or one that does not complete within
-    /// `connect_timeout_ms`, returns `ClientError::TlsHandshake`.
+    /// is identical to the plaintext path. The TCP connection, the handshake and
+    /// the COTP CR and CC share one deadline of `connect_timeout_ms`. On failure
+    /// the connection is left `Closed`. A failed handshake returns
+    /// `ClientError::TlsHandshake`, and so does running out of the deadline
+    /// during the handshake, with the `Timeout` kind; running out of it during
+    /// the TCP connection or the COTP handshake returns `ConnectTimeout`.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,
@@ -454,37 +485,41 @@ impl MmsConnection<TcpStream, TokioTimer> {
         self.reset_association_state();
         self.set_state(ConnectionState::Connecting);
         let timeout_ms = self.connect_timeout_ms;
-        let connect_dur = Duration::from_millis(timeout_ms);
-
-        // Step 0: TCP connect
-        let tcp = with_timeout(&self.timer, connect_dur, TcpStream::connect(addr))
-            .await
-            .map_err(|_| ClientError::ConnectTimeout { timeout_ms })?
-            .map_err(|e| ClientError::Transport(TransportError::from(e)))?;
-        let _ = tcp.set_nodelay(true);
-
-        // Step 0b: TLS handshake
-        let tls_stream = with_timeout(
-            &self.timer,
-            connect_dur,
-            connector.connect(server_name, tcp),
-        )
-        .await
-        .map_err(|_| ClientError::TlsHandshake {
-            kind: TlsFailureKind::Timeout,
-            message: format!("the handshake did not complete within {timeout_ms} ms"),
-        })?
-        .map_err(|e: TlsError| ClientError::TlsHandshake {
-            kind: tls_failure_kind(&e),
-            message: tls_failure_message(&e),
-        })?;
-        debug!("tls handshake complete");
-
-        // Step 1+2: COTP CR/CC
         let opts = cotp_options(&self.iso_parameters);
-        let mut cotp = CotpConnection::connect(tls_stream, opts)
-            .await
-            .map_err(|e| association_failed("cotp tls", e))?;
+
+        // Steps 0 to 2: TCP connect, TLS handshake and COTP CR/CC, under one
+        // deadline.
+        let step = core::sync::atomic::AtomicU8::new(STEP_TCP);
+        let established = with_timeout(&self.timer, Duration::from_millis(timeout_ms), async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|e| ClientError::Transport(TransportError::from(e)))?;
+            let _ = tcp.set_nodelay(true);
+            step.store(STEP_TLS_HANDSHAKE, Ordering::Relaxed);
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e: TlsError| ClientError::TlsHandshake {
+                    kind: tls_failure_kind(&e),
+                    message: tls_failure_message(&e),
+                })?;
+            debug!("tls handshake complete");
+            step.store(STEP_COTP, Ordering::Relaxed);
+            CotpConnection::connect(tls_stream, opts)
+                .await
+                .map_err(|e| association_failed("cotp tls", e))
+        })
+        .await;
+        let mut cotp = match established {
+            Ok(result) => result?,
+            Err(_) if step.load(Ordering::Relaxed) == STEP_TLS_HANDSHAKE => {
+                return Err(ClientError::TlsHandshake {
+                    kind: TlsFailureKind::Timeout,
+                    message: format!("the handshake did not complete within {timeout_ms} ms"),
+                });
+            }
+            Err(_) => return Err(ClientError::ConnectTimeout { timeout_ms }),
+        };
         debug!("cotp connection over tls established");
 
         // Step 3: Session CN + Presentation CP + ACSE AARQ + MMS Initiate-Request
@@ -625,8 +660,12 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// `connect_tls`, which drives its own COTP connection instead. On failure the
     /// connection is left `Closed`.
     ///
+    /// The COTP CR and CC are bounded by `connect_timeout_ms`.
+    ///
     /// # Errors
     ///
+    /// - `ConnectTimeout` when the COTP handshake does not complete within
+    ///   `connect_timeout_ms`.
     /// - `ServiceTimeout` when the Initiate response does not arrive within
     ///   `request_timeout_ms`.
     /// - `SessionRefused`, `AssociateFailed` or `InitiateFailed` when the peer
@@ -638,15 +677,32 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
 
         // Step 1+2: COTP CR/CC handshake
         let opts = cotp_options(&self.iso_parameters);
-        let mut cotp = match CotpConnection::connect(transport, opts).await {
-            Ok(cotp) => cotp,
-            Err(e) => {
+        let timeout_ms = self.connect_timeout_ms;
+        let established = with_timeout(
+            &self.timer,
+            Duration::from_millis(timeout_ms),
+            CotpConnection::connect(transport, opts),
+        )
+        .await;
+        let cotp = match established {
+            Ok(Ok(cotp)) => cotp,
+            Ok(Err(e)) => {
                 self.set_state(ConnectionState::Closed);
                 return Err(association_failed("cotp", e));
             }
+            Err(_) => {
+                self.set_state(ConnectionState::Closed);
+                return Err(ClientError::ConnectTimeout { timeout_ms });
+            }
         };
         debug!("cotp connection established over the supplied transport");
+        self.finish_association(cotp).await
+    }
 
+    /// Runs the Session, Presentation, ACSE and MMS Initiate negotiation over
+    /// an established COTP connection, leaving the connection `Closed` on
+    /// failure.
+    async fn finish_association(&mut self, mut cotp: CotpConnection<T>) -> Result<(), ClientError> {
         // ISO negotiation and the MMS Initiate exchange
         if let Err(e) = self.run_initiate_handshake(&mut cotp).await {
             self.set_state(ConnectionState::Closed);

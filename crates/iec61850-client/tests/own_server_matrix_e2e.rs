@@ -1170,27 +1170,45 @@ mod over_tls {
         .expect("the TLS matrix finishes within 60 s");
     }
 
-    /// A handshake the server never answers ends at the connect timeout. The
-    /// listener accepts and then neither reads nor writes, so only the timeout
-    /// can end the handshake.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_unanswered_handshake_ends_at_the_connect_timeout() {
-        let (ca, _, _) = certificates();
+    /// Accepts one connection and runs `then` on it, holding it open after.
+    async fn accept_once<F, Fut>(then: F) -> (SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("address");
-        let silent = tokio::spawn(async move {
+        let peer = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
+            then(socket).await;
+        });
+        (addr, peer)
+    }
+
+    /// A client whose connection establishment is bounded by 2 s.
+    fn client_bounded_by_two_seconds() -> IedConnection {
+        IedConnection::with_mms_client(
+            MmsClientBuilder::new()
+                .connect_timeout_ms(2_000)
+                .request_timeout_ms(2_000)
+                .build(),
+        )
+    }
+
+    /// A handshake the server never answers ends at the connect deadline as a
+    /// TLS failure of the timeout kind. The peer accepts and then neither
+    /// reads nor writes, so only the deadline can end the handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_handshake_ends_at_the_connect_deadline() {
+        let (ca, _, _) = certificates();
+        let (addr, peer) = accept_once(|socket| async move {
             std::future::pending::<()>().await;
             drop(socket);
-        });
-        let conn = IedConnection::with_mms_client(
-            MmsClientBuilder::new()
-                .connect_timeout_ms(200)
-                .request_timeout_ms(200)
-                .build(),
-        );
+        })
+        .await;
+        let conn = client_bounded_by_two_seconds();
         let kind = tokio::time::timeout(
             Duration::from_secs(30),
             handshake_failure(&conn, addr, &connector(&ca, TlsVersion::Tls13)),
@@ -1198,6 +1216,87 @@ mod over_tls {
         .await
         .expect("the connect ends");
         assert_eq!(kind, TlsFailureKind::Timeout);
-        silent.abort();
+        peer.abort();
     }
+
+    /// A peer that completes the TLS handshake and never answers the COTP
+    /// connection request ends the connect at the same deadline, as a connect
+    /// timeout rather than a TLS failure. Only the deadline can end it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_cotp_request_over_tls_ends_at_the_connect_deadline() {
+        let (ca, cert, key) = certificates();
+        let acceptor = TlsAcceptor::new(
+            TlsConfigBuilder::new()
+                .with_cert_pem(&cert, &key)
+                .expect("server certificate")
+                .build_server()
+                .expect("server config"),
+        );
+        let (addr, peer) = accept_once(move |socket| async move {
+            let stream = acceptor.accept(socket).await.expect("TLS handshake");
+            std::future::pending::<()>().await;
+            drop(stream);
+        })
+        .await;
+        let conn = client_bounded_by_two_seconds();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            conn.connect_tls(
+                addr,
+                &connector(&ca, TlsVersion::Tls13),
+                "localhost".try_into().expect("server name"),
+            ),
+        )
+        .await
+        .expect("the connect ends");
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::ConnectTimeout {
+                    after_ms: 2_000,
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
+        assert!(!conn.is_connected());
+        peer.abort();
+    }
+}
+
+/// A peer that accepts the TCP connection and never answers the COTP
+/// connection request ends the connect at the connect deadline. Only the
+/// deadline can end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unanswered_cotp_request_ends_at_the_connect_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        std::future::pending::<()>().await;
+        drop(socket);
+    });
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(2_000)
+            .request_timeout_ms(2_000)
+            .build(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), conn.connect("127.0.0.1", port))
+        .await
+        .expect("the connect ends");
+    assert!(
+        matches!(
+            result,
+            Err(ClientError::ConnectTimeout {
+                after_ms: 2_000,
+                ..
+            })
+        ),
+        "got {result:?}"
+    );
+    assert!(!conn.is_connected());
+    peer.abort();
 }

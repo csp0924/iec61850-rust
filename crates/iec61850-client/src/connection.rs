@@ -236,10 +236,13 @@ impl IedConnection<TcpStream, TokioTimer> {
     ///
     /// # Errors
     ///
-    /// A failed handshake returns [`ClientError::TlsHandshake`], whose
-    /// [`TlsFailureKind`](crate::TlsFailureKind) tells why; the handshake is
-    /// bounded by the connect timeout of the MMS client. A failure after the
-    /// handshake returns the error of that step.
+    /// The TCP connection, the TLS handshake and the COTP CR and CC share one
+    /// deadline, the connect timeout of the MMS client. A failed handshake
+    /// returns [`ClientError::TlsHandshake`], whose
+    /// [`TlsFailureKind`](crate::TlsFailureKind) tells why; running out of the
+    /// deadline during the handshake is the `Timeout` kind, and during the TCP
+    /// connection or the COTP handshake [`ClientError::ConnectTimeout`]. A
+    /// failure after these steps returns the error of that step.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &self,
