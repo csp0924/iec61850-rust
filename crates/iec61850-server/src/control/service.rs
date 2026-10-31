@@ -22,6 +22,7 @@ use super::model::{
     CancelParams, ControlAction, ControlAddCause, ControlLastApplError, ControlModel, OperParams,
 };
 use super::object::{CancelResult, ControlObject, ControlSettings, OperateBeginResult};
+use crate::connection::ConnectionId;
 use bytes::{Bytes, BytesMut};
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
@@ -86,20 +87,22 @@ pub struct RecordingCommandTermination {
 #[non_exhaustive]
 pub enum TerminationEvent {
     /// The command finished successfully.
+    #[non_exhaustive]
     Positive {
         /// Object reference the command targeted.
         obj_ref: String,
         /// Connection the command arrived on.
-        conn_id: u64,
+        conn_id: ConnectionId,
         /// Encoded Oper structure.
         oper_value: Bytes,
     },
     /// The command failed.
+    #[non_exhaustive]
     Negative {
         /// Object reference the command targeted.
         obj_ref: String,
         /// Connection the command arrived on.
-        conn_id: u64,
+        conn_id: ConnectionId,
         /// Cause reported to the client.
         add_cause: ControlAddCause,
         /// `Error` member of the LastApplError.
@@ -122,6 +125,7 @@ pub enum TerminationEvent {
 #[non_exhaustive]
 pub enum ConnectionTerminationEvent {
     /// The command finished successfully.
+    #[non_exhaustive]
     Positive {
         /// The object reference, `<LD>/<LN>$CO$<DO>`.
         obj_ref: String,
@@ -130,6 +134,7 @@ pub enum ConnectionTerminationEvent {
         oper_value: Bytes,
     },
     /// The command failed.
+    #[non_exhaustive]
     Negative {
         /// The object reference, `<LD>/<LN>$CO$<DO>`.
         obj_ref: String,

@@ -236,6 +236,7 @@ async fn dispatcher_direct_enhanced_oper_sends_command_termination_positive() {
             conn_id,
             obj_ref,
             oper_value,
+            ..
         } => {
             assert_eq!(*conn_id, 1);
             assert!(obj_ref.contains("SPCSO1"));
