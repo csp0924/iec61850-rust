@@ -9,15 +9,15 @@
 //! |---|---|
 //! | Resv | any client, moving the block from idle to reserved |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
+//! | RptEna = true | reserved, and the writer owns the reservation |
+//! | RptEna = false | enabled, and the writer owns the reservation |
+//! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
+//! | ConfRev, SqNum, Owner, TimeOfEntry | never writable; answered with ObjectAccessDenied |
 //!
 //! A DatSet write must name a data set the server knows; a name it does not
 //! know is refused with ObjectValueInvalid. An accepted DatSet write binds the
 //! control block to the members of the named data set, for URCBs and BRCBs
 //! alike.
-//! | RptEna = true | reserved, and the writer owns the reservation |
-//! | RptEna = false | enabled, and the writer owns the reservation |
-//! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
-//! | ConfRev, SqNum, Owner, TimeOfEntry | never writable; answered with ObjectAccessDenied |
 
 use super::engine::ReportingEngine;
 use crate::connection::ConnectionId;
