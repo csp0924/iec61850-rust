@@ -80,8 +80,13 @@ pub enum TlsEventCode {
     /// A connection was attempted from an unauthorized address or port. Not
     /// raised by this crate.
     AlmUnauthorizedAccess = 206,
-    /// The TLS handshake timed out. Not raised by this crate: the acceptor and
-    /// the connector apply no timeout of their own.
+    /// The TLS handshake timed out. The acceptor and the connector apply no
+    /// timeout of their own; [`TlsAcceptor::report_handshake_timeout`] raises
+    /// it for the caller that bounds the handshake, as the IEC 61850 server
+    /// does when the handshake or the association setup after it exceeds its
+    /// setup timeout.
+    ///
+    /// [`TlsAcceptor::report_handshake_timeout`]: crate::TlsAcceptor::report_handshake_timeout
     AlmHandshakeTimeout = 207,
     /// The peer aborted the handshake with a TLS alert. Raised by the acceptor
     /// and the connector.

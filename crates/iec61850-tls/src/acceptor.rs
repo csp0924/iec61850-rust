@@ -92,4 +92,65 @@ impl TlsAcceptor {
             }
         }
     }
+
+    /// Raises `AlmHandshakeTimeout` at the `Incident` level on the event
+    /// handler, with `message`, and logs it as a warning.
+    ///
+    /// [`accept`](Self::accept) applies no timeout of its own; the caller that
+    /// bounds the handshake, or the association setup that follows it, reports
+    /// the expiry through this method.
+    pub fn report_handshake_timeout(&self, message: &str) {
+        self.event_handler.on_event(
+            TlsEventLevel::Incident,
+            TlsEventCode::AlmHandshakeTimeout,
+            message,
+        );
+        tracing::warn!("{}", message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(TlsEventLevel, TlsEventCode, String)>>);
+
+    impl TlsEventHandler for Recorder {
+        fn on_event(&self, level: TlsEventLevel, code: TlsEventCode, message: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((level, code, message.to_string()));
+        }
+    }
+
+    #[test]
+    fn handshake_timeout_is_reported_as_an_incident() {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let recorder = Arc::new(Recorder::default());
+        let acceptor = TlsAcceptor {
+            inner: RustlsTlsAcceptor::from(Arc::new(config)),
+            event_handler: recorder.clone(),
+            client_auth_optional: false,
+        };
+
+        acceptor.report_handshake_timeout("setup timed out");
+
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![(
+                TlsEventLevel::Incident,
+                TlsEventCode::AlmHandshakeTimeout,
+                "setup timed out".to_string()
+            )]
+        );
+    }
 }
