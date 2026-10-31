@@ -230,12 +230,16 @@ pub struct ReportingEngineMetrics {
     /// Shared as an `Arc` so every BRCB backend increments the same counter
     /// directly instead of reporting back to the engine.
     pub dropped_buffer_full: Arc<AtomicU64>,
+    /// URCB reports and BRCB entries dropped because they cannot be encoded
+    /// within the PDU size the association negotiated.
+    pub dropped_oversized: Arc<AtomicU64>,
 }
 
 impl Default for ReportingEngineMetrics {
     fn default() -> Self {
         Self {
             dropped_buffer_full: Arc::new(AtomicU64::new(0)),
+            dropped_oversized: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -249,6 +253,11 @@ impl ReportingEngineMetrics {
     /// Returns the current `dropped_buffer_full` value.
     pub fn dropped_buffer_full(&self) -> u64 {
         self.dropped_buffer_full.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current `dropped_oversized` value.
+    pub fn dropped_oversized(&self) -> u64 {
+        self.dropped_oversized.load(Ordering::Relaxed)
     }
 }
 
@@ -1264,18 +1273,13 @@ impl ReportingEngine {
             max_pdu_size_bytes: self.max_pdu_size_bytes(conn_id),
         };
 
-        // A PduTooSmall result is a fatal configuration error: the report is dropped
-        // and sqNum is rolled back to the value taken above, so the client sees no
-        // gap. The failure is reported rather than silently skipped.
+        // A report that does not fit the negotiated PDU size is dropped, logged
+        // and counted once, and sqNum is rolled back to the value taken above,
+        // so the client sees no gap.
         let pdus = match encode_report_pdus(&params) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(
-                    mms_path = %rc.mms_path,
-                    sq_num,
-                    error = %e,
-                    "urcb report encode failed, dropping the pending report"
-                );
+                self.report_oversized(&rc.mms_path, None, &dataset_clone, &e);
                 if let Ok(mut state) = rc.state.lock() {
                     state.sq_num = sq_num;
                 }
@@ -1306,21 +1310,7 @@ impl ReportingEngine {
                     }
                     SendOutcome::WouldBlock => {
                         // This segment and the ones after it are dropped.
-                        let dropped = (segments - n) as u64;
-                        rc.metrics
-                            .dropped_socket_full
-                            .fetch_add(dropped, Ordering::Relaxed);
-                        let before = rc.metrics.consecutive_socket_full.fetch_add(
-                            u32::try_from(dropped).unwrap_or(u32::MAX),
-                            Ordering::Relaxed,
-                        );
-                        if before == 0 {
-                            tracing::warn!(
-                                conn_id,
-                                mms_path = %rc.mms_path,
-                                "report channel full, dropping urcb reports until it drains; RptEna and Resv are kept"
-                            );
-                        }
+                        self.count_urcb_drop(rc, conn_id, segments - n);
                         return None;
                     }
                     SendOutcome::ReceiverDropped | SendOutcome::NotFound => {
@@ -1350,6 +1340,54 @@ impl ReportingEngine {
         None
     }
 
+    /// Counts `dropped` report PDUs of a URCB lost to a full channel, and logs
+    /// when a run of drops starts.
+    fn count_urcb_drop(&self, rc: &ReportControl, conn_id: ConnectionId, dropped: usize) {
+        let dropped = dropped as u64;
+        rc.metrics
+            .dropped_socket_full
+            .fetch_add(dropped, Ordering::Relaxed);
+        let before = rc.metrics.consecutive_socket_full.fetch_add(
+            u32::try_from(dropped).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        if before == 0 {
+            tracing::warn!(
+                conn_id,
+                mms_path = %rc.mms_path,
+                "report channel full, dropping urcb reports until it drains; RptEna and Resv are kept"
+            );
+        }
+    }
+
+    /// Logs and counts a URCB report or BRCB entry that cannot be encoded within
+    /// the negotiated PDU size; the caller drops it.
+    fn report_oversized(
+        &self,
+        mms_path: &str,
+        entry_id: Option<super::buffer::EntryId>,
+        dataset: &Dataset,
+        error: &super::pdu::ReportEncodeError,
+    ) {
+        self.metrics
+            .dropped_oversized
+            .fetch_add(1, Ordering::Relaxed);
+        let member = match error {
+            super::pdu::ReportEncodeError::MemberTooLarge { index, .. } => dataset
+                .entry(*index)
+                .map(|e| e.attr_ref.as_str())
+                .unwrap_or_default(),
+            _ => "",
+        };
+        tracing::error!(
+            mms_path = %mms_path,
+            entry_id = entry_id.map(|id| id.as_u64()),
+            member,
+            error = %error,
+            "report does not fit the negotiated pdu size, dropping it"
+        );
+    }
+
     // ─── BRCB send path ───────────────────────────────────────────────────────
 
     /// Sends the entries a BRCB has buffered, to one client connection.
@@ -1368,12 +1406,12 @@ impl ReportingEngine {
     ///
     /// Each entry is encoded, segmented at the PDU size the association
     /// negotiated, then sent segment by segment. Every segment of an entry
-    /// carries the EntryID of that entry. `sq_num`, the transmit
-    /// anchor, and the overflow flag advance only once the last segment of an entry
-    /// has been accepted, so a partial send is retried from the same entry. A
+    /// carries the EntryID of that entry. `sq_num`, the transmit anchor, and the
+    /// overflow flag advance only once the last segment of an entry has been
+    /// accepted, so a partial send is retried from the same entry. A
     /// `WouldBlock` leaves the anchor untouched for the next attempt; a closed or
-    /// unknown receiver drops the connection; an encoding failure also leaves the
-    /// anchor untouched.
+    /// unknown receiver drops the connection. An entry that cannot be encoded within the negotiated PDU size is dropped: it is
+    /// logged and counted once, and the anchor moves past it.
     ///
     /// Every report carries, as TimeOfEntry, the time its entry entered the
     /// buffer, which is also what GetBRCBValues reads back as `TimeofEntry`; the
@@ -1495,15 +1533,14 @@ impl ReportingEngine {
             let pdus = match encode_brcb_report_pdus(&params) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::error!(
-                        mms_path = %brcb.mms_path,
-                        entry_id = entry.entry_id.as_u64(),
-                        error = %e,
-                        "brcb report encode failed, entry dropped and the anchor left in place"
-                    );
-                    // The anchor and sqNum stay put, so the entry is retried once the
-                    // configuration is corrected.
-                    return sent_count;
+                    // The entry is dropped once: the anchor moves past it, so no
+                    // later flush tries it again. sqNum stays put, since nothing
+                    // was sent.
+                    self.report_oversized(&brcb.mms_path, Some(entry.entry_id), dataset, &e);
+                    if let Ok(mut state) = brcb.state.lock() {
+                        state.transmit_anchor = TransmitAnchor::AfterEntryId(entry.entry_id);
+                    }
+                    continue;
                 }
             };
 
@@ -3805,5 +3842,108 @@ mod tests {
         // A full buffer time after the retrigger, the second value goes out.
         engine.tick_at(Instant::now() + Duration::from_secs(61), 63_000);
         assert_eq!(sink.pdus.lock().unwrap().len(), 2);
+    }
+
+    /// A data set whose first member holds a 100-byte string and whose second
+    /// holds an integer; only the second fits a 64-byte PDU.
+    fn big_and_small_ds() -> (Dataset, String, String) {
+        let big = "IED1LD0/GGIO1$ST$Big$stVal".to_string();
+        let small = "IED1LD0/GGIO1$ST$Small$stVal".to_string();
+        let ds = make_ds(vec![
+            (big.as_str(), MmsValue::VisibleString(String::new())),
+            (small.as_str(), MmsValue::Integer(0)),
+        ]);
+        (ds, big, small)
+    }
+
+    #[test]
+    fn oversized_urcb_report_is_dropped_once_and_the_next_one_is_sent() {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
+        let (ds, big, small) = big_and_small_ds();
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_rpt_id("r")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM);
+        engine
+            .register_rcb(ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb), ds)
+            .unwrap();
+        engine.register_peer(3, "10.0.0.3".parse().unwrap(), 64);
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 3);
+
+        let flag = InclusionFlag::VALUE_CHANGED;
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            engine.on_value_updated(&big, MmsValue::VisibleString("x".repeat(100)), flag, 1);
+            engine.tick_at(Instant::now(), 2);
+            engine.tick_at(Instant::now(), 3);
+            assert!(
+                sink.pdus.lock().unwrap().is_empty(),
+                "nothing over 64 bytes"
+            );
+            engine.on_value_updated(&small, MmsValue::Integer(5), flag, 4);
+            engine.tick_at(Instant::now(), 5);
+        });
+        assert_eq!(logs.errors(), 1, "the oversized report is logged once");
+        assert_eq!(engine.engine_metrics().dropped_oversized(), 1);
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(pdus.len(), 1, "the next report goes out");
+        assert!(pdus[0].1.len() <= 64);
+        // The dropped report used no sequence number: the sent one is SqNum 0.
+        assert!(contains(&pdus[0].1, &[0x86, 0x01, 0x00]));
+        assert!(rc_arc.lock().unwrap().state.lock().unwrap().rpt_ena);
+    }
+
+    #[test]
+    fn oversized_brcb_entry_is_dropped_once_and_the_next_one_is_sent() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let sink = Arc::new(CollectReportSink::default());
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
+        let (ds, big, small) = big_and_small_ds();
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_rpt_id("b")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::ENTRY_ID);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), ds)
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 64);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        let flag = InclusionFlag::VALUE_CHANGED;
+        eng.on_brcb_value_updated(&big, MmsValue::VisibleString("x".repeat(100)), flag, 1);
+        eng.on_brcb_value_updated(&small, MmsValue::Integer(5), flag, 2);
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let entries = brcb_arc.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 2);
+
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 1, "the next entry");
+            for _ in 0..50 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+            }
+        });
+        assert_eq!(logs.errors(), 1, "the oversized entry is logged once");
+        assert_eq!(eng.engine_metrics().dropped_oversized(), 1);
+        let pdus = sink.pdus.lock().unwrap();
+        assert_eq!(pdus.len(), 1);
+        assert!(pdus[0].1.len() <= 64);
+        assert!(
+            contains(&pdus[0].1, &entries[1].entry_id.0),
+            "the second entry"
+        );
+        let s = brcb_arc.state.lock().unwrap();
+        assert_eq!(
+            s.transmit_anchor,
+            TransmitAnchor::AfterEntryId(entries[1].entry_id)
+        );
+        assert_eq!(s.sq_num, 1, "only the sent entry used a sequence number");
     }
 }

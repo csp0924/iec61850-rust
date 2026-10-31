@@ -61,8 +61,8 @@
 //! `0xa3` tag and length count, the Session and Presentation envelope does not.
 //! The size of a PDU is computed before it is encoded, so a report larger than
 //! the limit is split rather than emitted as one oversized PDU. A report with a
-//! member that does not fit in a segment on its own is not sent at all; see
-//! `ReportEncodeError::PduTooSmall`.
+//! member that does not fit in a segment on its own, or whose header alone
+//! exceeds the limit, is not sent at all; see `ReportEncodeError`.
 //!
 //! ## variableAccessSpecification
 //!
@@ -108,20 +108,32 @@ pub const MIN_REPORT_OVERHEAD_BYTES: usize = 30;
 
 /// Why a report PDU could not be encoded.
 ///
-/// When the negotiated maximum PDU size cannot hold even a single data set
-/// element, encoding fails instead of sending an oversized PDU. The reporting
-/// engine logs the failure and leaves SqNum where it was. A URCB report is
-/// dropped. A BRCB entry stays at the transmit anchor and is tried again on
-/// every flush, so it is not lost and goes out once an association with a
-/// large enough PDU size enables the control block.
+/// Encoding fails instead of sending a PDU larger than the negotiated maximum
+/// PDU size. The reporting engine drops such a report, or such a buffered
+/// entry, logs it once, counts it in
+/// `ReportingEngineMetrics::dropped_oversized`, leaves SqNum where it was, and
+/// goes on with the next report or entry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReportEncodeError {
-    /// `max_pdu_size` is too small to hold a single data set element. `needed` is
-    /// the encoded size in bytes, `max` the configured limit.
-    #[error("report pdu too large: {needed} bytes exceeds the {max} byte limit even with a single element")]
+    /// The report fields alone exceed the limit, or the report needs more
+    /// segments than `subSeqNum` can number. `needed` is the encoded size in
+    /// bytes, `max` the limit.
+    #[error("report pdu too large: {needed} bytes exceeds the {max} byte limit")]
     PduTooSmall {
         /// Encoded size in bytes.
+        needed: usize,
+        /// Configured maximum PDU size in bytes.
+        max: usize,
+    },
+    /// One data set member does not fit in a segment together with the report
+    /// fields. `index` is its position in the data set, `needed` the size of
+    /// the smallest PDU carrying it, in bytes, and `max` the limit.
+    #[error("data set member {index} needs a {needed} byte pdu, over the {max} byte limit")]
+    MemberTooLarge {
+        /// Position of the member in the data set.
+        index: usize,
+        /// Size of the smallest PDU that carries the member, in bytes.
         needed: usize,
         /// Configured maximum PDU size in bytes.
         max: usize,
@@ -203,10 +215,11 @@ impl<'a> ReportEncodeParams<'a> {
 ///
 /// # Errors
 ///
-/// Returns `ReportEncodeError::PduTooSmall` when the report fields together with
-/// a single data set element do not fit within the limit, or when a report would
-/// need more segments than `subSeqNum` can number. The caller must not advance
-/// sqNum on that error.
+/// Returns `ReportEncodeError::MemberTooLarge` when a data set member does not
+/// fit in a segment together with the report fields, and
+/// `ReportEncodeError::PduTooSmall` when the report fields alone exceed the
+/// limit or a report would need more segments than `subSeqNum` can number.
+/// The caller must not advance sqNum on either error.
 pub fn encode_report_pdus(
     params: &ReportEncodeParams<'_>,
 ) -> Result<Vec<Bytes>, ReportEncodeError> {
@@ -448,7 +461,14 @@ fn encode_pdus(
             end += 1;
         }
         if end == start {
-            return Err(ReportEncodeError::PduTooSmall {
+            if pdu_len(seg_fixed) > limit {
+                return Err(ReportEncodeError::PduTooSmall {
+                    needed: pdu_len(seg_fixed),
+                    max: limit,
+                });
+            }
+            return Err(ReportEncodeError::MemberTooLarge {
+                index: members[start].index,
                 needed: pdu_len(seg_fixed + costs[start]),
                 max: limit,
             });
@@ -772,8 +792,7 @@ impl<'a> BrcbReportEncodeParams<'a> {
 ///
 /// # Errors
 ///
-/// Returns `ReportEncodeError::PduTooSmall` when the report fields together with
-/// a single data set element do not fit within the limit.
+/// Returns the errors of `encode_report_pdus`, under the same conditions.
 pub fn encode_brcb_report_pdus(
     params: &BrcbReportEncodeParams<'_>,
 ) -> Result<Vec<Bytes>, ReportEncodeError> {
@@ -1566,7 +1585,11 @@ mod tests {
         };
         assert!(matches!(
             encode_report_pdus(&params),
-            Err(ReportEncodeError::PduTooSmall { max: 65_535, .. })
+            Err(ReportEncodeError::MemberTooLarge {
+                index: 0,
+                max: 65_535,
+                ..
+            })
         ));
     }
 

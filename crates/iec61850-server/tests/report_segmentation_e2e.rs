@@ -300,3 +300,75 @@ async fn brcb_buffered_entry_and_gi_are_segmented_at_the_negotiated_pdu_size() {
     assert_ne!(gi[0].report.entry_id.as_ref(), Some(&entry_id));
     assert_ne!(gi[0].report.seq_num, entry[0].report.seq_num);
 }
+
+/// A BRCB entry with a member too large for a 64-byte PDU is dropped once,
+/// and the entries after it are reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_entry_too_large_for_a_64_byte_pdu_is_dropped_and_the_next_is_sent() {
+    let server = IedServer::builder()
+        .model(build_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .build()
+        .expect("server build");
+    let text = DataAttribute::with_shared_value(
+        "d",
+        FC::Dc,
+        DataAttributeType::VisibleString(255),
+        TrgOps::DCHG,
+        Arc::new(RwLock::new(MmsValue::VisibleString(String::new()))),
+    );
+    let count = DataAttribute::with_shared_value(
+        "i",
+        FC::Mx,
+        DataAttributeType::Int32,
+        TrgOps::DCHG,
+        Arc::new(RwLock::new(MmsValue::Integer(0))),
+    );
+    let mut ds = Dataset::new("LLN0$dsTiny");
+    ds.push(DatasetEntry::new("t", Arc::clone(&text.value)));
+    ds.push(DatasetEntry::new("c", Arc::clone(&count.value)));
+    let brcb = Brcb::new("b", "LLN0$dsTiny")
+        .with_rpt_id("b")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(OptFlds::SEQ_NUM);
+    server
+        .register_brcb(
+            BufferedReportControl::new(format!("{DOMAIN}/LLN0$BR$b"), brcb),
+            ds,
+        )
+        .expect("register_brcb");
+    let handle = server.start().await.expect("server start");
+
+    // Buffered before any client connects: the first entry cannot fit 64 bytes.
+    server
+        .update_visible_string(&text, "x".repeat(100))
+        .expect("update");
+    server.update_int32(&count, 7).expect("update");
+
+    let mut mms = MmsClientBuilder::new()
+        .connect_timeout_ms(3_000)
+        .request_timeout_ms(3_000)
+        .local_max_pdu_size(64)
+        .build();
+    mms.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+    write(&mut mms, "LLN0$BR$b$RptEna", true).await;
+    let s = next_segment(&mut mms).await;
+    assert!(s.pdu_len <= 64, "{} bytes", s.pdu_len);
+    assert_eq!(s.report.inclusion_bits, vec![false, true]);
+    assert_eq!(s.report.data_values, vec![MmsValue::Integer(7)]);
+    assert_eq!(s.report.seq_num, Some(0), "the dropped entry used no SqNum");
+
+    // Later entries keep coming.
+    server.update_int32(&count, 8).expect("update");
+    let s = next_segment(&mut mms).await;
+    assert_eq!(s.report.data_values, vec![MmsValue::Integer(8)]);
+    let engine = server.reporting_engine();
+    let dropped = engine
+        .lock()
+        .expect("engine")
+        .engine_metrics()
+        .dropped_oversized();
+    assert_eq!(dropped, 1, "the oversized entry is counted once");
+}
