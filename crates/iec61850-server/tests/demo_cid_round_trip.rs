@@ -532,11 +532,12 @@ fn emit_rcb(out: &mut String, rcb: &ReportControlBlock) {
     use iec61850_model::cb::OptFlds;
     let _ = writeln!(
         out,
-        r#"            <ReportControl name="{}" rptID="{}" datSet="{}" buffered="{}" confRev="{}" bufTime="{}" intgPd="{}">"#,
+        r#"            <ReportControl name="{}" rptID="{}" datSet="{}" buffered="{}" indexed="{}" confRev="{}" bufTime="{}" intgPd="{}">"#,
         esc(&rcb.name),
         esc(&rcb.rpt_id),
         esc(&rcb.dataset_ref),
         rcb.is_buffered,
+        rcb.indexed,
         rcb.conf_rev,
         rcb.buf_tm_ms,
         rcb.intg_pd_ms
@@ -563,6 +564,11 @@ fn emit_rcb(out: &mut String, rcb: &ReportControlBlock) {
         o.contains(OptFlds::CONF_REV),
         o.contains(OptFlds::BUFFER_OVERFLOW),
         o.contains(OptFlds::SEGMENTATION)
+    );
+    let _ = writeln!(
+        out,
+        r#"              <RptEnabled max="{}"/>"#,
+        rcb.max_instances
     );
     let _ = writeln!(out, "            </ReportControl>");
 }

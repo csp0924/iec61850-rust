@@ -173,7 +173,11 @@ fn build_ln(
 
     // Report control blocks
     for raw_rcb in &raw_ln.report_controls {
-        ln_b = ln_b.add_rcb(build_rcb(raw_rcb));
+        let path = format!(
+            "SCL/.../LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/ReportControl[name=\"{}\"]",
+            ld_inst, raw_ln.ln_class, raw_ln.inst, raw_rcb.name
+        );
+        ln_b = ln_b.add_rcb(build_rcb(raw_rcb, &path)?);
     }
 
     // GOOSE control blocks
@@ -682,11 +686,18 @@ pub fn fcda_do_path(
 
 /// Converts a `<ReportControl>` into a [`ReportControlBlock`].
 ///
-/// The trigger options, option fields, integrity period and buffer time are
-/// part of the model schema, so a model built from an `.icd` needs no further
-/// configuration. The report instance limit stays a server runtime setting and
-/// is not carried here.
-fn build_rcb(raw_rcb: &RawReportControlBlock) -> ReportControlBlock {
+/// The trigger options, option fields, integrity period, buffer time and the
+/// instance count and naming are part of the model schema, so a model built
+/// from an `.icd` needs no further configuration; see [`report_instances`].
+///
+/// # Errors
+///
+/// Whatever [`report_instances`] reports.
+fn build_rcb(
+    raw_rcb: &RawReportControlBlock,
+    path: &str,
+) -> Result<ReportControlBlock, SclParseError> {
+    let (indexed, max_instances) = report_instances(raw_rcb, path)?;
     let mut rcb = ReportControlBlock::new(
         raw_rcb.name.clone(),
         raw_rcb.dat_set.clone().unwrap_or_default(),
@@ -698,7 +709,55 @@ fn build_rcb(raw_rcb: &RawReportControlBlock) -> ReportControlBlock {
     rcb.opt_flds = opt_fields_to_model(raw_rcb.opt_fields);
     rcb.buf_tm_ms = raw_rcb.buf_time;
     rcb.intg_pd_ms = raw_rcb.intg_pd;
-    rcb
+    rcb.indexed = indexed;
+    rcb.max_instances = max_instances;
+    Ok(rcb)
+}
+
+/// Returns the `indexed` flag and the instance count of a `<ReportControl>`.
+///
+/// The count is the `max` of `<RptEnabled>`, 1 when the element is absent
+/// (IEC 61850-6 tRptEnabled). An indexed block names its instances with a
+/// two-digit suffix from 01 to `max` (IEC 61850-8-1 §17.1.2, §17.1.3), so
+/// `max` stays within 99. A block that is not indexed can only have a single
+/// instance; a larger `max` on one is logged and counted as 1.
+///
+/// Also used by the build-script path, so a generated model applies the same
+/// limits.
+///
+/// # Errors
+///
+/// [`ErrorKind::AttributeValueInvalid`] when an indexed block declares more
+/// than 99 instances.
+pub fn report_instances(
+    raw_rcb: &RawReportControlBlock,
+    path: &str,
+) -> Result<(bool, u32), SclParseError> {
+    let max = raw_rcb.rpt_enabled_max.unwrap_or(1);
+    if !raw_rcb.indexed {
+        if max > 1 {
+            tracing::warn!(
+                path,
+                max,
+                "a report control block with indexed=\"false\" has a single instance; RptEnabled max is counted as 1"
+            );
+        }
+        return Ok((false, 1));
+    }
+    if max > 99 {
+        return Err(SclParseError::at(
+            raw_rcb.span,
+            format!("{path}/RptEnabled"),
+            ErrorKind::AttributeValueInvalid {
+                name: "max".to_string(),
+                expected_type: "u32 (1..=99, the two-digit instance suffix)".to_string(),
+                raw_value: max.to_string(),
+                cause: None,
+            },
+        )
+        .with_attribute("max"));
+    }
+    Ok((true, max))
 }
 
 /// Converts a `<GSEControl>` into a [`GooseControlBlock`], whose GoID comes

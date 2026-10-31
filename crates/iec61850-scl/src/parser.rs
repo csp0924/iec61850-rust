@@ -934,10 +934,8 @@ fn handle_start(
                 ));
             }
         }
-        // Still skipped: RptEnabled and Inputs.
-        // RptEnabled belongs to service negotiation, where a client limits the
-        // number of report instances, and the model does not need it. Inputs
-        // belongs to GOOSE subscription, which this parser does not read.
+        // Still skipped: Inputs, which belongs to GOOSE subscription and is
+        // not read by this parser.
         "SettingControl" => {
             // A SettingControl belongs to the setting groups of IEC 61850-6
             // §9.3.3: it is attached to LN0, at most once per logical node. It
@@ -967,20 +965,43 @@ fn handle_start(
             }
             state.enter_skip(name.clone());
         }
-        "RptEnabled" | "Inputs" => {
-            // The parent has to be plausible, so a broken structure is not let
-            // through unnoticed.
-            if name == "RptEnabled" {
-                if state.cur_report_control.is_none() {
+        "RptEnabled" => {
+            // `max` is the number of instances of the enclosing report control
+            // block (IEC 61850-6 tRptEnabled); the ClientLN children are not
+            // read, so the subtree is skipped after the attributes.
+            let path = state.path_str();
+            let max = parse_optional::<u32>(start.attributes(), "max", span, &path)?.unwrap_or(1);
+            if max == 0 {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::AttributeValueInvalid {
+                        name: "max".to_string(),
+                        expected_type: "u32 (at least 1)".to_string(),
+                        raw_value: max.to_string(),
+                        cause: None,
+                    },
+                )
+                .with_attribute("max"));
+            }
+            match state.cur_report_control.as_mut() {
+                Some(rc) => rc.rpt_enabled_max = Some(max),
+                None => {
                     return Err(SclParseError::at(
                         span,
-                        state.path_str(),
+                        path,
                         ErrorKind::Xml(
                             "`<RptEnabled>` must appear inside `<ReportControl>`".into(),
                         ),
                     ));
                 }
-            } else if state.cur_ln.is_none() {
+            }
+            state.enter_skip(name.clone());
+        }
+        "Inputs" => {
+            // The parent has to be plausible, so a broken structure is not let
+            // through unnoticed.
+            if state.cur_ln.is_none() {
                 return Err(SclParseError::at(
                     span,
                     state.path_str(),
@@ -1796,8 +1817,7 @@ fn build_fcda(
 /// handlers. When either element is absent, `default_when_missing` supplies the
 /// value, so a file that omits it parses instead of failing.
 ///
-/// `<RptEnabled>` is skipped: it belongs to service negotiation, where a client
-/// limits the number of report instances, and the model does not need it.
+/// The `max` of the `<RptEnabled>` child is read by its own start handler.
 ///
 /// # Errors
 ///
@@ -1817,7 +1837,8 @@ fn build_report_control(
         parse_optional::<bool>(start.attributes(), "buffered", span, path)?.unwrap_or(false);
     let intg_pd = parse_optional::<u32>(start.attributes(), "intgPd", span, path)?.unwrap_or(0);
     let buf_time = parse_optional::<u32>(start.attributes(), "bufTime", span, path)?.unwrap_or(0);
-    let rpt_enabled_max = parse_optional::<u32>(start.attributes(), "rptEnabledMax", span, path)?;
+    let indexed =
+        parse_optional::<bool>(start.attributes(), "indexed", span, path)?.unwrap_or(true);
     Ok(RawReportControlBlock {
         name,
         rpt_id,
@@ -1830,7 +1851,8 @@ fn build_report_control(
         // overwrites them.
         trg_ops: TriggerOptionsBits::default_when_missing(),
         opt_fields: OptionFieldsBits::default_when_missing(),
-        rpt_enabled_max,
+        indexed,
+        rpt_enabled_max: None,
         span,
     })
 }

@@ -121,3 +121,88 @@ fn raw_log_control_reason_code_defaults_to_true() {
     assert!(ln0.log_controls[0].reason_code);
     assert!(ln0.log_controls[0].log_ena);
 }
+
+/// `indexed` and the `max` of `<RptEnabled>` reach the model, and the model
+/// names the instances `name01` to `nameNN`.
+#[test]
+fn rpt_enabled_max_and_indexed_reach_the_model() {
+    let m = build(&wrap(
+        r#"<ReportControl name="EventsBRCB" datSet="ds1" buffered="true">
+             <RptEnabled max="3"><ClientLN iedName="C1" ldInst="LD0" lnClass="IHMI" lnInst="1"/></RptEnabled>
+           </ReportControl>
+           <ReportControl name="urcbA" datSet="ds1" indexed="false"/>"#,
+    ));
+    let rcbs = rcbs(&m);
+    assert!(rcbs[0].indexed);
+    assert_eq!(rcbs[0].max_instances, 3);
+    assert_eq!(
+        rcbs[0].instance_names(),
+        ["EventsBRCB01", "EventsBRCB02", "EventsBRCB03"]
+    );
+    assert!(!rcbs[1].indexed);
+    assert_eq!(rcbs[1].max_instances, 1);
+    assert_eq!(rcbs[1].instance_names(), ["urcbA"]);
+}
+
+/// The raw `<ReportControl>` reads `max` from the `<RptEnabled>` child,
+/// leaves it unset without one, and defaults `indexed` to true.
+#[test]
+fn raw_report_control_reads_the_rpt_enabled_child() {
+    let raw = iec61850_scl::parse_scl(&wrap(
+        r#"<ReportControl name="a" datSet="ds1"><RptEnabled max="5"/></ReportControl>
+           <ReportControl name="b" datSet="ds1"/>
+           <ReportControl name="c" datSet="ds1"><RptEnabled/></ReportControl>"#,
+    ))
+    .expect("parse");
+    let ln0 = &raw.ieds[0].access_points[0]
+        .server
+        .as_ref()
+        .expect("server")
+        .logical_devices[0]
+        .logical_nodes[0];
+    let rc = &ln0.report_controls;
+    assert_eq!(rc[0].rpt_enabled_max, Some(5));
+    assert_eq!(rc[1].rpt_enabled_max, None);
+    assert_eq!(rc[2].rpt_enabled_max, Some(1));
+    assert!(rc.iter().all(|r| r.indexed));
+}
+
+/// `max="0"` is rejected, and so are more than 99 indexed instances, which a
+/// two-digit suffix cannot name.
+#[test]
+fn impossible_instance_counts_are_rejected() {
+    for body in [
+        r#"<ReportControl name="a" datSet="ds1"><RptEnabled max="0"/></ReportControl>"#,
+        r#"<ReportControl name="a" datSet="ds1"><RptEnabled max="100"/></ReportControl>"#,
+    ] {
+        assert!(try_build(&wrap(body)).is_err(), "{body} accepted");
+    }
+    // Control: the bounds themselves are accepted.
+    for body in [
+        r#"<ReportControl name="a" datSet="ds1"><RptEnabled max="99"/></ReportControl>"#,
+        r#"<ReportControl name="a" datSet="ds1" indexed="false"><RptEnabled max="1"/></ReportControl>"#,
+    ] {
+        assert!(try_build(&wrap(body)).is_ok(), "{body} rejected");
+    }
+}
+
+/// A block that is not indexed has a single instance, however large the
+/// `max` it declares.
+#[test]
+fn unindexed_block_counts_one_instance() {
+    let m = build(&wrap(
+        r#"<ReportControl name="a" datSet="ds1" indexed="false"><RptEnabled max="2"/></ReportControl>"#,
+    ));
+    assert_eq!(rcbs(&m)[0].max_instances, 1);
+    assert_eq!(rcbs(&m)[0].instance_names(), ["a"]);
+}
+
+/// The attribute `rptEnabledMax` does not exist in IEC 61850-6 and no longer
+/// sets the instance count.
+#[test]
+fn rpt_enabled_max_attribute_is_not_read() {
+    let m = build(&wrap(
+        r#"<ReportControl name="a" datSet="ds1" rptEnabledMax="7"/>"#,
+    ));
+    assert_eq!(rcbs(&m)[0].max_instances, 1);
+}

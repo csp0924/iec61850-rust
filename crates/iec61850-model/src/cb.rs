@@ -17,7 +17,8 @@ use crate::types::TrgOps;
 /// Carries the full static schema of an SCL `<ReportControl>` element: the
 /// name, the buffering flag, the referenced data set, the configuration
 /// revision, the report identifier, the trigger options, the option fields,
-/// the buffer time and the integrity period.
+/// the buffer time, the integrity period, and how many instances the block
+/// declares and how they are named.
 ///
 /// Runtime state - whether reporting is enabled, which client owns the block,
 /// the current entry identifier - stays in the server crate and is not mixed
@@ -53,6 +54,12 @@ pub struct ReportControlBlock {
     /// `0` disables the periodic trigger, and the value only matters when
     /// `trg_ops` contains `TrgOps::INTEGRITY`.
     pub intg_pd_ms: u32,
+    /// The SCL `indexed` attribute: whether each instance name carries a
+    /// two-digit suffix. See [`instance_names`](Self::instance_names).
+    pub indexed: bool,
+    /// The `max` attribute of the SCL `<RptEnabled>` element: how many
+    /// instances of this block the logical node holds, at least 1.
+    pub max_instances: u32,
 }
 
 impl ReportControlBlock {
@@ -62,8 +69,9 @@ impl ReportControlBlock {
     /// The other fields take the values an SCL `<ReportControl>` gets when the
     /// corresponding attribute or child element is absent: `is_buffered` is
     /// `false`, `conf_rev` is 0, `rpt_id` is empty, `trg_ops` is
-    /// [`TrgOps::NONE`], `opt_flds` is [`OptFlds::BUFFER_OVERFLOW`], and
-    /// `buf_tm_ms` and `intg_pd_ms` are 0.
+    /// [`TrgOps::NONE`], `opt_flds` is [`OptFlds::BUFFER_OVERFLOW`],
+    /// `buf_tm_ms` and `intg_pd_ms` are 0, `indexed` is `true` and
+    /// `max_instances` is 1.
     pub fn new(name: impl Into<String>, dataset_ref: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -75,7 +83,25 @@ impl ReportControlBlock {
             opt_flds: OptFlds::BUFFER_OVERFLOW,
             buf_tm_ms: 0,
             intg_pd_ms: 0,
+            indexed: true,
+            max_instances: 1,
         }
+    }
+
+    /// Returns the names of the instances this block declares, in order.
+    ///
+    /// With `indexed` set, each name is `name` followed by a two-digit index
+    /// from `01` to `max_instances` (IEC 61850-8-1 §17.1.2, §17.1.3, and
+    /// IEC 61850-6 `RptEnabled`); otherwise the single instance is named
+    /// `name`. A `max_instances` of 0 counts as 1, and an index above 99, which
+    /// two digits cannot hold, is not produced.
+    pub fn instance_names(&self) -> Vec<String> {
+        if !self.indexed {
+            return vec![self.name.clone()];
+        }
+        (1..=self.max_instances.clamp(1, 99))
+            .map(|i| format!("{}{i:02}", self.name))
+            .collect()
     }
 }
 
@@ -372,6 +398,42 @@ impl core::ops::BitOr for OptFlds {
 impl core::ops::BitOrAssign for OptFlds {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
+    }
+}
+
+#[cfg(test)]
+mod rcb_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_instances_carry_a_two_digit_suffix() {
+        let mut rcb = ReportControlBlock::new("EventsBRCB", "LLN0$Events");
+        assert_eq!(rcb.instance_names(), ["EventsBRCB01"]);
+        rcb.max_instances = 3;
+        assert_eq!(
+            rcb.instance_names(),
+            ["EventsBRCB01", "EventsBRCB02", "EventsBRCB03"]
+        );
+        rcb.max_instances = 12;
+        assert_eq!(rcb.instance_names().last().unwrap(), "EventsBRCB12");
+    }
+
+    #[test]
+    fn unindexed_block_has_one_instance_named_as_declared() {
+        let mut rcb = ReportControlBlock::new("urcbA", "LLN0$Events");
+        rcb.indexed = false;
+        assert_eq!(rcb.instance_names(), ["urcbA"]);
+    }
+
+    #[test]
+    fn instance_count_stays_within_two_digits() {
+        let mut rcb = ReportControlBlock::new("r", "LLN0$Events");
+        rcb.max_instances = 0;
+        assert_eq!(rcb.instance_names(), ["r01"]);
+        rcb.max_instances = 150;
+        let names = rcb.instance_names();
+        assert_eq!(names.len(), 99);
+        assert_eq!(names.last().unwrap(), "r99");
     }
 }
 

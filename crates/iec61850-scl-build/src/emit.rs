@@ -29,8 +29,8 @@ use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
     attribute_type, derives_setting_view, fcda_do_path, gse_control_go_id, ld_domain_name,
-    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance,
-    template_initial_value, warn_count_not_modeled, MmsValue,
+    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, report_instances,
+    skip_indexed_instance, template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -277,7 +277,7 @@ fn emit_ln_expr(
     let rcb_exprs = sorted_by_name(ln.report_controls.iter(), cfg, |r| r.name.as_str())
         .into_iter()
         .map(emit_rcb_expr)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let gocb_exprs = sorted_by_name(ln.gse_controls.iter(), cfg, |g| g.name.as_str())
         .into_iter()
         .map(|g| emit_gocb_expr(g, domain))
@@ -611,7 +611,9 @@ fn emit_fcda_expr(
 // 6. Control blocks
 // -----------------------------------------------------------------------------
 
-fn emit_rcb_expr(r: &RawReportControlBlock) -> TokenStream {
+fn emit_rcb_expr(r: &RawReportControlBlock) -> Result<TokenStream, CompileError> {
+    let (indexed, max_instances) =
+        report_instances(r, "ReportControl").map_err(CompileError::ResolveScl)?;
     let name = r.name.as_str();
     let is_buffered = r.buffered;
     let dataset_ref = r.dat_set.clone().unwrap_or_default();
@@ -621,7 +623,7 @@ fn emit_rcb_expr(r: &RawReportControlBlock) -> TokenStream {
     let opt_flds_tok = emit_opt_flds(r.opt_fields);
     let buf_tm_ms = r.buf_time;
     let intg_pd_ms = r.intg_pd;
-    quote! {
+    Ok(quote! {
         {
             let mut __rcb = ReportControlBlock::new(
                 ::std::string::String::from(#name),
@@ -634,9 +636,11 @@ fn emit_rcb_expr(r: &RawReportControlBlock) -> TokenStream {
             __rcb.opt_flds = #opt_flds_tok;
             __rcb.buf_tm_ms = #buf_tm_ms;
             __rcb.intg_pd_ms = #intg_pd_ms;
+            __rcb.indexed = #indexed;
+            __rcb.max_instances = #max_instances;
             __rcb
         }
-    }
+    })
 }
 
 fn emit_gocb_expr(g: &RawGseControl, domain: &str) -> TokenStream {

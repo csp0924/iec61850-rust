@@ -268,7 +268,11 @@ pub struct RawReportControlBlock {
     pub trg_ops: TriggerOptionsBits,
     /// The `<OptFields>` child, or its default when the element is absent.
     pub opt_fields: OptionFieldsBits,
-    /// The `max` attribute of the `<RptEnabled>` child.
+    /// The `indexed` attribute, which defaults to true.
+    pub indexed: bool,
+    /// The `max` attribute of the `<RptEnabled>` child, 1 when the element
+    /// carries none; `None` when there is no `<RptEnabled>`, in which case the
+    /// block has a single instance.
     pub rpt_enabled_max: Option<u32>,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
