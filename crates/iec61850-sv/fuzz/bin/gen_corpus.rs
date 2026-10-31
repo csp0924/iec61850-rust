@@ -53,64 +53,50 @@ fn encode_pdu(pdu: &SavPdu) -> Vec<u8> {
 }
 
 fn make_minimal_asdu(sv_id: &str, sample_size: usize) -> Asdu {
-    Asdu {
-        sv_id: sv_id.to_string(),
-        dat_set: None,
-        smp_cnt: 0,
-        conf_rev: 1,
-        refr_tm: None,
-        smp_synch: SmpSynch::GlobalClock,
-        smp_rate: None,
-        sample: vec![0u8; sample_size],
-        smp_mod: None,
-        gm_identity: None,
-    }
+    let mut asdu = Asdu::new(sv_id.to_string(), 0, vec![0u8; sample_size]);
+    asdu.smp_synch = SmpSynch::GlobalClock;
+    asdu
 }
 
 fn make_pdu_minimal() -> SavPdu {
-    SavPdu {
-        asdus: vec![make_minimal_asdu("svMin", 8)],
-    }
+    SavPdu::new(vec![make_minimal_asdu("svMin", 8)])
 }
 
 fn make_pdu_two_asdu() -> SavPdu {
-    SavPdu {
-        asdus: vec![make_minimal_asdu("sv01", 8), make_minimal_asdu("sv02", 8)],
-    }
+    SavPdu::new(vec![
+        make_minimal_asdu("sv01", 8),
+        make_minimal_asdu("sv02", 8),
+    ])
 }
 
 fn make_pdu_9_2_le() -> SavPdu {
     // IEC 61850-9-2 LE: a 64-byte sample, eight channels of eight bytes.
-    SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "MUnn01".to_string(),
-            dat_set: Some("MUnn01/LLN0$dataset".to_string()),
-            smp_cnt: 1234,
-            conf_rev: 1,
-            refr_tm: Some([0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0xA0]),
-            smp_synch: SmpSynch::GlobalClock,
-            smp_rate: Some(4000),
-            sample: vec![0x55u8; 64],
-            smp_mod: Some(SmpMod::PerNominalPeriod),
-            gm_identity: Some([0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED, 0xFA, 0xCE]),
-        }],
-    }
+    SavPdu::new(vec![{
+        let mut asdu = Asdu::new("MUnn01".to_string(), 1234, vec![0x55u8; 64]);
+        asdu.dat_set = Some("MUnn01/LLN0$dataset".to_string());
+        asdu.refr_tm = Some([0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0xA0]);
+        asdu.smp_synch = SmpSynch::GlobalClock;
+        asdu.smp_rate = Some(4000);
+        asdu.smp_mod = Some(SmpMod::PerNominalPeriod);
+        asdu.gm_identity = Some([0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED, 0xFA, 0xCE]);
+        asdu
+    }])
 }
 
 fn make_pdu_all_optional() -> SavPdu {
     // Every optional field is present, so the full decode path is exercised.
     let mut pdu = make_pdu_9_2_le();
-    pdu.asdus.push(Asdu {
-        sv_id: "MUnn02".to_string(),
-        dat_set: Some("ds2".to_string()),
-        smp_cnt: 65534,
-        conf_rev: 0xCAFEBABE,
-        refr_tm: Some([0xFF; 8]),
-        smp_synch: SmpSynch::LocalIdentified(100),
-        smp_rate: Some(0xFFFF),
-        sample: vec![0xAA; 128], // over 127 bytes, forcing long-form length
-        smp_mod: Some(SmpMod::SamplesPerSecond),
-        gm_identity: Some([0u8; 8]),
+    pdu.asdus.push({
+        // The 128-byte sample, over 127 bytes, forces a long-form length.
+        let mut asdu = Asdu::new("MUnn02".to_string(), 65534, vec![0xAA; 128]);
+        asdu.dat_set = Some("ds2".to_string());
+        asdu.conf_rev = 0xCAFEBABE;
+        asdu.refr_tm = Some([0xFF; 8]);
+        asdu.smp_synch = SmpSynch::LocalIdentified(100);
+        asdu.smp_rate = Some(0xFFFF);
+        asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+        asdu.gm_identity = Some([0u8; 8]);
+        asdu
     });
     pdu
 }
@@ -307,13 +293,9 @@ fn poison_no_asdu_multi_octet() -> Vec<u8> {
 // -- Frame builders --
 
 fn make_frame(pdu_bytes: Vec<u8>, vlan: Option<VlanTag>) -> Vec<u8> {
-    let header = SvFrameHeader {
-        dst_mac: SV_DEFAULT_DST_MAC,
-        src_mac: [0x02, 0, 0, 0, 0, 1],
-        vlan,
-        app_id: 0x4000,
-        length: (pdu_bytes.len() + 8) as u16,
-    };
+    let mut header = SvFrameHeader::new(SV_DEFAULT_DST_MAC, [0x02, 0, 0, 0, 0, 1], 0x4000);
+    header.vlan = vlan;
+    header.length = (pdu_bytes.len() + 8) as u16;
     let frame = SvFrame { header, pdu_bytes };
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).expect("frame encode");
@@ -376,11 +358,7 @@ fn main() {
         "large_sample_long_form_length.bin",
         &poison_large_sample_long_form_length(),
     );
-    write_seed(
-        &pdu_dir,
-        "sample_size_zero.bin",
-        &poison_sample_size_zero(),
-    );
+    write_seed(&pdu_dir, "sample_size_zero.bin", &poison_sample_size_zero());
     write_seed(&pdu_dir, "sv_id_too_long.bin", &poison_sv_id_too_long());
     write_seed(&pdu_dir, "dat_set_too_long.bin", &poison_dat_set_too_long());
     write_seed(

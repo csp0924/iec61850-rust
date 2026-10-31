@@ -10,18 +10,7 @@ use iec61850_sv::pdu::{
 use iec61850_sv::SvError;
 
 fn minimal_asdu(sv_id: &str, smp_cnt: u16) -> Asdu {
-    Asdu {
-        sv_id: sv_id.to_owned(),
-        dat_set: None,
-        smp_cnt,
-        conf_rev: 1,
-        refr_tm: None,
-        smp_synch: SmpSynch::NotSynced,
-        smp_rate: None,
-        sample: vec![0u8; 8],
-        smp_mod: None,
-        gm_identity: None,
-    }
+    Asdu::new(sv_id.to_owned(), smp_cnt, vec![0u8; 8])
 }
 
 fn encode_decode(pdu: &SavPdu) -> SavPdu {
@@ -32,9 +21,7 @@ fn encode_decode(pdu: &SavPdu) -> SavPdu {
 
 #[test]
 fn minimal_asdu_byte_exact_roundtrip() {
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu("TESTLD/LLN0$SV$sv1", 0)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu("TESTLD/LLN0$SV$sv1", 0)]);
     let mut buf1 = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf1).unwrap();
 
@@ -53,29 +40,24 @@ fn minimal_asdu_byte_exact_roundtrip() {
 
 #[test]
 fn minimal_asdu_roundtrip_2() {
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu("IED2/LLN0$SV$myStream", 4000)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu("IED2/LLN0$SV$myStream", 4000)]);
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded, pdu);
 }
 
 #[test]
 fn full_optional_fields_roundtrip() {
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "IED1/LLN0$SV$fullSV".to_owned(),
-            dat_set: Some("IED1/LLN0$SV$testDS".to_owned()),
-            smp_cnt: 100,
-            conf_rev: 0xABCDEF01,
-            refr_tm: Some([0x5F, 0xA1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD]),
-            smp_synch: SmpSynch::GlobalClock,
-            smp_rate: Some(4000),
-            sample: vec![0xABu8; 64],
-            smp_mod: Some(SmpMod::SamplesPerSecond),
-            gm_identity: Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
-        }],
-    };
+    let pdu = SavPdu::new(vec![{
+        let mut asdu = Asdu::new("IED1/LLN0$SV$fullSV".to_owned(), 100, vec![0xABu8; 64]);
+        asdu.dat_set = Some("IED1/LLN0$SV$testDS".to_owned());
+        asdu.conf_rev = 0xABCDEF01;
+        asdu.refr_tm = Some([0x5F, 0xA1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD]);
+        asdu.smp_synch = SmpSynch::GlobalClock;
+        asdu.smp_rate = Some(4000);
+        asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+        asdu.gm_identity = Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        asdu
+    }]);
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded, pdu);
     let a = &decoded.asdus[0];
@@ -94,9 +76,7 @@ fn full_optional_fields_roundtrip() {
 
 #[test]
 fn no_asdu_1_roundtrip() {
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu("sv1", 1)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu("sv1", 1)]);
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded.asdus.len(), 1);
     assert_eq!(decoded, pdu);
@@ -104,9 +84,7 @@ fn no_asdu_1_roundtrip() {
 
 #[test]
 fn no_asdu_2_roundtrip() {
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu("sv1", 10), minimal_asdu("sv2", 20)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu("sv1", 10), minimal_asdu("sv2", 20)]);
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded.asdus.len(), 2);
     assert_eq!(decoded.asdus[0].sv_id, "sv1");
@@ -116,11 +94,11 @@ fn no_asdu_2_roundtrip() {
 
 #[test]
 fn no_asdu_4_roundtrip() {
-    let pdu = SavPdu {
-        asdus: (0..4)
+    let pdu = SavPdu::new(
+        (0..4)
             .map(|i| minimal_asdu(&format!("sv{}", i), i as u16 * 100))
             .collect(),
-    };
+    );
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded.asdus.len(), 4);
     assert_eq!(decoded, pdu);
@@ -129,11 +107,11 @@ fn no_asdu_4_roundtrip() {
 #[test]
 fn no_asdu_10_boundary_ok() {
     assert_eq!(MAX_ASDU_PER_FRAME, 10, "the frame limit is 10 asdus");
-    let pdu = SavPdu {
-        asdus: (0..10)
+    let pdu = SavPdu::new(
+        (0..10)
             .map(|i| minimal_asdu(&format!("sv{}", i), i as u16))
             .collect(),
-    };
+    );
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded.asdus.len(), 10);
 }
@@ -197,20 +175,11 @@ fn smp_mod_two_octets_decode() {
 
 #[test]
 fn smp_synch_local_identified_roundtrip() {
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "svLocal".to_owned(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: SmpSynch::LocalIdentified(100),
-            smp_rate: None,
-            sample: vec![0u8; 8],
-            smp_mod: None,
-            gm_identity: None,
-        }],
-    };
+    let pdu = SavPdu::new(vec![{
+        let mut asdu = Asdu::new("svLocal".to_owned(), 0, vec![0u8; 8]);
+        asdu.smp_synch = SmpSynch::LocalIdentified(100);
+        asdu
+    }]);
     let decoded = encode_decode(&pdu);
     assert_eq!(decoded.asdus[0].smp_synch, SmpSynch::LocalIdentified(100));
 }
@@ -233,20 +202,12 @@ fn nine_two_le_64_byte_sample_roundtrip() {
     assert_eq!(sample_bytes.len(), SAMPLE_SIZE);
 
     // Carry the sample through a full PDU round trip.
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "IED1/LLN0$SV$sv9_2LE".to_owned(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: SmpSynch::GlobalClock,
-            smp_rate: Some(4000),
-            sample: sample_bytes.to_vec(),
-            smp_mod: None,
-            gm_identity: None,
-        }],
-    };
+    let pdu = SavPdu::new(vec![{
+        let mut asdu = Asdu::new("IED1/LLN0$SV$sv9_2LE".to_owned(), 0, sample_bytes.to_vec());
+        asdu.smp_synch = SmpSynch::GlobalClock;
+        asdu.smp_rate = Some(4000);
+        asdu
+    }]);
     let decoded = encode_decode(&pdu);
     let decoded_bytes: [u8; SAMPLE_SIZE] = decoded.asdus[0].sample[..].try_into().unwrap();
     let decoded_sv = NineTwoLE::from_sample(&decoded_bytes);
@@ -256,20 +217,11 @@ fn nine_two_le_64_byte_sample_roundtrip() {
 /// smpMod is encoded as an INT16U in two octets, the last member here.
 #[test]
 fn smp_mod_encodes_two_octets() {
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "sv1".to_owned(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: SmpSynch::NotSynced,
-            smp_rate: None,
-            sample: vec![0u8; 4],
-            smp_mod: Some(SmpMod::SamplesPerSecond),
-            gm_identity: None,
-        }],
-    };
+    let pdu = SavPdu::new(vec![{
+        let mut asdu = Asdu::new("sv1".to_owned(), 0, vec![0u8; 4]);
+        asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+        asdu
+    }]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).unwrap();
     assert_eq!(&buf[buf.len() - 4..], &[0x88, 0x02, 0x00, 0x01]);
@@ -280,20 +232,7 @@ fn smp_mod_encodes_two_octets() {
 #[test]
 fn large_sample_ber_length() {
     let large_sample = vec![0xABu8; 200];
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "sv1".to_owned(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: SmpSynch::NotSynced,
-            smp_rate: None,
-            sample: large_sample,
-            smp_mod: None,
-            gm_identity: None,
-        }],
-    };
+    let pdu = SavPdu::new(vec![Asdu::new("sv1".to_owned(), 0, large_sample)]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).unwrap();
     let bytes = &buf[..];
@@ -326,9 +265,7 @@ fn corrupt_ber_length_rejected() {
 #[test]
 fn sv_id_at_the_limit_accepted() {
     let sv_id = "A".repeat(SV_STRING_MAX_LEN);
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu(&sv_id, 0)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu(&sv_id, 0)]);
     assert_eq!(encode_decode(&pdu).asdus[0].sv_id, sv_id);
 }
 
@@ -336,9 +273,7 @@ fn sv_id_at_the_limit_accepted() {
 /// truncated, and without reading past the enclosing ASDU.
 #[test]
 fn sv_id_too_long_rejected() {
-    let pdu = SavPdu {
-        asdus: vec![minimal_asdu(&"A".repeat(SV_STRING_MAX_LEN + 1), 0)],
-    };
+    let pdu = SavPdu::new(vec![minimal_asdu(&"A".repeat(SV_STRING_MAX_LEN + 1), 0)]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).expect("encode the pdu");
     let result = decode_sav_pdu(&buf);
@@ -356,7 +291,7 @@ fn dat_set_at_the_limit_accepted() {
     let dat_set = "D".repeat(SV_STRING_MAX_LEN);
     let mut asdu = minimal_asdu("sv1", 0);
     asdu.dat_set = Some(dat_set.clone());
-    let pdu = SavPdu { asdus: vec![asdu] };
+    let pdu = SavPdu::new(vec![asdu]);
     assert_eq!(
         encode_decode(&pdu).asdus[0].dat_set.as_deref(),
         Some(dat_set.as_str())
@@ -369,7 +304,7 @@ fn dat_set_at_the_limit_accepted() {
 fn dat_set_too_long_rejected() {
     let mut asdu = minimal_asdu("sv1", 0);
     asdu.dat_set = Some("D".repeat(SV_STRING_MAX_LEN + 1));
-    let pdu = SavPdu { asdus: vec![asdu] };
+    let pdu = SavPdu::new(vec![asdu]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).expect("encode the pdu");
     let result = decode_sav_pdu(&buf);

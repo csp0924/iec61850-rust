@@ -34,20 +34,12 @@ fn publisher_without_smp_mod_sends_none() {
 
 /// Encodes a one-ASDU savPdu whose smpMod member carries `smp_mod`.
 fn pdu_with_smp_mod(smp_mod: &[u8]) -> Vec<u8> {
-    let pdu = SavPdu {
-        asdus: vec![Asdu {
-            sv_id: "MU01".into(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: SmpSynch::GlobalClock,
-            smp_rate: None,
-            sample: vec![0; 8],
-            smp_mod: Some(SmpMod::SamplesPerSecond),
-            gm_identity: None,
-        }],
-    };
+    let pdu = SavPdu::new(vec![{
+        let mut asdu = Asdu::new("MU01", 0, vec![0; 8]);
+        asdu.smp_synch = SmpSynch::GlobalClock;
+        asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+        asdu
+    }]);
     let mut buf = BytesMut::new();
     encode_sav_pdu(&pdu, &mut buf).unwrap();
     let mut b = buf.to_vec();

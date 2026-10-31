@@ -7,18 +7,9 @@ mod log_capture;
 use log_capture::warnings_containing;
 
 fn asdu(sv_id: &str, cnt: u16) -> Asdu {
-    Asdu {
-        sv_id: sv_id.into(),
-        dat_set: None,
-        smp_cnt: cnt,
-        conf_rev: 1,
-        refr_tm: None,
-        smp_synch: SmpSynch::GlobalClock,
-        smp_rate: None,
-        sample: vec![0; 64],
-        smp_mod: None,
-        gm_identity: None,
-    }
+    let mut asdu = Asdu::new(sv_id, cnt, vec![0; 64]);
+    asdu.smp_synch = SmpSynch::GlobalClock;
+    asdu
 }
 
 fn feed(sub: &SvSubscriber, asdus: impl IntoIterator<Item = Asdu>) {
@@ -62,10 +53,11 @@ fn samples_lost_across_the_configured_limit_are_counted() {
 #[test]
 fn samples_lost_across_an_announced_rate_are_counted() {
     let sub = SvSubscriber::builder().sv_id("MU01").build();
-    let announced = |c| Asdu {
-        smp_rate: Some(4000),
-        smp_mod: Some(SmpMod::SamplesPerSecond),
-        ..asdu("MU01", c)
+    let announced = |c| {
+        let mut a = asdu("MU01", c);
+        a.smp_rate = Some(4000);
+        a.smp_mod = Some(SmpMod::SamplesPerSecond);
+        a
     };
     feed(&sub, [3990, 3999, 0, 2].map(announced));
     assert_eq!(sub.missed_count(), 8 + 1);
@@ -142,9 +134,10 @@ fn lost_reset_sample_without_a_limit_counts_only_the_samples_after_zero() {
 fn smp_rate_without_smp_mod_is_not_a_limit() {
     let sub = SvSubscriber::builder().sv_id("MU01").build();
     // smpMod absent means samples per nominal period, so 80 is no wrap point.
-    let per_period = |c| Asdu {
-        smp_rate: Some(80),
-        ..asdu("MU01", c)
+    let per_period = |c| {
+        let mut a = asdu("MU01", c);
+        a.smp_rate = Some(80);
+        a
     };
     feed(&sub, (3990..4000).chain(0..10).map(per_period));
     assert_eq!(sub.missed_count(), 0);

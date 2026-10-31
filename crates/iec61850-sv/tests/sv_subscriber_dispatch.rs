@@ -10,33 +10,21 @@ use iec61850_sv::subscriber::{SvSubscriberAsdu, SvSubscriberBuilder};
 use iec61850_sv::{ChannelSample, NineTwoLE};
 
 fn make_asdu(sv_id: &str, smp_cnt: u16, sample: Vec<u8>) -> Asdu {
-    Asdu {
-        sv_id: sv_id.to_owned(),
-        dat_set: None,
-        smp_cnt,
-        conf_rev: 1,
-        refr_tm: None,
-        smp_synch: SmpSynch::GlobalClock,
-        smp_rate: None,
-        sample,
-        smp_mod: None,
-        gm_identity: None,
-    }
+    let mut asdu = Asdu::new(sv_id.to_owned(), smp_cnt, sample);
+    asdu.smp_synch = SmpSynch::GlobalClock;
+    asdu
 }
 
 fn make_full_asdu(sv_id: &str, smp_cnt: u16) -> Asdu {
-    Asdu {
-        sv_id: sv_id.to_owned(),
-        dat_set: Some("IED1/LLN0$SV$ds".to_owned()),
-        smp_cnt,
-        conf_rev: 0x12345678,
-        refr_tm: Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]),
-        smp_synch: SmpSynch::LocalIdentified(7),
-        smp_rate: Some(4000),
-        sample: vec![0x5Au8; 64],
-        smp_mod: Some(SmpMod::SamplesPerSecond),
-        gm_identity: Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
-    }
+    let mut asdu = Asdu::new(sv_id.to_owned(), smp_cnt, vec![0x5Au8; 64]);
+    asdu.dat_set = Some("IED1/LLN0$SV$ds".to_owned());
+    asdu.conf_rev = 0x12345678;
+    asdu.refr_tm = Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]);
+    asdu.smp_synch = SmpSynch::LocalIdentified(7);
+    asdu.smp_rate = Some(4000);
+    asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
+    asdu.gm_identity = Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    asdu
 }
 
 #[test]
@@ -302,12 +290,11 @@ fn too_many_asdus_tick_returns_err() {
     let pdu_bytes = pdu_buf.to_vec();
 
     let frame = SvFrame {
-        header: SvFrameHeader {
-            dst_mac: iec61850_sv::SV_DEFAULT_DST_MAC,
-            src_mac: [0u8; 6],
-            vlan: None,
-            app_id: SV_DEFAULT_APPID,
-            length: (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16,
+        header: {
+            let mut header =
+                SvFrameHeader::new(iec61850_sv::SV_DEFAULT_DST_MAC, [0u8; 6], SV_DEFAULT_APPID);
+            header.length = (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16;
+            header
         },
         pdu_bytes,
     };
@@ -357,12 +344,11 @@ fn corrupt_frame_incomplete_asdu_returns_err() {
     let pdu_bytes = pdu_buf.to_vec();
 
     let frame = SvFrame {
-        header: SvFrameHeader {
-            dst_mac: iec61850_sv::SV_DEFAULT_DST_MAC,
-            src_mac: [0u8; 6],
-            vlan: None,
-            app_id: SV_DEFAULT_APPID,
-            length: (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16,
+        header: {
+            let mut header =
+                SvFrameHeader::new(iec61850_sv::SV_DEFAULT_DST_MAC, [0u8; 6], SV_DEFAULT_APPID);
+            header.length = (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16;
+            header
         },
         pdu_bytes,
     };

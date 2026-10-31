@@ -84,6 +84,7 @@ const UTC_TIME_SIZE: usize = 8;
 /// publisher using a value assigned after this implementation was written
 /// still round-trips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SmpSynch {
     /// 0: samples are not synchronized.
     NotSynced,
@@ -127,6 +128,7 @@ impl SmpSynch {
 /// defined values fit one octet, so the variants map to the low octet;
 /// unassigned values up to 255 are preserved rather than rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SmpMod {
     /// 0: samples per nominal period, the default.
     PerNominalPeriod,
@@ -165,6 +167,7 @@ impl SmpMod {
 /// The ASDU owns its strings and sample bytes, so it outlives the buffer it
 /// was decoded from.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Asdu {
     /// svID, the identifier of this Sampled Values stream.
     pub sv_id: String,
@@ -191,11 +194,42 @@ pub struct Asdu {
     pub gm_identity: Option<[u8; 8]>,
 }
 
+impl Asdu {
+    /// Creates an ASDU of the stream `sv_id` with sample counter `smp_cnt` and
+    /// the raw sample bytes `sample`.
+    ///
+    /// `conf_rev` is 1, `smp_synch` is [`SmpSynch::NotSynced`], and every
+    /// optional field (`dat_set`, `refr_tm`, `smp_rate`, `smp_mod`,
+    /// `gm_identity`) is `None`.
+    pub fn new(sv_id: impl Into<String>, smp_cnt: u16, sample: Vec<u8>) -> Self {
+        Self {
+            sv_id: sv_id.into(),
+            dat_set: None,
+            smp_cnt,
+            conf_rev: 1,
+            refr_tm: None,
+            smp_synch: SmpSynch::NotSynced,
+            smp_rate: None,
+            sample,
+            smp_mod: None,
+            gm_identity: None,
+        }
+    }
+}
+
 /// A savPdu carrying one or more ASDUs.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SavPdu {
     /// The ASDUs of this PDU, at most `MAX_ASDU_PER_FRAME`.
     pub asdus: Vec<Asdu>,
+}
+
+impl SavPdu {
+    /// Creates a PDU carrying `asdus`.
+    pub fn new(asdus: Vec<Asdu>) -> Self {
+        Self { asdus }
+    }
 }
 
 /// Returns the encoded size of an ASDU's contents, excluding its own tag and

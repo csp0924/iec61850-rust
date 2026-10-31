@@ -9,6 +9,7 @@ use thiserror::Error;
 /// past its enclosing ASDU are all rejected instead of skipped, so a subscriber
 /// never publishes samples reconstructed from a damaged frame.
 #[derive(Debug, Error, PartialEq, Clone)]
+#[non_exhaustive]
 pub enum SvError {
     /// Ethernet frame shorter than the 22-byte minimum.
     #[error("sv ethernet frame too short, {0} bytes")]

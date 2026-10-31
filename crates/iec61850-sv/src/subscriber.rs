@@ -40,6 +40,7 @@ pub const DEFAULT_MAX_STREAMS: usize = 64;
 pub type SvListener = Arc<dyn Fn(&SvSubscriberAsdu<'_>) + Send + Sync>;
 
 /// A borrowed view of one ASDU, valid for the duration of the callback.
+#[non_exhaustive]
 pub struct SvSubscriberAsdu<'a> {
     /// svID, the identifier of this stream.
     pub sv_id: &'a str,

@@ -13,12 +13,10 @@ const APP_HDR: usize = SV_APP_HEADER_SIZE;
 fn make_frame_no_vlan(pdu_bytes: Vec<u8>) -> SvFrame {
     let length = (APP_HDR + pdu_bytes.len()) as u16;
     SvFrame {
-        header: SvFrameHeader {
-            dst_mac: SV_DEFAULT_DST_MAC,
-            src_mac: SRC_MAC,
-            vlan: None,
-            app_id: SV_DEFAULT_APPID,
-            length,
+        header: {
+            let mut header = SvFrameHeader::new(SV_DEFAULT_DST_MAC, SRC_MAC, SV_DEFAULT_APPID);
+            header.length = length;
+            header
         },
         pdu_bytes,
     }
@@ -27,15 +25,14 @@ fn make_frame_no_vlan(pdu_bytes: Vec<u8>) -> SvFrame {
 fn make_frame_with_vlan(pdu_bytes: Vec<u8>, priority: u8, vlan_id: u16) -> SvFrame {
     let length = (APP_HDR + pdu_bytes.len()) as u16;
     SvFrame {
-        header: SvFrameHeader {
-            dst_mac: SV_DEFAULT_DST_MAC,
-            src_mac: SRC_MAC,
-            vlan: Some(VlanTag {
+        header: {
+            let mut header = SvFrameHeader::new(SV_DEFAULT_DST_MAC, SRC_MAC, SV_DEFAULT_APPID);
+            header.vlan = Some(VlanTag {
                 priority: VlanPriority::new(priority).unwrap(),
                 vlan_id,
-            }),
-            app_id: SV_DEFAULT_APPID,
-            length,
+            });
+            header.length = length;
+            header
         },
         pdu_bytes,
     }

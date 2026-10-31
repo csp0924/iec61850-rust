@@ -14,18 +14,9 @@ use iec61850_sv::subscriber::SvSubscriberBuilder;
 use iec61850_sv::{SvSubscriber, SV_DEFAULT_DST_MAC};
 
 fn make_asdu(sv_id: &str, smp_cnt: u16, sample_size: usize) -> Asdu {
-    Asdu {
-        sv_id: sv_id.to_owned(),
-        dat_set: None,
-        smp_cnt,
-        conf_rev: 1,
-        refr_tm: None,
-        smp_synch: SmpSynch::GlobalClock,
-        smp_rate: None,
-        sample: vec![0xBBu8; sample_size],
-        smp_mod: None,
-        gm_identity: None,
-    }
+    let mut asdu = Asdu::new(sv_id.to_owned(), smp_cnt, vec![0xBBu8; sample_size]);
+    asdu.smp_synch = SmpSynch::GlobalClock;
+    asdu
 }
 
 fn encode_frame(pdu: &SavPdu, app_id: u16, dst_mac: [u8; 6]) -> Vec<u8> {
@@ -34,12 +25,11 @@ fn encode_frame(pdu: &SavPdu, app_id: u16, dst_mac: [u8; 6]) -> Vec<u8> {
     let pdu_bytes = pdu_buf.to_vec();
     let pdu_len = pdu_bytes.len();
     let frame = SvFrame {
-        header: SvFrameHeader {
-            dst_mac,
-            src_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
-            vlan: None,
-            app_id,
-            length: (SV_APP_HEADER_SIZE + pdu_len) as u16,
+        header: {
+            let mut header =
+                SvFrameHeader::new(dst_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], app_id);
+            header.length = (SV_APP_HEADER_SIZE + pdu_len) as u16;
+            header
         },
         pdu_bytes,
     };
@@ -56,9 +46,7 @@ fn idle_to_threadless_running_can_tick() {
     let result = running.tick(&[]);
     assert_eq!(result, Ok(0));
 
-    let pdu = SavPdu {
-        asdus: vec![make_asdu("sv1", 0, 8)],
-    };
+    let pdu = SavPdu::new(vec![make_asdu("sv1", 0, 8)]);
     let frame_bytes = encode_frame(&pdu, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC);
     let result = running.tick(&frame_bytes);
     assert_eq!(result, Ok(0), "no subscriber means no dispatch");
@@ -94,9 +82,7 @@ fn tick_valid_frame_callback_count_correct() {
     rx.add_subscriber(sub);
     let mut running = rx.into_threadless();
 
-    let pdu = SavPdu {
-        asdus: vec![make_asdu("IED1/LLN0$SV$sv1", 0, 64)],
-    };
+    let pdu = SavPdu::new(vec![make_asdu("IED1/LLN0$SV$sv1", 0, 64)]);
     let frame_bytes = encode_frame(&pdu, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC);
 
     let dispatch_count = running.tick(&frame_bytes).unwrap();
@@ -145,9 +131,7 @@ fn multi_asdu_frame_subscriber_receives_twice() {
     rx.add_subscriber(sub);
     let mut running = rx.into_threadless();
 
-    let pdu = SavPdu {
-        asdus: vec![make_asdu("sv1", 0, 64), make_asdu("sv1", 1, 64)],
-    };
+    let pdu = SavPdu::new(vec![make_asdu("sv1", 0, 64), make_asdu("sv1", 1, 64)]);
     let dispatch_count = running
         .tick(&encode_frame(&pdu, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC))
         .unwrap();

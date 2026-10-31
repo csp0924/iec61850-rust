@@ -49,6 +49,7 @@ pub const CHANNEL_NAMES: [&str; CHANNEL_COUNT] = ["IA", "IB", "IC", "IN", "VA", 
 
 /// One channel of a sample: an instantaneous value and its quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelSample {
     /// Instantaneous value; the unit and scaling come from the data set.
     pub value: i32,
