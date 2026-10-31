@@ -493,7 +493,12 @@ fn lookup_domain_specific_value(
 /// The members a group of a logical node holds ahead of its data objects, such
 /// as the control blocks of the group: `Ok` with the values in order, possibly
 /// none, or the error that fails the whole read.
-#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+#[cfg(any(
+    feature = "reporting",
+    feature = "logging",
+    feature = "setting-groups",
+    feature = "goose-mapping"
+))]
 pub(crate) type LeadingMembers<'a> =
     dyn FnMut(&LogicalNode, FC) -> Result<Vec<MmsData>, DataAccessError> + 'a;
 
@@ -507,7 +512,12 @@ pub(crate) type LeadingMembers<'a> =
 /// IEC 61850-8-1 order. `None` means `item_id` names something below a group,
 /// which the caller reads by its own route. The leading members are charged to
 /// the budget like the rest of the value.
-#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+#[cfg(any(
+    feature = "reporting",
+    feature = "logging",
+    feature = "setting-groups",
+    feature = "goose-mapping"
+))]
 pub(crate) fn read_ln_with_leading_members(
     ied_model: &IedModel,
     domain: &str,

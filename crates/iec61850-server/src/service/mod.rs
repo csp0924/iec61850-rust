@@ -503,6 +503,8 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &self.reporting_engine,
                 #[cfg(feature = "logging")]
                 &self.log_controls,
+                #[cfg(feature = "goose-mapping")]
+                &self.gocb_registry,
             ),
             SERVICE_TAG_STATUS_REQUEST => dispatch_status(invoke_id, &body),
             SERVICE_TAG_IDENTIFY_REQUEST => dispatch_identify(invoke_id, &self.identification),
@@ -676,12 +678,11 @@ fn dispatch_get_name_list(
 /// nothing registered has no Read handler, and listing it would advertise a
 /// name that answers object-non-existent.
 ///
-/// Only three combinations have members. Domain-scope named variables gain the
-/// GOOSE control blocks of the domain and, flattened the way the model's own
-/// names are, every report and log control block of
-/// [`domain_control_blocks`]: the `<LN>$RP`, `<LN>$BR` or `<LN>$LG` group, the
-/// block itself and each of its members, as GetVariableAccessAttributes
-/// describes them. Domain-scope named variable lists gain the data sets of the
+/// Only three combinations have members. Domain-scope named variables gain,
+/// flattened the way the model's own names are, every report, log and GOOSE
+/// control block of [`domain_control_blocks`]: the `<LN>$RP`, `<LN>$BR`,
+/// `<LN>$LG` or `<LN>$GO` group, the block itself and each of its members, as
+/// GetVariableAccessAttributes describes them. Domain-scope named variable lists gain the data sets of the
 /// registry, which covers both those the application registered and those a
 /// client created with DefineNamedVariableList.
 /// Domain-scope journals gain the journals of the log control registry.
@@ -701,9 +702,6 @@ fn runtime_extras(
     match (&req.object_class, &req.object_scope) {
         (ObjectClass::NamedVariable, ObjectScope::DomainSpecific(domain)) => {
             let mut out = Vec::new();
-            #[cfg(feature = "goose-mapping")]
-            out.extend(gocb_registry.list_mms_names_in_domain(domain));
-            #[cfg(any(feature = "reporting", feature = "logging"))]
             for (ln, block) in domain_control_blocks(
                 domain,
                 None,
@@ -711,6 +709,8 @@ fn runtime_extras(
                 reporting_engine,
                 #[cfg(feature = "logging")]
                 log_controls,
+                #[cfg(feature = "goose-mapping")]
+                gocb_registry,
             ) {
                 let group = format!("{ln}${}", block.kind.fc().as_str());
                 out.extend(crate::mapping::flat_paths(
@@ -746,23 +746,25 @@ fn runtime_extras(
     }
 }
 
-/// The report and log control blocks registered in `domain`, as the logical
-/// node each belongs to and its entry, sorted by logical node, then by the
-/// IEC 61850-8-1 order of their groups, then by name. `ln` limits the answer
-/// to one logical node.
+/// The report, log and GOOSE control blocks registered in `domain`, as the
+/// logical node each belongs to and its entry, sorted by logical node, then by
+/// the IEC 61850-8-1 order of their groups, then by name. `ln` limits the
+/// answer to one logical node.
 ///
-/// The reporting engine and the log control registry are the registries the
-/// Read paths resolve a control block against, so every block this returns is
-/// one a client can go on to read. A report control block counts only under
-/// the group its table serves, unbuffered under RP and buffered under BR, and
-/// a log control registry key only in its `<LN>$LG$<name>` form. A poisoned
-/// registry contributes nothing rather than failing the caller.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+/// The reporting engine, the log control registry and the GOOSE control block
+/// registry are the registries the Read paths resolve a control block against,
+/// so every block this returns is one a client can go on to read. A report
+/// control block counts only under the group its table serves, unbuffered
+/// under RP and buffered under BR, and a log control registry key only in its
+/// `<LN>$LG$<name>` form. A poisoned registry contributes nothing rather than
+/// failing the caller.
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 fn domain_control_blocks(
     domain: &str,
     ln: Option<&str>,
     #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
     #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
+    #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
 ) -> Vec<(String, crate::mapping::ControlBlockEntry)> {
     use crate::mapping::{ControlBlockEntry, ControlBlockKind};
     let mut out: Vec<(String, ControlBlockEntry)> = Vec::new();
@@ -828,6 +830,10 @@ fn domain_control_blocks(
             "the log control registry lock is poisoned, no log control block is listed"
         ),
     }
+    #[cfg(feature = "goose-mapping")]
+    for item in gocb_registry.item_bases_in_domain(domain) {
+        push(&item, ControlBlockKind::Goose);
+    }
     out.sort_by(|(ln_a, a), (ln_b, b)| {
         let rank = |k: ControlBlockKind| {
             iec61850_model::FC::WIRE_ORDER
@@ -862,9 +868,9 @@ fn is_lcb_path(item: &str) -> bool {
 
 /// Dispatches a GetVariableAccessAttributes request (`0xa6`).
 ///
-/// The report and log control blocks of [`domain_control_blocks`] are merged
-/// into the structure of their logical node, so every control block name
-/// GetNameList reports has a type description.
+/// The report, log and GOOSE control blocks of [`domain_control_blocks`] are
+/// merged into the structure of their logical node, so every control block
+/// name GetNameList reports has a type description.
 ///
 /// The type specification of a logical node grows with the model, so a
 /// response can outgrow the negotiated maximum PDU size; the dispatcher's
@@ -875,6 +881,7 @@ fn dispatch_get_var_access_attrs(
     mms_model: &MmsDeviceModel,
     #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
     #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
+    #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
 ) -> ConfirmedResponse {
     let req = match GetVariableAccessAttributesRequest::decode(body) {
         Ok(r) => r,
@@ -888,7 +895,7 @@ fn dispatch_get_var_access_attrs(
         }
     };
 
-    #[cfg(any(feature = "reporting", feature = "logging"))]
+    #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
     let result = get_var_access_attrs::handle_get_var_access_attrs_with_control_blocks(
         mms_model,
         &req,
@@ -900,13 +907,15 @@ fn dispatch_get_var_access_attrs(
                 reporting_engine,
                 #[cfg(feature = "logging")]
                 log_controls,
+                #[cfg(feature = "goose-mapping")]
+                gocb_registry,
             )
             .into_iter()
             .map(|(_, block)| block)
             .collect()
         },
     );
-    #[cfg(not(any(feature = "reporting", feature = "logging")))]
+    #[cfg(not(any(feature = "reporting", feature = "logging", feature = "goose-mapping")))]
     let result = get_var_access_attrs::handle_get_var_access_attrs(mms_model, &req);
 
     match result {
@@ -1163,7 +1172,12 @@ fn dispatch_read(
 
     let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
     for entry in &entries {
-        #[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+        #[cfg(any(
+            feature = "reporting",
+            feature = "logging",
+            feature = "setting-groups",
+            feature = "goose-mapping"
+        ))]
         let ln_read = read_ln_with_control_blocks(
             ied_model,
             #[cfg(feature = "setting-groups")]
@@ -1172,13 +1186,20 @@ fn dispatch_read(
             reporting_engine,
             #[cfg(feature = "logging")]
             log_controls,
-            #[cfg(any(feature = "reporting", feature = "logging"))]
+            #[cfg(feature = "goose-mapping")]
+            gocb_registry,
+            #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
             &route,
             &entry.name,
             entry.alt_access.as_ref(),
             remaining_budget,
         );
-        #[cfg(not(any(feature = "reporting", feature = "logging", feature = "setting-groups")))]
+        #[cfg(not(any(
+            feature = "reporting",
+            feature = "logging",
+            feature = "setting-groups",
+            feature = "goose-mapping"
+        )))]
         let ln_read: Option<ReadRoutingOutcome> = None;
         let outcome = match ln_read {
             Some(outcome) => outcome,
@@ -1228,7 +1249,7 @@ fn dispatch_read(
 
 /// Reads one object name through the ordinary read routes, under an optional
 /// alternate access and byte budget.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 type ReadRoute<'a> = dyn Fn(
         &iec61850_mms::mms::pdu::common::ObjectName,
         Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
@@ -1249,14 +1270,21 @@ type ReadRoute<'a> = dyn Fn(
 ///
 /// `None` means the entry names something below a group, or carries an
 /// alternate access, which the ordinary routes handle.
-#[cfg(any(feature = "reporting", feature = "logging", feature = "setting-groups"))]
+#[cfg(any(
+    feature = "reporting",
+    feature = "logging",
+    feature = "setting-groups",
+    feature = "goose-mapping"
+))]
 #[allow(clippy::too_many_arguments)]
 fn read_ln_with_control_blocks(
     ied_model: &IedModel,
     #[cfg(feature = "setting-groups")] setting_groups: &crate::setting_groups::SettingGroupRegistry,
     #[cfg(feature = "reporting")] reporting_engine: &Arc<Mutex<ReportingEngine>>,
     #[cfg(feature = "logging")] log_controls: &LogControlRegistry,
-    #[cfg(any(feature = "reporting", feature = "logging"))] route: &ReadRoute<'_>,
+    #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
+    #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
+    route: &ReadRoute<'_>,
     name: &iec61850_mms::mms::pdu::common::ObjectName,
     alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
     remaining_budget: Option<usize>,
@@ -1288,7 +1316,7 @@ fn read_ln_with_control_blocks(
                 AccessResult::Failure(e) => return Err(e),
             }
         }
-        #[cfg(any(feature = "reporting", feature = "logging"))]
+        #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
         {
             let ln_name = format!("{}{}{}", ln.prefix, ln.class, ln.inst);
             let blocks = domain_control_blocks(
@@ -1298,6 +1326,8 @@ fn read_ln_with_control_blocks(
                 reporting_engine,
                 #[cfg(feature = "logging")]
                 log_controls,
+                #[cfg(feature = "goose-mapping")]
+                gocb_registry,
             );
             for (_, block) in blocks.iter().filter(|(_, b)| b.kind.fc() == fc) {
                 let block_name = ObjectName::DomainSpecific {

@@ -424,30 +424,34 @@ fn build_da_type_spec(da: &DataAttribute) -> Result<MmsTypeSpec> {
         return Ok(MmsTypeSpec::Structure(children));
     }
 
-    // PhyComAddr is a fixed four-member structure.
     if da.ty == DataAttributeType::PhyComAddr {
-        return Ok(MmsTypeSpec::Structure(vec![
-            NamedVariableSpec {
-                name: "Addr".into(),
-                type_spec: MmsTypeSpec::Leaf(MmsLeafType::OctetString(StringSize::Fixed(6))),
-            },
-            NamedVariableSpec {
-                name: "PRIORITY".into(),
-                type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(8)),
-            },
-            NamedVariableSpec {
-                name: "VID".into(),
-                type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(16)),
-            },
-            NamedVariableSpec {
-                name: "APPID".into(),
-                type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(16)),
-            },
-        ]));
+        return Ok(phy_com_addr_type_spec());
     }
 
     let leaf = leaf_from_da_type(da.ty)?;
     Ok(MmsTypeSpec::Leaf(leaf))
+}
+
+/// The PhyComAddr structure: `Addr`, `PRIORITY`, `VID` and `APPID`.
+fn phy_com_addr_type_spec() -> MmsTypeSpec {
+    MmsTypeSpec::Structure(vec![
+        NamedVariableSpec {
+            name: "Addr".into(),
+            type_spec: MmsTypeSpec::Leaf(MmsLeafType::OctetString(StringSize::Fixed(6))),
+        },
+        NamedVariableSpec {
+            name: "PRIORITY".into(),
+            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(8)),
+        },
+        NamedVariableSpec {
+            name: "VID".into(),
+            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(16)),
+        },
+        NamedVariableSpec {
+            name: "APPID".into(),
+            type_spec: MmsTypeSpec::Leaf(MmsLeafType::Unsigned(16)),
+        },
+    ])
 }
 
 /// Returns the declared size of a bit-string data attribute type, or `None` for
@@ -597,7 +601,7 @@ fn leaf_member(name: &str, leaf: MmsLeafType) -> NamedVariableSpec {
 
 /// The kind of a control block a server registers at run time, which decides
 /// the functional-constraint group it appears in and its MMS structure.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlBlockKind {
     /// An unbuffered report control block, under RP.
@@ -609,9 +613,12 @@ pub(crate) enum ControlBlockKind {
     /// A log control block, under LG.
     #[cfg(feature = "logging")]
     Log,
+    /// A GOOSE control block, under GO.
+    #[cfg(feature = "goose-mapping")]
+    Goose,
 }
 
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 impl ControlBlockKind {
     /// The functional-constraint group the control block belongs to.
     pub(crate) fn fc(self) -> FC {
@@ -622,6 +629,8 @@ impl ControlBlockKind {
             Self::Buffered => FC::Br,
             #[cfg(feature = "logging")]
             Self::Log => FC::Lg,
+            #[cfg(feature = "goose-mapping")]
+            Self::Goose => FC::Go,
         }
     }
 
@@ -631,7 +640,9 @@ impl ControlBlockKind {
     /// A report control block ends in `Owner`. A log control block has the nine
     /// members `LogEna`, `LogRef`, `DatSet`, `OldEntrTm`, `NewEntrTm`, `OldEnt`,
     /// `NewEnt`, `TrgOps`, and `IntgPd`: the ACSI attributes OldEntr and NewEntr
-    /// map onto the MMS components `OldEnt` and `NewEnt`.
+    /// map onto the MMS components `OldEnt` and `NewEnt`. A GOOSE control block
+    /// has the nine components of IEC 61850-8-1 §18.1.1.1.1 Table 83, named by
+    /// [`GOCB_DA_NAMES`](crate::goose_mapping::GOCB_DA_NAMES).
     pub(crate) fn type_spec(self) -> MmsTypeSpec {
         use MmsLeafType as L;
         let object_ref = || L::VisibleString(StringSize::Max(129));
@@ -681,6 +692,28 @@ impl ControlBlockKind {
                 leaf_member("TrgOps", L::BitString(StringSize::Max(6))),
                 leaf_member("IntgPd", L::Unsigned(32)),
             ],
+            #[cfg(feature = "goose-mapping")]
+            Self::Goose => {
+                let types = [
+                    MmsTypeSpec::Leaf(L::Boolean),
+                    MmsTypeSpec::Leaf(object_ref()),
+                    MmsTypeSpec::Leaf(object_ref()),
+                    MmsTypeSpec::Leaf(L::Unsigned(32)),
+                    MmsTypeSpec::Leaf(L::Boolean),
+                    phy_com_addr_type_spec(),
+                    MmsTypeSpec::Leaf(L::Unsigned(32)),
+                    MmsTypeSpec::Leaf(L::Unsigned(32)),
+                    MmsTypeSpec::Leaf(L::Boolean),
+                ];
+                crate::goose_mapping::GOCB_DA_NAMES
+                    .iter()
+                    .zip(types)
+                    .map(|(name, type_spec)| NamedVariableSpec {
+                        name: (*name).to_string(),
+                        type_spec,
+                    })
+                    .collect()
+            }
         };
         MmsTypeSpec::Structure(members)
     }
@@ -701,7 +734,7 @@ pub(crate) fn lcb_member_name(name: &str) -> &str {
 }
 
 /// One control block of a logical node, registered at run time.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ControlBlockEntry {
     /// The control block kind.
@@ -718,7 +751,7 @@ pub(crate) struct ControlBlockEntry {
 /// `blocks` lists them; a group the model has no data for is created in its
 /// place in the IEC 61850-8-1 order. A Read of a logical node or of one of its
 /// groups lays its value out the same way.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 pub(crate) fn ln_spec_with_control_blocks(
     base: &MmsTypeSpec,
     blocks: &[ControlBlockEntry],
@@ -753,7 +786,7 @@ pub(crate) fn ln_spec_with_control_blocks(
 
 /// Returns the path of `prefix` and of every structure member beneath it, the
 /// flattened form GetNameList reports.
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 pub(crate) fn flat_paths(prefix: &str, spec: &MmsTypeSpec) -> Vec<String> {
     let mut out = Vec::new();
     push_flat_paths(prefix, spec, &mut out);

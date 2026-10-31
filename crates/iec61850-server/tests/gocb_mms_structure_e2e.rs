@@ -13,6 +13,8 @@ use iec61850_goose::frame::{VlanPriority, VlanTag};
 use iec61850_goose::publisher::CommParameters;
 use iec61850_goose::GoosePublisher;
 use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
+use iec61850_mms::mms::pdu::type_specification::TypeSpecification;
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
 use iec61850_server::goose_mapping::GoCBHandle;
@@ -260,6 +262,243 @@ async fn dat_set_reads_with_its_domain() {
         MmsData::VisibleString("TESTLD0/LLN0$ds1".into())
     );
     assert_eq!(publisher.lock().unwrap().data_set_ref(), "TESTLD0/LLN0$ds1");
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+// ── Type descriptions, name list and logical node reads ─────────────────
+
+fn member_names(spec: &TypeSpecification) -> Vec<String> {
+    match spec {
+        TypeSpecification::Structure { components } => {
+            components.iter().map(|c| c.name.clone()).collect()
+        }
+        other => panic!("expected a structure, got {other:?}"),
+    }
+}
+
+/// Reports whether `value` has the shape `spec` describes: the same structure
+/// nesting and member counts, and leaves of the matching kind.
+fn fits(spec: &TypeSpecification, value: &MmsData) -> bool {
+    use TypeSpecification as T;
+    match (spec, value) {
+        (T::Structure { components }, MmsData::Structure(members)) => {
+            components.len() == members.len()
+                && components
+                    .iter()
+                    .zip(members)
+                    .all(|(c, m)| fits(&c.type_spec, m))
+        }
+        (T::Array { element_type, .. }, MmsData::Array(items)) => {
+            items.iter().all(|i| fits(element_type, i))
+        }
+        (T::Boolean, MmsData::Boolean(_))
+        | (T::Integer { .. }, MmsData::Integer(_))
+        | (T::Unsigned { .. }, MmsData::Unsigned(_))
+        | (T::FloatingPoint { .. }, MmsData::Float32(_) | MmsData::Float64(_))
+        | (T::BitString { .. }, MmsData::BitString { .. })
+        | (T::OctetString { .. }, MmsData::OctetString(_))
+        | (T::VisibleString { .. }, MmsData::VisibleString(_))
+        | (T::MmsString { .. }, MmsData::MmsString(_))
+        | (T::UtcTime, MmsData::UtcTime(_))
+        | (T::BinaryTime { .. }, MmsData::BinaryTime(_)) => true,
+        _ => false,
+    }
+}
+
+async fn gvaa(client: &mut MmsClient, item: &str) -> TypeSpecification {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_variable_access_attributes(DOMAIN, item),
+    )
+    .await
+    .expect("timeout")
+    .unwrap_or_else(|e| panic!("{item} has no type description: {e:?}"))
+}
+
+async fn all_names(client: &mut MmsClient) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (page, more) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_name_list(ObjectClass::NamedVariable, Some(DOMAIN), cursor.as_deref()),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetNameList");
+        cursor = page.last().cloned();
+        out.extend(page);
+        if !more {
+            return out;
+        }
+    }
+}
+
+const TABLE_83: [&str; 9] = [
+    "GoEna",
+    "GoID",
+    "DatSet",
+    "ConfRev",
+    "NdsCom",
+    "DstAddress",
+    "MinTime",
+    "MaxTime",
+    "FixedOffs",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_variable_access_attributes_describes_table_83() {
+    use TypeSpecification as T;
+
+    let (handle, _publisher) = start_server(IedServerConfig::default()).await;
+    let mut client = connect(&handle).await;
+
+    let spec = gvaa(&mut client, GOCB_ITEM).await;
+    assert_eq!(member_names(&spec), TABLE_83);
+    let T::Structure { components } = &spec else {
+        unreachable!()
+    };
+    let kinds: Vec<&str> = components
+        .iter()
+        .map(|c| match &c.type_spec {
+            T::Boolean => "Boolean",
+            T::VisibleString { .. } => "VisibleString",
+            T::Unsigned { .. } => "Unsigned",
+            T::Structure { .. } => "Structure",
+            other => panic!("{}: unexpected type {other:?}", c.name),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "Boolean",
+            "VisibleString",
+            "VisibleString",
+            "Unsigned",
+            "Boolean",
+            "Structure",
+            "Unsigned",
+            "Unsigned",
+            "Boolean"
+        ]
+    );
+    assert_eq!(
+        member_names(&components[5].type_spec),
+        ["Addr", "PRIORITY", "VID", "APPID"]
+    );
+
+    assert_eq!(member_names(&gvaa(&mut client, "LLN0$GO").await), ["gcb01"]);
+    assert!(matches!(
+        gvaa(&mut client, "LLN0$GO$gcb01$GoEna").await,
+        T::Boolean
+    ));
+    assert!(matches!(
+        gvaa(&mut client, "LLN0$GO$gcb01$DstAddress$APPID").await,
+        T::Unsigned { .. }
+    ));
+    assert!(member_names(&gvaa(&mut client, "LLN0").await).contains(&"GO".to_string()));
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_name_list_lists_the_go_group_and_every_component() {
+    let (handle, _publisher) = start_server(IedServerConfig::default()).await;
+    let mut client = connect(&handle).await;
+
+    let names = all_names(&mut client).await;
+    let expected = ["LLN0$GO".to_string(), GOCB_ITEM.to_string()]
+        .into_iter()
+        .chain(TABLE_83.iter().map(|c| format!("{GOCB_ITEM}${c}")))
+        .chain(
+            ["Addr", "PRIORITY", "VID", "APPID"]
+                .iter()
+                .map(|m| format!("{GOCB_ITEM}$DstAddress${m}")),
+        );
+    for name in expected {
+        assert!(names.contains(&name), "{name} is not listed in {names:?}");
+    }
+    assert!(!names.iter().any(|n| n.ends_with("$GoCBRef")));
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logical_node_and_go_group_reads_hold_the_gocb() {
+    let (handle, _publisher) = start_server(IedServerConfig::default()).await;
+    let mut client = connect(&handle).await;
+
+    let whole = read(&mut client, GOCB_ITEM).await;
+    assert_eq!(
+        read(&mut client, "LLN0$GO").await,
+        MmsData::Structure(vec![whole.clone()])
+    );
+
+    let lln0_spec = gvaa(&mut client, "LLN0").await;
+    let lln0 = read(&mut client, "LLN0").await;
+    let (TypeSpecification::Structure { components }, MmsData::Structure(groups)) =
+        (&lln0_spec, &lln0)
+    else {
+        panic!("LLN0 is a structure: {lln0:?}");
+    };
+    assert_eq!(components.len(), groups.len());
+    let go = components
+        .iter()
+        .position(|c| c.name == "GO")
+        .expect("LLN0 has a GO group");
+    assert_eq!(groups[go], MmsData::Structure(vec![whole]));
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+/// Every listed name under a GO group, for every GoCB of the server, reads a
+/// value of the type GetVariableAccessAttributes describes for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_gocb_name_reads_the_type_it_is_described_with() {
+    let server = IedServer::builder()
+        .model(build_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .config(IedServerConfig::default())
+        .build()
+        .expect("build server");
+    for name in ["gcb01", "gcb02"] {
+        let publisher = GoosePublisher::new(
+            comm(),
+            format!("TESTLD0/LLN0$GO${name}"),
+            None,
+            "TESTLD0/LLN0$ds1",
+            3,
+        )
+        .unwrap();
+        server.register_gocb(Arc::new(GoCBHandle::new(
+            DOMAIN,
+            "LLN0",
+            name,
+            Arc::new(Mutex::new(publisher)),
+        )));
+    }
+    let handle = server.start().await.expect("start");
+    let mut client = connect(&handle).await;
+
+    let names: Vec<String> = all_names(&mut client)
+        .await
+        .into_iter()
+        .filter(|n| n.starts_with("LLN0$GO"))
+        .collect();
+    assert_eq!(names.len(), 1 + 2 * (1 + TABLE_83.len() + 4));
+    for name in names.iter().map(String::as_str).chain(["LLN0"]) {
+        let spec = gvaa(&mut client, name).await;
+        let value = read(&mut client, name).await;
+        assert!(
+            fits(&spec, &value),
+            "{name}: {value:?} does not fit {spec:?}"
+        );
+    }
 
     client.disconnect().await.expect("disconnect");
     handle.stop().await;

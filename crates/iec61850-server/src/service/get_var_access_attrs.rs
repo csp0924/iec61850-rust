@@ -16,7 +16,7 @@ use alloc::{
     vec::Vec,
 };
 
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 use crate::mapping::ln_spec_with_control_blocks;
 use crate::mapping::MmsDeviceModel;
 use crate::mapping::MmsTypeSpec;
@@ -72,7 +72,7 @@ pub fn handle_get_var_access_attrs(
 /// Read of the node, of one of its groups, or of a control block returns. A
 /// member of a log control block also resolves by the ACSI name of
 /// [`lcb_member_name`](crate::mapping::lcb_member_name).
-#[cfg(any(feature = "reporting", feature = "logging"))]
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 pub(crate) fn handle_get_var_access_attrs_with_control_blocks(
     model: &MmsDeviceModel,
     req: &GetVariableAccessAttributesRequest,

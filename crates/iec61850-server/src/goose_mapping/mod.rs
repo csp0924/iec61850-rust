@@ -49,6 +49,8 @@ use std::sync::{Arc, Mutex};
 use iec61850_goose::GoosePublisher;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, WriteOutcome};
 
+use crate::mapping::{ControlBlockKind, MmsTypeSpec};
+
 // GoCB handle
 
 /// One server-side GoCB: where it sits in the MMS name space and the publisher
@@ -209,26 +211,20 @@ impl GoCBRegistry {
         self.inner.read().ok()?.get(&key).cloned()
     }
 
-    /// Lists the MMS names of every GoCB in a domain, for GetNameList.
-    ///
-    /// The result looks like `["LLN0$GO$gcb01", "LLN0$GO$gcb01$GoEna", ...]`.
-    pub fn list_mms_names_in_domain(&self, domain: &str) -> Vec<String> {
+    /// Lists the MMS item bases, `<LN>$GO$<name>`, of every GoCB in a domain.
+    pub fn item_bases_in_domain(&self, domain: &str) -> Vec<String> {
         let Ok(g) = self.inner.read() else {
+            tracing::warn!(
+                domain,
+                "gocb registry lock poisoned, no control block is listed"
+            );
             return vec![];
         };
-        let mut out = Vec::new();
-        for (d, item_base) in g.keys() {
-            if d != domain {
-                continue;
-            }
-            // Both the control block itself and its attributes are listed. A client
-            // could reach the attributes through GetVariableAccessAttributes, but
-            // listing them keeps the name list self-sufficient.
-            out.push(item_base.clone());
-            for da in GOCB_DA_NAMES {
-                out.push(format!("{item_base}${da}"));
-            }
-        }
+        let mut out: Vec<String> = g
+            .keys()
+            .filter(|(d, _)| d == domain)
+            .map(|(_, item_base)| item_base.clone())
+            .collect();
         out.sort();
         out
     }
@@ -279,18 +275,62 @@ pub fn encode_gocb_structure(handle: &GoCBHandle) -> Result<MmsData, DataAccessE
     Ok(MmsData::Structure(items))
 }
 
-/// Encodes one GoCB component.
+/// Encodes one GoCB component, or a member below one.
+///
+/// `da_name` is a component name such as `GoEna`, or a `$`-separated path into
+/// a structured component such as `DstAddress$APPID`; members are found by the
+/// names the GoCB's type description gives them.
 ///
 /// # Errors
 ///
-/// `ObjectNonExistent` for a name that is not a component of Table 83, and
-/// `HardwareFault` when the publisher's mutex is poisoned.
+/// `ObjectNonExistent` for a path that names no component or member of
+/// Table 83, and `HardwareFault` when the publisher's mutex is poisoned.
 pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> Result<MmsData, DataAccessError> {
-    let publisher = lock_publisher(handle)?;
-    encode_component(&publisher, da_name).ok_or_else(|| {
+    let mut segments = da_name.split('$');
+    let component = segments.next().unwrap_or_default();
+    let value = {
+        let publisher = lock_publisher(handle)?;
+        encode_component(&publisher, component)
+    };
+    let (Some(mut value), Some(mut spec)) = (value, component_type_spec(component)) else {
         tracing::warn!(da_name, "read of an unknown GoCB component");
-        DataAccessError::ObjectNonExistent
-    })
+        return Err(DataAccessError::ObjectNonExistent);
+    };
+    for member in segments {
+        match select_member(value, &spec, member) {
+            Some((v, s)) => {
+                value = v;
+                spec = s;
+            }
+            None => {
+                tracing::warn!(da_name, member, "read of an unknown GoCB component member");
+                return Err(DataAccessError::ObjectNonExistent);
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// The type description of one GoCB component.
+fn component_type_spec(component: &str) -> Option<MmsTypeSpec> {
+    let MmsTypeSpec::Structure(members) = ControlBlockKind::Goose.type_spec() else {
+        return None;
+    };
+    members
+        .into_iter()
+        .find(|m| m.name == component)
+        .map(|m| m.type_spec)
+}
+
+/// Selects the member called `name` of a structured value, by the position its
+/// type description gives it.
+fn select_member(value: MmsData, spec: &MmsTypeSpec, name: &str) -> Option<(MmsData, MmsTypeSpec)> {
+    let (MmsData::Structure(items), MmsTypeSpec::Structure(members)) = (value, spec) else {
+        return None;
+    };
+    let index = members.iter().position(|m| m.name == name)?;
+    let item = items.into_iter().nth(index)?;
+    Some((item, members[index].type_spec.clone()))
 }
 
 /// Locks the publisher, reporting a poisoned mutex as a hardware fault, the
@@ -347,9 +387,22 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 /// GoEna, a boolean, and GoID, a visible string, are writable; GoID only while
 /// the publisher is disabled, and otherwise it is refused with
 /// `TemporarilyUnavailable`. The other seven components are read-only and are
-/// refused with `ObjectAccessDenied`. An unknown component is refused with
+/// refused with `ObjectAccessDenied`, and so is a member below a component,
+/// such as `DstAddress$APPID`. An unknown component is refused with
 /// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
 pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> WriteOutcome {
+    if da_name.contains('$') {
+        return match encode_gocb_da(handle, da_name) {
+            Ok(_) => {
+                tracing::warn!(
+                    da_name,
+                    "write to a member of a read-only GoCB component refused"
+                );
+                WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
+            }
+            Err(e) => WriteOutcome::Failure(e),
+        };
+    }
     match da_name {
         "GoEna" => {
             let MmsData::Boolean(b) = value else {
@@ -403,24 +456,26 @@ pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> 
 }
 
 /// Splits an MMS item identifier of the form `<LN>$GO$<name>` or
-/// `<LN>$GO$<name>$<da>` into its item base and optional attribute name.
+/// `<LN>$GO$<name>$<da>[$<member>...]` into its item base and the optional
+/// component path below it, such as `GoEna` or `DstAddress$APPID`.
 ///
-/// Returns `None` when the identifier has the wrong number of segments or its
-/// second segment is not `GO`.
+/// Returns `None` when the identifier has fewer than three segments, an empty
+/// segment, or a second segment other than `GO`.
 pub fn parse_go_item_id(item_id: &str) -> Option<(&str, Option<&str>)> {
-    let parts: Vec<&str> = item_id.split('$').collect();
-    match parts.len() {
-        // <LN>$GO$<name>
-        3 if parts[1] == "GO" => Some((item_id, None)),
-        // <LN>$GO$<name>$<da>
-        4 if parts[1] == "GO" => {
-            // Split at the last separator.
-            let last = item_id.rfind('$')?;
-            let base = &item_id[..last];
-            let da = &item_id[last + 1..];
-            Some((base, Some(da)))
+    let mut parts = item_id.splitn(4, '$');
+    let (Some(ln), Some("GO"), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    if ln.is_empty() || name.is_empty() {
+        return None;
+    }
+    match parts.next() {
+        None => Some((item_id, None)),
+        Some(path) if !path.is_empty() && !path.split('$').any(str::is_empty) => {
+            let base_len = ln.len() + "$GO$".len() + name.len();
+            Some((&item_id[..base_len], Some(path)))
         }
-        _ => None,
+        Some(_) => None,
     }
 }
 
@@ -510,25 +565,11 @@ mod tests {
     }
 
     #[test]
-    fn list_mms_names_in_domain_includes_all_da() {
+    fn item_bases_in_domain_lists_each_registered_block() {
         let reg = GoCBRegistry::new();
-        let h = sample_handle();
-        reg.register(h);
-        let names = reg.list_mms_names_in_domain("IED1LD0");
-        // One base name plus nine attributes.
-        assert_eq!(names.len(), 10);
-        assert!(names.contains(&"LLN0$GO$gcb01".to_string()));
-        assert!(names.contains(&"LLN0$GO$gcb01$GoEna".to_string()));
-        assert!(names.contains(&"LLN0$GO$gcb01$DstAddress".to_string()));
-    }
-
-    #[test]
-    fn list_mms_names_in_other_domain_empty() {
-        let reg = GoCBRegistry::new();
-        let h = sample_handle();
-        reg.register(h);
-        let names = reg.list_mms_names_in_domain("OTHER");
-        assert!(names.is_empty());
+        reg.register(sample_handle());
+        assert_eq!(reg.item_bases_in_domain("IED1LD0"), ["LLN0$GO$gcb01"]);
+        assert!(reg.item_bases_in_domain("OTHER").is_empty());
     }
 
     // ── encode_gocb_da ──────────────────────────────────────────────────────────
@@ -754,8 +795,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_go_item_id_wrong_segment_count_rejects() {
+    fn parse_go_item_id_member_path() {
+        let r = parse_go_item_id("LLN0$GO$gcb01$DstAddress$APPID");
+        assert_eq!(r, Some(("LLN0$GO$gcb01", Some("DstAddress$APPID"))));
+    }
+
+    #[test]
+    fn parse_go_item_id_malformed_rejects() {
         assert!(parse_go_item_id("LLN0$GO").is_none());
-        assert!(parse_go_item_id("LLN0$GO$gcb01$GoEna$extra").is_none());
+        assert!(parse_go_item_id("LLN0$GO$").is_none());
+        assert!(parse_go_item_id("LLN0$GO$gcb01$").is_none());
+        assert!(parse_go_item_id("LLN0$GO$gcb01$DstAddress$$APPID").is_none());
+    }
+
+    #[test]
+    fn encode_member_of_dst_address() {
+        let h = sample_handle();
+        assert_eq!(read(&h, "DstAddress$APPID"), MmsData::Unsigned(0x1000));
+        assert_eq!(
+            read(&h, "DstAddress$Addr"),
+            MmsData::OctetString(vec![0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
+        );
+        for path in ["DstAddress$Nope", "GoEna$x", "DstAddress$APPID$x"] {
+            assert_eq!(
+                encode_gocb_da(&h, path),
+                Err(DataAccessError::ObjectNonExistent),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_member_of_dst_address_is_denied() {
+        let h = sample_handle();
+        assert_eq!(
+            apply_gocb_write(&h, "DstAddress$APPID", &MmsData::Unsigned(1)),
+            WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            apply_gocb_write(&h, "DstAddress$Nope", &MmsData::Unsigned(1)),
+            WriteOutcome::Failure(DataAccessError::ObjectNonExistent)
+        );
     }
 }
