@@ -64,7 +64,8 @@ impl TlsConnector {
     ///
     /// # Errors
     ///
-    /// [`TlsError::Io`] if the handshake fails.
+    /// The [`TlsError`] variant that classifies the failure, as described
+    /// there, when the handshake fails.
     pub async fn connect(
         &self,
         server_name: ServerName<'static>,
@@ -79,7 +80,7 @@ impl TlsConnector {
             Err(e) => {
                 tracing::warn!("TLS client handshake failed: {}", e);
                 report_handshake_failure(self.event_handler.as_ref(), "client", &e);
-                Err(TlsError::Io(e))
+                Err(TlsError::from_handshake(e))
             }
         }
     }

@@ -1672,3 +1672,158 @@ async fn hand_built_hello_with_a_whitelisted_suite_gets_a_server_hello() {
     assert!(result.is_err(), "handshake completed");
     assert!(events.codes().is_empty(), "events: {:?}", events.codes());
 }
+
+// -----------------------------------------------------------------------------
+// Handshake error classification
+// -----------------------------------------------------------------------------
+
+/// Runs one handshake over loopback TCP and returns what `accept` and
+/// `connect` return, without exchanging data.
+async fn handshake_results(
+    acceptor: TlsAcceptor,
+    connector: &TlsConnector,
+) -> (Result<(), TlsError>, Result<(), TlsError>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        acceptor.accept(tcp).await.map(|_| ())
+    });
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from(SERVER_NAME.to_string()).unwrap();
+    let client = connector.connect(name, tcp).await.map(|_| ());
+    let server = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server task finishes")
+        .unwrap();
+    (server, client)
+}
+
+#[tokio::test]
+async fn an_untrusted_server_certificate_is_a_verification_error() {
+    let rogue_ca = Ca::new();
+    let server = server_with(&rogue_ca.leaf(SERVER_NAME, 1))
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&Ca::new()).build_client().unwrap();
+
+    let (srv, cli) = handshake_results(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        matches!(
+            cli,
+            Err(TlsError::Verification(rustls::Error::InvalidCertificate(_)))
+        ),
+        "client side: {cli:?}"
+    );
+    assert!(
+        matches!(
+            srv,
+            Err(TlsError::Handshake(rustls::Error::AlertReceived(_)))
+        ),
+        "server side: {srv:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_client_certificate_is_a_verification_error_on_the_server() {
+    let server_ca = Ca::new();
+    let client_ca = Ca::new();
+    let server = server_with(&server_ca.leaf(SERVER_NAME, 1))
+        .add_ca_pem(client_ca.pem().as_bytes())
+        .unwrap()
+        .require_client_auth(true)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&server_ca).build_client().unwrap();
+
+    let (srv, _) = handshake_results(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        matches!(
+            srv,
+            Err(TlsError::Verification(
+                rustls::Error::NoCertificatesPresented
+            ))
+        ),
+        "server side: {srv:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_version_in_common_is_a_version_error() {
+    let ca = Ca::new();
+    let server = server_with(&rsa_leaf(&ca, SERVER_NAME))
+        .max_version(TlsVersion::Tls12)
+        .build_server()
+        .unwrap();
+    let client = client_trusting(&ca)
+        .min_version(TlsVersion::Tls13)
+        .build_client()
+        .unwrap();
+
+    let (srv, cli) = handshake_results(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
+
+    assert!(
+        matches!(srv, Err(TlsError::VersionUnsupported(_))),
+        "server side: {srv:?}"
+    );
+    assert!(
+        matches!(
+            cli,
+            Err(TlsError::Handshake(rustls::Error::AlertReceived(_)))
+        ),
+        "client side: {cli:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_cipher_suite_in_common_is_a_cipher_error() {
+    let ca = Ca::new();
+    let server = server_with(&ca.leaf(SERVER_NAME, 1))
+        .build_server()
+        .unwrap();
+    // A client offering only a suite outside the whitelist.
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256],
+        ..rustls::crypto::ring::default_provider()
+    };
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+
+    let (srv, _) = handshake_results(
+        TlsAcceptor::new(server),
+        &TlsConnector::from_rustls(Arc::new(client)),
+    )
+    .await;
+
+    assert!(
+        matches!(srv, Err(TlsError::CipherUnsupported(_))),
+        "server side: {srv:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_closed_during_the_handshake_is_an_io_error() {
+    let ca = Ca::new();
+    let server = server_with(&ca.leaf(SERVER_NAME, 1))
+        .build_server()
+        .unwrap();
+    let acceptor = TlsAcceptor::new(server);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        acceptor.accept(tcp).await.map(|_| ())
+    });
+    drop(TcpStream::connect(addr).await.unwrap());
+
+    let srv = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server task finishes")
+        .unwrap();
+    assert!(matches!(srv, Err(TlsError::Io(_))), "server side: {srv:?}");
+}

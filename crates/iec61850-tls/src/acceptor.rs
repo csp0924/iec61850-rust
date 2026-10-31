@@ -68,7 +68,8 @@ impl TlsAcceptor {
     ///
     /// # Errors
     ///
-    /// [`TlsError::Io`] if the handshake fails.
+    /// The [`TlsError`] variant that classifies the failure, as described
+    /// there, when the handshake fails.
     pub async fn accept(&self, tcp: TcpStream) -> Result<TlsStream<TcpStream>, TlsError> {
         match self.inner.accept(tcp).await {
             Ok(stream) => {
@@ -89,7 +90,7 @@ impl TlsAcceptor {
             Err(e) => {
                 tracing::warn!("TLS server handshake failed: {}", e);
                 report_handshake_failure(self.event_handler.as_ref(), "server", &e);
-                Err(TlsError::Io(e))
+                Err(TlsError::from_handshake(e))
             }
         }
     }

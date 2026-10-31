@@ -160,27 +160,18 @@ pub(crate) fn report_handshake_failure(
     side: &str,
     err: &std::io::Error,
 ) {
-    use rustls::{Error as E, PeerIncompatible as P};
+    use crate::error::{handshake_cause, HandshakeCause};
     let Some(tls_err) = err
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
     else {
         return;
     };
-    let code = match tls_err {
-        E::NoCertificatesPresented => TlsEventCode::AlmCertNotConfigured,
-        E::PeerIncompatible(P::NoCipherSuitesInCommon | P::NoKxGroupsInCommon) => {
-            TlsEventCode::AlmCipherNotAllowed
-        }
-        E::PeerIncompatible(
-            P::Tls12NotOffered
-            | P::Tls12NotOfferedOrEnabled
-            | P::SupportedVersionsExtensionRequired
-            | P::SignatureAlgorithmsExtensionRequired
-            | P::ServerDoesNotSupportTls12Or13
-            | P::ServerTlsVersionIsDisabledByOurConfig,
-        ) => TlsEventCode::AlmVersionTooOld,
-        E::AlertReceived(_) => TlsEventCode::AlmUnexpectedAlert,
+    let code = match (tls_err, handshake_cause(tls_err)) {
+        (rustls::Error::NoCertificatesPresented, _) => TlsEventCode::AlmCertNotConfigured,
+        (_, HandshakeCause::Cipher) => TlsEventCode::AlmCipherNotAllowed,
+        (_, HandshakeCause::Version) => TlsEventCode::AlmVersionTooOld,
+        (rustls::Error::AlertReceived(_), _) => TlsEventCode::AlmUnexpectedAlert,
         _ => return,
     };
     let msg = format!("{side} TLS handshake failed: {tls_err}");
