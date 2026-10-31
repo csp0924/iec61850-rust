@@ -755,3 +755,42 @@ async fn client_release_is_conclude_then_finish_and_disconnect() {
     );
     handle.stop().await;
 }
+
+// ── Long session lengths ────────────────────────────────────────────────
+
+/// An AP-title of `arcs` arcs, each encoded in one octet.
+fn long_title(arcs: usize, tail: u32) -> iec61850_mms::ApTitle {
+    let mut all = vec![1, 3];
+    all.extend((0..arcs as u32).map(|i| (i % 100) + tail));
+    iec61850_mms::ApTitle::from_arcs(&all).unwrap()
+}
+
+/// The iec61850-mms client associates and reads with AP-titles long enough
+/// that the CONNECT carries over 254 octets of user data, and over 512, which
+/// takes the long form of the session lengths and then the Extended User Data
+/// parameter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn association_with_long_ap_titles_uses_long_session_lengths() {
+    let handle = start_server().await;
+    for arcs in [150usize, 300] {
+        let mut params = iec61850_mms::IsoConnectionParameters::default();
+        params.local_ap_title = Some(long_title(arcs, 2));
+        params.remote_ap_title = Some(long_title(arcs, 1));
+        let mut client = MmsClientBuilder::new()
+            .connect_timeout_ms(2_000)
+            .request_timeout_ms(2_000)
+            .iso_parameters(params)
+            .build();
+        client
+            .connect("127.0.0.1", handle.bound_addr.port())
+            .await
+            .unwrap_or_else(|e| panic!("connect with {arcs}-arc titles: {e}"));
+        let value = client
+            .read("TESTLD0", "LLN0$DC$NamPlt$vendor")
+            .await
+            .expect("read");
+        assert_eq!(value, MmsData::VisibleString("acme".into()));
+        client.disconnect().await.expect("release");
+    }
+    handle.stop().await;
+}
