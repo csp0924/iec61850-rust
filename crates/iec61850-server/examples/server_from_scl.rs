@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iec61850_model::cb::{OptFlds, ReportControlBlock};
-use iec61850_model::tree::{DataAttribute, DataSet, IedModel, LogicalNode};
+use iec61850_model::tree::{DataAttribute, DataSet, IedModel, LogicalDevice, LogicalNode};
 use iec61850_model::{ControlModel, MmsValue, NodeRef, ObjectRef, TrgOps, FC};
 use iec61850_server::control::handler::OperateFuture;
 use iec61850_server::control::{
@@ -141,14 +141,12 @@ fn register_control_blocks(
     domain: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = server.model();
-    let ln0 = model
-        .ld_by_inst(LD_INST)
-        .and_then(|ld| ld.ln_by_name("LLN0"))
-        .ok_or("LD0 has no LLN0")?;
+    let ld = model.ld_by_inst(LD_INST).ok_or("the model has no LD0")?;
+    let ln0 = ld.ln_by_name("LLN0").ok_or("LD0 has no LLN0")?;
 
     let mut datasets: HashMap<&str, Dataset> = HashMap::new();
     for ds in &ln0.datasets {
-        let built = build_dataset(&model, ln0, ds)?;
+        let built = build_dataset(&model, ld, ln0, ds)?;
         println!(
             "data set {}/{} with {} members",
             domain,
@@ -195,12 +193,13 @@ fn register_control_blocks(
 /// A member without a daName is a data object (FCD) and is served whole.
 fn build_dataset(
     model: &IedModel,
+    ld: &LogicalDevice,
     owner: &LogicalNode,
     ds: &DataSet,
 ) -> Result<Dataset, Box<dyn std::error::Error>> {
     let mut out = Dataset::new(format!("{}${}", owner.full_name(), ds.name));
     for entry in &ds.entries {
-        out.push(DatasetEntry::from_data_set_entry(model, entry)?);
+        out.push(DatasetEntry::from_data_set_entry(model, ld, entry)?);
     }
     Ok(out)
 }

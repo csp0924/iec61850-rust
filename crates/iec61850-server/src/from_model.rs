@@ -538,26 +538,10 @@ fn member_entry(
     owner: &LogicalDevice,
     entry: &DataSetEntry,
 ) -> core::result::Result<DatasetEntry, &'static str> {
-    if entry.array_index.is_some() {
-        return Err("names an array element, which is not supported");
-    }
-    let ld = if entry.ld_inst.is_empty() {
-        owner
-    } else {
-        model
-            .ld_by_inst(&entry.ld_inst)
-            .or_else(|| model.ld_by_domain(&entry.ld_inst))
-            .ok_or("names no logical device of the model")?
-    };
-    let mut path = format!("{}${}", entry.ln_name, entry.fc.as_str());
-    let component = entry.component.iter().flat_map(|c| c.split('.'));
-    for seg in entry.do_path.iter().map(String::as_str).chain(component) {
-        path.push('$');
-        path.push_str(seg);
-    }
-    DatasetEntry::from_model(model, &ld.domain_name(&model.ied_name), &path).map_err(|e| match e {
+    DatasetEntry::from_data_set_entry(model, owner, entry).map_err(|e| match e {
         DatasetError::MemberNotFound { .. } => "does not resolve under its functional constraint",
         DatasetError::TooLarge { .. } => "holds more attributes than a member may",
+        _ if entry.array_index.is_some() => "names an array element, which is not supported",
         _ => "is not a valid member path",
     })
 }

@@ -27,7 +27,7 @@
 //! leaf is the key of the reporting engine's inverted index; the reference of
 //! a member is what a report, a log entry and GetDataSetDirectory carry.
 
-use iec61850_model::{IedModel, MmsValue, FC};
+use iec61850_model::{IedModel, LogicalDevice, MmsValue, FC};
 use std::sync::{Arc, RwLock};
 
 use super::dynamic_ops::DatasetError;
@@ -228,27 +228,34 @@ impl DatasetEntry {
     }
 
     /// Resolves a member of a data set the model declares, such as one an SCL
-    /// file configures, against `model`.
+    /// file configures, against `model`; `owner` is the logical device that
+    /// holds the data set.
     ///
     /// The member lies in the logical device `entry.ld_inst`, an instance name
-    /// or a domain name, and names
-    /// `<ln_name>$<fc>$<do_path...>[$<component>]`, resolved as
-    /// [`DatasetEntry::from_model`] resolves a path: an entry without a data
-    /// attribute is an FCD, one with a data attribute an FCDA.
+    /// or a domain name, or in `owner` when `ld_inst` is empty, and names
+    /// `<ln_name>$<fc>$<do_path...>[$<component>]`, the component split at
+    /// its dots, resolved as [`DatasetEntry::from_model`] resolves a path: an
+    /// entry without a data attribute is an FCD, one with a data attribute an
+    /// FCDA.
     ///
     /// # Errors
     ///
     /// The errors of [`DatasetEntry::from_model`];
-    /// [`DatasetError::MemberNotFound`] when the logical device is not in the
-    /// model, and [`DatasetError::MemberInvalidPath`] when the entry carries an
-    /// array index.
+    /// [`DatasetError::MemberNotFound`] when `ld_inst` names no logical device
+    /// of the model, and [`DatasetError::MemberInvalidPath`] when the entry
+    /// carries an array index.
     pub fn from_data_set_entry(
         model: &IedModel,
+        owner: &LogicalDevice,
         entry: &iec61850_model::DataSetEntry,
     ) -> Result<Self, DatasetError> {
-        let ld = model
-            .ld_by_inst(&entry.ld_inst)
-            .or_else(|| model.ld_by_domain(&entry.ld_inst));
+        let ld = if entry.ld_inst.is_empty() {
+            Some(owner)
+        } else {
+            model
+                .ld_by_inst(&entry.ld_inst)
+                .or_else(|| model.ld_by_domain(&entry.ld_inst))
+        };
         let Some(ld) = ld else {
             return Err(DatasetError::MemberNotFound {
                 path: entry.to_string(),
@@ -740,36 +747,39 @@ mod tests {
 
     /// A member the model declares resolves as an FCD without a data
     /// attribute and as an FCDA with one, a component descending further; an
-    /// array index is refused.
+    /// empty logical device instance is the owner's, and an array index is
+    /// refused.
     #[test]
     fn a_declared_member_resolves_as_fcd_or_fcda() {
         let model = build_model();
+        let owner = model.ld_by_inst("LD0").unwrap();
         let mut fcd = iec61850_model::DataSetEntry::new("GGIO1", FC::St, vec!["Ind1".into()]);
-        fcd.ld_inst = "LD0".into();
-        let e = DatasetEntry::from_data_set_entry(&model, &fcd).unwrap();
+        let e = DatasetEntry::from_data_set_entry(&model, owner, &fcd).unwrap();
         assert_eq!(e.attr_ref, "IED1LD0/GGIO1$ST$Ind1");
         assert_eq!(e.leaf_count(), 3);
+        fcd.ld_inst = "LD0".into();
+        let e = DatasetEntry::from_data_set_entry(&model, owner, &fcd).unwrap();
+        assert_eq!(e.attr_ref, "IED1LD0/GGIO1$ST$Ind1");
 
         let mut fcda =
             iec61850_model::DataSetEntry::new("MMXU1", FC::Mx, vec!["TotW".into(), "mag".into()]);
-        fcda.ld_inst = "LD0".into();
-        let e = DatasetEntry::from_data_set_entry(&model, &fcda).unwrap();
+        let e = DatasetEntry::from_data_set_entry(&model, owner, &fcda).unwrap();
         assert_eq!(e.attr_ref, "IED1LD0/MMXU1$MX$TotW$mag");
         assert!(!e.is_leaf());
         fcda.component = Some("f".into());
-        let e = DatasetEntry::from_data_set_entry(&model, &fcda).unwrap();
+        let e = DatasetEntry::from_data_set_entry(&model, owner, &fcda).unwrap();
         assert_eq!(e.attr_ref, "IED1LD0/MMXU1$MX$TotW$mag$f");
         assert!(e.is_leaf());
 
         fcd.array_index = Some(0);
         assert!(matches!(
-            DatasetEntry::from_data_set_entry(&model, &fcd),
+            DatasetEntry::from_data_set_entry(&model, owner, &fcd),
             Err(DatasetError::MemberInvalidPath { .. })
         ));
         fcd.array_index = None;
         fcd.ld_inst = "LD9".into();
         assert!(matches!(
-            DatasetEntry::from_data_set_entry(&model, &fcd),
+            DatasetEntry::from_data_set_entry(&model, owner, &fcd),
             Err(DatasetError::MemberNotFound { .. })
         ));
     }
