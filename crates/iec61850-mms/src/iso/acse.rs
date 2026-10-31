@@ -176,7 +176,8 @@ pub struct IsoApplicationReference {
 pub struct AcseConnection {
     /// Association state, advanced by the caller.
     pub state: AcseConnectionState,
-    /// indirect-reference value; MMS uses 3, and an AARE echoes it back.
+    /// indirect-reference value: the presentation context identifier the MMS
+    /// PDU in the user-information travels on.
     pub next_reference: u32,
     /// Application reference decoded from the AARQ.
     pub application_reference: IsoApplicationReference,
@@ -515,7 +516,8 @@ impl AcseConnection {
 ///
 /// - `payload`: the MMS Initiate PDU carried inside user-information.
 /// - `auth`: credentials; `None` selects no authentication.
-/// - `next_reference`: the indirect-reference value, 3 for MMS.
+/// - `next_reference`: the indirect-reference value, the presentation context
+///   identifier of MMS (3 as this end proposes it).
 /// - `addressing`: the optional AP-title and AE-qualifier fields; each `None`
 ///   field is left out.
 ///
@@ -557,7 +559,8 @@ pub fn encode_aarq(
 ///
 /// - `result`: 0 accepts, 1 rejects permanently, 2 rejects transiently.
 /// - `payload`: the MMS Initiate response; required when `result` is 0.
-/// - `next_reference`: the indirect-reference echoed from the AARQ, normally 3.
+/// - `next_reference`: the indirect-reference, the presentation context
+///   identifier of MMS that the initiator chose.
 pub fn encode_aare(result: u32, payload: Option<&[u8]>, next_reference: u32, out: &mut BytesMut) {
     let app_ctx_bytes = build_app_context_name();
 

@@ -146,10 +146,16 @@ const ASN_ID_MMS: [u8; 5] = [0x28, 0xca, 0x22, 0x02, 0x01];
 /// BER transfer-syntax OID 2.1.1, as BER content octets.
 const BER_ID: [u8; 2] = [0x51, 0x01];
 
-/// Presentation context identifier used for ACSE; fixed, never negotiated.
+/// Presentation context identifier this end proposes for ACSE in a CP.
+///
+/// The initiator chooses the identifiers; a responder uses the ones a parsed CP
+/// carries, recorded in [`IsoPresentation::acse_context_id`].
 pub const ACSE_CONTEXT_ID: u8 = 1;
 
-/// Presentation context identifier used for MMS; fixed, never negotiated.
+/// Presentation context identifier this end proposes for MMS in a CP.
+///
+/// The initiator chooses the identifiers; a responder uses the ones a parsed CP
+/// carries, recorded in [`IsoPresentation::mms_context_id`].
 pub const MMS_CONTEXT_ID: u8 = 3;
 
 /// Maximum P-Selector length in bytes.
@@ -235,11 +241,13 @@ pub struct IsoPresentation {
     pub called_p_sel: PSelector,
     /// presentation-context-identifier seen in the most recent parse.
     pub next_context_id: u8,
-    /// Context identifier bound to the ACSE abstract syntax; taken from a parsed
-    /// CP PDU, and always encoded as 1.
+    /// Context identifier bound to the ACSE abstract syntax: `ACSE_CONTEXT_ID`
+    /// until a parsed CP PDU replaces it with the identifier the initiator chose.
+    /// Every PDV this layer encodes for ACSE carries it.
     pub acse_context_id: u8,
-    /// Context identifier bound to the MMS abstract syntax; taken from a parsed
-    /// CP PDU, and always encoded as 3.
+    /// Context identifier bound to the MMS abstract syntax: `MMS_CONTEXT_ID`
+    /// until a parsed CP PDU replaces it with the identifier the initiator chose.
+    /// Every PDV this layer encodes for MMS carries it.
     pub mms_context_id: u8,
 }
 
@@ -286,7 +294,8 @@ impl ConnectResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UserDataResult {
-    /// presentation-context-identifier: 1 for ACSE, 3 for MMS.
+    /// presentation-context-identifier of the PDV, to be compared with
+    /// `IsoPresentation::acse_context_id` and `mms_context_id`.
     pub context_id: u8,
     /// Offset of the MMS or ACSE payload within the input buffer.
     pub payload_start: usize,
@@ -672,13 +681,13 @@ fn encode_user_data_with_ctx(context_id: u8, payload: &[u8], out: &mut BytesMut)
     out.extend_from_slice(payload);
 }
 
-/// Encodes a Fully-Encoded-Data container under `pres.mms_context_id`, 3 by default.
+/// Encodes a Fully-Encoded-Data container under `pres.mms_context_id`.
 pub fn encode_user_data(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
     encode_user_data_with_ctx(pres.mms_context_id, payload, out);
 }
 
-/// Encodes a Fully-Encoded-Data container under `pres.acse_context_id`, 1 by
-/// default, as used for ACSE Finish and Abort payloads.
+/// Encodes a Fully-Encoded-Data container under `pres.acse_context_id`, as
+/// used for ACSE release and abort payloads.
 pub fn encode_user_data_acse(pres: &IsoPresentation, payload: &[u8], out: &mut BytesMut) {
     encode_user_data_with_ctx(pres.acse_context_id, payload, out);
 }

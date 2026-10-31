@@ -53,7 +53,6 @@ use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions, DEFAULT_MAX_TSDU_SIZE
 use iec61850_mms::iso::presentation::{
     encode_abort as pres_encode_abort, encode_cpa, encode_user_data, encode_user_data_acse,
     parse_connect as pres_parse_connect, parse_user_data, IsoPresentation, PresentationError,
-    ACSE_CONTEXT_ID, MMS_CONTEXT_ID,
 };
 use iec61850_mms::iso::session::{
     encode_abort as sess_encode_abort, encode_accept as sess_encode_accept, encode_data,
@@ -514,7 +513,12 @@ where
             // The response is wrapped outwards: MMS, ACSE AARE, Presentation
             // CPA, Session AC, COTP data.
             let mut aare_buf = BytesMut::new();
-            encode_aare(0, Some(&response_bytes), 3, &mut aare_buf);
+            encode_aare(
+                0,
+                Some(&response_bytes),
+                pres.mms_context_id.into(),
+                &mut aare_buf,
+            );
 
             let mut cpa_buf = BytesMut::new();
             encode_cpa(&pres, &aare_buf, &mut cpa_buf);
@@ -867,8 +871,9 @@ where
         };
         let inner_payload = pres_result.payload(&mms_or_acse_payload).to_vec();
 
+        // The context identifiers are the ones the client chose in its CP.
         match pres_result.context_id {
-            id if id == ACSE_CONTEXT_ID => {
+            id if id == pres.acse_context_id => {
                 // On the ACSE context the peer is releasing or aborting.
                 let mut local_acse = AcseConnection::new(None);
                 let (acse_ind, _) = match local_acse.parse_message(&inner_payload) {
@@ -910,7 +915,7 @@ where
                     }
                 }
             }
-            id if id == MMS_CONTEXT_ID => {
+            id if id == pres.mms_context_id => {
                 let outcome = client_conn
                     .with_mms(|m| parse_message(m, dispatcher.as_ref(), &inner_payload))
                     .unwrap_or(MessageOutcome::Silent);
