@@ -27,10 +27,11 @@
 //! - An answer is bound to its request by invokeID. A request without an answer
 //!   within the request timeout returns `ClientError::ServiceTimeout` and its late
 //!   answer is discarded; the association stays usable.
-//! - The end of the transport, or a Session abort, finish or disconnect from the
-//!   peer, closes the client and returns `ClientError::ConnectionLost`.
-//! - A Conclude request from the server is answered with `0x8c` and reported as a
-//!   lost connection.
+//! - The end of the transport, or a Session abort or disconnect from the peer,
+//!   closes the client and returns `ClientError::ConnectionLost`.
+//! - A release by the peer, a Session finish or a Conclude request from the
+//!   server, is answered, closes the client and returns
+//!   `ClientError::ReleasedByPeer`.
 
 // `blocking` is the synchronous wrapper; it starts a runtime internally and is std only.
 #[cfg(feature = "std")]
@@ -576,7 +577,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
     ///   leaving `0xa0 <combined_body>` for the InformationReport decoder.
     /// - `Ok(None)` when no unconfirmed PDU arrived within the timeout.
     /// - `Err(ConnectionLost)` when the peer ended the connection, which is then
-    ///   closed; a Conclude request from the server is answered with `0x8c` first.
+    ///   closed.
+    /// - `Err(ReleasedByPeer)` when the peer released the association; the
+    ///   release is answered and the connection closed.
     /// - `Err(_)` otherwise on an I/O or parse failure, or when a confirmed answer
     ///   arrives that matches no request, which means the exchange is out of step.
     pub async fn recv_unconfirmed_pdu_with_timeout(

@@ -9,6 +9,7 @@
 //!   (`0xad`)
 //! - `ServiceTimeout`: no answer arrived within the request timeout
 //! - `ConnectionLost`: the peer closed the transport or aborted the association
+//! - `ReleasedByPeer`: the peer released the association
 //! - `Transport`: the transport failed, with the cause it reported
 //! - `IsoError`: a lower ISO layer failed to parse
 //! - `ServiceError`: the peer answered with a confirmed error PDU
@@ -104,6 +105,13 @@ pub enum ClientError {
     /// association; the connection is closed.
     #[error("the transport connection was lost")]
     ConnectionLost,
+
+    /// The peer released the association: it sent a Session FN carrying an
+    /// ACSE release request, which was answered with a Session DN carrying the
+    /// release response, or a Conclude request, which was answered with a
+    /// Conclude response. The connection is closed either way.
+    #[error("the peer released the association")]
+    ReleasedByPeer,
 
     /// The transport failed with an I/O error; the connection is closed.
     ///

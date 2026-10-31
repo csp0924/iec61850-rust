@@ -29,9 +29,13 @@
 //!
 //! ## Behavior
 //!
-//! - A Conclude request arriving from the server (`0x8b`) is answered with `0x8c`,
-//!   the transport is closed and the caller sees `ConnectionLost`.
-//! - The end of the transport, a COTP DR, and a Session AB, FN or DN close the
+//! - A Session FN from the peer, which carries its ACSE release request, is
+//!   answered with a Session DN carrying the release response (ISO 8327-1,
+//!   ISO 8650-1); the transport is then closed and the caller sees
+//!   `ReleasedByPeer`.
+//! - A Conclude request arriving from the server (`0x8b`) is answered with
+//!   `0x8c`, the transport is closed and the caller sees `ReleasedByPeer`.
+//! - The end of the transport, a COTP DR, and a Session AB or DN close the
 //!   connection and surface as `ConnectionLost`.
 //! - An I/O error of the transport closes the connection and surfaces as
 //!   `Transport`, carrying the category and text the transport reported; a TLS
@@ -93,6 +97,9 @@ const ACSE_INDIRECT_REFERENCE: u32 = 3;
 
 /// Tag of the Conclude-ErrorPDU, `[13] IMPLICIT ServiceError` (ISO 9506-2).
 const TAG_CONCLUDE_ERROR: u8 = 0xad;
+
+/// Tag of the ACSE RLRQ APDU (ISO 8650-1).
+const TAG_ACSE_RLRQ: u8 = 0x62;
 
 /// Tag of the ACSE RLRE APDU (ISO 8650-1).
 const TAG_ACSE_RLRE: u8 = 0x63;
@@ -972,13 +979,16 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// Receives one MMS PDU, parsing the full ISO stack, within `request_timeout_ms`.
     ///
     /// A Conclude request from the server (`0x8b`) is answered with `0x8c`, the
-    /// transport is closed, and the call returns `Err(ConnectionLost)`.
+    /// transport is closed, and the call returns `Err(ReleasedByPeer)`.
     ///
     /// # Errors
     ///
     /// - `ServiceTimeout` when no complete PDU arrives in time.
+    /// - `ReleasedByPeer` when the peer releases the association with a Session
+    ///   FN or a Conclude request; the release is answered and the connection
+    ///   is closed.
     /// - `ConnectionLost` when the transport ends, a COTP DR arrives, or the peer
-    ///   sends a Session AB, FN or DN; the connection is closed.
+    ///   sends a Session AB or DN; the connection is closed.
     /// - `Transport` when the transport reports an I/O error; the connection is
     ///   closed.
     /// - `NotConnected` when there is no transport.
@@ -1168,14 +1178,42 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
 
         if pdu == MmsPdu::ConcludeRequest {
             warn!(
-                "received a conclude request (0x8b) from the server, answering with 0x8c and reporting a lost connection"
+                "received a conclude request (0x8b) from the server, answering with 0x8c and closing"
             );
             let _ = self.send_mms_pdu(&MmsPdu::ConcludeResponse).await;
             self.close_raw();
-            return Err(ClientError::ConnectionLost);
+            return Err(ClientError::ReleasedByPeer);
         }
 
         Ok(pdu)
+    }
+
+    /// Answers the peer's Session FN with a Session DN carrying an ACSE RLRE.
+    ///
+    /// `finish_user_data` is the user data of the FN, which should hold the
+    /// peer's RLRQ; the RLRE is sent either way, so the peer is never left
+    /// without an answer.
+    async fn answer_peer_release(&mut self, finish_user_data: &[u8]) {
+        let carries_rlrq = presentation::parse_user_data(&mut self.presentation, finish_user_data)
+            .ok()
+            .and_then(|ud| finish_user_data.get(ud.payload_start).copied())
+            == Some(TAG_ACSE_RLRQ);
+        if !carries_rlrq {
+            warn!("the session finish from the peer carries no acse rlrq");
+        }
+        let mut rlre = [0u8; 2];
+        acse::encode_rlre(&mut rlre);
+        let mut pres_buf = BytesMut::new();
+        presentation::encode_user_data_acse(&self.presentation, &rlre, &mut pres_buf);
+        let mut sess_buf = BytesMut::new();
+        match session::encode_disconnect(&pres_buf, &mut sess_buf) {
+            Ok(()) => {
+                if self.send_tsdu(&sess_buf, "release response").await.is_ok() {
+                    debug!("answered the release request of the peer");
+                }
+            }
+            Err(e) => warn!("session dn failed to encode: {e}"),
+        }
     }
 
     /// Receives one TSDU and returns the MMS bytes of its Session DT and
@@ -1189,9 +1227,14 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             .map_err(|e| ClientError::IsoError(format!("session: {e}")))?;
         match sess_ind {
             SessionIndication::Data => {}
-            SessionIndication::Abort
-            | SessionIndication::Finish
-            | SessionIndication::Disconnect => {
+            SessionIndication::Finish => {
+                warn!("the peer released the association, answering and closing the connection");
+                let user_data = self.session.user_data(&raw).to_vec();
+                self.answer_peer_release(&user_data).await;
+                self.close_raw();
+                return Err(ClientError::ReleasedByPeer);
+            }
+            SessionIndication::Abort | SessionIndication::Disconnect => {
                 warn!(indication = ?sess_ind, "the peer ended the session, closing the connection");
                 self.close_raw();
                 return Err(ClientError::ConnectionLost);

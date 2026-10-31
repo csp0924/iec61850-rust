@@ -16,8 +16,8 @@ use iec61850_mms::iso::presentation::{
     parse_connect, parse_user_data, IsoPresentation,
 };
 use iec61850_mms::iso::session::{
-    encode_abort as sess_encode_abort, encode_accept, encode_data, encode_disconnect, IsoSession,
-    SessionIndication,
+    encode_abort as sess_encode_abort, encode_accept, encode_data, encode_disconnect,
+    encode_finish, IsoSession, SessionIndication,
 };
 use iec61850_mms::mms::client::{ClientError, ConnectionState, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::initiate::InitiateResponsePdu;
@@ -292,6 +292,29 @@ async fn transport_end_is_connection_lost() {
     );
 }
 
+impl Peer {
+    /// Sends a Session FN carrying an ACSE RLRQ on the ACSE context.
+    async fn send_release_request(&mut self) {
+        let mut rlrq = [0u8; 5];
+        iec61850_mms::iso::acse::encode_rlrq(&mut rlrq);
+        let mut p = BytesMut::new();
+        encode_user_data_acse(&self.pres, &rlrq, &mut p);
+        let mut s = BytesMut::new();
+        encode_finish(&p, &mut s).unwrap();
+        self.cotp.send_data(&s).await.unwrap();
+    }
+
+    /// Receives the answer to a release request and returns its session
+    /// indication and the ACSE APDU it carries.
+    async fn recv_release_response(&mut self) -> (SessionIndication, Vec<u8>) {
+        let (ind, ud) = self.recv_spdu().await.expect("release response");
+        let mut pres = IsoPresentation::new();
+        let parsed = parse_user_data(&mut pres, &ud).expect("release response user data");
+        assert_eq!(parsed.context_id, 1, "rlre travels on the acse context");
+        (ind, parsed.payload(&ud).to_vec())
+    }
+}
+
 #[tokio::test]
 async fn conclude_request_from_the_server_closes_the_client() {
     let (mut c, mut peer) = connected().await;
@@ -302,8 +325,41 @@ async fn conclude_request_from_the_server_closes_the_client() {
         (peer, answer)
     };
     let (r, (_peer, answer)) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), server);
-    assert!(matches!(r, Err(ClientError::ConnectionLost)), "got {r:?}");
+    assert!(matches!(r, Err(ClientError::ReleasedByPeer)), "got {r:?}");
     assert_eq!(answer, vec![0x8c, 0x00]);
+    assert_eq!(c.state(), ConnectionState::Closed);
+}
+
+#[tokio::test]
+async fn release_request_from_the_peer_is_answered_with_rlre_in_a_disconnect() {
+    let (mut c, mut peer) = connected().await;
+    let server = async {
+        let _ = peer.recv_read().await;
+        peer.send_release_request().await;
+        let release = peer.recv_release_response().await;
+        (peer, release)
+    };
+    let (r, (_peer, (ind, apdu))) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), server);
+    assert!(matches!(r, Err(ClientError::ReleasedByPeer)), "got {r:?}");
+    assert_eq!(ind, SessionIndication::Disconnect);
+    assert_eq!(apdu.first(), Some(&0x63), "an rlre: {apdu:02x?}");
+    assert_eq!(c.state(), ConnectionState::Closed);
+}
+
+#[tokio::test]
+async fn release_request_while_polling_reports_is_answered() {
+    let (mut c, mut peer) = connected().await;
+    let server = async {
+        peer.send_release_request().await;
+        let release = peer.recv_release_response().await;
+        (peer, release)
+    };
+    let (r, (_peer, (ind, _))) = tokio::join!(
+        c.recv_unconfirmed_pdu_with_timeout(Duration::from_secs(3)),
+        server
+    );
+    assert!(matches!(r, Err(ClientError::ReleasedByPeer)), "got {r:?}");
+    assert_eq!(ind, SessionIndication::Disconnect);
     assert_eq!(c.state(), ConnectionState::Closed);
 }
 
