@@ -2,8 +2,10 @@
 //!
 //! An `SvSubscriber` selects streams by APPID, destination MAC, and svID, and
 //! hands each matching ASDU to its listener as an `SvSubscriberAsdu` borrowed
-//! from the receive buffer, so dispatch copies no samples. Every ASDU is
-//! delivered to every subscriber that matches it.
+//! from the decoded ASDU. The receiver copies the PDU out of the receive
+//! buffer and decodes it into owned ASDUs once per frame; dispatching to any
+//! number of subscribers copies nothing further. Every ASDU is delivered to
+//! every subscriber that matches it.
 //!
 //! Two consistency checks run before the listener. A subscriber built with a
 //! sample length, the encoded size of the data set it subscribes to, reports
@@ -59,7 +61,7 @@ pub struct SvSubscriberAsdu<'a> {
     pub smp_synch: SmpSynch,
     /// Sample rate, when present.
     pub smp_rate: Option<u16>,
-    /// Raw sample bytes, borrowed from the received frame.
+    /// Raw sample bytes, borrowed from the decoded ASDU.
     pub sample: &'a [u8],
     /// Sampling mode, when present.
     pub smp_mod: Option<SmpMod>,
