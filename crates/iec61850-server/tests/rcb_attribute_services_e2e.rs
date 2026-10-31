@@ -595,3 +595,41 @@ async fn resv_and_resv_tms_refused_while_enabled() {
     assert_eq!(read_urcb(&mut mms, "Resv").await, MmsData::Boolean(false));
     assert_eq!(read_brcb(&mut mms, "ResvTms").await, MmsData::Integer(0));
 }
+
+/// Owner names the client that holds a control block by its IP address:
+/// the client that reserved a URCB, and the client that enabled a BRCB. A
+/// control block no client holds has an empty Owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_names_the_holding_client() {
+    const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+    let empty = MmsData::OctetString(Vec::new());
+    let f = start().await;
+    let mut holder = f.connect().await;
+    let mut other = f.connect().await;
+    assert_eq!(read_urcb(&mut other, "Owner").await, empty);
+    assert_eq!(read_brcb(&mut other, "Owner").await, empty);
+
+    write_urcb(&mut holder, "Resv", MmsData::Boolean(true))
+        .await
+        .expect("reserve the URCB");
+    write_brcb(&mut holder, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+    assert_eq!(
+        read_urcb(&mut other, "Owner").await,
+        MmsData::OctetString(LOOPBACK.to_vec())
+    );
+    assert_eq!(
+        read_brcb(&mut other, "Owner").await,
+        MmsData::OctetString(LOOPBACK.to_vec())
+    );
+
+    write_urcb(&mut holder, "Resv", MmsData::Boolean(false))
+        .await
+        .expect("release the URCB");
+    write_brcb(&mut holder, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable the BRCB");
+    assert_eq!(read_urcb(&mut other, "Owner").await, empty);
+    assert_eq!(read_brcb(&mut other, "Owner").await, empty);
+}

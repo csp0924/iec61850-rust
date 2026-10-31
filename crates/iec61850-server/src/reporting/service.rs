@@ -240,9 +240,11 @@ pub fn handle_set_rcb_field(
         if v {
             state.resv = true;
             state.client_conn_id = Some(conn_id);
+            state.owner = eng.peer(conn_id);
         } else {
             state.resv = false;
             state.client_conn_id = None;
+            state.owner = None;
         }
         return Ok(());
     }
@@ -286,6 +288,7 @@ pub fn handle_set_rcb_field(
             if implicit_reservation {
                 state.resv = true;
                 state.client_conn_id = Some(conn_id);
+                state.owner = eng.peer(conn_id);
             }
             state.rpt_ena = true;
             state.sq_num = 0;
@@ -492,11 +495,13 @@ pub fn handle_get_rcb_field(
         }
         RcbField::IntgPd => MmsData::Unsigned(state.intg_pd_ms as u64),
         RcbField::Gi => MmsData::Boolean(state.gi),
-        RcbField::Owner => match state.owner {
-            Some(std::net::IpAddr::V4(a)) => MmsData::OctetString(a.octets().to_vec()),
-            Some(std::net::IpAddr::V6(a)) => MmsData::OctetString(a.octets().to_vec()),
-            None => MmsData::OctetString(vec![]),
-        },
+        // The pre-configured client, or the client holding the reservation; an
+        // unreserved URCB has no owner. IEC 61850-8-1 §17.1.2.
+        RcbField::Owner => owner_octets(
+            rc.rcb
+                .client_reservation
+                .or(state.owner.filter(|_| state.resv)),
+        ),
         // These exist only on a BRCB; a client that addressed $RP$ instead of $BR$
         // gets ObjectNonExistent from the caller.
         RcbField::EntryId | RcbField::PurgeBuf | RcbField::TimeOfEntry | RcbField::ResvTms => {
@@ -815,11 +820,14 @@ fn brcb_field_value(
         }
         RcbField::IntgPd => MmsData::Unsigned(state_guard.intg_pd_ms as u64),
         RcbField::Gi => MmsData::Boolean(state_guard.gi),
-        RcbField::Owner => match state_guard.owner {
-            Some(std::net::IpAddr::V4(a)) => MmsData::OctetString(a.octets().to_vec()),
-            Some(std::net::IpAddr::V6(a)) => MmsData::OctetString(a.octets().to_vec()),
-            None => MmsData::OctetString(vec![]),
-        },
+        // The pre-configured client, or the client that reserved or enabled the
+        // BRCB; a free BRCB has no owner. IEC 61850-8-1 §17.1.2.
+        RcbField::Owner => owner_octets(match state_guard.resv_tms {
+            super::brcb::ResvTmsState::Preconfigured => {
+                brcb.brcb.client_reservation.or(state_guard.owner)
+            }
+            _ => state_guard.owner,
+        }),
         // Read above, before the state lock is taken.
         RcbField::EntryId => return None,
         RcbField::TimeOfEntry => return None,
@@ -835,6 +843,18 @@ fn brcb_field_value(
     };
 
     Some(data)
+}
+
+/// Encodes an Owner value: the four octets of an IPv4 address or the sixteen of
+/// an IPv6 address, or the empty string when there is no owner, per
+/// IEC 61850-8-1 §17.1.2.
+fn owner_octets(owner: Option<std::net::IpAddr>) -> iec61850_mms::mms::pdu::common::MmsData {
+    use iec61850_mms::mms::pdu::common::MmsData;
+    MmsData::OctetString(match owner {
+        Some(std::net::IpAddr::V4(a)) => a.octets().to_vec(),
+        Some(std::net::IpAddr::V6(a)) => a.octets().to_vec(),
+        None => Vec::new(),
+    })
 }
 
 /// Returns the EntryID a GetBRCBValues response exposes, with its TimeOfEntry
@@ -891,6 +911,12 @@ fn claim_brcb(
 }
 
 /// Applies the `claim_brcb` decision to state the caller already holds locked.
+///
+/// While a ResvTms reservation outlives its association, the client that may
+/// take the BRCB over is recognized by the peer address recorded for the
+/// reservation. That is the ownership of the reservation itself; the Owner
+/// attribute only reports it and decides nothing, as IEC 61850-8-1 §17.1.2
+/// requires.
 ///
 /// A setter that changes which connection holds the BRCB repeats the decision
 /// inside its own critical section, so a claim decided before another
@@ -977,6 +1003,9 @@ fn set_brcb_rpt_ena(
             return Err(DataAccessError::TemporarilyUnavailable);
         }
         state.client_conn_id = Some(conn_id);
+        if state.resv_tms == super::brcb::ResvTmsState::NotReserved {
+            state.owner = writer_ip;
+        }
         if state.rpt_ena {
             return Ok(false);
         }
@@ -993,6 +1022,10 @@ fn set_brcb_rpt_ena(
             return Ok(false);
         }
         state.rpt_ena = false;
+        // A BRCB that is not reserved is free once disabled.
+        if state.resv_tms == super::brcb::ResvTmsState::NotReserved {
+            state.owner = None;
+        }
         // Disabling a BRCB keeps the buffer; only the overflow indication matters,
         // and the send path already implies it for a from-head or unset anchor, so
         // the backend is left untouched here.
@@ -1964,6 +1997,38 @@ mod tests {
         set(RcbField::RptEna, RcbWriteValue::Bool(false), 1).unwrap();
         assert_eq!(set(RcbField::Resv, RcbWriteValue::Bool(false), 1), Ok(()));
         assert_eq!(urcb_resv(&engine, &path), (false, None));
+    }
+
+    /// The Owner of a URCB is the address of the client holding the reservation,
+    /// and empty while it is not reserved.
+    #[test]
+    fn urcb_owner_is_the_reserving_client() {
+        use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        engine
+            .lock()
+            .unwrap()
+            .register_peer(1, "10.0.0.1".parse().unwrap());
+        let owner = || match handle_get_rcb_field(&engine, &path, RcbField::Owner) {
+            Some(AccessResult::Success(MmsData::OctetString(o))) => o,
+            other => panic!("expected an OctetString, got {other:?}"),
+        };
+        let set = |field: RcbField, value: RcbWriteValue| {
+            handle_set_rcb_field(&engine, &path, field, value, 1).unwrap()
+        };
+        assert_eq!(owner(), Vec::<u8>::new());
+        set(RcbField::Resv, RcbWriteValue::Bool(true));
+        assert_eq!(owner(), [10, 0, 0, 1]);
+        set(RcbField::Resv, RcbWriteValue::Bool(false));
+        assert_eq!(owner(), Vec::<u8>::new());
+        set(RcbField::RptEna, RcbWriteValue::Bool(true));
+        assert_eq!(
+            owner(),
+            [10, 0, 0, 1],
+            "an implicit reservation has an owner"
+        );
+        engine.lock().unwrap().on_connection_dropped(1);
+        assert_eq!(owner(), Vec::<u8>::new());
     }
 
     /// The end of the association releases a disabled URCB as well.
@@ -3264,6 +3329,40 @@ mod tests {
             Some(Ok(()))
         );
         assert_eq!(brcb.state.lock().unwrap().client_conn_id, None);
+    }
+
+    /// The Owner of a BRCB is the client that enabled it, or reserved it with
+    /// ResvTms, and empty once it is free again; a pre-configured BRCB reports
+    /// its configured client.
+    #[test]
+    fn brcb_owner_is_the_holding_client() {
+        use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+        let owner = |engine: &Arc<Mutex<ReportingEngine>>, path: &str| match handle_get_brcb_field(
+            engine,
+            path,
+            RcbField::Owner,
+        ) {
+            Some(AccessResult::Success(MmsData::OctetString(o))) => o,
+            other => panic!("expected an OctetString, got {other:?}"),
+        };
+        let (engine, path) = reservation_fixture(plain_brcb());
+        assert_eq!(owner(&engine, &path), Vec::<u8>::new());
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+        assert_eq!(owner(&engine, &path), [10, 0, 0, 1]);
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(false)),
+            Some(Ok(()))
+        );
+        assert_eq!(owner(&engine, &path), Vec::<u8>::new());
+        reserve(&engine, &path, OWNER);
+        assert_eq!(owner(&engine, &path), [10, 0, 0, 1]);
+
+        let (engine, path) =
+            reservation_fixture(plain_brcb().with_preconfigured_owner("10.0.0.1".parse().unwrap()));
+        assert_eq!(owner(&engine, &path), [10, 0, 0, 1]);
     }
 
     #[test]
