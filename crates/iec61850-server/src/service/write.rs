@@ -467,16 +467,31 @@ fn write_to_target(
 
     // Every leaf is stored under the exclusive value lock, so a read sees the
     // whole write or none of it.
-    let _values = crate::compat::rwlock_write(mms_model.value_lock());
-    for (leaf, new_value) in updates {
-        if let Err(e) = store_value(leaf, new_value.clone()) {
-            tracing::warn!(
-                domain = domain,
-                da = leaf.name.as_str(),
-                "write: the value lock is poisoned, answering temporarily-unavailable"
-            );
-            return WriteOutcome::Failure(e);
+    let mut written: Vec<WrittenLeaf<'_>> = Vec::with_capacity(updates.len());
+    {
+        let _values = crate::compat::rwlock_write(mms_model.value_lock());
+        for (leaf, new_value) in updates {
+            match store_value(leaf, new_value.clone()) {
+                Ok(old) => written.push(WrittenLeaf {
+                    da: leaf,
+                    old,
+                    new: new_value.clone(),
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        domain = domain,
+                        da = leaf.name.as_str(),
+                        "write: the value lock is poisoned, answering temporarily-unavailable"
+                    );
+                    return WriteOutcome::Failure(e);
+                }
+            }
         }
+    }
+    // The report and log triggers of all the leaves go out as one batch, once
+    // the values are in place.
+    if let Some(sink) = mms_model.written_leaves() {
+        sink.leaves_written(&written);
     }
     tracing::debug!(
         domain = domain,
@@ -766,7 +781,23 @@ fn handler_at<'h>(
         .find_map(|(key, handler)| (key == path).then_some(handler))
 }
 
-/// Replaces the cached value of a leaf.
+/// A leaf a write stored: the attribute, the value it held before and the
+/// value it holds now.
+#[cfg_attr(not(feature = "full-server"), allow(dead_code))]
+pub(crate) struct WrittenLeaf<'a> {
+    pub(crate) da: &'a DataAttribute,
+    pub(crate) old: iec61850_model::MmsValue,
+    pub(crate) new: iec61850_model::MmsValue,
+}
+
+/// Raises the report and log triggers of the leaves one write stored, as one
+/// batch.
+pub(crate) trait WrittenLeaves: Send + Sync {
+    /// Takes the leaves one write stored, in the order it stored them.
+    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf<'_>]);
+}
+
+/// Replaces the cached value of a leaf and returns the value it held.
 ///
 /// `std::sync::RwLock::write` yields a `Result` while `spin::RwLock::write`
 /// yields the guard, hence the two arms. Only a panic while the value was
@@ -774,20 +805,15 @@ fn handler_at<'h>(
 fn store_value(
     da: &DataAttribute,
     new_value: iec61850_model::MmsValue,
-) -> Result<(), DataAccessError> {
+) -> Result<iec61850_model::MmsValue, DataAccessError> {
     #[cfg(feature = "std")]
-    {
-        let mut guard = da
-            .value
-            .write()
-            .map_err(|_| DataAccessError::TemporarilyUnavailable)?;
-        *guard = new_value;
-    }
+    let mut guard = da
+        .value
+        .write()
+        .map_err(|_| DataAccessError::TemporarilyUnavailable)?;
     #[cfg(not(feature = "std"))]
-    {
-        *da.value.write() = new_value;
-    }
-    Ok(())
+    let mut guard = da.value.write();
+    Ok(core::mem::replace(&mut *guard, new_value))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

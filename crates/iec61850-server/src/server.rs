@@ -26,6 +26,7 @@ use crate::reporting::{
     BufferedReportControl, ChannelReportSink, DataAttributeRef, Dataset, InclusionFlag,
     ReportControl, ReportingEngine, TriggerOptions,
 };
+use crate::service::write::{WrittenLeaf, WrittenLeaves};
 use crate::service::MmsModelDispatcher;
 use iec61850_mms::mms::server::MmsServiceDispatcher;
 use iec61850_model::{DataAttribute, IedModel, MmsValue, TrgOps};
@@ -681,6 +682,37 @@ impl IedServer {
         }
         self.raise_triggers(std::slice::from_ref(&trigger));
         Ok(())
+    }
+
+    /// Raises the report and log triggers of the leaves an MMS write stored,
+    /// as one batch, or defers them while the data model is locked. Each leaf
+    /// raises the triggers its trigger options declare for the change from its
+    /// old value to its new one, as an `update_*` call would.
+    fn raise_written(&self, leaves: &[WrittenLeaf<'_>]) {
+        let triggers: Vec<PendingTrigger> = leaves
+            .iter()
+            .filter_map(|leaf| {
+                let flag = update_triggers(leaf.da, &leaf.old, &leaf.new);
+                flag.has_trigger().then(|| PendingTrigger {
+                    cell: Arc::clone(&leaf.da.value),
+                    value: leaf.new.clone(),
+                    flag,
+                })
+            })
+            .collect();
+        if triggers.is_empty() {
+            return;
+        }
+        {
+            let mut deferred = self.deferred();
+            if deferred.active {
+                for trigger in triggers {
+                    deferred.merge(trigger);
+                }
+                return;
+            }
+        }
+        self.raise_triggers(&triggers);
     }
 
     /// Raises the log and report triggers of attribute updates.
@@ -1743,10 +1775,14 @@ impl IedServerBuilder<Bound> {
                 })),
         );
 
+        // The MMS view of a dispatcher the builder makes hands the leaves each
+        // write stores back to the server, which raises their triggers.
+        let mut written_view: Option<Arc<MmsDeviceModel>> = None;
         let dispatcher: Arc<dyn MmsServiceDispatcher> = match self.dispatcher {
             Some(d) => d,
             None => {
-                let mms_model = MmsDeviceModel::from_ied_model(&model)?;
+                let mms_model = Arc::new(MmsDeviceModel::from_ied_model(&model)?);
+                written_view = Some(Arc::clone(&mms_model));
                 let ident = crate::service::IdentificationStrings {
                     vendor_name: self.config.vendor_name.clone().unwrap_or_else(|| {
                         crate::service::IdentificationStrings::DEFAULT_VENDOR.into()
@@ -1760,7 +1796,7 @@ impl IedServerBuilder<Bound> {
                 };
                 let dispatcher = MmsModelDispatcher::with_identification(
                     model.clone(),
-                    Arc::new(mms_model),
+                    mms_model,
                     Arc::new(write_access_policies),
                     Arc::new(ident),
                 )
@@ -1810,6 +1846,10 @@ impl IedServerBuilder<Bound> {
             }),
         };
         server.install_value_hooks();
+        if let Some(mms_model) = written_view {
+            let sink: Arc<dyn WrittenLeaves> = server.inner.clone();
+            mms_model.set_written_leaves(Arc::downgrade(&sink));
+        }
         Ok(server)
     }
 }
@@ -1843,6 +1883,12 @@ impl IedServer {
                 }
             },
         ));
+    }
+}
+
+impl WrittenLeaves for IedServerInner {
+    fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf<'_>]) {
+        IedServer { inner: self }.raise_written(leaves);
     }
 }
 

@@ -16,6 +16,7 @@
 
 use crate::compat::{Arc, HashMap, RwLock};
 use crate::error::{Result, ServerError};
+use crate::service::write::WrittenLeaves;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
@@ -23,10 +24,14 @@ use alloc::format;
 #[cfg(not(feature = "std"))]
 use alloc::string::{String, ToString};
 #[cfg(not(feature = "std"))]
+use alloc::sync::Weak;
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use iec61850_model::{
     DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, LogicalDevice, LogicalNode, FC,
 };
+#[cfg(feature = "std")]
+use std::sync::Weak;
 
 /// Order in which the functional-constraint groups of a logical node appear.
 ///
@@ -167,6 +172,9 @@ pub struct MmsDeviceModel {
     /// exclusively while a write stores them, so a read sees a write of a data
     /// object or a constructed attribute whole or not at all.
     value_lock: Arc<RwLock<()>>,
+    /// Where a write hands the leaves it stored, to raise their report and log
+    /// triggers; unset for a view no server owns.
+    written_leaves: Arc<RwLock<Option<Weak<dyn WrittenLeaves>>>>,
 }
 
 impl MmsDeviceModel {
@@ -197,7 +205,23 @@ impl MmsDeviceModel {
             domains,
             domain_index,
             value_lock: Arc::new(RwLock::new(())),
+            written_leaves: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Sets where a write hands the leaves it stored.
+    #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
+    pub(crate) fn set_written_leaves(&self, sink: Weak<dyn WrittenLeaves>) {
+        if let Some(mut g) = crate::compat::rwlock_write(&self.written_leaves) {
+            *g = Some(sink);
+        }
+    }
+
+    /// Returns where a write hands the leaves it stored, while its owner lives.
+    pub(crate) fn written_leaves(&self) -> Option<Arc<dyn WrittenLeaves>> {
+        crate::compat::rwlock_read(&self.written_leaves)?
+            .as_ref()?
+            .upgrade()
     }
 
     /// The lock that keeps a read from seeing part of a write; see the field.

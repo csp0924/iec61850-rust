@@ -14,6 +14,9 @@
 //! below, and a refused read carries no part of the value.
 //!
 //! A data set created at run time may take a member beneath a sub-data-object.
+//!
+//! The report triggers of the leaves one write stores go out as one batch, so
+//! an FCD write is reported once with all its leaves.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -150,7 +153,22 @@ fn build_model() -> Arc<IedModel> {
             ),
         ],
     );
-    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt, set, ind]);
+    let rep = DataObject::new(
+        "Rep",
+        ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                DoChild::Da(DataAttribute::new(
+                    name,
+                    FC::Sp,
+                    DataAttributeType::Int32,
+                    TrgOps::DCHG,
+                    MmsValue::Integer(0),
+                ))
+            })
+            .collect(),
+    );
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt, set, ind, rep]);
     let lln0 = LogicalNodeBuilder::lln0()
         .set_sgcb({
             let mut sgcb = SettingGroupControlBlock::default();
@@ -805,6 +823,157 @@ async fn read_handler_can_guard_its_own_path_only() {
             .read(DOMAIN, "GGIO1")
             .await
             .expect("the logical node reads");
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A running server whose BRCB reports `GGIO1.Rep.a` and `GGIO1.Rep.b` on a
+/// data change, with no buffer time, to an MMS association that enabled it.
+/// Without a buffer time every trigger batch is one buffered entry, so one
+/// report per batch.
+async fn start_reporting() -> (IedServer, ServerHandle, MmsClient) {
+    use iec61850_model::{NodeRef, ObjectRef};
+    use iec61850_server::reporting::{Brcb, BufferedReportControl};
+    use iec61850_server::{Dataset, DatasetEntry, OptFlds, TriggerOptions};
+
+    let server = IedServer::builder()
+        .model(build_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .build()
+        .expect("build server");
+    let model = server.model();
+    let mut ds = Dataset::new("LLN0$dsRep");
+    for leaf in ["a", "b"] {
+        let reference = format!("IED1LD0/GGIO1$SP$Rep${leaf}");
+        let Some(NodeRef::Da(da)) =
+            model.node_by_object_ref(&ObjectRef::parse_mms(&reference).unwrap())
+        else {
+            panic!("{reference} is a data attribute");
+        };
+        ds.push(DatasetEntry::new(reference.clone(), Arc::clone(&da.value)));
+    }
+    let brcb = Brcb::new("brcbRep", "LLN0$dsRep")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(OptFlds::REASON | OptFlds::DATA_SET);
+    server
+        .register_brcb(
+            BufferedReportControl::new("IED1LD0/LLN0$BR$brcbRep", brcb),
+            ds,
+        )
+        .expect("register_brcb");
+    let handle = server.start().await.expect("start");
+    let mut client = connect(&handle).await;
+    client
+        .write(DOMAIN, "LLN0$BR$brcbRep$RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the control block");
+    (server, handle, client)
+}
+
+/// The inclusion bitmap and the values of the next report; fails after four
+/// seconds without one.
+async fn next_report(client: &mut MmsClient) -> (Vec<bool>, Vec<MmsValue>) {
+    use iec61850_client::mms_compat::mms_data_to_mms_value;
+    use iec61850_client::report::parse::parse_report;
+    use iec61850_mms::mms::pdu::common::ObjectName;
+    use iec61850_mms::mms::pdu::information_report::{
+        decode_information_report, VariableAccessSpec,
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "no report arrived");
+        let Some(inner) = client
+            .recv_unconfirmed_pdu_with_timeout(remaining)
+            .await
+            .expect("receive")
+        else {
+            continue;
+        };
+        let report = decode_information_report(&inner).expect("decode information report");
+        if !matches!(
+            &report.variable_access_spec,
+            VariableAccessSpec::VariableListName(ObjectName::VmdSpecific(s)) if s == "RPT"
+        ) {
+            continue;
+        }
+        let elements = report
+            .list_of_access_result
+            .iter()
+            .map(mms_data_to_mms_value)
+            .collect();
+        let parsed = parse_report(&MmsValue::Array(elements)).expect("parse report");
+        return (parsed.inclusion_bits, parsed.data_values);
+    }
+}
+
+/// An FCD write is reported once, with every leaf it changed, and a later
+/// write of one leaf is reported with that leaf alone: the leaves of the FCD
+/// write left nothing behind for a second report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_object_write_is_reported_as_one_batch() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_server, handle, mut client) = start_reporting().await;
+
+        client
+            .write(
+                DOMAIN,
+                "GGIO1$SP$Rep",
+                MmsData::Structure(vec![MmsData::Integer(1), MmsData::Integer(2)]),
+            )
+            .await
+            .expect("FCD write");
+        assert_eq!(
+            next_report(&mut client).await,
+            (
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)]
+            )
+        );
+
+        client
+            .write(DOMAIN, "GGIO1$SP$Rep$b", MmsData::Integer(3))
+            .await
+            .expect("leaf write");
+        assert_eq!(
+            next_report(&mut client).await,
+            (vec![false, true], vec![MmsValue::Integer(3)])
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// While the data model is locked, the triggers of an FCD write wait for the
+/// release and then go out as one report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_object_write_under_the_model_lock_is_reported_on_release() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle, mut client) = start_reporting().await;
+
+        let guard = server.lock_data_model().expect("lock the data model");
+        client
+            .write(
+                DOMAIN,
+                "GGIO1$SP$Rep",
+                MmsData::Structure(vec![MmsData::Integer(4), MmsData::Integer(5)]),
+            )
+            .await
+            .expect("FCD write");
+        drop(guard);
+        assert_eq!(
+            next_report(&mut client).await,
+            (
+                vec![true, true],
+                vec![MmsValue::Integer(4), MmsValue::Integer(5)]
+            )
+        );
 
         handle.stop().await;
     })
