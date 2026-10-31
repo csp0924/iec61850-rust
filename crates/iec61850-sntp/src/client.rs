@@ -78,7 +78,8 @@ impl SntpClient {
     /// [`SntpError::UnexpectedMode`] when the reply is not in server mode;
     /// and [`SntpError::InvalidHeader`] when the reply does not echo the
     /// originate timestamp, carries a zero transmit timestamp, or reports an
-    /// unsynchronized clock.
+    /// unsynchronized clock. Each rejected reply is also reported through
+    /// `tracing::warn!`.
     pub async fn query(&self, recv_timeout: Duration) -> Result<SntpResponse, SntpError> {
         let socket = UdpSocket::bind(self.bind_addr).await?;
         socket.connect(self.server).await?;
@@ -99,24 +100,13 @@ impl SntpClient {
         // Take t4 the instant the reply arrives, as close to the wire as possible.
         let t4_unix = system_now_unix_s()?;
 
-        let reply = SntpPacket::decode(&buf[..len])?;
-        if reply.mode != Mode::Server {
-            return Err(SntpError::UnexpectedMode(reply.mode as u8));
-        }
-        // RFC 4330: the reply must echo our transmit timestamp as originate;
-        // anything else is another client's reply, or a replay.
-        if reply.originate_ts != t1_ntp {
-            return Err(SntpError::InvalidHeader("originate_ts mismatch (replay?)"));
-        }
-        // RFC 4330 section 5: a reply whose transmit timestamp is zero is discarded.
-        if reply.transmit_ts == NtpTimestamp::ZERO {
-            return Err(SntpError::InvalidHeader("transmit_ts is zero"));
-        }
-        if reply.leap == LeapIndicator::AlarmUnsynchronized || reply.stratum == 0 {
-            return Err(SntpError::InvalidHeader(
-                "server reports kiss-of-death / unsynchronized",
-            ));
-        }
+        let reply = match check_reply(&buf[..len], t1_ntp) {
+            Ok(reply) => reply,
+            Err(err) => {
+                tracing::warn!(?err, server = %self.server, len, "rejected SNTP reply");
+                return Err(err);
+            }
+        };
 
         let t2_unix = ntp_to_unix_s(reply.receive_ts);
         let t3_unix = ntp_to_unix_s(reply.transmit_ts);
@@ -137,6 +127,30 @@ impl SntpClient {
             version: reply.version,
         })
     }
+}
+
+/// Decodes a reply and checks it against the request whose transmit
+/// timestamp was `t1`.
+fn check_reply(buf: &[u8], t1: NtpTimestamp) -> Result<SntpPacket, SntpError> {
+    let reply = SntpPacket::decode(buf)?;
+    if reply.mode != Mode::Server {
+        return Err(SntpError::UnexpectedMode(reply.mode as u8));
+    }
+    // RFC 4330: the reply must echo our transmit timestamp as originate;
+    // anything else is another client's reply, or a replay.
+    if reply.originate_ts != t1 {
+        return Err(SntpError::InvalidHeader("originate_ts mismatch (replay?)"));
+    }
+    // RFC 4330 section 5: a reply whose transmit timestamp is zero is discarded.
+    if reply.transmit_ts == NtpTimestamp::ZERO {
+        return Err(SntpError::InvalidHeader("transmit_ts is zero"));
+    }
+    if reply.leap == LeapIndicator::AlarmUnsynchronized || reply.stratum == 0 {
+        return Err(SntpError::InvalidHeader(
+            "server reports kiss-of-death / unsynchronized",
+        ));
+    }
+    Ok(reply)
 }
 
 /// The result of one SNTP query, converted to Unix epoch seconds.
