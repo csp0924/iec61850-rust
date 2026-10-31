@@ -1260,7 +1260,7 @@ mod tests {
 
         let eng = engine.lock().unwrap();
         assert_eq!(
-            eng.attr_ref_for_value(&values[0]).as_deref(),
+            eng.value_index().attr_ref_for(&values[0]).as_deref(),
             Some(DS2_MEMBER)
         );
         let flag = crate::flags::InclusionFlag::VALUE_CHANGED;
@@ -1355,7 +1355,7 @@ mod tests {
             .collect();
         assert_eq!(refs, [DS2_MEMBER]);
         assert_eq!(
-            eng.attr_ref_for_value(&values[0]).as_deref(),
+            eng.value_index().attr_ref_for(&values[0]).as_deref(),
             Some(DS2_MEMBER)
         );
         eng.on_brcb_value_updated(
@@ -1396,10 +1396,13 @@ mod tests {
     }
 
     #[test]
-    fn attr_ref_for_value_ignores_a_value_no_data_set_holds() {
+    fn value_index_ignores_a_value_no_data_set_holds() {
         let (engine, _path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
         let other = Arc::new(RwLock::new(MmsValue::Integer(0)));
-        assert_eq!(engine.lock().unwrap().attr_ref_for_value(&other), None);
+        assert_eq!(
+            engine.lock().unwrap().value_index().attr_ref_for(&other),
+            None
+        );
     }
 
     // ── RcbField parsing ─────────────────────────────────────────────────────

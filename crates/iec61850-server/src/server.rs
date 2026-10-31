@@ -99,6 +99,8 @@ struct IedServerInner {
 
     /// Reporting engine, shared with the dispatcher and driven by the tick loop.
     reporting_engine: Arc<Mutex<ReportingEngine>>,
+    /// The engine's index of bound data set members, queried without its lock.
+    value_index: crate::reporting::engine::ValueIndex,
 
     /// Maps the address of a shared data attribute value to the reference the
     /// reporting engine knows it by, so that an update can trigger a report
@@ -601,15 +603,9 @@ impl IedServer {
             .ok()
             .and_then(|g| g.get(&ptr_key).cloned());
 
-        // A member of a data set a control block was bound to over MMS is known
-        // to the engine only.
-        let engine_guard = self.inner.reporting_engine.lock();
-        let attr_ref_opt = attr_ref_opt.or_else(|| {
-            engine_guard
-                .as_ref()
-                .ok()
-                .and_then(|e| e.attr_ref_for_value(&da.value))
-        });
+        // A member of a data set a control block was bound to over MMS is in
+        // the engine's index only, which is read without the engine lock.
+        let attr_ref_opt = attr_ref_opt.or_else(|| self.inner.value_index.attr_ref_for(&da.value));
 
         if let Some(attr_ref) = attr_ref_opt {
             let now_ms = SystemTime::now()
@@ -617,7 +613,7 @@ impl IedServer {
                 .unwrap_or_default()
                 .as_millis() as u64;
 
-            if let Ok(engine) = engine_guard {
+            if let Ok(engine) = self.inner.reporting_engine.lock() {
                 let flag = change_flag(da);
                 engine.on_value_updated(&attr_ref, new_value.clone(), flag, now_ms);
                 // The buffered path is always tried too; it returns at once
@@ -1397,6 +1393,7 @@ impl IedServerBuilder<Bound> {
         // DatSet writes resolve against the same registry the dispatcher serves.
         let mut engine = ReportingEngine::new_with_channel_sink(report_sink.clone());
         engine.set_dataset_registry(dataset_registry.clone());
+        let value_index = engine.value_index();
         let reporting_engine: Arc<Mutex<ReportingEngine>> = Arc::new(Mutex::new(engine));
 
         let handler_registry: Arc<HandlerRegistry> = Arc::new(HandlerRegistry::new());
@@ -1473,6 +1470,7 @@ impl IedServerBuilder<Bound> {
                 control_objects,
                 ct_sink,
                 reporting_engine,
+                value_index,
                 attr_ref_index: RwLock::new(HashMap::new()),
                 dataset_registry,
                 report_sink,

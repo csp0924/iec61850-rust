@@ -129,10 +129,63 @@ pub struct ReportingEngine {
     peers: HashMap<ConnectionId, IpAddr>,
     /// Data sets a DatSet write may name, shared with the server.
     dataset_registry: Option<super::DatasetRegistry>,
-    /// Attribute reference of every member bound to a control block, keyed by the
-    /// address of its value lock. The weak handle confirms that the address still
-    /// belongs to the same value.
-    value_index: HashMap<usize, (Weak<RwLock<MmsValue>>, DataAttributeRef)>,
+    /// Attribute reference of every member a DatSet write bound a control
+    /// block to.
+    value_index: ValueIndex,
+}
+
+/// Attribute reference of every data set member a DatSet write bound a control
+/// block to, keyed by the address of the member's value lock.
+///
+/// Members of the data sets registered with a control block are indexed by the
+/// server; this index holds the ones a client binds later. The server holds a
+/// clone and looks an updated value up without taking the engine lock, and an
+/// index nothing was ever added to costs a single atomic load. The weak handle
+/// confirms that an address still belongs to the same value.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ValueIndex(Arc<ValueIndexInner>);
+
+#[derive(Debug, Default)]
+struct ValueIndexInner {
+    /// Set once the first member is added; the map is not read before.
+    populated: std::sync::atomic::AtomicBool,
+    members: RwLock<MemberMap>,
+}
+
+/// Value lock address to the weak handle of that lock and its attribute
+/// reference.
+type MemberMap = HashMap<usize, (Weak<RwLock<MmsValue>>, DataAttributeRef)>;
+
+impl ValueIndex {
+    /// Records the attribute reference of every member of `dataset`.
+    fn insert_members(&self, dataset: &Dataset) {
+        let Ok(mut index) = self.0.members.write() else {
+            tracing::warn!("the member value index lock is poisoned; the members were not indexed");
+            return;
+        };
+        for entry in &dataset.entries {
+            index.insert(
+                Arc::as_ptr(&entry.value) as usize,
+                (Arc::downgrade(&entry.value), entry.attr_ref.clone()),
+            );
+        }
+        if !dataset.entries.is_empty() {
+            self.0.populated.store(true, Ordering::Release);
+        }
+    }
+
+    /// Returns the attribute reference a control block knows the value lock
+    /// `value` by, when a data set bound by a DatSet write has it as a member.
+    #[cfg(any(feature = "full-server", test))]
+    pub(crate) fn attr_ref_for(&self, value: &Arc<RwLock<MmsValue>>) -> Option<DataAttributeRef> {
+        if !self.0.populated.load(Ordering::Acquire) {
+            return None;
+        }
+        let index = self.0.members.read().ok()?;
+        let (weak, attr_ref) = index.get(&(Arc::as_ptr(value) as usize))?;
+        (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(value)))
+            .then(|| attr_ref.clone())
+    }
 }
 
 /// Buffer-time accumulation state for one BRCB.
@@ -219,7 +272,7 @@ impl ReportingEngine {
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: None,
-            value_index: HashMap::new(),
+            value_index: ValueIndex::default(),
         }
     }
 
@@ -244,7 +297,7 @@ impl ReportingEngine {
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: None,
-            value_index: HashMap::new(),
+            value_index: ValueIndex::default(),
         }
     }
 
@@ -288,7 +341,6 @@ impl ReportingEngine {
                 .or_default()
                 .push(weak);
         }
-        self.index_values(&dataset);
 
         self.rcbs.insert(mms_path, rc);
         Ok(())
@@ -383,7 +435,6 @@ impl ReportingEngine {
                 .or_default()
                 .push(weak);
         }
-        self.index_values(&dataset);
         self.brcb_datasets.insert(mms_path.clone(), dataset);
         self.brcbs.insert(mms_path, brcb_arc);
         Ok(())
@@ -421,25 +472,17 @@ impl ReportingEngine {
         self.dataset_registry = Some(registry);
     }
 
-    /// Returns the attribute reference a control block knows the value lock
-    /// `value` by, when a bound data set has it as a member.
-    pub(crate) fn attr_ref_for_value(
-        &self,
-        value: &Arc<RwLock<MmsValue>>,
-    ) -> Option<DataAttributeRef> {
-        let (weak, attr_ref) = self.value_index.get(&(Arc::as_ptr(value) as usize))?;
-        (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(value)))
-            .then(|| attr_ref.clone())
+    /// Returns the index of the members bound to a control block, which the
+    /// caller queries without the engine lock.
+    #[cfg(any(feature = "full-server", test))]
+    pub(crate) fn value_index(&self) -> ValueIndex {
+        self.value_index.clone()
     }
 
-    /// Records the attribute reference of every member of `dataset`.
+    /// Records the attribute reference of every member of `dataset`, which a
+    /// DatSet write bound a control block to.
     fn index_values(&mut self, dataset: &Dataset) {
-        for entry in &dataset.entries {
-            self.value_index.insert(
-                Arc::as_ptr(&entry.value) as usize,
-                (Arc::downgrade(&entry.value), entry.attr_ref.clone()),
-            );
-        }
+        self.value_index.insert_members(dataset);
     }
 
     /// Looks up the data set a DatSet value names, for the control block at
