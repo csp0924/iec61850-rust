@@ -119,6 +119,14 @@ pub enum ClientError {
         limit: usize,
     },
 
+    /// A journal read by `IedConnection::query_journal_all` did not advance:
+    /// the server reported that more entries follow but sent none past the
+    /// last entry received, or a continuation began before the entry it
+    /// resumes after. Following `moreFollows` would repeat the same request
+    /// forever.
+    #[error("the server reported more journal entries but sent none past the last one received")]
+    JournalNotAdvancing,
+
     /// An error from the MMS or ISO layer below that no other variant
     /// describes, rendered through its `Display`: a PDU or SPDU that does not
     /// decode, an exhausted invokeID space, or another protocol failure.

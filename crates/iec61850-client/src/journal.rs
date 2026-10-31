@@ -324,11 +324,12 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::query_journal`]; `Mms` when the server reports
-    /// that more entries follow but returns none, which leaves nothing to
-    /// resume after, and when a continuation page does not move past the
-    /// entry it resumes after, as from a server that ignores
-    /// entryToStartAfter, which would otherwise repeat the same page forever.
+    /// The errors of [`Self::query_journal`];
+    /// [`ClientError::JournalNotAdvancing`] when the server reports that more
+    /// entries follow but returns none, which leaves nothing to resume after,
+    /// and when a continuation page does not move past the entry it resumes
+    /// after, as from a server that ignores entryToStartAfter, which would
+    /// otherwise repeat the same page forever.
     pub async fn query_journal_all(
         &self,
         log_ref: &str,
@@ -341,9 +342,7 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
             let (page, more) = self.query_journal(log_ref, &next).await?;
             if let Some((cursor, previous_first)) = &resumed {
                 if !advances(cursor, *previous_first, &page) {
-                    return Err(ClientError::Mms(
-                        "the server did not advance past the last journal entry".to_string(),
-                    ));
+                    return Err(ClientError::JournalNotAdvancing);
                 }
             }
             if !more {
@@ -351,9 +350,7 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
                 return Ok(all);
             }
             let Some(continued) = next.continuation(&page) else {
-                return Err(ClientError::Mms(
-                    "the server reported more journal entries but returned none".to_string(),
-                ));
+                return Err(ClientError::JournalNotAdvancing);
             };
             resumed = continued.after.zip(page.first().map(|e| e.entry_id));
             next = continued;
