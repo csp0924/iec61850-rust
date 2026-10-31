@@ -157,7 +157,8 @@ fn round_trip_brcb_time_of_entry(time_of_entry_ms: u64) -> u64 {
     };
     use std::sync::Mutex;
 
-    // Server: a BRCB whose last sent report carries the instant under test.
+    // Server: an enabled BRCB whose last sent report carries the instant under
+    // test; GetBRCBValues exposes that entry while RptEna is true.
     let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
     let brcb = Brcb::new("01", "MMXU1$ds1").with_trg_ops(TriggerOptions::DATA_CHANGED);
     let path = "IED1LD0/MMXU1$BR$brcb01".to_string();
@@ -169,10 +170,9 @@ fn round_trip_brcb_time_of_entry(time_of_entry_ms: u64) -> u64 {
         let guard = engine.lock().expect("engine lock");
         let brcb = guard.get_brcb(&path).expect("registered brcb");
         drop(guard);
-        brcb.state
-            .lock()
-            .expect("brcb state lock")
-            .last_sent_time_of_entry_ms = time_of_entry_ms;
+        let mut state = brcb.state.lock().expect("brcb state lock");
+        state.rpt_ena = true;
+        state.last_sent_time_of_entry_ms = time_of_entry_ms;
     }
 
     let field = handle_get_brcb_field(&engine, &path, RcbField::Unknown("TimeofEntry".to_string()));

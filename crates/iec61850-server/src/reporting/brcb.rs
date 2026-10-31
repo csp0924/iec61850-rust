@@ -374,8 +374,9 @@ pub struct BrcbState {
     /// resolves it when it is `WaitingForNext`; the send path reads it to decide
     /// where to start.
     pub transmit_anchor: TransmitAnchor,
-    /// EntryID the client wrote most recently. GetBRCBValues reads it back, so a
-    /// read after a write returns the same value.
+    /// EntryID the client wrote most recently, the anchor a `WaitingForNext`
+    /// transmit anchor resolves against. GetBRCBValues does not read it back: the
+    /// EntryID it exposes follows the buffer and the send path.
     pub last_committed_entry_id: EntryId,
     /// When the reservation expires. The tick path scans this and releases the
     /// reservation once it has passed. `None` when no timer is needed, that is for
@@ -526,7 +527,7 @@ impl BrcbState {
         id: EntryId,
         backend: &dyn ReportBufferBackend,
     ) -> Result<(), ApplyEntryIdError> {
-        // A read of EntryID after this write returns the value just written.
+        // The anchor a later `WaitingForNext` resolves against.
         self.last_committed_entry_id = id;
 
         if id.is_zero() {
@@ -976,8 +977,9 @@ impl BufferedReportControl {
         Ok(outcome)
     }
 
-    /// Returns the EntryID the client wrote most recently, for GetBRCBValues. It is
-    /// the all-zero identifier until a client writes one.
+    /// Returns the EntryID the client wrote most recently. It is the all-zero
+    /// identifier until a client writes one. GetBRCBValues exposes a different
+    /// value, which follows the buffer and the send path.
     ///
     /// # Errors
     ///

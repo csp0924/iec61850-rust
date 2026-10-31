@@ -660,7 +660,24 @@ pub fn handle_get_brcb_field(
         eng.get_brcb(mms_path)?
     };
 
-    // Most fields come from the runtime state.
+    // EntryID and TimeofEntry may need the buffer, whose lock is never held
+    // together with the state lock.
+    match field {
+        RcbField::EntryId => {
+            let (id, _) = exposed_entry(&brcb)?;
+            return Some(AccessResult::Success(MmsData::OctetString(id.0.to_vec())));
+        }
+        RcbField::Unknown(ref n) if n == "TimeofEntry" => {
+            // BinaryTime6 wire format; the stored value is host-order milliseconds.
+            let (_, ms) = exposed_entry(&brcb)?;
+            return Some(AccessResult::Success(MmsData::BinaryTime(
+                encode_binary_time6_bytes(ms),
+            )));
+        }
+        _ => {}
+    }
+
+    // The other fields come from the runtime state.
     let state_guard = brcb.state.lock().ok()?;
 
     let data = match field {
@@ -705,19 +722,11 @@ pub fn handle_get_brcb_field(
             Some(std::net::IpAddr::V6(a)) => MmsData::OctetString(a.octets().to_vec()),
             None => MmsData::OctetString(vec![]),
         },
-        // EntryID.
-        RcbField::EntryId => {
-            // The state lock is already held here, so the field is read directly.
-            MmsData::OctetString(state_guard.last_committed_entry_id.0.to_vec())
-        }
+        // Read above, before the state lock is taken.
+        RcbField::EntryId => return None,
         RcbField::Unknown(ref n) if n == "PurgeBuf" => {
             // PurgeBuf is a trigger flag: it reads back false once the purge has run.
             MmsData::Boolean(state_guard.purge_buf_pending)
-        }
-        RcbField::Unknown(ref n) if n == "TimeofEntry" => {
-            // BinaryTime6 wire format; the stored value is host-order milliseconds.
-            let ms = state_guard.last_sent_time_of_entry_ms;
-            MmsData::BinaryTime(encode_binary_time6_bytes(ms))
         }
         RcbField::Unknown(ref n) if n == "ResvTms" => {
             // INT16 wire format.
@@ -727,6 +736,34 @@ pub fn handle_get_brcb_field(
     };
 
     Some(AccessResult::Success(data))
+}
+
+/// Returns the EntryID a GetBRCBValues response exposes, with its TimeOfEntry
+/// in milliseconds, per IEC 61850-7-2.
+///
+/// With RptEna true it is the last entry formatted and queued for transmission.
+/// With RptEna false it is the newest entry in the buffer, or the all-zero
+/// EntryID with a zero timestamp when the buffer is empty. A client write of
+/// EntryID moves the transmit anchor only and does not change this value.
+///
+/// Returns `None` when a mutex is poisoned.
+fn exposed_entry(brcb: &super::brcb::BufferedReportControl) -> Option<(EntryId, u64)> {
+    let (rpt_ena, last_sent) = {
+        let state = brcb.state.lock().ok()?;
+        (
+            state.rpt_ena,
+            (state.last_sent_entry_id, state.last_sent_time_of_entry_ms),
+        )
+    };
+    if rpt_ena {
+        return Some(last_sent);
+    }
+    let buffer = brcb.report_buffer.lock().ok()?;
+    let newest = buffer
+        .iter_entries()
+        .last()
+        .map_or((EntryId::ZERO, 0), |e| (e.entry_id, e.time_of_entry_ms));
+    Some(newest)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2056,6 +2093,52 @@ mod tests {
             }
             other => panic!("expected a BinaryTime, got {:?}", other),
         }
+    }
+
+    /// While RptEna is true, EntryID and TimeofEntry expose the last entry sent,
+    /// not a newer entry already in the buffer; while it is false, the newest
+    /// entry in the buffer.
+    #[test]
+    fn brcb_get_entry_id_follows_rpt_ena() {
+        use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+        let (engine, path) = make_engine_with_brcb("16", TriggerOptions::DATA_CHANGED);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        let (sent, _) = brcb
+            .enqueue_entry(1_700_000_000_000, false, false, bytes::Bytes::new())
+            .unwrap();
+        let (newest, _) = brcb
+            .enqueue_entry(1_700_000_000_500, false, false, bytes::Bytes::new())
+            .unwrap();
+        {
+            let mut state = brcb.lock_state().unwrap();
+            state.rpt_ena = true;
+            state.last_sent_entry_id = sent;
+            state.last_sent_time_of_entry_ms = 1_700_000_000_000;
+        }
+        let read = |field: RcbField| match handle_get_brcb_field(&engine, &path, field) {
+            Some(AccessResult::Success(d)) => d,
+            other => panic!("expected a value, got {other:?}"),
+        };
+        let time_of_entry = || RcbField::Unknown("TimeofEntry".to_string());
+
+        assert_eq!(
+            read(RcbField::EntryId),
+            MmsData::OctetString(sent.0.to_vec())
+        );
+        assert_eq!(
+            read(time_of_entry()),
+            MmsData::BinaryTime(encode_binary_time6_bytes(1_700_000_000_000))
+        );
+
+        brcb.lock_state().unwrap().rpt_ena = false;
+        assert_eq!(
+            read(RcbField::EntryId),
+            MmsData::OctetString(newest.0.to_vec())
+        );
+        assert_eq!(
+            read(time_of_entry()),
+            MmsData::BinaryTime(encode_binary_time6_bytes(1_700_000_000_500))
+        );
     }
 
     #[test]
