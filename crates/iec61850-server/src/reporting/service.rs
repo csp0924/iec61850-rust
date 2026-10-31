@@ -517,8 +517,9 @@ use iec61850_mms::binary_time6_from_epoch_ms;
 ///   ObjectAccessDenied
 /// - a positive ResvTms reserves the BRCB for `conn_id` and its peer address;
 ///   the reservation outlives the association by ResvTms seconds
-/// - DatSet, TrgOps, IntgPd, BufTm, and RptID are refused with
-///   TemporarilyUnavailable while RptEna is true
+/// - DatSet, OptFlds, TrgOps, IntgPd, BufTm, RptID, EntryID, and PurgeBuf are
+///   refused with TemporarilyUnavailable while RptEna is true, per
+///   IEC 61850-8-1 Table 72
 /// - an accepted change to one of those fields purges the report buffer, through
 ///   `BufferedReportControl::set_config_field`; of them only DatSet increments
 ///   ConfRev, and an OptFlds change does neither
@@ -596,6 +597,9 @@ pub fn handle_set_brcb_field(
                 Ok(Ok(())) => Some(Ok(())),
                 Ok(Err(ApplyEntryIdError::InvalidEntryId)) => {
                     Some(Err(DataAccessError::ObjectValueInvalid))
+                }
+                Ok(Err(ApplyEntryIdError::ReportingEnabled)) => {
+                    Some(Err(DataAccessError::TemporarilyUnavailable))
                 }
                 Err(_) => Some(Err(DataAccessError::HardwareFault)),
             }
@@ -853,10 +857,13 @@ fn set_brcb_purge_buf(
         RcbWriteValue::Bool(b) => b,
         _ => return Some(Err(DataAccessError::TypeInconsistent)),
     };
-    // Writing false has no effect and is not an error; writing true purges the
-    // buffer while RptEna is false.
+    // While RptEna is false, writing false has no effect and writing true purges
+    // the buffer; while it is true, either value is refused.
     match brcb.handle_purge_buf_write(v) {
         Ok(_purged) => Some(Ok(())),
+        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
+            Some(Err(DataAccessError::TemporarilyUnavailable))
+        }
         Err(_) => Some(Err(DataAccessError::HardwareFault)),
     }
 }
@@ -2256,6 +2263,53 @@ mod tests {
         drop(eng);
         let buf = brcb.lock_buffer().unwrap();
         assert_eq!(buf.len(), 0, "PurgeBuf=true must empty the buffer");
+    }
+
+    /// While a BRCB is enabled, EntryID and PurgeBuf writes are refused with
+    /// TemporarilyUnavailable and change nothing; once it is disabled both are
+    /// accepted again.
+    #[test]
+    fn brcb_entry_id_and_purge_buf_refused_while_enabled() {
+        use super::super::brcb::TransmitAnchor;
+        let (engine, path) = make_engine_with_brcb("25", TriggerOptions::DATA_CHANGED);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        brcb.enqueue_entry(1000, false, false, bytes::Bytes::from_static(b"x"))
+            .unwrap();
+        let write = |field: RcbField, value: RcbWriteValue| {
+            handle_set_brcb_field(&engine, &path, field, value, 1)
+        };
+        assert_eq!(
+            write(RcbField::RptEna, RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+        let anchor = brcb_state(&engine, &path).2;
+        for (field, value) in [
+            (RcbField::EntryId, RcbWriteValue::OctetString(vec![0; 8])),
+            (RcbField::PurgeBuf, RcbWriteValue::Bool(true)),
+            (RcbField::PurgeBuf, RcbWriteValue::Bool(false)),
+        ] {
+            assert_eq!(
+                write(field, value),
+                Some(Err(DataAccessError::TemporarilyUnavailable))
+            );
+        }
+        assert_eq!(brcb_state(&engine, &path).2, anchor);
+        assert_eq!(brcb.lock_buffer().unwrap().len(), 1);
+
+        assert_eq!(
+            write(RcbField::RptEna, RcbWriteValue::Bool(false)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            write(RcbField::EntryId, RcbWriteValue::OctetString(vec![0; 8])),
+            Some(Ok(()))
+        );
+        assert_eq!(brcb_state(&engine, &path).2, TransmitAnchor::FromHead);
+        assert_eq!(
+            write(RcbField::PurgeBuf, RcbWriteValue::Bool(true)),
+            Some(Ok(()))
+        );
+        assert_eq!(brcb.lock_buffer().unwrap().len(), 0);
     }
 
     /// Every BRCB field reads back with the expected type.

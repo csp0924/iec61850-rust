@@ -342,3 +342,55 @@ async fn brcb_opt_flds_and_buf_tm_writes_keep_conf_rev() {
         .expect("write DatSet");
     assert_eq!(read_brcb(&mut mms, "ConfRev").await, MmsData::Unsigned(2));
 }
+
+/// The `stVal` a Dbpos of `n` reads as.
+fn dbpos(n: u8) -> MmsValue {
+    MmsValue::BitString {
+        padding: 6,
+        data: vec![n << 6],
+    }
+}
+
+/// An enabled BRCB refuses EntryID and PurgeBuf with temporarily-unavailable:
+/// the buffer is neither resent nor purged, and the next report is the next
+/// entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_entry_id_and_purge_buf_refused_while_enabled() {
+    let f = start().await;
+    let mut mms = f.connect().await;
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable");
+    f.set_st_val(2);
+    let first = next_report(&mut mms).await;
+    assert_eq!(first.data_values, [dbpos(2)]);
+
+    assert_refused_with(
+        write_brcb(&mut mms, "EntryID", MmsData::OctetString(vec![0; 8])).await,
+        DataAccessError::TemporarilyUnavailable,
+    );
+    assert_refused_with(
+        write_brcb(&mut mms, "PurgeBuf", MmsData::Boolean(true)).await,
+        DataAccessError::TemporarilyUnavailable,
+    );
+
+    f.set_st_val(1);
+    let second = next_report(&mut mms).await;
+    assert_eq!(second.data_values, [dbpos(1)], "no entry is resent");
+    assert!(second.entry_id > first.entry_id);
+
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable");
+    assert_eq!(
+        read_brcb(&mut mms, "EntryID").await,
+        MmsData::OctetString(second.entry_id.clone().unwrap())
+    );
+    write_brcb(&mut mms, "PurgeBuf", MmsData::Boolean(true))
+        .await
+        .expect("purge a disabled BRCB");
+    assert_eq!(
+        read_brcb(&mut mms, "EntryID").await,
+        MmsData::OctetString(vec![0; 8])
+    );
+}

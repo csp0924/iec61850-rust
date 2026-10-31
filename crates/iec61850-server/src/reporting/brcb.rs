@@ -183,15 +183,16 @@ pub enum TransmitAnchor {
 }
 
 /// Why `apply_entry_id_write` failed.
-///
-/// Only one case exists today; it is an enum rather than a unit struct so a later
-/// case does not force every caller to change the shape of its match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApplyEntryIdError {
     /// The EntryID is not in the buffer, having been evicted or never stored. The
     /// dispatcher answers `DataAccessError::ObjectValueInvalid`.
     InvalidEntryId,
+    /// Reporting is enabled, and EntryID is not writable while RptEna is true,
+    /// per IEC 61850-8-1 Table 72. The dispatcher answers
+    /// `DataAccessError::TemporarilyUnavailable`.
+    ReportingEnabled,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,17 +521,23 @@ impl BrcbState {
     ///    refused, and the dispatcher answers
     ///    `DataAccessError::ObjectValueInvalid`.
     ///
+    /// While RptEna is true the write is refused and nothing changes.
+    ///
     /// This method does not set the overflow flag itself. The caller owns it, and
     /// the send path infers it — see `BufferedReportControl::apply_entry_id_write`.
     ///
     /// # Errors
     ///
-    /// Returns `ApplyEntryIdError::InvalidEntryId` for the fourth case.
+    /// Returns `ApplyEntryIdError::ReportingEnabled` while RptEna is true and
+    /// `ApplyEntryIdError::InvalidEntryId` for the fourth case.
     pub fn apply_entry_id_write(
         &mut self,
         id: EntryId,
         backend: &dyn ReportBufferBackend,
     ) -> Result<(), ApplyEntryIdError> {
+        if self.rpt_ena {
+            return Err(ApplyEntryIdError::ReportingEnabled);
+        }
         // The anchor a later `WaitingForNext` resolves against.
         self.last_committed_entry_id = id;
 
@@ -798,29 +805,30 @@ impl BufferedReportControl {
 
     /// Applies a client write to the PurgeBuf field.
     ///
-    /// Writing false has no effect. Writing true purges the report buffer, but only
-    /// while `RptEna` is false; while reporting is enabled the write is ignored.
-    /// Returns the number of entries removed.
+    /// PurgeBuf is writable only while `RptEna` is false, per IEC 61850-8-1
+    /// Table 72. Writing false then has no effect; writing true purges the report
+    /// buffer. Returns the number of entries removed.
     ///
     /// # Errors
     ///
-    /// Returns `ServerError::InvalidModel` when the state or buffer mutex is
-    /// poisoned.
+    /// Returns `ServerError::InvalidModel` when reporting is enabled, whatever the
+    /// value, or when the state or buffer mutex is poisoned.
     pub fn handle_purge_buf_write(&self, value: bool) -> Result<usize, crate::error::ServerError> {
+        let state = self.lock_state()?;
+        if state.rpt_ena {
+            tracing::warn!(
+                mms_path = %self.mms_path,
+                "PurgeBuf write refused while RptEna is true"
+            );
+            return Err(crate::error::ServerError::InvalidModel(
+                "brcb PurgeBuf cannot be written while RptEna=true".into(),
+            ));
+        }
+        drop(state);
         if !value {
             // Writing false is not an error; nothing is purged.
             return Ok(0);
         }
-        let state = self.lock_state()?;
-        if state.rpt_ena {
-            // PurgeBuf is effective only while reporting is disabled.
-            tracing::warn!(
-                mms_path = %self.mms_path,
-                "PurgeBuf write ignored while RptEna is true"
-            );
-            return Ok(0);
-        }
-        drop(state);
         let purged = {
             let mut buf = self.lock_buffer()?;
             buf.purge()
@@ -925,6 +933,8 @@ impl BufferedReportControl {
     /// is taken, so the two are never held at once.
     ///
     /// Outcomes:
+    /// - `Err(ReportingEnabled)` while RptEna is true, with nothing changed; the
+    ///   dispatcher answers `DataAccessError::TemporarilyUnavailable`
     /// - `Ok(())` with `transmit_anchor = FromHead` for an all-zero EntryID
     /// - `Ok(())` with `transmit_anchor = AfterEntryId(id)` when the entry is found
     ///   and is not the newest
@@ -956,32 +966,37 @@ impl BufferedReportControl {
 
         // Then apply the result to the state.
         let mut state = self.lock_state()?;
+        if state.rpt_ena {
+            tracing::warn!(
+                mms_path = %self.mms_path,
+                "SetBRCBValues EntryID: refused while RptEna is true"
+            );
+            return Ok(Err(ApplyEntryIdError::ReportingEnabled));
+        }
         state.last_committed_entry_id = id;
-        let outcome = if id.is_zero() {
-            state.transmit_anchor = TransmitAnchor::FromHead;
-            state.is_resync = false;
-            Ok(())
-        } else {
-            // The non-zero path always took the Some branch above.
-            match seek.expect("a non-zero entry id always has a seek result") {
-                SeekResult::FoundWithNext(_) => {
-                    state.transmit_anchor = TransmitAnchor::AfterEntryId(id);
-                    state.is_resync = true;
-                    Ok(())
-                }
-                SeekResult::FoundLast => {
-                    state.transmit_anchor = TransmitAnchor::WaitingForNext;
-                    state.is_resync = true;
-                    Ok(())
-                }
-                SeekResult::NotFound => {
-                    tracing::warn!(
-                        mms_path = %self.mms_path,
-                        entry_id = id.as_u64(),
-                        "SetBRCBValues EntryID: not found in the buffer, answering InvalidEntryId"
-                    );
-                    Err(ApplyEntryIdError::InvalidEntryId)
-                }
+        let outcome = match seek {
+            None => {
+                state.transmit_anchor = TransmitAnchor::FromHead;
+                state.is_resync = false;
+                Ok(())
+            }
+            Some(SeekResult::FoundWithNext(_)) => {
+                state.transmit_anchor = TransmitAnchor::AfterEntryId(id);
+                state.is_resync = true;
+                Ok(())
+            }
+            Some(SeekResult::FoundLast) => {
+                state.transmit_anchor = TransmitAnchor::WaitingForNext;
+                state.is_resync = true;
+                Ok(())
+            }
+            Some(SeekResult::NotFound) => {
+                tracing::warn!(
+                    mms_path = %self.mms_path,
+                    entry_id = id.as_u64(),
+                    "SetBRCBValues EntryID: not found in the buffer, answering InvalidEntryId"
+                );
+                Err(ApplyEntryIdError::InvalidEntryId)
             }
         };
         Ok(outcome)
@@ -1295,15 +1310,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_purge_buf_write_ignored_when_enabled() {
-        // A PurgeBuf write is ignored while reporting is enabled.
+    fn handle_purge_buf_write_refused_when_enabled() {
+        // PurgeBuf is not writable while reporting is enabled, whatever the value.
         let brcb = make_brcb();
         let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", brcb);
         rc.enqueue_entry(1000, false, false, Bytes::from_static(b"a"))
             .unwrap();
         rc.lock_state().unwrap().rpt_ena = true;
-        let purged = rc.handle_purge_buf_write(true).unwrap();
-        assert_eq!(purged, 0);
+        assert!(rc.handle_purge_buf_write(true).is_err());
+        assert!(rc.handle_purge_buf_write(false).is_err());
         assert_eq!(rc.lock_buffer().unwrap().len(), 1);
     }
 
@@ -1427,6 +1442,22 @@ mod tests {
         // The written value is still recorded, so a client reads back what it wrote
         // even though no such entry exists.
         assert_eq!(state.last_committed_entry_id, bogus);
+    }
+
+    #[test]
+    fn apply_entry_id_write_refused_when_enabled() {
+        // EntryID is not writable while reporting is enabled; the anchor stays.
+        let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", make_brcb());
+        rc.enqueue_entry(1000, false, false, Bytes::from_static(b"a"))
+            .unwrap();
+        rc.lock_state().unwrap().rpt_ena = true;
+        assert_eq!(
+            rc.apply_entry_id_write(EntryId::ZERO).unwrap(),
+            Err(ApplyEntryIdError::ReportingEnabled)
+        );
+        let state = rc.lock_state().unwrap();
+        assert_eq!(state.transmit_anchor, TransmitAnchor::None);
+        assert_eq!(state.last_committed_entry_id, EntryId::ZERO);
     }
 
     #[test]
