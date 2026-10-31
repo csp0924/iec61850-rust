@@ -2,7 +2,8 @@
 //! through the full ISO stack.
 //!
 //! A write is held to the type each attribute declares, its integer range and
-//! its string length. A write may name a whole data object under one
+//! its string length; a bit string shorter than its declared maximum is padded
+//! to it. A write may name a whole data object under one
 //! functional constraint (FCD): every leaf is checked, and every handler asked,
 //! before any of them changes.
 
@@ -345,6 +346,39 @@ async fn write_of_a_data_object_is_refused_whole() {
             DataAccessError::ObjectAccessDenied
         );
         assert_eq!(pt_leaves(&mut client).await, unchanged);
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A Quality written with 9 bits reads back with the 13 bits it declares: the
+/// written bits, then zero bits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn short_quality_reads_back_at_its_declared_length() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_server, handle) = start().await;
+        let mut client = connect(&handle).await;
+
+        client
+            .write(
+                DOMAIN,
+                "GGIO1$SP$Lim$qual",
+                MmsData::BitString {
+                    padding: 7,
+                    data: vec![0x41, 0x80],
+                },
+            )
+            .await
+            .expect("9 bits fit a Quality");
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$SP$Lim$qual").await.unwrap(),
+            MmsData::BitString {
+                padding: 3,
+                data: vec![0x41, 0x80],
+            }
+        );
 
         handle.stop().await;
     })

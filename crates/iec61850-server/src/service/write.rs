@@ -35,7 +35,8 @@
 //! integer outside the range of its width, and a visible, Unicode or octet
 //! string longer than its maximum length, or of another length than a fixed
 //! one, answer `ObjectValueInvalid` (§8.1.2.1). A bit string that does not fit
-//! the declared size answers `TypeInconsistent`.
+//! the declared size answers `TypeInconsistent`; one shorter than a `Max(n)`
+//! size is padded with zero bits to n bits before it is stored.
 //!
 //! A write below a data attribute is also a write of each attribute above it.
 //! The handler of every such ancestor, outermost first, decides the write with
@@ -682,7 +683,10 @@ fn check_value(
 /// type-inconsistent. The length of a Unicode string counts characters, as
 /// IEC 61850-8-1 §8.1.2.6 sizes an MMSString.
 ///
-/// A bit string must fit its declared size, else type-inconsistent.
+/// A bit string must fit its declared size, else type-inconsistent. One
+/// shorter than a `Max(n)` size is padded with zero bits to n bits, as
+/// IEC 61850-8-1 §8.1.2.1 has the server supply the bits a client leaves out,
+/// so it is stored, and read, at the full length (§8.2).
 fn check_declared_type(
     spec: &MmsTypeSpec,
     data: &MmsData,
@@ -763,8 +767,9 @@ fn fits_length(size: StringSize, len: usize) -> bool {
 }
 
 /// Checks a bit string of `bytes` with `padding` unused bits against its
-/// declared size and returns the bit string to store, with the unused bits of
-/// the last byte cleared.
+/// declared size and returns the bit string to store: padded with zero bits to
+/// n bits for a `Max(n)` size, as written otherwise, with the unused bits of
+/// the last byte cleared either way.
 fn fit_bit_string(
     size: StringSize,
     padding: u8,
@@ -773,9 +778,16 @@ fn fit_bit_string(
     if !bit_string_fits(size, bytes.len(), padding) {
         return Err(DataAccessError::TypeInconsistent);
     }
+    let mut data = bit_string_bytes(padding, bytes);
+    let StringSize::Max(n) = size else {
+        return Ok(iec61850_model::MmsValue::BitString { padding, data });
+    };
+    let n = usize::from(n);
+    data.resize(n.div_ceil(8), 0);
     Ok(iec61850_model::MmsValue::BitString {
-        padding,
-        data: bit_string_bytes(padding, bytes),
+        // The length is at most 65535 bits, so the unused bits fit a u8.
+        padding: (data.len() * 8 - n) as u8,
+        data,
     })
 }
 
@@ -2293,6 +2305,75 @@ mod tests {
         assert_eq!(
             leaf_value(&model, "IED1LD0/GGIO1$SP$Lim$oct8"),
             MmsValue::OctetString(vec![9; 8])
+        );
+    }
+
+    // ── A short bit string is padded to the declared maximum ───────────
+
+    /// A Quality written with 9 bits is stored with 13: the 9 written bits,
+    /// then zero bits, and the unused bits of the last byte cleared.
+    #[test]
+    fn write_short_bit_string_is_padded_to_its_maximum() {
+        let qual = DataAttribute::new(
+            "qual",
+            FC::Sp,
+            DataAttributeType::Quality,
+            TrgOps::default(),
+            MmsValue::default_for(DataAttributeType::Quality),
+        );
+        let value = Arc::clone(&qual.value);
+        let cfg_do = DataObject::new("Cfg", vec![DoChild::Da(qual)]);
+        let ggio_ln = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(cfg_do)
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio_ln)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SP$Cfg$qual".to_string(),
+        };
+        let policies = WriteAccessPolicies::default();
+
+        // 9 bits: 1100 0000 1, with garbage in the unused bits.
+        let data = MmsData::BitString {
+            padding: 7,
+            data: vec![0xc0, 0xff],
+        };
+        let result =
+            handle_single_write(&model, &mms_model, &policies, None, None, 0, &name, &data);
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *value.read().unwrap(),
+            MmsValue::BitString {
+                padding: 3,
+                data: vec![0xc0, 0x80],
+            }
+        );
+
+        // One bit grows a byte: 1 → 1000 0000 0000 0.
+        let data = MmsData::BitString {
+            padding: 7,
+            data: vec![0x80],
+        };
+        let result =
+            handle_single_write(&model, &mms_model, &policies, None, None, 0, &name, &data);
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *value.read().unwrap(),
+            MmsValue::BitString {
+                padding: 3,
+                data: vec![0x80, 0x00],
+            }
         );
     }
 }
