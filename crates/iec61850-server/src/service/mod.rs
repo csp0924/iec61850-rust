@@ -2479,7 +2479,13 @@ fn handle_write_with_routing(
     #[cfg(feature = "setting-groups")]
     {
         if let Some((domain, ln, field)) = crate::setting_groups::extract_sgcb_target(name) {
-            return crate::setting_groups::handle_sgcb_write(
+            // A commit of the active group makes the edited values active.
+            let commits_active_group = field == crate::setting_groups::SgcbField::CnfEdit
+                && setting_groups.lookup(domain).is_some_and(|rt| {
+                    let s = rt.snapshot();
+                    s.edit_sg != 0 && s.edit_sg == s.act_sg
+                });
+            let outcome = crate::setting_groups::handle_sgcb_write(
                 setting_groups,
                 domain,
                 ln,
@@ -2487,6 +2493,10 @@ fn handle_write_with_routing(
                 data,
                 conn_id,
             );
+            if commits_active_group && outcome == WriteOutcome::Success {
+                crate::setting_groups::activate_edited_values(ied_model, domain);
+            }
+            return outcome;
         }
     }
 

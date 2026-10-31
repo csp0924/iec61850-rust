@@ -18,13 +18,17 @@
 //! This module implements the control protocol only. The values of a setting
 //! group are stored by the application, which receives the commit through
 //! [`SettingGroupHandler::confirm_edit_sg`] and writes the data attributes
-//! itself.
+//! itself. The model holds one value per setting: the FC=SE data attribute is
+//! the edit buffer and the FC=SG data attribute of the same name the value of
+//! the active group. Once a commit of the active group succeeds, every FC=SE
+//! value of the logical device is copied to its FC=SG counterpart; selecting
+//! another active group leaves the FC=SG values to the application.
 
 use crate::connection::ConnectionId;
 use iec61850_mms::mms::pdu::common::{
     AccessResult, DataAccessError, MmsData, ObjectName, WriteOutcome,
 };
-use iec61850_model::IedModel;
+use iec61850_model::{DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, FC};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -584,6 +588,58 @@ impl SettingGroupRegistry {
         for rt in g.values() {
             rt.release_edit_session_for_conn(conn_id);
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active values
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Copies every FC=SE value of the logical device named `domain` to the FC=SG
+/// data attribute of the same name, making the committed edit buffer the
+/// values of the active group.
+///
+/// A setting without an FC=SG counterpart, or whose counterpart differs in
+/// type or structure, is left as it is.
+pub(crate) fn activate_edited_values(model: &IedModel, domain: &str) {
+    for ld in &model.lds {
+        if ld.domain_name(&model.ied_name) != domain {
+            continue;
+        }
+        for ln in &ld.lns {
+            for dobj in &ln.dos {
+                copy_edit_buffer(dobj);
+            }
+        }
+    }
+}
+
+fn copy_edit_buffer(dobj: &DataObject) {
+    for child in &dobj.children {
+        match child {
+            DoChild::SubDo(sub) => copy_edit_buffer(sub),
+            DoChild::Da(se) if se.fc == FC::Se => {
+                if let Some(sg) = dobj.children_with_fc(FC::Sg).find(|d| d.name == se.name) {
+                    copy_values(se, sg);
+                }
+            }
+            DoChild::Da(_) => {}
+        }
+    }
+}
+
+fn copy_values(from: &DataAttribute, to: &DataAttribute) {
+    if from.ty != to.ty {
+        return;
+    }
+    if from.ty == DataAttributeType::Constructed {
+        for c in &from.children {
+            if let Some(t) = to.child_by_name(&c.name) {
+                copy_values(c, t);
+            }
+        }
+    } else {
+        to.store(from.snapshot());
     }
 }
 
