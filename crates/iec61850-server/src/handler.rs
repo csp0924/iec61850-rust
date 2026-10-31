@@ -135,7 +135,14 @@ pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
     /// written one, up to its data object, and, for a data object or a
     /// constructed attribute, those of the nodes beneath it. A handler on a
     /// data object therefore decides every write that reaches the object
-    /// under the functional constraint of its path. The write fails as a whole when any of them refuses, after
+    /// under the functional constraint of its path.
+    ///
+    /// A handler above the written node receives that node's value merged
+    /// into the current values of its siblings, read when the write is
+    /// checked. Nothing holds those siblings until the leaves are stored, so a
+    /// concurrent write of a sibling leaf can make the merged value differ from
+    /// the final state by that leaf; the decision the handler makes still
+    /// applies to this write only. The write fails as a whole when any of them refuses, after
     /// the earlier ones may already have answered `Accept` or `AcceptNoUpdate`.
     /// No cached value changes in that case, but a handler that applies a value
     /// itself on `AcceptNoUpdate` sees no notice of the failure, so it should
