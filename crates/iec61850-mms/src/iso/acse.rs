@@ -398,7 +398,8 @@ impl AcseConnection {
     /// user-information payload. Result 0 accepts, any other value rejects.
     ///
     /// The result field is mandatory in an AARE (ISO 8650-1); `None` reports one
-    /// that is absent or not an INTEGER, which the caller treats as a rejection.
+    /// that is absent, not an INTEGER or an INTEGER without content octets, which
+    /// the caller treats as a rejection.
     ///
     /// Every TLV is bounds checked before it is read.
     fn parse_aare<'buf>(
@@ -459,6 +460,12 @@ impl AcseConnection {
                             claimed: inner_len,
                             remaining: inner_end.saturating_sub(inner_pos),
                         });
+                    }
+                    if inner_len == 0 {
+                        // an INTEGER has at least one content octet
+                        warn!("aare result is an empty integer");
+                        pos += len;
+                        continue;
                     }
                     result_code = ber_decode_uint(buf, inner_pos, inner_len);
                     saw_result = true;
@@ -1421,6 +1428,24 @@ mod tests {
 
         assert_eq!(indication, AcseIndication::AssociateFailed);
         assert_eq!(user_data, &[]);
+    }
+
+    /// An AARE whose result is an INTEGER without content octets is not an
+    /// acceptance, although its user-information carries an Initiate response.
+    #[test]
+    fn aare_with_an_empty_result_integer_is_a_rejection() {
+        let mms_payload = &[0xde, 0xad, 0xbe, 0xef];
+        let accept = make_aare_accept(mms_payload);
+        let at = find(&accept, &[0xa2, 0x03, 0x02, 0x01, 0x00]).expect("the result field");
+        let mut aare = accept[..at].to_vec();
+        aare.extend_from_slice(&[0xa2, 0x02, 0x02, 0x00]);
+        aare.extend_from_slice(&accept[at + 5..]);
+        assert!(aare[1] < 0x80, "short-form outer length");
+        aare[1] -= 1;
+
+        let mut conn = AcseConnection::new(None);
+        let (indication, _) = conn.parse_message(&aare).expect("the aare parses");
+        assert_eq!(indication, AcseIndication::AssociateFailed);
     }
 
     // RLRQ, RLRE and ABRT parsing
