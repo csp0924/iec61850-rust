@@ -62,6 +62,10 @@ pub struct SvSubscriberAsdu<'a> {
     pub smp_mod: Option<SmpMod>,
     /// Raw PTP grandmaster identity, when present.
     pub gm_identity: Option<&'a [u8; 8]>,
+    /// S (simulate) bit of Reserved1 in the frame that carried this ASDU
+    /// (IEC 61850-9-2 §5.3.3.4.4). [`from_asdu`](Self::from_asdu) leaves it
+    /// false; the receiver sets it from the frame header.
+    pub simulate: bool,
 }
 
 impl<'a> SvSubscriberAsdu<'a> {
@@ -78,6 +82,7 @@ impl<'a> SvSubscriberAsdu<'a> {
             sample: &asdu.sample,
             smp_mod: asdu.smp_mod,
             gm_identity: asdu.gm_identity.as_ref(),
+            simulate: false,
         }
     }
 

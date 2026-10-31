@@ -12,6 +12,7 @@
 //!     .setup_complete()          -> SvPublisher
 //!
 //! SvPublisher
+//!     .set_simulate(bool)        S bit of Reserved1
 //!     .set_sample(h, &[u8])
 //!     .set_smp_cnt(h, u16)
 //!     .increase_smp_cnt(h)       wraps per the smpCnt limit
@@ -39,8 +40,8 @@ use iec61850_asn1::encode_length;
 
 use crate::error::SvError;
 use crate::frame::{
-    VlanTag, SV_APP_HEADER_SIZE, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC, SV_ETHER_TYPE,
-    SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
+    VlanTag, RESERVED1_SIMULATE, SV_APP_HEADER_SIZE, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC,
+    SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
 };
 use crate::pdu::{SmpSynch, MAX_ASDU_PER_FRAME, SV_STRING_MAX_LEN};
 
@@ -145,6 +146,8 @@ pub struct SvPublisherBuilder {
     app_id: u16,
     /// Optional 802.1Q VLAN tag.
     vlan: Option<VlanTag>,
+    /// S bit of Reserved1.
+    simulate: bool,
     /// Configured ASDUs, at most `MAX_ASDU_PER_FRAME`.
     asdus: Vec<AsduConfig>,
 }
@@ -160,6 +163,7 @@ impl SvPublisherBuilder {
             src_mac,
             app_id: SV_DEFAULT_APPID,
             vlan: None,
+            simulate: false,
             asdus: Vec::new(),
         }
     }
@@ -179,6 +183,15 @@ impl SvPublisherBuilder {
     /// Adds an 802.1Q VLAN tag to the frame.
     pub fn with_vlan(mut self, vlan: VlanTag) -> Self {
         self.vlan = Some(vlan);
+        self
+    }
+
+    /// Sets the S (simulate) bit of Reserved1, which marks the stream as sent
+    /// by a test device in place of the configured publisher (IEC 61850-9-2
+    /// §5.3.3.4.4). It can also be changed after setup with
+    /// [`SvPublisher::set_simulate`].
+    pub fn with_simulate(mut self, simulate: bool) -> Self {
+        self.simulate = simulate;
         self
     }
 
@@ -378,6 +391,7 @@ impl SvPublisherBuilder {
             self.vlan,
             self.app_id,
             pdu_size as u16 + SV_APP_HEADER_SIZE as u16,
+            self.simulate,
         );
 
         let pdu_start = header_size;
@@ -398,6 +412,7 @@ impl SvPublisherBuilder {
             frame_len: frame_size,
             asdus: templates,
             pdu_start,
+            simulate: self.simulate,
             no_asdu: self.asdus.len() as u8,
         })
     }
@@ -416,13 +431,33 @@ pub struct SvPublisher {
     /// Field offsets of each ASDU, indexed by `AsduHandle`.
     asdus: Vec<AsduTemplate>,
     /// Offset of the savPdu within the frame, equal to the header size.
-    #[allow(dead_code)]
     pdu_start: usize,
+    /// S bit of Reserved1.
+    simulate: bool,
     /// Number of ASDUs, fixed at setup.
     no_asdu: u8,
 }
 
 impl SvPublisher {
+    /// Sets the S (simulate) bit of Reserved1 in the frame (IEC 61850-9-2
+    /// §5.3.3.4.4).
+    pub fn set_simulate(&mut self, simulate: bool) {
+        self.simulate = simulate;
+        // Reserved1 and Reserved2 are the last four header bytes.
+        let reserved1 = self.pdu_start - 4;
+        let s_bit = (RESERVED1_SIMULATE >> 8) as u8;
+        if simulate {
+            self.buffer[reserved1] |= s_bit;
+        } else {
+            self.buffer[reserved1] &= !s_bit;
+        }
+    }
+
+    /// Returns the S (simulate) bit.
+    pub fn simulate(&self) -> bool {
+        self.simulate
+    }
+
     /// Writes the sample data of one ASDU into the frame.
     ///
     /// # Errors
@@ -639,6 +674,7 @@ fn write_ethernet_header(
     vlan: Option<VlanTag>,
     app_id: u16,
     length: u16,
+    simulate: bool,
 ) {
     let mut pos = 0;
     buf[pos..][..6].copy_from_slice(dst_mac);
@@ -661,8 +697,10 @@ fn write_ethernet_header(
     pos += 2;
     buf[pos..][..2].copy_from_slice(&length.to_be_bytes());
     pos += 2;
-    // Reserved1 and Reserved2, transmitted as zero.
-    buf[pos..][..4].fill(0);
+    // Reserved1 carries only the S bit; Reserved2 is zero.
+    let reserved1 = if simulate { RESERVED1_SIMULATE } else { 0 };
+    buf[pos..][..2].copy_from_slice(&reserved1.to_be_bytes());
+    buf[pos + 2..][..2].fill(0);
 }
 
 /// Writes the savPdu into `buf` and records the field offsets of each ASDU.
@@ -794,6 +832,47 @@ mod tests {
             .unwrap();
         let pub_ = builder.setup_complete().unwrap();
         (pub_, h)
+    }
+
+    #[test]
+    fn simulate_is_off_by_default() {
+        let (p, _) = build_single_asdu_publisher(8);
+        assert!(!p.simulate());
+        assert_eq!(&p.frame_bytes()[18..22], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn builder_simulate_sets_the_s_bit() {
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).with_simulate(true);
+        builder
+            .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, 8)
+            .unwrap();
+        let p = builder.setup_complete().unwrap();
+        assert!(p.simulate());
+        assert_eq!(&p.frame_bytes()[18..22], &[0x80, 0, 0, 0]);
+        assert!(
+            crate::frame::SvFrame::decode(p.frame_bytes())
+                .unwrap()
+                .header
+                .simulate
+        );
+    }
+
+    #[test]
+    fn set_simulate_toggles_only_the_s_bit() {
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).with_vlan(VlanTag::default());
+        builder
+            .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, 8)
+            .unwrap();
+        let mut p = builder.setup_complete().unwrap();
+        let before = p.frame_bytes().to_vec();
+        p.set_simulate(true);
+        assert_eq!(&p.frame_bytes()[22..26], &[0x80, 0, 0, 0]);
+        let mut expected = before.clone();
+        expected[22] = 0x80;
+        assert_eq!(p.frame_bytes(), &expected[..]);
+        p.set_simulate(false);
+        assert_eq!(p.frame_bytes(), &before[..]);
     }
 
     #[test]

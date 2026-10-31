@@ -31,8 +31,9 @@ pub mod publish_thread;
 
 pub use error::SvError;
 pub use frame::{
-    SvFrame, SvFrameHeader, VlanPriority, VlanTag, SV_APP_HEADER_SIZE, SV_DEFAULT_APPID,
-    SV_DEFAULT_DST_MAC, SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN, SV_MIN_FRAME_SIZE,
+    SvFrame, SvFrameHeader, VlanPriority, VlanTag, RESERVED1_SIMULATE, SV_APP_HEADER_SIZE,
+    SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC, SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
+    SV_MIN_FRAME_SIZE,
 };
 pub use nine_two_le::{
     ChannelSample, NineTwoLE, BYTES_PER_CHANNEL, CHANNEL_COUNT, CHANNEL_NAMES, SAMPLE_SIZE,

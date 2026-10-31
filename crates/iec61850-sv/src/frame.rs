@@ -13,7 +13,7 @@
 //!   [12..14] EtherType = 0x88BA
 //!   [14..16] APPID (big-endian u16, 0x4000 by default)
 //!   [16..18] Length (8 header bytes plus the savPdu length)
-//!   [18..20] Reserved1 = 0x0000
+//!   [18..20] Reserved1, bit 15 = S (simulate), other bits 0
 //!   [20..22] Reserved2 = 0x0000
 //!   [22..]   savPdu (BER)
 //!
@@ -70,6 +70,10 @@ pub const SV_APP_HEADER_SIZE: usize = 8;
 /// Smallest valid SV frame, an untagged frame with an empty APDU.
 pub const SV_MIN_FRAME_SIZE: usize = 22;
 
+/// S (simulate) bit of Reserved1, the most significant bit of its first
+/// octet (IEC 61850-9-2 §5.3.3.4.4, Figure 3).
+pub const RESERVED1_SIMULATE: u16 = 0x8000;
+
 /// VLAN priority code point, a 3-bit value in the range 0-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VlanPriority(u8);
@@ -124,6 +128,11 @@ pub struct SvFrameHeader {
     /// Length from the APPID field through the end of the PDU: the 8 header
     /// bytes plus the savPdu. `SvFrame::encode` recomputes it.
     pub length: u16,
+    /// S bit of Reserved1: the frame comes from a publisher in a test device
+    /// rather than the one the configuration names (IEC 61850-9-2
+    /// §5.3.3.4.4). The other Reserved1 bits and Reserved2 are sent as zero
+    /// and ignored on receipt.
+    pub simulate: bool,
 }
 
 impl SvFrameHeader {
@@ -137,6 +146,7 @@ impl SvFrameHeader {
             vlan: None,
             app_id,
             length: 0,
+            simulate: false,
         }
     }
 }
@@ -192,8 +202,14 @@ impl SvFrame {
 
         buf.extend_from_slice(&(length_val as u16).to_be_bytes());
 
-        // Reserved1 and Reserved2, transmitted as zero.
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // Reserved1 carries only the S bit; Reserved2 is zero.
+        let reserved1 = if self.header.simulate {
+            RESERVED1_SIMULATE
+        } else {
+            0
+        };
+        buf.extend_from_slice(&reserved1.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x00]);
 
         buf.extend_from_slice(&self.pdu_bytes);
 
@@ -269,10 +285,13 @@ impl SvFrame {
             return Err(SvError::InvalidHeaderLength(length));
         }
 
-        // Reserved1 and Reserved2 are not interpreted.
+        // Only the S bit of Reserved1 is interpreted; the reserved bits and
+        // Reserved2 are ignored.
         if pos + 4 > data.len() {
             return Err(SvError::EthernetFrameTooShort(data.len()));
         }
+        let reserved1 = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let simulate = reserved1 & RESERVED1_SIMULATE != 0;
         pos += 4;
 
         // The Length field is attacker-controlled; the APDU must be present.
@@ -294,6 +313,7 @@ impl SvFrame {
                 vlan,
                 app_id,
                 length,
+                simulate,
             },
             pdu_bytes,
         })
@@ -313,6 +333,7 @@ mod tests {
                 vlan,
                 app_id: SV_DEFAULT_APPID,
                 length: (SV_APP_HEADER_SIZE + pdu_len) as u16,
+                simulate: false,
             },
             pdu_bytes,
         }
@@ -348,6 +369,49 @@ mod tests {
         assert_eq!(decoded.header.vlan, Some(vlan));
         assert_eq!(decoded.header.dst_mac, SV_DEFAULT_DST_MAC);
         assert_eq!(decoded.pdu_bytes, vec![0x60, 0x03, 0x80, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn simulate_sets_bit_15_of_reserved1() {
+        let mut frame = make_frame(None, vec![0x60, 0x00]);
+        frame.header.simulate = true;
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        assert_eq!(&buf[18..22], &[0x80, 0x00, 0x00, 0x00]);
+        assert!(SvFrame::decode(&buf).unwrap().header.simulate);
+    }
+
+    #[test]
+    fn simulate_off_leaves_reserved1_zero() {
+        let frame = make_frame(None, vec![0x60, 0x00]);
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        assert_eq!(&buf[18..22], &[0x00, 0x00, 0x00, 0x00]);
+        assert!(!SvFrame::decode(&buf).unwrap().header.simulate);
+    }
+
+    #[test]
+    fn simulate_bit_sits_after_the_vlan_tag() {
+        let mut frame = make_frame(Some(VlanTag::default()), vec![0x60, 0x00]);
+        frame.header.simulate = true;
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        assert_eq!(&buf[22..26], &[0x80, 0x00, 0x00, 0x00]);
+        assert!(SvFrame::decode(&buf).unwrap().header.simulate);
+    }
+
+    #[test]
+    fn reserved_bits_other_than_s_are_ignored() {
+        let frame = make_frame(None, vec![0x60, 0x00]);
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        buf[18] = 0x7F;
+        buf[19] = 0xFF;
+        buf[20] = 0xFF;
+        buf[21] = 0xFF;
+        let decoded = SvFrame::decode(&buf).unwrap();
+        assert!(!decoded.header.simulate);
+        assert_eq!(decoded.pdu_bytes, vec![0x60, 0x00]);
     }
 
     #[test]

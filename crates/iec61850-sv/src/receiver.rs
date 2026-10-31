@@ -206,6 +206,7 @@ impl SvReceiver<Running> {
 
         let frame_app_id = sv_frame.header.app_id;
         let dst_mac = sv_frame.header.dst_mac;
+        let simulate = sv_frame.header.simulate;
 
         // A decoded frame always carries the SV EtherType.
         let _ = SV_ETHER_TYPE;
@@ -226,7 +227,8 @@ impl SvReceiver<Running> {
         let mut dispatch_count = 0usize;
 
         for asdu in &sav_pdu.asdus {
-            let view = SvSubscriberAsdu::from_asdu(asdu);
+            let mut view = SvSubscriberAsdu::from_asdu(asdu);
+            view.simulate = simulate;
             for sub in &self.inner.subscribers {
                 if sub.matches(frame_app_id, &dst_mac, asdu) {
                     sub.dispatch(&view);
@@ -282,6 +284,7 @@ mod tests {
                 vlan: None,
                 app_id,
                 length: (SV_APP_HEADER_SIZE + pdu_len) as u16,
+                simulate: false,
             },
             pdu_bytes,
         };
@@ -574,6 +577,31 @@ mod tests {
     }
 
     #[test]
+    fn simulate_bit_reaches_the_listener() {
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![]));
+        let c = seen.clone();
+        let sub = Arc::new(
+            SvSubscriberBuilder::new()
+                .sv_id("sv1")
+                .listener(move |a| c.lock().unwrap().push(a.simulate))
+                .build(),
+        );
+        let mut rx = SvReceiver::<Idle>::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.into_threadless();
+
+        let mut builder = crate::publisher::SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 1]);
+        let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
+        let mut p = builder.setup_complete().unwrap();
+        running.tick(p.frame_bytes()).unwrap();
+        p.set_simulate(true);
+        p.increase_smp_cnt(h).unwrap();
+        running.tick(p.frame_bytes()).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
     fn too_many_asdus_returns_err() {
         use iec61850_asn1::encode_length;
 
@@ -592,6 +620,7 @@ mod tests {
                 vlan: None,
                 app_id: SV_DEFAULT_APPID,
                 length: (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16,
+                simulate: false,
             },
             pdu_bytes,
         };
@@ -650,6 +679,7 @@ mod tests {
                 vlan: None,
                 app_id: SV_DEFAULT_APPID,
                 length: (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16,
+                simulate: false,
             },
             pdu_bytes,
         };
