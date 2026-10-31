@@ -136,6 +136,11 @@ pub trait EthernetSink {
 ///
 /// Add ASDUs with `add_asdu`, then call `setup_complete` to encode the frame
 /// and obtain an `SvPublisher`.
+///
+/// Frames carry an 802.1Q tag by default: IEC 61850-9-2 Table 6 makes
+/// priority tagging mandatory, and §5.3.3.3 applies the defaults of Table 7,
+/// priority 4 and VID 0, when none is configured. [`with_vlan`](Self::with_vlan)
+/// sets another tag and [`without_vlan`](Self::without_vlan) removes it.
 #[derive(Debug)]
 pub struct SvPublisherBuilder {
     /// Destination MAC address; defaults to `SV_DEFAULT_DST_MAC`.
@@ -144,7 +149,7 @@ pub struct SvPublisherBuilder {
     src_mac: [u8; 6],
     /// Application identifier.
     app_id: u16,
-    /// Optional 802.1Q VLAN tag.
+    /// 802.1Q VLAN tag; `None` sends untagged frames.
     vlan: Option<VlanTag>,
     /// S bit of Reserved1.
     simulate: bool,
@@ -153,7 +158,8 @@ pub struct SvPublisherBuilder {
 }
 
 impl SvPublisherBuilder {
-    /// Creates a builder for the given source MAC address.
+    /// Creates a builder for the given source MAC address, with the default
+    /// 802.1Q tag, priority 4 and VID 0.
     ///
     /// The address is supplied rather than read from an interface, so the
     /// builder needs no network access.
@@ -162,7 +168,7 @@ impl SvPublisherBuilder {
             dst_mac: SV_DEFAULT_DST_MAC,
             src_mac,
             app_id: SV_DEFAULT_APPID,
-            vlan: None,
+            vlan: Some(VlanTag::default()),
             simulate: false,
             asdus: Vec::new(),
         }
@@ -180,9 +186,15 @@ impl SvPublisherBuilder {
         self
     }
 
-    /// Adds an 802.1Q VLAN tag to the frame.
+    /// Sets the 802.1Q VLAN tag of the frame.
     pub fn with_vlan(mut self, vlan: VlanTag) -> Self {
         self.vlan = Some(vlan);
+        self
+    }
+
+    /// Removes the 802.1Q tag, so frames are sent untagged.
+    pub fn without_vlan(mut self) -> Self {
+        self.vlan = None;
         self
     }
 
@@ -826,7 +838,7 @@ mod tests {
     const SRC_MAC: [u8; 6] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
 
     fn build_single_asdu_publisher(sample_size: usize) -> (SvPublisher, AsduHandle) {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder
             .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, sample_size)
             .unwrap();
@@ -843,7 +855,9 @@ mod tests {
 
     #[test]
     fn builder_simulate_sets_the_s_bit() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC).with_simulate(true);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC)
+            .without_vlan()
+            .with_simulate(true);
         builder
             .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, 8)
             .unwrap();
@@ -860,7 +874,9 @@ mod tests {
 
     #[test]
     fn set_simulate_toggles_only_the_s_bit() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC).with_vlan(VlanTag::default());
+        let mut builder = SvPublisherBuilder::new(SRC_MAC)
+            .without_vlan()
+            .with_vlan(VlanTag::default());
         builder
             .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, 8)
             .unwrap();
@@ -905,7 +921,7 @@ mod tests {
 
     #[test]
     fn builder_add_2_asdus_ok() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let _h0 = builder.add_asdu("sv1", None::<String>, 1, 64).unwrap();
         let _h1 = builder.add_asdu("sv2", None::<String>, 1, 64).unwrap();
         let pub_ = builder.setup_complete().unwrap();
@@ -914,7 +930,7 @@ mod tests {
 
     #[test]
     fn builder_add_4_asdus_ok() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         for i in 0..4 {
             builder
                 .add_asdu(format!("sv{}", i), None::<String>, 1, 64)
@@ -926,7 +942,7 @@ mod tests {
 
     #[test]
     fn builder_add_10_asdus_ok() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         for i in 0..10 {
             builder
                 .add_asdu(format!("sv{}", i), None::<String>, 1, 8)
@@ -938,7 +954,7 @@ mod tests {
 
     #[test]
     fn builder_add_11_asdus_err() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         for i in 0..10 {
             builder
                 .add_asdu(format!("sv{}", i), None::<String>, 1, 8)
@@ -957,7 +973,7 @@ mod tests {
     #[test]
     fn builder_sv_id_at_the_limit_ok() {
         let sv_id = "A".repeat(SV_STRING_MAX_LEN);
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         builder
             .add_asdu(sv_id.clone(), None::<String>, 1, 8)
             .expect("an svid at the limit is accepted");
@@ -971,7 +987,7 @@ mod tests {
     /// publisher never emits a stream identifier a subscriber must reject.
     #[test]
     fn builder_sv_id_too_long_err() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let result = builder.add_asdu("A".repeat(SV_STRING_MAX_LEN + 1), None::<String>, 1, 8);
         assert!(
             matches!(result, Err(SvError::SvIdTooLong(130))),
@@ -990,7 +1006,7 @@ mod tests {
     #[test]
     fn builder_dat_set_at_the_limit_ok() {
         let dat_set = "D".repeat(SV_STRING_MAX_LEN);
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         builder
             .add_asdu("sv1", Some(dat_set.clone()), 1, 8)
             .expect("a datset at the limit is accepted");
@@ -1004,7 +1020,7 @@ mod tests {
     /// a publisher never emits a reference a subscriber must reject.
     #[test]
     fn builder_dat_set_too_long_err() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let result = builder.add_asdu("sv1", Some("D".repeat(SV_STRING_MAX_LEN + 1)), 1, 8);
         assert!(
             matches!(result, Err(SvError::DatSetTooLong(130))),
@@ -1040,7 +1056,7 @@ mod tests {
 
     #[test]
     fn smp_cnt_none_wrap_at_65535() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
         let mut pub_ = builder.setup_complete().unwrap();
 
@@ -1051,7 +1067,7 @@ mod tests {
 
     #[test]
     fn smp_cnt_limit_80_wrap() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
         builder
             .set_smp_cnt_limit(h, Some(NonZeroU16::new(80).unwrap()))
@@ -1069,7 +1085,7 @@ mod tests {
 
     #[test]
     fn smp_cnt_limit_4000_wrap() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
         builder
             .set_smp_cnt_limit(h, Some(NonZeroU16::new(4000).unwrap()))
@@ -1111,7 +1127,7 @@ mod tests {
 
     #[test]
     fn gm_identity_post_setup_write() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
         let gm_initial = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         builder.set_gm_identity(h, gm_initial).unwrap();
@@ -1139,7 +1155,7 @@ mod tests {
 
     #[test]
     fn refr_tm_set_and_decode() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h = builder.add_asdu("sv1", None::<String>, 1, 8).unwrap();
         builder.enable_refr_tm(h).unwrap();
         let mut pub_ = builder.setup_complete().unwrap();
@@ -1160,7 +1176,7 @@ mod tests {
 
     #[test]
     fn multi_asdu_frame_decode() {
-        let mut builder = SvPublisherBuilder::new(SRC_MAC);
+        let mut builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let h0 = builder.add_asdu("sv0", None::<String>, 1, 64).unwrap();
         let h1 = builder.add_asdu("sv1", None::<String>, 1, 64).unwrap();
         let mut pub_ = builder.setup_complete().unwrap();
@@ -1225,7 +1241,7 @@ mod tests {
 
     #[test]
     fn no_asdu_zero_err() {
-        let builder = SvPublisherBuilder::new(SRC_MAC);
+        let builder = SvPublisherBuilder::new(SRC_MAC).without_vlan();
         let result = builder.setup_complete();
         assert!(matches!(result, Err(SvError::NoAsdus)));
     }

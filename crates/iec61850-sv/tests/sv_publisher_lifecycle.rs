@@ -20,7 +20,7 @@ fn make_simple(sample_size: usize) -> (SvPublisher, AsduHandle) {
 
 fn decode_pdu(pub_: &SvPublisher) -> iec61850_sv::SavPdu {
     let bytes = pub_.frame_bytes();
-    decode_sav_pdu(&bytes[SV_HEADER_NO_VLAN..]).unwrap()
+    decode_sav_pdu(&bytes[SV_HEADER_WITH_VLAN..]).unwrap()
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn add_10_asdus_setup_ok() {
     let p = b.setup_complete().unwrap();
     assert_eq!(p.no_asdu(), 10);
     let bytes = p.frame_bytes();
-    let pdu = decode_sav_pdu(&bytes[SV_HEADER_NO_VLAN..]).unwrap();
+    let pdu = decode_sav_pdu(&bytes[SV_HEADER_WITH_VLAN..]).unwrap();
     assert_eq!(pdu.asdus.len(), 10);
 }
 
@@ -207,7 +207,7 @@ fn multi_asdu_no_asdu_2_byte_exact_decode() {
     p.set_smp_cnt(h1, 20).unwrap();
 
     let bytes = p.frame_bytes();
-    let pdu = decode_sav_pdu(&bytes[SV_HEADER_NO_VLAN..]).unwrap();
+    let pdu = decode_sav_pdu(&bytes[SV_HEADER_WITH_VLAN..]).unwrap();
 
     assert_eq!(pdu.asdus.len(), 2);
     assert_eq!(pdu.asdus[0].sample, s0);
@@ -320,4 +320,33 @@ fn add_asdu_dat_set_too_long_err() {
         "an over-long datset returns datsettoolong, got {:?}",
         result
     );
+}
+
+/// Frames carry the default 802.1Q tag, priority 4 and VID 0, as IEC 61850-9-2
+/// Tables 6 and 7 require.
+#[test]
+fn default_frame_carries_priority_4_vid_0_tag() {
+    let mut b = SvPublisherBuilder::new(SRC_MAC);
+    b.add_asdu("sv1", None::<String>, 1, 8).unwrap();
+    let p = b.setup_complete().unwrap();
+    let bytes = p.frame_bytes();
+    assert_eq!(
+        &bytes[12..16],
+        &[0x81, 0x00, 0x80, 0x00],
+        "tpid, pcp 4, vid 0"
+    );
+    assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]), 0x88BA);
+    let pdu = decode_sav_pdu(&bytes[SV_HEADER_WITH_VLAN..]).unwrap();
+    assert_eq!(pdu.asdus[0].sv_id, "sv1");
+}
+
+#[test]
+fn without_vlan_sends_untagged_frames() {
+    let mut b = SvPublisherBuilder::new(SRC_MAC).without_vlan();
+    b.add_asdu("sv1", None::<String>, 1, 8).unwrap();
+    let p = b.setup_complete().unwrap();
+    let bytes = p.frame_bytes();
+    assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), 0x88BA);
+    let pdu = decode_sav_pdu(&bytes[SV_HEADER_NO_VLAN..]).unwrap();
+    assert_eq!(pdu.asdus[0].sv_id, "sv1");
 }

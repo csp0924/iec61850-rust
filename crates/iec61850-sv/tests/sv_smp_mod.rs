@@ -7,7 +7,7 @@
 use bytes::BytesMut;
 use iec61850_sv::{
     decode_sav_pdu, encode_sav_pdu, Asdu, SavPdu, SmpMod, SmpSynch, SvPublisherBuilder,
-    SV_HEADER_NO_VLAN,
+    SV_HEADER_WITH_VLAN,
 };
 
 #[test]
@@ -19,7 +19,7 @@ fn publisher_encodes_smp_mod_in_two_octets() {
     let frame = p.frame_bytes();
     let tail = &frame[frame.len() - 4..];
     assert_eq!(tail, &[0x88, 0x02, 0x00, 0x01], "smpmod is the last member");
-    let pdu = decode_sav_pdu(&frame[SV_HEADER_NO_VLAN..]).unwrap();
+    let pdu = decode_sav_pdu(&frame[SV_HEADER_WITH_VLAN..]).unwrap();
     assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::SamplesPerSecond));
 }
 
@@ -31,7 +31,7 @@ fn publisher_encodes_an_smp_mod_above_255() {
     let p = b.setup_complete().unwrap();
     let frame = p.frame_bytes();
     assert_eq!(&frame[frame.len() - 4..], &[0x88, 0x02, 0x01, 0x02]);
-    let pdu = decode_sav_pdu(&frame[SV_HEADER_NO_VLAN..]).unwrap();
+    let pdu = decode_sav_pdu(&frame[SV_HEADER_WITH_VLAN..]).unwrap();
     assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::Unknown(0x0102)));
 }
 
@@ -40,7 +40,7 @@ fn publisher_without_smp_mod_sends_none() {
     let mut b = SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 1]);
     b.add_asdu("MU01", None::<String>, 1, 8).unwrap();
     let p = b.setup_complete().unwrap();
-    let pdu = decode_sav_pdu(&p.frame_bytes()[SV_HEADER_NO_VLAN..]).unwrap();
+    let pdu = decode_sav_pdu(&p.frame_bytes()[SV_HEADER_WITH_VLAN..]).unwrap();
     assert_eq!(pdu.asdus[0].smp_mod, None);
 }
 
