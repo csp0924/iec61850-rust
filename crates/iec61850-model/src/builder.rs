@@ -163,13 +163,7 @@ fn validate_datasets(model: &IedModel) -> Result<()> {
                 for entry in &ds.entries {
                     let unresolved = || ModelError::DataSetEntryUnresolved {
                         dataset: ds.name.clone(),
-                        entry: format!(
-                            "{}/{}${}${}",
-                            entry.ld_inst,
-                            entry.ln_name,
-                            entry.fc,
-                            entry.do_path.join("$")
-                        ),
+                        entry: entry.to_string(),
                     };
                     let target_ld = if entry.ld_inst.is_empty() {
                         ld

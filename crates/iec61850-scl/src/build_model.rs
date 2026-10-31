@@ -28,6 +28,7 @@ use iec61850_model::{
         GooseControlBlock, LogControlBlock, ReportControlBlock, SettingGroupControlBlock,
         SvControlBlock,
     },
+    error::ModelError,
     fc::FC,
     tree::{DataAttribute, DataObject, DataSet, DataSetEntry, DoChild, IedModel},
     types::{DataAttributeType, TrgOps},
@@ -37,7 +38,7 @@ use iec61850_model::{
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
     DataTypeTemplates, OptionFieldsBits, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
-    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawLNodeType,
+    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLNodeType,
     RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl,
     RawScl, RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
 };
@@ -104,14 +105,48 @@ pub(crate) fn build_ied_model(raw: &RawScl, ied_name: &str) -> Result<IedModel, 
     }
 
     model_b.build().map_err(|e| {
+        let detail = format!("the model builder rejected the IED: {}", e);
+        if let ModelError::DataSetEntryUnresolved { dataset, entry } = &e {
+            if let Some((span, path)) = locate_fcda(ied, dataset, entry) {
+                return SclParseError::at(span, path, ErrorKind::SemanticConflict { detail });
+            }
+        }
         SclParseError::at(
             ied.span,
             format!("SCL/IED[name=\"{}\"]", ied_name),
-            ErrorKind::SemanticConflict {
-                detail: format!("the model builder rejected the IED: {}", e),
-            },
+            ErrorKind::SemanticConflict { detail },
         )
     })
+}
+
+/// Finds the `<FCDA>` of the data set `dataset` in `ied` whose entry renders
+/// as `entry`, and returns its span and element path, so an unresolved data set
+/// member is reported where the file declares it.
+fn locate_fcda(ied: &RawIed, dataset: &str, entry: &str) -> Option<(SourceSpan, String)> {
+    for ap in &ied.access_points {
+        let Some(server) = ap.server.as_ref() else {
+            continue;
+        };
+        for raw_ld in &server.logical_devices {
+            for raw_ln in &raw_ld.logical_nodes {
+                for raw_ds in raw_ln.data_sets.iter().filter(|d| d.name == dataset) {
+                    for fcda in &raw_ds.fcdas {
+                        let Ok(e) = build_fcda(fcda, &raw_ld.inst, raw_ln, &raw_ds.name) else {
+                            continue;
+                        };
+                        if e.to_string() == entry {
+                            let path = format!(
+                                "SCL/IED[name=\"{}\"]/AccessPoint[name=\"{}\"]/Server/LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/DataSet[name=\"{}\"]/FCDA",
+                                ied.name, ap.name, raw_ld.inst, raw_ln.ln_class, raw_ln.inst, raw_ds.name
+                            );
+                            return Some((fcda.span, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn build_ld(

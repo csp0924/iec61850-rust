@@ -148,10 +148,19 @@ fn emit_ied_fn(
         )));
     }
 
+    // A helper the run-time build shares fails here only where that build
+    // fails too; the error is reported for this IED.
     let ld_exprs = lds
         .iter()
         .map(|ld| emit_ld_expr(ld, dtt, &ied.name, cfg))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| match e {
+            CompileError::BuildModel { source, .. } => CompileError::BuildModel {
+                ied: ied.name.clone(),
+                source,
+            },
+            other => other,
+        })?;
 
     Ok(quote! {
         /// Generated IED model.
@@ -409,7 +418,7 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
         // already validated the input, so a placeholder is enough.
         "DA",
     )
-    .map_err(CompileError::ResolveScl)?;
+    .map_err(model_error)?;
     let fc_tok = emit_fc_value(fc);
     let trg_tok = emit_trg_ops(da.trg_ops);
     let name_lit = da.name.as_str();
@@ -448,7 +457,7 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
     // `<Val>` of the declaration or the zero value, from
     // `template_initial_value`.
     let dat = attribute_type(&da.b_type, da.type_ref.as_deref(), dtt, da.span, "DA")
-        .map_err(CompileError::ResolveScl)?;
+        .map_err(model_error)?;
     let dat_tok = emit_dat_value(dat);
     let initial = template_initial_value(
         dat,
@@ -459,7 +468,7 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
         da.span,
         "DA",
     )
-    .map_err(CompileError::ResolveScl)?;
+    .map_err(model_error)?;
     let initial_tok = emit_mms_value(&initial);
 
     Ok(quote! {
@@ -512,7 +521,7 @@ fn emit_bda_expr(
     }
 
     let dat = attribute_type(&bda.b_type, bda.type_ref.as_deref(), dtt, bda.span, "BDA")
-        .map_err(CompileError::ResolveScl)?;
+        .map_err(model_error)?;
     let dat_tok = emit_dat_value(dat);
     let initial = template_initial_value(
         dat,
@@ -523,7 +532,7 @@ fn emit_bda_expr(
         bda.span,
         "BDA",
     )
-    .map_err(CompileError::ResolveScl)?;
+    .map_err(model_error)?;
     let initial_tok = emit_mms_value(&initial);
 
     Ok(quote! {
@@ -577,7 +586,7 @@ fn emit_fcda_expr(
         ln_name.push_str(i);
     }
 
-    let fc = parse_fc(&f.fc, f.span, "FCDA").map_err(CompileError::ResolveScl)?;
+    let fc = parse_fc(&f.fc, f.span, "FCDA").map_err(model_error)?;
     let fc_tok = emit_fc_value(fc);
 
     // do_path and the array index come from the runtime helper.
@@ -588,7 +597,7 @@ fn emit_fcda_expr(
         f.span,
         "FCDA",
     )
-    .map_err(CompileError::ResolveScl)?;
+    .map_err(model_error)?;
     let do_path_lits: Vec<&str> = do_path.iter().map(|s| s.as_str()).collect();
 
     let array_index_tok = match array_index {
@@ -615,8 +624,7 @@ fn emit_fcda_expr(
 // -----------------------------------------------------------------------------
 
 fn emit_rcb_expr(r: &RawReportControlBlock) -> Result<TokenStream, CompileError> {
-    let (indexed, max_instances) =
-        report_instances(r, "ReportControl").map_err(CompileError::ResolveScl)?;
+    let (indexed, max_instances) = report_instances(r, "ReportControl").map_err(model_error)?;
     let name = r.name.as_str();
     let is_buffered = r.buffered;
     let dataset_ref = r.dat_set.clone().unwrap_or_default();
@@ -1106,10 +1114,8 @@ fn emit_dai_assignment(
             path
         )));
     }
-    let (value, sgroup_values) = dai_values(dai, b_type, type_ref, ctx.dtt, ctx.num_of_sgs, path)
-        .map_err(|e| {
-        CompileError::Emit(format!("failed to parse the DAI value at {}: {}", path, e))
-    })?;
+    let (value, sgroup_values) =
+        dai_values(dai, b_type, type_ref, ctx.dtt, ctx.num_of_sgs, path).map_err(model_error)?;
     if base_path.is_empty() {
         return Err(CompileError::Emit(format!(
             "{}: the DAI override path is empty",
@@ -1127,6 +1133,15 @@ fn emit_dai_assignment(
 // -----------------------------------------------------------------------------
 // Small helpers
 // -----------------------------------------------------------------------------
+
+/// Wraps the failure of a helper the run-time model build shares; the IED name
+/// is filled in by `emit_ied_fn`.
+fn model_error(source: iec61850_scl::SclParseError) -> CompileError {
+    CompileError::BuildModel {
+        ied: String::new(),
+        source,
+    }
+}
 
 /// Converts an IED name into a valid Rust identifier. The SCL schema allows
 /// `[A-Za-z_][A-Za-z0-9_]*`; any other character is stripped for safety.

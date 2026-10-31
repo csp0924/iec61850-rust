@@ -33,10 +33,11 @@
 //! serialized into a `TokenStream`. A generated model therefore cannot
 //! disagree with a model built at run time.
 //!
-//! Before the file is written, every IED it covers is also built through
+//! Before anything is emitted, every IED the file covers is built through
 //! `ResolvedScl::build_model`, the run-time path. An SCL file that path rejects
-//! fails the build script with [`CompileError::ResolveScl`] instead of
-//! producing a `build_<X>_model` that panics when called.
+//! fails the build script with [`CompileError::BuildModel`], pointing at the
+//! offending element, instead of producing a `build_<X>_model` that panics
+//! when called.
 //!
 //! Layering: [`emit`] walks the `RawScl` tree and emits each level as `quote!`
 //! tokens; [`tokens`] holds the shared to-tokens helpers for functional
@@ -109,16 +110,16 @@ impl CompileBuilder {
         self
     }
 
-    /// Runs the build: reads the input, parses and resolves the SCL, emits the
-    /// tokens, builds the run-time model of every IED the file covers, formats
-    /// the tokens and writes `OUT_DIR/<out_file>`.
+    /// Runs the build: reads the input, parses and resolves the SCL, builds the
+    /// run-time model of every IED the file covers, emits the tokens, formats
+    /// them and writes `OUT_DIR/<out_file>`.
     ///
     /// Also prints `cargo:rerun-if-changed=<input_path>`.
     ///
     /// # Errors
     ///
     /// See [`CompileError`]; every stage reports its own variant. A model the
-    /// run-time path rejects is reported as [`CompileError::ResolveScl`], and
+    /// run-time path rejects is reported as [`CompileError::BuildModel`], and
     /// nothing is written.
     pub fn compile(self) -> Result<(), CompileError> {
         // Cargo reads the rerun trigger from the build script's stdout.
@@ -141,18 +142,17 @@ impl CompileBuilder {
         Ok(())
     }
 
-    /// Parses, resolves and emits `xml`, checks every emitted IED against the
-    /// run-time model build, and returns the formatted source.
+    /// Parses and resolves `xml`, builds every IED it covers through the
+    /// run-time path, emits the selected IEDs and returns the formatted source.
     fn generate(&self, xml: &str) -> Result<String, CompileError> {
         let raw = iec61850_scl::parse_scl(xml).map_err(CompileError::ParseScl)?;
         let resolved = raw
             .resolve_with(&self.resolve_options)
             .map_err(CompileError::ResolveScl)?;
 
-        let tokens = emit::emit_file(&resolved, self)?;
-
         // The emitted functions call the model builders with `expect`; running
-        // the same builders here turns each such failure into a build error.
+        // the same builders first turns each such failure into a build error
+        // that points at the offending element.
         for ied in &resolved.raw().ieds {
             if self
                 .requested_ied_name()
@@ -162,8 +162,13 @@ impl CompileBuilder {
             }
             resolved
                 .build_model(&ied.name)
-                .map_err(CompileError::ResolveScl)?;
+                .map_err(|source| CompileError::BuildModel {
+                    ied: ied.name.clone(),
+                    source,
+                })?;
         }
+
+        let tokens = emit::emit_file(&resolved, self)?;
 
         // Formatting keeps a panic inside the generated code readable.
         let file: syn::File = syn::parse2(tokens).map_err(|e| CompileError::Syn {
@@ -201,13 +206,27 @@ pub enum CompileError {
     #[error("failed to parse the SCL: {0}")]
     ParseScl(iec61850_scl::SclParseError),
 
-    /// Type reference resolution or a cross-element consistency check failed,
-    /// or the run-time model build rejected an IED the file covers.
+    /// Type reference resolution or a cross-element consistency check failed.
     #[error("failed to resolve the SCL: {0}")]
     ResolveScl(iec61850_scl::SclParseError),
 
-    /// The emit stage found a semantic problem, such as several IEDs with no
-    /// `ied_name` selected.
+    /// The run-time model build rejected an IED the file covers.
+    #[error("failed to build the model of IED `{ied}`: {source}")]
+    BuildModel {
+        /// Name of the IED whose model failed to build.
+        ied: String,
+        /// The error of the run-time build, located at the offending element
+        /// where it can be.
+        #[source]
+        source: iec61850_scl::SclParseError,
+    },
+
+    /// The emit stage found a problem the run-time build does not report: the
+    /// IED named by [`CompileBuilder::ied_name`] is not in the file, an IED
+    /// has no logical device, a `<DAI>` lands on a constructed attribute, an
+    /// instance path is empty, or a type reference the resolve stage checked
+    /// is missing. The last three mean a defect in this crate, since the
+    /// run-time build, which runs first, rejects such a file itself.
     #[error("code generation failed: {0}")]
     Emit(String),
 
@@ -300,7 +319,25 @@ mod tests {
         let err = compile_icd("unused.icd")
             .generate(&scl(&[ied("IED1", "Missing")]))
             .expect_err("a data set member the model lacks must fail the build");
-        assert!(matches!(err, CompileError::ResolveScl(_)), "{err:?}");
+        let CompileError::BuildModel { ied, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(ied, "IED1");
+        // The error points at the FCDA naming the missing member.
+        assert!(
+            source.element_path.ends_with("/DataSet[name=\"ds1\"]/FCDA"),
+            "{err}"
+        );
+        assert_eq!(source.span.line, 8, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("failed to build the model of IED `IED1`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("parse error") && !text.contains("failed to resolve"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -308,7 +345,10 @@ mod tests {
         let err = compile_icd("unused.icd")
             .generate(&scl(&[ied("Good", "TotW"), ied("Bad", "Missing")]))
             .expect_err("an IED that would panic must fail the build");
-        assert!(matches!(err, CompileError::ResolveScl(_)), "{err:?}");
+        assert!(
+            matches!(&err, CompileError::BuildModel { ied, .. } if ied == "Bad"),
+            "{err:?}"
+        );
     }
 
     #[test]

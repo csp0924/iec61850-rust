@@ -30,7 +30,7 @@ pub struct SclParseError {
 
 impl fmt::Display for SclParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SCL parse error at {} ({}", self.span, self.element_path)?;
+        write!(f, "SCL error at {} ({}", self.span, self.element_path)?;
         if let Some(attr) = &self.attribute {
             write!(f, " @{}", attr)?;
         }

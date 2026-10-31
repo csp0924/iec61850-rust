@@ -616,6 +616,21 @@ impl DataSetEntry {
     }
 }
 
+/// Writes the entry as `ld_inst/ln_name$FC$do_path`, the segments of
+/// `do_path` joined with `$`, which is how a data set entry error names it.
+impl core::fmt::Display for DataSetEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}/{}${}$", self.ld_inst, self.ln_name, self.fc)?;
+        for (i, seg) in self.do_path.iter().enumerate() {
+            if i > 0 {
+                f.write_str("$")?;
+            }
+            f.write_str(seg)?;
+        }
+        Ok(())
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Node references used when traversing
 // -----------------------------------------------------------------------------
