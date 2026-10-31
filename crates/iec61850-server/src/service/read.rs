@@ -483,6 +483,46 @@ pub(crate) fn apply_read_handlers(
     }
 }
 
+/// Passes `baseline`, the model value of the array element `alt` selects in
+/// the array `array_item` names in `domain`, through the read handlers of
+/// `registry`, as a read of that array with that alternate access would: the
+/// handlers at, above and below the array decide the value of the whole
+/// array, from which the element is then selected. A failure, and a path that
+/// does not resolve to an array, pass unchanged.
+#[cfg(feature = "reporting")]
+pub(crate) fn apply_read_handlers_to_element(
+    ied_model: &IedModel,
+    registry: &HandlerRegistry,
+    conn_id: u64,
+    domain: &str,
+    array_item: &str,
+    alt: &AlternateAccess,
+    baseline: AccessResult,
+) -> AccessResult {
+    if !matches!(baseline, AccessResult::Success(_)) {
+        return baseline;
+    }
+    if ReadHandlerScope::around(registry, array_item, conn_id).is_empty() {
+        return baseline;
+    }
+    let Some((fc, nodes)) = resolve_node_path(ied_model, domain, array_item) else {
+        return baseline;
+    };
+    let Some(&array) = nodes.last() else {
+        return baseline;
+    };
+    if !array.is_array() {
+        return baseline;
+    }
+    let whole = AccessResult::Success(mms_value_to_mms_data(&array.snapshot(fc)));
+    match apply_read_handlers(ied_model, registry, conn_id, domain, array_item, whole) {
+        AccessResult::Success(data) => {
+            select_element(array, fc, &mms_data_to_mms_value(&data), alt)
+        }
+        failure => failure,
+    }
+}
+
 /// Why an expansion stopped short.
 enum Halt {
     /// The response no longer fits the negotiated PDU size.

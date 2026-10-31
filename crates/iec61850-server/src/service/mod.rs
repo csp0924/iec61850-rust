@@ -1131,14 +1131,32 @@ fn dispatch_read(
                     {
                         AccessResult::Failure(DataAccessError::TemporarilyUnavailable)
                     }
-                    Some((domain_id, item_id)) => crate::service::read::apply_read_handlers(
-                        ied_model,
-                        handler_registry,
-                        conn_id,
-                        &domain_id,
-                        &item_id,
-                        baseline,
-                    ),
+                    Some((domain_id, item_id)) => {
+                        match get_named_variable_list_attrs::member_variable(&entry.attr_ref) {
+                            // A member naming an array element is read as its
+                            // array, selected by the alternate access.
+                            Some((
+                                iec61850_mms::ObjectName::DomainSpecific { item_id: array, .. },
+                                Some(alt),
+                            )) => crate::service::read::apply_read_handlers_to_element(
+                                ied_model,
+                                handler_registry,
+                                conn_id,
+                                &domain_id,
+                                &array,
+                                &alt,
+                                baseline,
+                            ),
+                            _ => crate::service::read::apply_read_handlers(
+                                ied_model,
+                                handler_registry,
+                                conn_id,
+                                &domain_id,
+                                &item_id,
+                                baseline,
+                            ),
+                        }
+                    }
                     None => baseline,
                 };
                 if let Some(b) = remaining_budget.as_mut() {
@@ -1800,8 +1818,8 @@ fn dispatch_write(
                     .iter()
                     .zip(req.list_of_data.iter())
                     .map(|(entry, data)| {
-                        let Some((domain_id, item_id)) =
-                            get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref)
+                        let Some((member, alt_access)) =
+                            get_named_variable_list_attrs::member_variable(&entry.attr_ref)
                         else {
                             tracing::warn!(
                                 invoke_id,
@@ -1810,7 +1828,22 @@ fn dispatch_write(
                             );
                             return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
                         };
-                        let member = iec61850_mms::ObjectName::DomainSpecific { domain_id, item_id };
+                        // A member naming an array element is written as the
+                        // element of the array its alternate access selects.
+                        if let Some(alt) = alt_access {
+                            return crate::service::write::handle_single_write_with_access(
+                                ied_model,
+                                mms_model,
+                                policies,
+                                Some(handler_registry),
+                                #[cfg(feature = "setting-groups")]
+                                Some(setting_groups),
+                                conn_id,
+                                &member,
+                                Some(&alt),
+                                data,
+                            );
+                        }
                         handle_write_with_routing(
                             ied_model,
                             mms_model,

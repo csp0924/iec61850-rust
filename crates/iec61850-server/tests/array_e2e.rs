@@ -1330,3 +1330,86 @@ async fn data_set_directory_names_array_elements_by_alternate_access() {
     .await
     .expect("timed out");
 }
+
+/// Registers `LLN0$Lims`, whose only member names the element
+/// `GGIO1.Arr.cfg.lims(1)`.
+fn register_lims_element(server: &IedServer) {
+    let model = server.model();
+    let r = ObjectRef::parse(&format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)")).unwrap();
+    let Some(NodeRef::Da(lim)) = model.node_by_object_ref(&r) else {
+        panic!("the element resolves to an attribute");
+    };
+    let mut ds = iec61850_server::Dataset::new("LLN0$Lims");
+    ds.push(iec61850_server::DatasetEntry::new(
+        format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)"),
+        Arc::clone(&lim.value),
+    ));
+    server.register_dataset(DOMAIN, ds);
+}
+
+#[derive(Debug)]
+struct DenyRead;
+impl ReadHandler for DenyRead {
+    fn read(&self, _ctx: &ReadContext<'_>) -> ReadOutcome {
+        ReadOutcome::Error(DataAccessError::ObjectAccessDenied)
+    }
+}
+
+/// A data set member naming an array element is written by SetDataSetValues
+/// as that element of the array, and read by GetDataSetValues through the
+/// read handlers of the array, as a Read of the array with an alternate access
+/// is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_set_member_naming_an_element_is_served_as_that_element() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (handle, mut client) = serve_with(model(), register_lims_element).await;
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write_named_variable_list_values(DOMAIN, "LLN0$Lims", vec![MmsData::Integer(4)]),
+        )
+        .await
+        .expect("timeout")
+        .expect("SetDataSetValues");
+        assert_eq!(
+            outcomes,
+            vec![iec61850_mms::mms::pdu::common::WriteOutcome::Success]
+        );
+        assert_eq!(
+            read_element(&mut client, "GGIO1$SP$Arr$cfg$lims", 1, None)
+                .await
+                .expect("lims(1)"),
+            MmsData::Integer(4)
+        );
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$Lims"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(values, vec![AccessResult::Success(MmsData::Integer(4))]);
+        handle.stop().await;
+
+        let (handle, mut client) = serve_with(model(), |server| {
+            register_lims_element(server);
+            server
+                .install_read_handler("GGIO1$SP$Arr$cfg$lims", Arc::new(DenyRead))
+                .expect("install_read_handler");
+        })
+        .await;
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$Lims"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(
+            values,
+            vec![AccessResult::Failure(DataAccessError::ObjectAccessDenied)]
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
