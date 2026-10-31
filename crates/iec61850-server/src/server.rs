@@ -24,8 +24,8 @@ use crate::mapping::{
 };
 use crate::policy::WriteAccessPolicies;
 use crate::reporting::{
-    BufferedReportControl, ChannelReportSink, DataAttributeRef, Dataset, ReportControl,
-    ReportingEngine,
+    BufferedReportControl, ChannelReportSink, DataAttributeRef, Dataset, InclusionFlag,
+    ReportControl, ReportingEngine, TriggerOptions,
 };
 use crate::service::MmsModelDispatcher;
 use iec61850_mms::mms::server::MmsServiceDispatcher;
@@ -548,7 +548,7 @@ impl IedServer {
     }
 
     /// Checks that the attribute currently holds the same variant as the new
-    /// value, writes it, and triggers any report that watches the attribute.
+    /// value, writes it, and raises the report and log triggers of the update.
     fn update_typed(
         &self,
         da: &DataAttribute,
@@ -559,26 +559,29 @@ impl IedServer {
     }
 
     /// Checks that the attribute currently holds the `expected_name` variant,
-    /// writes the value `build` derives from the current one, and triggers any
-    /// report that watches the attribute.
+    /// writes the value `build` derives from the current one, and raises the
+    /// report and log triggers of the update.
     ///
     /// The check and the write happen under one write lock, so the attribute is
-    /// unchanged when `build` fails. The report trigger follows the attribute's
-    /// trigger options: a quality change for an attribute that names `qchg` and
-    /// not `dchg`, a data change for every other attribute. The same trigger
-    /// writes a log entry through every enabled log control block whose data
-    /// set holds the attribute.
+    /// unchanged when `build` fails. The triggers are chosen under the same
+    /// lock, by comparing the new value with the old one against the trigger
+    /// options of the attribute (IEC 61850-7-2 TrgOp, table 21):
+    ///
+    /// - a changed value raises each of data-change, quality-change and
+    ///   data-update the attribute declares in `dchg`, `qchg` and `dupd`;
+    /// - an unchanged value raises data-update when the attribute declares
+    ///   `dupd`;
+    /// - an attribute that declares none of them raises nothing.
+    ///
+    /// Reports and log entries act on the same triggers, each control block on
+    /// those its TrgOps enable.
     fn update_with(
         &self,
         da: &DataAttribute,
         expected_name: &'static str,
         build: impl FnOnce(&MmsValue) -> Result<MmsValue>,
     ) -> Result<()> {
-        // Taken before the lock, so the write lock is held as briefly as
-        // possible.
-        let ptr_key = Arc::as_ptr(&da.value) as usize;
-
-        let new_value = {
+        let (new_value, flag) = {
             let mut guard = da.value.write().map_err(|_| {
                 ServerError::InvalidModel("DataAttribute value RwLock poisoned".into())
             })?;
@@ -591,45 +594,55 @@ impl IedServer {
                 });
             }
             let new_value = build(&guard)?;
+            let flag = update_triggers(da, &guard, &new_value);
             *guard = new_value.clone();
-            new_value
+            (new_value, flag)
         };
-        // The write lock is released before the reporting engine is triggered.
-        self.log_update(ptr_key, change_flag(da), &new_value);
-        let attr_ref_opt = self
+        // The write lock is released before any trigger is raised.
+        if flag.has_trigger() {
+            self.raise_triggers(&da.value, new_value, flag);
+        }
+        Ok(())
+    }
+
+    /// Raises the log and report triggers of an attribute update.
+    ///
+    /// The attribute is looked up in the report indexes before the reporting
+    /// engine is locked.
+    fn raise_triggers(&self, cell: &Arc<RwLock<MmsValue>>, value: MmsValue, flag: InclusionFlag) {
+        let ptr_key = Arc::as_ptr(cell) as usize;
+        self.log_update(ptr_key, flag, &value);
+        let attr_ref = self
             .inner
             .attr_ref_index
             .read()
             .ok()
-            .and_then(|g| g.get(&ptr_key).cloned());
-
-        // A member of a data set a control block was bound to over MMS is in
-        // the engine's index only, which is read without the engine lock.
-        let attr_ref_opt = attr_ref_opt.or_else(|| self.inner.value_index.attr_ref_for(&da.value));
-
-        if let Some(attr_ref) = attr_ref_opt {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            if let Ok(engine) = self.inner.reporting_engine.lock() {
-                let flag = change_flag(da);
-                engine.on_value_updated(&attr_ref, new_value.clone(), flag, now_ms);
-                // The buffered path is always tried too; it returns at once
-                // when no buffered control block watches the attribute.
-                engine.on_brcb_value_updated(&attr_ref, new_value, flag, now_ms);
-            } else {
-                tracing::warn!(
-                    attr_ref = %attr_ref,
-                    "the reporting engine lock is poisoned, the update triggered no report"
-                );
-            }
-        }
+            .and_then(|g| g.get(&ptr_key).cloned())
+            // A member of a data set a control block was bound to over MMS is
+            // in the engine's index only, which is read without the engine
+            // lock.
+            .or_else(|| self.inner.value_index.attr_ref_for(cell));
         // An attribute in no data set has no index entry, which is the ordinary
         // case and needs no report.
-
-        Ok(())
+        let Some(attr_ref) = attr_ref else {
+            return;
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        match self.inner.reporting_engine.lock() {
+            Ok(engine) => {
+                engine.on_value_updated(&attr_ref, value.clone(), flag, now_ms);
+                // The buffered path is always tried too; it returns at once
+                // when no buffered control block watches the attribute.
+                engine.on_brcb_value_updated(&attr_ref, value, flag, now_ms);
+            }
+            Err(_) => tracing::warn!(
+                attr_ref = %attr_ref,
+                "the reporting engine lock is poisoned, the update triggered no report"
+            ),
+        }
     }
 
     /// Writes one log entry for an updated attribute through every enabled log
@@ -637,41 +650,29 @@ impl IedServer {
     ///
     /// `ptr_key` identifies the attribute by the address of its shared value,
     /// which is how a data set member refers to it. A control block writes an
-    /// entry when its TrgOps holds the trigger of `flag`, data-change or
-    /// quality-change, and its DatSet names a registered data set of the
-    /// domain, as `<LN>$<name>` or `<LD>/<LN>$<name>`, with the attribute as a
-    /// member. The entry carries the member reference, the new value and the
-    /// matching reason code. A control block registered under several keys
-    /// writes once.
-    fn log_update(&self, ptr_key: usize, flag: crate::reporting::InclusionFlag, value: &MmsValue) {
-        use crate::reporting::{InclusionFlag, TriggerOptions};
-        let (trigger, reason_code) = if flag.contains(InclusionFlag::VALUE_CHANGED) {
-            (TriggerOptions::DATA_CHANGED, LOG_REASON_DATA_CHANGE)
-        } else if flag.contains(InclusionFlag::QUALITY_CHANGED) {
-            (TriggerOptions::QUALITY_CHANGED, LOG_REASON_QUALITY_CHANGE)
-        } else {
+    /// entry when its TrgOps enable at least one reason of `flag`, data-change,
+    /// quality-change or data-update, and its DatSet names a registered data
+    /// set of the domain, as `<LN>$<name>` or `<LD>/<LN>$<name>`, with the
+    /// attribute as a member. The entry carries the member reference, the new
+    /// value and the reason code of the enabled reasons, so an update writes
+    /// one entry whatever the number of its reasons. A control block registered
+    /// under several keys writes once.
+    fn log_update(&self, ptr_key: usize, flag: InclusionFlag, value: &MmsValue) {
+        if !flag.has_trigger() {
+            return;
+        }
+        let Some(controls) = self.unique_log_controls() else {
             return;
         };
-        let mut controls: Vec<Arc<crate::logging::LogControl>> =
-            match self.inner.log_controls.read() {
-                Ok(g) => g.values().cloned().collect(),
-                Err(_) => {
-                    tracing::warn!(
-                        "the log control registry lock is poisoned, the update was not logged"
-                    );
-                    return;
-                }
-            };
-        controls.sort_by_key(|lc| Arc::as_ptr(lc) as usize);
-        controls.dedup_by_key(|lc| Arc::as_ptr(lc) as usize);
         let mut now_ms: Option<u64> = None;
         for lc in controls {
-            let data_set = match lc.state.lock() {
-                Ok(state)
-                    if matches!(state.log_ena, crate::logging::LogState::Enabled)
-                        && state.trg_ops.contains(trigger) =>
-                {
-                    state.data_set.clone()
+            let (data_set, reason_code) = match lc.state.lock() {
+                Ok(state) if matches!(state.log_ena, crate::logging::LogState::Enabled) => {
+                    let reason_code = log_reason(flag, state.trg_ops);
+                    match state.data_set.clone() {
+                        Some(data_set) if reason_code != 0 => (data_set, reason_code),
+                        _ => continue,
+                    }
                 }
                 Ok(_) => continue,
                 Err(_) => {
@@ -682,31 +683,15 @@ impl IedServer {
                     continue;
                 }
             };
-            let Some(data_set) = data_set else {
+            let Some(ds) = self.log_data_set(&lc, data_set) else {
                 continue;
             };
-            let Some(lcb_domain) = lc.mms_path.split_once('/').map(|(d, _)| d) else {
-                continue;
-            };
-            let key = match data_set.split_once('/') {
-                Some((domain, name)) => (domain.to_string(), name.to_string()),
-                None => (lcb_domain.to_string(), data_set),
-            };
-            let member = match self.inner.dataset_registry.read() {
-                Ok(g) => g.get(&key).and_then(|ds| {
-                    ds.entries
-                        .iter()
-                        .find(|e| Arc::as_ptr(&e.value) as usize == ptr_key)
-                        .map(|e| e.attr_ref.clone())
-                }),
-                Err(_) => {
-                    tracing::warn!(
-                        "the data set registry lock is poisoned, the update was not logged"
-                    );
-                    return;
-                }
-            };
-            let Some(data_ref) = member else {
+            let Some(data_ref) = ds
+                .entries
+                .iter()
+                .find(|e| Arc::as_ptr(&e.value) as usize == ptr_key)
+                .map(|e| e.attr_ref.clone())
+            else {
                 continue;
             };
             let time_ms = *now_ms.get_or_insert_with(|| {
@@ -721,6 +706,43 @@ impl IedServer {
                     error = %e,
                     "the log storage backend failed, the update was not logged"
                 );
+            }
+        }
+    }
+
+    /// Returns every registered log control block once, however many keys it
+    /// is registered under, or `None` when the registry lock is poisoned.
+    fn unique_log_controls(&self) -> Option<Vec<Arc<crate::logging::LogControl>>> {
+        let mut controls: Vec<Arc<crate::logging::LogControl>> =
+            match self.inner.log_controls.read() {
+                Ok(g) => g.values().cloned().collect(),
+                Err(_) => {
+                    tracing::warn!("the log control registry lock is poisoned, nothing was logged");
+                    return None;
+                }
+            };
+        controls.sort_by_key(|lc| Arc::as_ptr(lc) as usize);
+        controls.dedup_by_key(|lc| Arc::as_ptr(lc) as usize);
+        Some(controls)
+    }
+
+    /// Resolves the data set a log control block's DatSet names, in the domain
+    /// of the control block unless the name carries one.
+    fn log_data_set(
+        &self,
+        lc: &crate::logging::LogControl,
+        data_set: String,
+    ) -> Option<Arc<Dataset>> {
+        let lcb_domain = lc.mms_path.split_once('/').map(|(d, _)| d)?;
+        let key = match data_set.split_once('/') {
+            Some((domain, name)) => (domain.to_string(), name.to_string()),
+            None => (lcb_domain.to_string(), data_set),
+        };
+        match self.inner.dataset_registry.read() {
+            Ok(g) => g.get(&key).cloned(),
+            Err(_) => {
+                tracing::warn!("the data set registry lock is poisoned, nothing was logged");
+                None
             }
         }
     }
@@ -1179,14 +1201,68 @@ const LOG_REASON_DATA_CHANGE: u8 = 0x02;
 /// Log reason code of a quality change: bit 2 of ReasonForInclusionInLog.
 const LOG_REASON_QUALITY_CHANGE: u8 = 0x04;
 
-/// Chooses the report trigger for an update from the attribute's trigger
-/// options: a quality change for a `qchg` attribute without `dchg`, a data
-/// change otherwise.
-fn change_flag(da: &DataAttribute) -> crate::reporting::InclusionFlag {
-    if da.trg_ops.contains(TrgOps::QCHG) && !da.trg_ops.contains(TrgOps::DCHG) {
-        crate::reporting::InclusionFlag::QUALITY_CHANGED
-    } else {
-        crate::reporting::InclusionFlag::VALUE_CHANGED
+/// Log reason code of a data update: bit 3 of ReasonForInclusionInLog.
+const LOG_REASON_DATA_UPDATE: u8 = 0x08;
+
+/// Returns the log reason code of the reasons of `flag` that `trg_ops` enable,
+/// with the bits of ReasonForInclusionInLog (IEC 61850-8-1 table 39).
+fn log_reason(flag: InclusionFlag, trg_ops: TriggerOptions) -> u8 {
+    let mut code = 0;
+    for (reason, trigger, bit) in [
+        (
+            InclusionFlag::VALUE_CHANGED,
+            TriggerOptions::DATA_CHANGED,
+            LOG_REASON_DATA_CHANGE,
+        ),
+        (
+            InclusionFlag::QUALITY_CHANGED,
+            TriggerOptions::QUALITY_CHANGED,
+            LOG_REASON_QUALITY_CHANGE,
+        ),
+        (
+            InclusionFlag::VALUE_UPDATE,
+            TriggerOptions::DATA_UPDATE,
+            LOG_REASON_DATA_UPDATE,
+        ),
+    ] {
+        if flag.contains(reason) && trg_ops.contains(trigger) {
+            code |= bit;
+        }
+    }
+    code
+}
+
+/// Chooses the reasons for inclusion an update raises, from whether it
+/// changes the value and from the trigger options the attribute declares.
+///
+/// An attribute raises only the triggers it declares (IEC 61850-7-2 TrgOp,
+/// table 21): a changed value raises data-change for `dchg`, quality-change
+/// for `qchg` and data-update for `dupd`; an unchanged value raises
+/// data-update for `dupd` and nothing else.
+fn update_triggers(da: &DataAttribute, old: &MmsValue, new: &MmsValue) -> InclusionFlag {
+    let declared = |trg: TrgOps, flag: InclusionFlag| {
+        if da.trg_ops.contains(trg) {
+            flag
+        } else {
+            InclusionFlag::NONE
+        }
+    };
+    let update = declared(TrgOps::DUPD, InclusionFlag::VALUE_UPDATE);
+    if same_value(old, new) {
+        return update;
+    }
+    declared(TrgOps::DCHG, InclusionFlag::VALUE_CHANGED)
+        .union(declared(TrgOps::QCHG, InclusionFlag::QUALITY_CHANGED))
+        .union(update)
+}
+
+/// Compares two values as they are encoded, so a floating-point value equals
+/// one with the same bits, NaN included.
+fn same_value(a: &MmsValue, b: &MmsValue) -> bool {
+    match (a, b) {
+        (MmsValue::Float32(x), MmsValue::Float32(y)) => x.to_bits() == y.to_bits(),
+        (MmsValue::Float64(x), MmsValue::Float64(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
     }
 }
 
@@ -1758,6 +1834,78 @@ mod tests {
         }
         // Dropping the guard clears the flag.
         assert!(!server.is_data_model_locked());
+    }
+
+    // ── Update triggers ─────────────────────────────────────────────────
+
+    #[test]
+    fn an_update_raises_the_triggers_its_attribute_declares() {
+        let (t, f) = (MmsValue::Boolean(true), MmsValue::Boolean(false));
+        let vc = InclusionFlag::VALUE_CHANGED;
+        let qc = InclusionFlag::QUALITY_CHANGED;
+        let vu = InclusionFlag::VALUE_UPDATE;
+        let cases = [
+            (TrgOps::DCHG, &f, &t, vc),
+            (TrgOps::DCHG, &t, &t, InclusionFlag::NONE),
+            (TrgOps::QCHG, &f, &t, qc),
+            (TrgOps::QCHG, &t, &t, InclusionFlag::NONE),
+            (TrgOps::DUPD, &f, &t, vu),
+            (TrgOps::DUPD, &t, &t, vu),
+            (TrgOps::DCHG | TrgOps::DUPD, &f, &t, vc.union(vu)),
+            (TrgOps::DCHG | TrgOps::DUPD, &t, &t, vu),
+            (TrgOps::QCHG | TrgOps::DUPD, &f, &t, qc.union(vu)),
+            (TrgOps::DCHG | TrgOps::QCHG, &f, &t, vc.union(qc)),
+            (TrgOps::NONE, &f, &t, InclusionFlag::NONE),
+            (TrgOps::NONE, &t, &t, InclusionFlag::NONE),
+        ];
+        for (trg_ops, old, new, expected) in cases {
+            let da = DataAttribute::new(
+                "a",
+                FC::St,
+                iec61850_model::DataAttributeType::Boolean,
+                trg_ops,
+                old.clone(),
+            );
+            assert_eq!(
+                update_triggers(&da, old, new),
+                expected,
+                "{trg_ops:?}: {old:?} -> {new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_float_is_unchanged_only_when_its_bits_are() {
+        assert!(same_value(
+            &MmsValue::Float32(f32::NAN),
+            &MmsValue::Float32(f32::NAN)
+        ));
+        assert!(same_value(
+            &MmsValue::Float64(f64::NAN),
+            &MmsValue::Float64(f64::NAN)
+        ));
+        assert!(!same_value(
+            &MmsValue::Float32(0.0),
+            &MmsValue::Float32(-0.0)
+        ));
+        assert!(same_value(&MmsValue::Float64(2.5), &MmsValue::Float64(2.5)));
+    }
+
+    #[test]
+    fn a_log_entry_takes_the_enabled_reasons() {
+        let all = InclusionFlag::VALUE_CHANGED
+            .union(InclusionFlag::QUALITY_CHANGED)
+            .union(InclusionFlag::VALUE_UPDATE);
+        assert_eq!(log_reason(all, TriggerOptions::DATA_CHANGED), 0x02);
+        assert_eq!(log_reason(all, TriggerOptions::QUALITY_CHANGED), 0x04);
+        assert_eq!(log_reason(all, TriggerOptions::DATA_UPDATE), 0x08);
+        assert_eq!(
+            log_reason(
+                InclusionFlag::VALUE_UPDATE,
+                TriggerOptions::DATA_CHANGED | TriggerOptions::INTEGRITY | TriggerOptions::GI
+            ),
+            0
+        );
     }
 
     #[test]

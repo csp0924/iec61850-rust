@@ -471,17 +471,20 @@ fn update_of_qchg_attribute_skips_dchg_only_rcb() {
     assert!(flag.is_none(), "{flag:?}");
 }
 
-/// An update of any attribute other than a `qchg` one without `dchg` triggers
-/// a data change: one that names `dchg`, with or without `qchg`, and one that
-/// names only `dupd` or no trigger option at all.
+/// An update raises only the triggers its attribute declares: data-change
+/// for `dchg`, with quality-change too when it also declares `qchg`, and none
+/// for an attribute that declares no trigger option.
 #[test]
-fn update_of_other_attributes_triggers_data_change() {
+fn update_of_other_attributes_triggers_what_they_declare() {
     let both = TriggerOptions::DATA_CHANGED | TriggerOptions::QUALITY_CHANGED;
-    for (trg_ops, rcb_trg_ops) in [
-        (TrgOps::DCHG, both),
-        (TrgOps::DCHG | TrgOps::QCHG, both),
-        (TrgOps::NONE, TriggerOptions::DATA_CHANGED),
-        (TrgOps::DUPD, TriggerOptions::DATA_CHANGED),
+    for (trg_ops, rcb_trg_ops, expected) in [
+        (TrgOps::DCHG, both, Some(InclusionFlag::VALUE_CHANGED)),
+        (
+            TrgOps::DCHG | TrgOps::QCHG,
+            both,
+            Some(InclusionFlag::VALUE_CHANGED.union(InclusionFlag::QUALITY_CHANGED)),
+        ),
+        (TrgOps::NONE, TriggerOptions::DATA_CHANGED, None),
     ] {
         let da = DataAttribute::new(
             "stVal",
@@ -492,14 +495,33 @@ fn update_of_other_attributes_triggers_data_change() {
         );
         let flag = trigger_of(&da, rcb_trg_ops, |s, da| {
             s.update_boolean(da, true).expect("update_boolean");
-        })
-        .expect("a dchg control block must be triggered");
-        assert!(flag.contains(InclusionFlag::VALUE_CHANGED), "{trg_ops:?}");
-        assert!(
-            !flag.contains(InclusionFlag::QUALITY_CHANGED),
-            "{trg_ops:?}"
-        );
+        });
+        assert_eq!(flag, expected, "{trg_ops:?}");
     }
+}
+
+/// A change of an attribute that declares only `dupd` is a data update: a
+/// control block enabled for `dchg` alone is not triggered, and one enabled
+/// for `dupd` is.
+#[test]
+fn update_of_dupd_only_attribute_is_a_data_update() {
+    let da = || {
+        DataAttribute::new(
+            "frVal",
+            FC::St,
+            DataAttributeType::Int32,
+            TrgOps::DUPD,
+            MmsValue::Integer(0),
+        )
+    };
+    let flag = trigger_of(&da(), TriggerOptions::DATA_CHANGED, |s, da| {
+        s.update_int32(da, 1).expect("update_int32");
+    });
+    assert!(flag.is_none(), "{flag:?}");
+    let flag = trigger_of(&da(), TriggerOptions::DATA_UPDATE, |s, da| {
+        s.update_int32(da, 1).expect("update_int32");
+    });
+    assert_eq!(flag, Some(InclusionFlag::VALUE_UPDATE));
 }
 
 /// A buffered control block enabled for `qchg` alone buffers an update of a

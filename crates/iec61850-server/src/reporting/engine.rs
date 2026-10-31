@@ -604,6 +604,10 @@ impl ReportingEngine {
     /// watching it, so the cost is proportional to the number of watchers rather
     /// than to the number of registered control blocks.
     ///
+    /// A control block takes the reasons of `flag` its TrgOps enable and no
+    /// other, so a report carries only enabled reasons for inclusion; a control
+    /// block that enables none of them is not triggered.
+    ///
     /// A member that triggers again while it is already part of the pending report
     /// sends that report immediately, and the new trigger opens the next buffer
     /// time, so no value is overwritten before it is reported.
@@ -642,17 +646,8 @@ impl ReportingEngine {
                 continue;
             }
 
-            let trg = if flag.contains(InclusionFlag::VALUE_CHANGED) {
-                TriggerOptions::DATA_CHANGED
-            } else if flag.contains(InclusionFlag::QUALITY_CHANGED) {
-                TriggerOptions::QUALITY_CHANGED
-            } else if flag.contains(InclusionFlag::VALUE_UPDATE) {
-                TriggerOptions::DATA_UPDATE
-            } else {
-                continue;
-            };
-
-            if !state.trg_ops.contains(trg) {
+            let flag = enabled_triggers(flag, state.trg_ops);
+            if !flag.has_trigger() {
                 rc_guard
                     .metrics
                     .skipped_trgops
@@ -745,8 +740,8 @@ impl ReportingEngine {
     ///
     /// Mirrors `on_value_updated`:
     /// 1. look the attribute up in `brcb_watch_map`;
-    /// 2. apply the trgOps filter and skip control blocks that do not subscribe to
-    ///    this trigger class;
+    /// 2. keep the reasons of `flag` the TrgOps enable, skipping a control block
+    ///    that enables none of them;
     /// 3. honor the `is_buffering` gate: a BRCB buffers whenever its data set is
     ///    valid, even while `RptEna` is false, which is the principal behavioral
     ///    difference between a BRCB and a URCB;
@@ -776,17 +771,6 @@ impl ReportingEngine {
                 continue;
             };
 
-            // trgOps filter
-            let trg = if flag.contains(InclusionFlag::VALUE_CHANGED) {
-                TriggerOptions::DATA_CHANGED
-            } else if flag.contains(InclusionFlag::QUALITY_CHANGED) {
-                TriggerOptions::QUALITY_CHANGED
-            } else if flag.contains(InclusionFlag::VALUE_UPDATE) {
-                TriggerOptions::DATA_UPDATE
-            } else {
-                continue;
-            };
-
             // Copy the fields needed, then release the state lock.
             let (is_buffering, buf_tm_ms, trg_ops, mms_path, ds_len) = {
                 let Ok(state) = brcb_arc.state.lock() else {
@@ -811,7 +795,8 @@ impl ReportingEngine {
             if !is_buffering {
                 continue;
             }
-            if !trg_ops.contains(trg) {
+            let flag = enabled_triggers(flag, trg_ops);
+            if !flag.has_trigger() {
                 tracing::trace!(
                     mms_path = %mms_path,
                     attr_ref = %attr_ref,
@@ -1748,6 +1733,25 @@ impl ReportingEngine {
             }
         }
     }
+}
+
+/// Returns the reasons of `flag` that `trg_ops` enable: data-change for
+/// `dchg`, quality-change for `qchg`, and data-update for `dupd`.
+fn enabled_triggers(flag: InclusionFlag, trg_ops: TriggerOptions) -> InclusionFlag {
+    let mut out = InclusionFlag::NONE;
+    for (reason, trigger) in [
+        (InclusionFlag::VALUE_CHANGED, TriggerOptions::DATA_CHANGED),
+        (
+            InclusionFlag::QUALITY_CHANGED,
+            TriggerOptions::QUALITY_CHANGED,
+        ),
+        (InclusionFlag::VALUE_UPDATE, TriggerOptions::DATA_UPDATE),
+    ] {
+        if flag.contains(reason) && trg_ops.contains(trigger) {
+            out = out.union(reason);
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
