@@ -113,6 +113,16 @@ impl ChannelReportSink {
         }
     }
 
+    /// Returns how many more PDUs the channel of one connection accepts right
+    /// now, or `None` when no channel is registered for it.
+    ///
+    /// Only the connection task takes PDUs out, so the value can only grow
+    /// until the caller pushes again.
+    pub fn available_capacity(&self, conn_id: ConnectionId) -> Option<usize> {
+        let g = self.inner.read().ok()?;
+        g.get(&conn_id).map(|tx| tx.capacity())
+    }
+
     /// Pushes PDU bytes into the channel of one connection.
     ///
     /// This is not the `ReportSink` trait method, because that returns a plain

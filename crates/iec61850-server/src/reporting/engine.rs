@@ -17,7 +17,7 @@ use super::pdu::{
     BrcbReportEncodeParams, ReportEncodeParams,
 };
 use super::rcb::{PendingReport, ReportControl};
-use super::sink::{ChannelReportSink, SendOutcome};
+use super::sink::{ChannelReportSink, SendOutcome, REPORT_CHANNEL_CAP};
 use crate::connection::ConnectionId;
 use crate::error::{Result, ServerError};
 use crate::flags::{InclusionFlag, TriggerOptions};
@@ -1209,10 +1209,12 @@ impl ReportingEngine {
     /// the `SendOutcome` decides what happens:
     ///
     /// - `Sent`: the `sent` counter is incremented
-    /// - `WouldBlock`: this PDU and the remaining segments of the report are
-    ///   dropped and counted in `dropped_socket_full`; RptEna and Resv are left as
-    ///   they are, since only the loss of the association disables a URCB
-    ///   (IEC 61850-7-2 §17.2.4.4, §17.2.4.5)
+    /// - no room: a report whose segments do not all fit in the channel is
+    ///   dropped whole and counted in `dropped_socket_full`; RptEna and Resv are
+    ///   left as they are, since only the loss of the association disables a
+    ///   URCB (IEC 61850-7-2 §17.2.4.4, §17.2.4.5). A report with more segments
+    ///   than the channel holds is started once the channel is empty, and a
+    ///   `WouldBlock` part way drops its remaining segments
     /// - `ReceiverDropped` or `NotFound`: the connection is treated as gone and
     ///   `Some(conn_id)` is returned
     ///
@@ -1288,8 +1290,13 @@ impl ReportingEngine {
         };
 
         if let Some(ref ch_sink) = self.channel_sink {
-            // Backpressure-aware path.
+            // Backpressure-aware path. A report the channel has no room for is
+            // dropped whole rather than sent in part.
             let segments = pdus.len();
+            if !channel_has_room(ch_sink, conn_id, segments) {
+                self.count_urcb_drop(rc, conn_id, segments);
+                return None;
+            }
             for (n, pdu) in pdus.into_iter().enumerate() {
                 let outcome = ch_sink.try_send_pdu(conn_id, pdu);
                 match outcome {
@@ -1309,7 +1316,8 @@ impl ReportingEngine {
                         }
                     }
                     SendOutcome::WouldBlock => {
-                        // This segment and the ones after it are dropped.
+                        // Only a report with more segments than the channel holds
+                        // gets here: this segment and the ones after it are dropped.
                         self.count_urcb_drop(rc, conn_id, segments - n);
                         return None;
                     }
@@ -1408,9 +1416,10 @@ impl ReportingEngine {
     /// negotiated, then sent segment by segment. Every segment of an entry
     /// carries the EntryID of that entry. `sq_num`, the transmit anchor, and the
     /// overflow flag advance only once the last segment of an entry has been
-    /// accepted, so a partial send is retried from the same entry. A
-    /// `WouldBlock` leaves the anchor untouched for the next attempt; a closed or
-    /// unknown receiver drops the connection. An entry that cannot be encoded within the negotiated PDU size is dropped: it is
+    /// accepted. An entry whose segments do not all fit in the channel is not
+    /// started and waits at the anchor for the next attempt, so no segment is
+    /// sent twice; a closed or unknown receiver drops the connection. An entry
+    /// that cannot be encoded within the negotiated PDU size is dropped: it is
     /// logged and counted once, and the anchor moves past it.
     ///
     /// Every report carries, as TimeOfEntry, the time its entry entered the
@@ -1546,6 +1555,19 @@ impl ReportingEngine {
 
             let mut all_segments_sent = true;
             if let Some(ref ch_sink) = self.channel_sink {
+                // An entry the channel has no room for waits whole for the next
+                // pass, so no segment of it is sent twice.
+                if !channel_has_room(ch_sink, conn_id, pdus.len()) {
+                    if self.set_brcb_blocked(&brcb.mms_path, true) {
+                        tracing::warn!(
+                            conn_id,
+                            mms_path = %brcb.mms_path,
+                            entry_id = entry.entry_id.as_u64(),
+                            "report channel full, brcb entries stay buffered until it drains"
+                        );
+                    }
+                    return sent_count;
+                }
                 for pdu in pdus {
                     let outcome = ch_sink.try_send_pdu(conn_id, pdu);
                     match outcome {
@@ -2166,6 +2188,15 @@ fn dataset_key(rcb_mms_path: &str, dat_set: &str) -> Option<(String, String)> {
             .split_once('/')
             .map(|(domain, _)| (domain.to_string(), dat_set.to_string())),
     }
+}
+
+/// Reports whether the channel of `conn_id` has room for a report of
+/// `segments` PDUs. A report with more segments than the channel ever holds
+/// needs an empty channel. A connection without a channel is let through, so
+/// the send itself reports it.
+fn channel_has_room(sink: &ChannelReportSink, conn_id: ConnectionId, segments: usize) -> bool {
+    sink.available_capacity(conn_id)
+        .is_none_or(|free| free >= segments.min(REPORT_CHANNEL_CAP))
 }
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
@@ -3945,5 +3976,151 @@ mod tests {
             TransmitAnchor::AfterEntryId(entries[1].entry_id)
         );
         assert_eq!(s.sq_num, 1, "only the sent entry used a sequence number");
+    }
+
+    /// A URCB GI over `wide_ds(30)` for association 7 on a channel sink, with
+    /// a 400-byte negotiated PDU.
+    fn channel_urcb_engine() -> (
+        ReportingEngine,
+        Arc<ChannelReportSink>,
+        Arc<Mutex<ReportControl>>,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+        engine
+            .register_rcb(
+                ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb),
+                wide_ds(30),
+            )
+            .unwrap();
+        engine.register_peer(7, "10.0.0.7".parse().unwrap(), 400);
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 7);
+        let (tx, rx) = ChannelReportSink::create_channel();
+        ch_sink.register(7, tx);
+        (engine, ch_sink, rc_arc, rx)
+    }
+
+    fn request_gi(rc_arc: &Arc<Mutex<ReportControl>>) {
+        rc_arc.lock().unwrap().state.lock().unwrap().gi = true;
+    }
+
+    #[test]
+    fn segmented_urcb_report_without_room_in_the_channel_is_dropped_whole() {
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let (engine, ch_sink, rc_arc, mut rx) = channel_urcb_engine();
+        let filler = Bytes::from_static(b"\xa3\x00");
+        for _ in 0..REPORT_CHANNEL_CAP - 2 {
+            ch_sink.try_send_pdu(7, filler.clone());
+        }
+        request_gi(&rc_arc);
+        engine.tick_at(Instant::now(), 1_000);
+        assert_eq!(ch_sink.available_capacity(7), Some(2), "no segment went in");
+        let dropped = rc_arc
+            .lock()
+            .unwrap()
+            .metrics_snapshot()
+            .dropped_socket_full;
+        assert!(dropped >= 3, "the whole report is counted, {dropped} pdus");
+        assert!(rc_arc.lock().unwrap().state.lock().unwrap().rpt_ena);
+
+        // With room again, the next general interrogation arrives whole.
+        while rx.try_recv().is_ok() {}
+        request_gi(&rc_arc);
+        engine.tick_at(Instant::now(), 2_000);
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received as u64, dropped, "every segment of the report");
+    }
+
+    #[test]
+    fn urcb_report_longer_than_the_channel_starts_on_an_empty_channel() {
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::DATA_REFERENCE);
+        engine
+            .register_rcb(
+                ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb),
+                wide_ds(150),
+            )
+            .unwrap();
+        engine.register_peer(7, "10.0.0.7".parse().unwrap(), 200);
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 7);
+        let (tx, _rx) = ChannelReportSink::create_channel();
+        ch_sink.register(7, tx);
+        request_gi(&rc_arc);
+        engine.tick_at(Instant::now(), 1_000);
+        // The reader takes nothing, so the channel fills and the rest is dropped.
+        assert_eq!(ch_sink.available_capacity(7), Some(0));
+        let snap = rc_arc.lock().unwrap().metrics_snapshot();
+        assert_eq!(snap.sent, REPORT_CHANNEL_CAP as u64);
+        assert!(snap.dropped_socket_full > 0);
+    }
+
+    #[test]
+    fn segmented_brcb_entry_without_room_in_the_channel_waits_whole() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(30))
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 400);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let snap = eng.snapshot_full_dataset(path).unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(1_000, false, true, snap)
+            .unwrap();
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+        let filler = Bytes::from_static(b"\xa3\x00");
+        for _ in 0..REPORT_CHANNEL_CAP - 1 {
+            ch_sink.try_send_pdu(5, filler.clone());
+        }
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        assert_eq!(ch_sink.available_capacity(5), Some(1), "no segment went in");
+        assert_eq!(
+            brcb_arc.state.lock().unwrap().transmit_anchor,
+            TransmitAnchor::FromHead
+        );
+
+        while rx.try_recv().is_ok() {}
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 1);
+        let mut segments = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            segments.push(p);
+        }
+        assert!(segments.len() >= 3, "{} segments", segments.len());
+        // Every segment differs from the others by its SubSeqNum.
+        let distinct: std::collections::HashSet<&Bytes> = segments.iter().collect();
+        assert_eq!(distinct.len(), segments.len(), "each segment once");
+        assert_eq!(
+            eng.flush_brcb_pending(&brcb_arc, 5),
+            0,
+            "nothing is sent twice"
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
