@@ -540,13 +540,11 @@ impl GoosePdu {
     /// Creates a PDU for the control block `gocb_ref` carrying `all_data` as
     /// the values of the data set `dat_set`.
     ///
-    /// `num_dataset_entries` is the length of `all_data`. The other fields
-    /// take the values of the first frame a freshly configured publisher
-    /// sends: `time_allowed_to_live` is 2000 ms (twice the default Tmax of
-    /// [`RetransIntervals`](crate::RetransIntervals)), `go_id` equals
-    /// `gocb_ref`, `t` is all zero, `st_num` is 1,
-    /// `sq_num` is 0, `conf_rev` is 1, and `simulation` and `nds_com` are
-    /// `false`.
+    /// `num_dataset_entries` is the length of `all_data` and `go_id` equals
+    /// `gocb_ref`. `time_allowed_to_live` is 2000 ms, twice the default Tmax
+    /// of [`RetransIntervals`](crate::RetransIntervals) and so the
+    /// steady-state value; `t` is all zero, `st_num` is 1, `sq_num` is 0,
+    /// `conf_rev` is 1, and `simulation` and `nds_com` are `false`.
     pub fn new(
         gocb_ref: impl Into<String>,
         dat_set: impl Into<String>,
