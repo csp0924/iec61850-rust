@@ -1352,8 +1352,11 @@ impl ReportingEngine {
     ///   `BufOvfl = true`
     /// - `AfterEntryId(id)`: sending resumes after `id`, and `BufOvfl` comes from the
     ///   backend
-    /// - `WaitingForNext`: the trigger path failed to run the `on_enqueue` hook; this
-    ///   is logged as an error and nothing is sent
+    /// - `WaitingForNext`: the client resynchronized on the newest entry and
+    ///   nothing is sent until a newer one is buffered; this is a normal state
+    ///   and is not logged. Should a newer entry be buffered without `on_enqueue`
+    ///   having resolved the anchor, the anchor is resolved here, once, with an
+    ///   error logged, and sending resumes after the resynchronized entry
     ///
     /// Each entry is encoded, segmented at the PDU size the association
     /// negotiated, then sent segment by segment. Every segment of an entry
@@ -1378,12 +1381,12 @@ impl ReportingEngine {
         // Read the anchor and release the state lock before calling
         // brcb_encode_snapshot, which takes the same lock; std mutexes are not
         // reentrant.
-        let anchor = {
+        let (anchor, resynced_on) = {
             let Ok(state) = brcb.state.lock() else {
                 tracing::warn!(mms_path = %brcb.mms_path, "brcb state mutex poisoned");
                 return 0;
             };
-            state.transmit_anchor.clone()
+            (state.transmit_anchor.clone(), state.last_committed_entry_id)
         };
         let snap = match brcb_encode_snapshot(brcb) {
             Ok(s) => s,
@@ -1417,13 +1420,32 @@ impl ReportingEngine {
                 (entries, ovfl)
             }
             TransmitAnchor::WaitingForNext => {
-                // on_enqueue should have moved this state on to AfterEntryId; seeing
-                // it here means the trigger path skipped that hook.
+                // The client resynchronized on the newest entry, and nothing has
+                // been buffered since: an ordinary wait for the next entry.
+                let buf = match brcb.lock_buffer() {
+                    Ok(b) => b,
+                    Err(_) => return 0,
+                };
+                let entries = buf.iter_from(&resynced_on);
+                let ovfl = buf.is_overflow();
+                drop(buf);
+                if entries.is_empty() {
+                    return 0;
+                }
+                // A newer entry is buffered, yet on_enqueue never resolved the
+                // anchor. Resolving it here logs this once and resumes after the
+                // entry the client resynchronized on.
                 tracing::error!(
                     mms_path = %brcb.mms_path,
-                    "brcb transmit anchor stuck at waiting-for-next: the trigger path skipped the on_enqueue hook"
+                    entry_id = resynced_on.as_u64(),
+                    "brcb transmit anchor still waiting for the next entry although a newer one is buffered, resuming after the resynchronized entry"
                 );
-                return 0;
+                if let Ok(mut state) = brcb.state.lock() {
+                    if state.transmit_anchor == TransmitAnchor::WaitingForNext {
+                        state.transmit_anchor = TransmitAnchor::AfterEntryId(resynced_on);
+                    }
+                }
+                (entries, ovfl)
             }
         };
 
@@ -3111,31 +3133,73 @@ mod tests {
         assert!(sink.pdus.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn flush_brcb_pending_logs_error_on_waiting_for_next_anchor() {
-        // on_enqueue should have cleared WaitingForNext; seeing it on the send path is
-        // logged as an error and must not panic.
+    /// A BRCB the client resynchronized on its newest entry, which is buffered.
+    fn brcb_resynced_on_the_newest_entry() -> (
+        ReportingEngine,
+        Arc<CollectReportSink>,
+        Arc<crate::reporting::brcb::BufferedReportControl>,
+    ) {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
         let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
-
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
         eng.register_brcb(brc).unwrap();
-        let path = "IED1LD0/GGIO1$BR$brcb01";
-        let brcb_arc = eng.get_brcb(path).unwrap();
-        brcb_arc
+        let brcb_arc = eng.get_brcb("IED1LD0/GGIO1$BR$brcb01").unwrap();
+        let (newest, _) = brcb_arc
             .enqueue_entry(1000, false, false, bytes::Bytes::from_static(b"e"))
             .unwrap();
+        brcb_arc.apply_entry_id_write(newest).unwrap().unwrap();
         {
             let mut s = brcb_arc.state.lock().unwrap();
-            s.transmit_anchor = TransmitAnchor::WaitingForNext;
+            assert_eq!(s.transmit_anchor, TransmitAnchor::WaitingForNext);
+            s.rpt_ena = true;
+            s.client_conn_id = Some(1);
         }
-        let n = eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000);
-        assert_eq!(
-            n, 0,
-            "a waiting-for-next anchor must send nothing and return 0"
-        );
+        (eng, sink, brcb_arc)
+    }
+
+    #[test]
+    fn brcb_waiting_for_the_next_entry_logs_nothing() {
+        let (eng, sink, brcb_arc) = brcb_resynced_on_the_newest_entry();
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            for t in 0..200 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000 + t), 0);
+            }
+        });
+        assert_eq!(logs.errors(), 0, "waiting for the next entry is no error");
+        assert_eq!(logs.warns(), 0);
+        assert!(sink.pdus.lock().unwrap().is_empty());
+
+        // The next entry is sent.
+        brcb_arc
+            .enqueue_entry(2000, false, false, bytes::Bytes::from_static(b"f"))
+            .unwrap();
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_000), 1);
+        assert_eq!(sink.pdus.lock().unwrap().len(), 1);
+    }
+
+    /// A newer entry buffered without `on_enqueue` resolving the anchor is
+    /// logged once and sent.
+    #[test]
+    fn brcb_anchor_left_waiting_behind_a_newer_entry_is_resolved_once() {
+        use crate::reporting::brcb::TransmitAnchor;
+        let (eng, sink, brcb_arc) = brcb_resynced_on_the_newest_entry();
+        brcb_arc
+            .enqueue_entry(2000, false, false, bytes::Bytes::from_static(b"f"))
+            .unwrap();
+        // Undo what on_enqueue did, standing in for a path that skipped it.
+        brcb_arc.state.lock().unwrap().transmit_anchor = TransmitAnchor::WaitingForNext;
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_000), 1);
+            for t in 0..50 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_001 + t), 0);
+            }
+        });
+        assert_eq!(logs.errors(), 1, "logged once, when the anchor is resolved");
+        assert_eq!(sink.pdus.lock().unwrap().len(), 1, "only the newer entry");
     }
 
     #[test]
