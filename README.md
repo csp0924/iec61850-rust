@@ -69,10 +69,10 @@ the sans-IO boundaries and the contracts every crate holds to.
 
 ## Protocol coverage
 
-**MMS services, server side.** Initiate and Conclude, GetNameList,
+**MMS services, server side.** Initiate and Conclude, Status, GetNameList,
 GetVariableAccessAttributes, Read, Write, Identify, DefineNamedVariableList,
 GetNamedVariableListAttributes, DeleteNamedVariableList, ReadJournal, and
-InformationReport for reports. PDU
+InformationReport for reports, LastApplError and command terminations. PDU
 size is negotiated on Initiate and enforced on every outbound PDU; a report too
 large for one PDU is segmented.
 
