@@ -5,7 +5,8 @@
 //! - `InvokeIdExhausted`: every invokeID is already in flight
 //! - `OutstandingCallLimit`: the outstanding request ceiling has been reached
 //! - `NotConnected`: a service was called while no association exists
-//! - `ConcludeRejected`: the peer refused the release with `0x8d`
+//! - `ConcludeRejected`: the peer refused the release with a Conclude-ErrorPDU
+//!   (`0xad`)
 //! - `ServiceTimeout`: no answer arrived within the request timeout
 //! - `ConnectionLost`: the transport closed
 //! - `IsoError`: a lower ISO layer failed to parse
@@ -85,7 +86,8 @@ pub enum ClientError {
         state: String,
     },
 
-    /// The peer answered the release with `0x8d`, so the association stays open.
+    /// The peer answered the Conclude request with a Conclude-ErrorPDU (`0xad`),
+    /// so the association stays open.
     #[error("the peer refused the conclude request")]
     ConcludeRejected,
 
