@@ -757,16 +757,23 @@ fn build_svcb(raw_svcb: &RawSampledValueControl) -> SvControlBlock {
     svcb
 }
 
-/// Converts a `<LogControl>` into a [`LogControlBlock`].
+/// Converts a `<LogControl>` into a [`LogControlBlock`], carrying `logEna`,
+/// `reasonCode`, `bufTime`, `intgPd` and the `<TrgOps>` child into the model.
 ///
-/// SCL defaults `logName` to `LN$Log`; when the raw element carries no value,
-/// the field is left empty for the caller to fill in.
+/// A `logName` the raw element does not carry is left empty for the caller to
+/// fill in. `<TrgOps>` maps as on a report control block, except that GI does
+/// not apply to a log and is dropped.
 fn build_lcb(raw_lcb: &RawLogControl) -> LogControlBlock {
     let mut lcb = LogControlBlock::new(
         raw_lcb.name.clone(),
         raw_lcb.log_name.clone().unwrap_or_default(),
     );
     lcb.dataset_ref = raw_lcb.data_set.clone().unwrap_or_default();
+    lcb.log_ena = raw_lcb.log_ena;
+    lcb.reason_code = raw_lcb.reason_code;
+    lcb.buf_tm_ms = raw_lcb.buf_time;
+    lcb.trg_ops = log_trg_ops_to_model(raw_lcb.trg_ops);
+    lcb.intg_pd_ms = raw_lcb.intg_pd;
     lcb
 }
 
@@ -1681,6 +1688,19 @@ pub fn report_trg_ops_to_model(t: TriggerOptionsBits) -> TrgOps {
     }
     if t.gi {
         bits = bits | TrgOps::GI;
+    }
+    bits
+}
+
+/// Converts the trigger-option bits of a `<LogControl><TrgOps>` into
+/// [`TrgOps`]: DCHG, QCHG, DUPD and, from `period`, INTEGRITY. GI does not
+/// apply to a log (IEC 61850-7-2 §17.3.2.3.2) and is dropped.
+///
+/// Also used by the build-script path, as [`trg_ops_to_model`] is.
+pub fn log_trg_ops_to_model(t: TriggerOptionsBits) -> TrgOps {
+    let mut bits = trg_ops_to_model(t);
+    if t.period {
+        bits = bits | TrgOps::INTEGRITY;
     }
     bits
 }

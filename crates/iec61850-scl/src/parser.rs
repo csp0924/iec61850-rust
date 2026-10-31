@@ -1854,8 +1854,9 @@ fn build_log_control(
     // logEna defaults to true
     let log_ena = parse_optional::<bool>(start.attributes(), "logEna", span, path)?.unwrap_or(true);
     let intg_pd = parse_optional::<u32>(start.attributes(), "intgPd", span, path)?.unwrap_or(0);
+    // reasonCode defaults to true
     let reason_code =
-        parse_optional::<bool>(start.attributes(), "reasonCode", span, path)?.unwrap_or(false);
+        parse_optional::<bool>(start.attributes(), "reasonCode", span, path)?.unwrap_or(true);
     let buf_time = parse_optional::<u32>(start.attributes(), "bufTime", span, path)?.unwrap_or(0);
     Ok(RawLogControl {
         name,

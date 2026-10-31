@@ -40,7 +40,8 @@ use iec61850_scl::raw::{
 use iec61850_scl::ResolvedScl;
 
 use crate::tokens::{
-    emit_dat_value, emit_fc_value, emit_mms_value, emit_opt_flds, emit_report_trg_ops, emit_trg_ops,
+    emit_dat_value, emit_fc_value, emit_log_trg_ops, emit_mms_value, emit_opt_flds,
+    emit_report_trg_ops, emit_trg_ops,
 };
 use crate::{CompileBuilder, CompileError};
 
@@ -682,6 +683,11 @@ fn emit_lcb_expr(l: &RawLogControl) -> TokenStream {
     let name = l.name.as_str();
     let dataset_ref = l.data_set.clone().unwrap_or_default();
     let log_ref = l.log_name.clone().unwrap_or_default();
+    let log_ena = l.log_ena;
+    let reason_code = l.reason_code;
+    let buf_tm_ms = l.buf_time;
+    let trg_ops_tok = emit_log_trg_ops(l.trg_ops);
+    let intg_pd_ms = l.intg_pd;
     quote! {
         {
             let mut __lcb = LogControlBlock::new(
@@ -689,6 +695,11 @@ fn emit_lcb_expr(l: &RawLogControl) -> TokenStream {
                 ::std::string::String::from(#log_ref),
             );
             __lcb.dataset_ref = ::std::string::String::from(#dataset_ref);
+            __lcb.log_ena = #log_ena;
+            __lcb.reason_code = #reason_code;
+            __lcb.buf_tm_ms = #buf_tm_ms;
+            __lcb.trg_ops = #trg_ops_tok;
+            __lcb.intg_pd_ms = #intg_pd_ms;
             __lcb
         }
     }
@@ -1562,7 +1573,10 @@ mod tests {
         assert_eq!(lln0.dos.len(), 2);
         // DOI override: Mod.stVal must become 1, since "on" has ord=1.
         let mod_do = lln0.do_by_name("Mod").expect("Mod DO");
-        let st_val = match mod_do.child_by_name("stVal", None).expect("Mod.stVal exists") {
+        let st_val = match mod_do
+            .child_by_name("stVal", None)
+            .expect("Mod.stVal exists")
+        {
             iec61850_scl::__rt::DoChild::Da(da) => da,
             _ => panic!("stVal should be DA"),
         };

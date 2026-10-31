@@ -16,9 +16,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use iec61850_scl::__build_internals::{
-    b_type_to_dat, opt_fields_to_model, parse_fc, report_trg_ops_to_model, trg_ops_to_model,
-    DataAttributeType, MmsValue, OptFlds, OptionFieldsBits, SourceSpan, TrgOps, TriggerOptionsBits,
-    FC,
+    b_type_to_dat, log_trg_ops_to_model, opt_fields_to_model, parse_fc, report_trg_ops_to_model,
+    trg_ops_to_model, DataAttributeType, MmsValue, OptFlds, OptionFieldsBits, SourceSpan, TrgOps,
+    TriggerOptionsBits, FC,
 };
 use iec61850_scl::SclParseError;
 
@@ -113,6 +113,12 @@ pub fn emit_trg_ops_value(trg: TrgOps) -> TokenStream {
 pub fn emit_report_trg_ops(bits: TriggerOptionsBits) -> TokenStream {
     let trg = report_trg_ops_to_model(bits);
     emit_trg_ops_value(trg)
+}
+
+/// Emits the trigger-option set of a `<LogControl><TrgOps>`: DCHG, QCHG, DUPD
+/// and INTEGRITY, without GI.
+pub fn emit_log_trg_ops(bits: TriggerOptionsBits) -> TokenStream {
+    emit_trg_ops_value(log_trg_ops_to_model(bits))
 }
 
 /// Emits the option-field set of a `<ReportControl><OptFields>`.

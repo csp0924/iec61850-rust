@@ -137,8 +137,15 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
     for cb in lcbs {
         let _ = writeln!(
             out,
-            "      LCB name={} dataset={} log={}",
-            cb.name, cb.dataset_ref, cb.log_ref,
+            "      LCB name={} dataset={} log={} logEna={} reasonCode={} bufTm={} trg=0x{:02x} intgPd={}",
+            cb.name,
+            cb.dataset_ref,
+            cb.log_ref,
+            cb.log_ena,
+            cb.reason_code,
+            cb.buf_tm_ms,
+            cb.trg_ops.0,
+            cb.intg_pd_ms,
         );
     }
 

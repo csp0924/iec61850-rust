@@ -288,11 +288,11 @@ pub struct RawLogControl {
     pub log_ena: bool,
     /// The `<TrgOps>` child, or its default when the element is absent.
     pub trg_ops: TriggerOptionsBits,
-    /// The `intgPd` attribute, in milliseconds.
+    /// The `intgPd` attribute, in milliseconds, which defaults to 0.
     pub intg_pd: u32,
-    /// The `reasonCode` attribute.
+    /// The `reasonCode` attribute, which defaults to true.
     pub reason_code: bool,
-    /// The `bufTime` attribute, in milliseconds.
+    /// The `bufTime` attribute, in milliseconds, which defaults to 0.
     pub buf_time: u32,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,

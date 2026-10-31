@@ -152,28 +152,50 @@ impl SvControlBlock {
 }
 
 /// A log control block.
+///
+/// Carries the static schema of an SCL `<LogControl>` element; the runtime
+/// state of the block lives in the server crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LogControlBlock {
     /// Control block name.
     pub name: String,
-    /// Name of the referenced log.
+    /// Name of the referenced data set; empty when the block names none.
     pub dataset_ref: String,
     /// The referenced log, as `LN$logName`.
     pub log_ref: String,
+    /// The initial `LogEna`: whether logging starts enabled.
+    pub log_ena: bool,
+    /// Whether each log entry carries the reason for inclusion.
+    pub reason_code: bool,
+    /// The `bufTime` attribute in milliseconds.
+    pub buf_tm_ms: u32,
+    /// The `TrgOps` attribute: the trigger conditions DCHG, QCHG, DUPD and
+    /// INTEGRITY. GI does not apply to a log.
+    pub trg_ops: TrgOps,
+    /// The `IntgPd` attribute in milliseconds; `0` disables the integrity
+    /// trigger.
+    pub intg_pd_ms: u32,
 }
 
 impl LogControlBlock {
     /// Creates a log control block named `name` that writes to the log
     /// `log_ref`.
     ///
-    /// `dataset_ref` is empty, the value an SCL `<LogControl>` without
-    /// `datSet` gets.
+    /// The other fields take the values an SCL `<LogControl>` gets when the
+    /// attribute or child element is absent (IEC 61850-6 `tLogControl`):
+    /// `dataset_ref` is empty, `log_ena` and `reason_code` are `true`,
+    /// `buf_tm_ms` and `intg_pd_ms` are 0, and `trg_ops` is [`TrgOps::NONE`].
     pub fn new(name: impl Into<String>, log_ref: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             dataset_ref: String::new(),
             log_ref: log_ref.into(),
+            log_ena: true,
+            reason_code: true,
+            buf_tm_ms: 0,
+            trg_ops: TrgOps::NONE,
+            intg_pd_ms: 0,
         }
     }
 }
