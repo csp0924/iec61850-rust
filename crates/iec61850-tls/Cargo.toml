@@ -17,11 +17,11 @@ iec61850-hal  = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 bytes         = { workspace = true }
-tokio         = { workspace = true, features = ["io-util", "net", "rt"] }
+tokio         = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 rustls        = { workspace = true }
 tokio-rustls  = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
-tokio         = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time"] }
+tokio         = { workspace = true, features = ["io-util", "net", "rt", "macros", "rt-multi-thread", "time", "test-util"] }
 rcgen         = { workspace = true }
