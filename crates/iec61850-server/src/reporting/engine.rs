@@ -1515,7 +1515,7 @@ impl ReportingEngine {
     }
 
     /// Forgets the partly sent report of the control block at `mms_path`.
-    fn forget_partial(&self, mms_path: &str) {
+    pub(crate) fn forget_partial(&self, mms_path: &str) {
         if let Ok(mut m) = self.partial_reports.lock() {
             m.remove(mms_path);
         }
@@ -4774,5 +4774,43 @@ mod tests {
         let after = pdus.split_off(pdus.len() - 2);
         assert!(buf_ovfl(&after[0]), "the next entry reports the overflow");
         assert!(!buf_ovfl(&after[1]), "the one after it does not");
+    }
+
+    /// Disabling a URCB drops the rest of a report longer than the channel at
+    /// once, so enabling it again, even before the next tick, sends none of it.
+    #[test]
+    fn disabling_a_urcb_forgets_its_partly_sent_report() {
+        use crate::reporting::service::{handle_set_rcb_field, RcbField, RcbWriteValue};
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$RP$urcb01";
+        engine
+            .register_rcb(ReportControl::new(path, rcb), wide_ds(150))
+            .unwrap();
+        engine.register_peer(7, "10.0.0.7".parse().unwrap(), 200);
+        let rc_arc = engine.get_rcb(path).unwrap();
+        enable_rcb(&rc_arc, 7);
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(7, tx);
+        let engine = Arc::new(Mutex::new(engine));
+
+        request_gi(&rc_arc);
+        engine.lock().unwrap().tick_at(Instant::now(), 1_000);
+        assert!(engine.lock().unwrap().has_partial(path));
+
+        let write = |v: bool| {
+            handle_set_rcb_field(&engine, path, RcbField::RptEna, RcbWriteValue::Bool(v), 7)
+        };
+        write(false).expect("disable");
+        assert!(!engine.lock().unwrap().has_partial(path));
+        write(true).expect("enable");
+        let mut stale = Vec::new();
+        drain(&mut rx, &mut stale);
+        engine.lock().unwrap().tick_at(Instant::now(), 2_000);
+        assert!(rx.try_recv().is_err(), "no segment of the old report");
     }
 }

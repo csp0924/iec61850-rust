@@ -308,6 +308,9 @@ pub fn handle_set_rcb_field(
             state.pending = None;
             state.triggered = false;
             state.report_due = None;
+            // The remaining segments of a report longer than the channel are
+            // dropped with it, so a later enable starts with a new report.
+            eng.forget_partial(mms_path);
         }
         return Ok(());
     }
