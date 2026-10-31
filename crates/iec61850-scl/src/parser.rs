@@ -1998,8 +1998,8 @@ fn build_smv_control(
 ///
 /// [`ErrorKind::MissingRequiredAttribute`] when `numOfSGs` is absent, and
 /// [`ErrorKind::AttributeValueInvalid`] for a malformed numeric attribute, a
-/// `numOfSGs` or `actSG` of 0, or an `actSG` above `numOfSGs`; setting groups
-/// are numbered from 1.
+/// `numOfSGs` or `actSG` of 0, a `numOfSGs` above 255, or an `actSG` above
+/// `numOfSGs`; setting groups are numbered from 1.
 fn build_setting_control(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -2021,11 +2021,12 @@ fn build_setting_control(
         )
         .with_attribute(name)
     };
-    if num_of_sgs == 0 {
+    // NumOfSG is an INT8U (IEC 61850-7-2 §16.2.2.3), so 255 groups at most.
+    if num_of_sgs == 0 || num_of_sgs > 255 {
         return Err(out_of_range(
             "numOfSGs",
             num_of_sgs,
-            "u32 (at least 1)".to_string(),
+            "u32 (1..=255)".to_string(),
         ));
     }
     if act_sg == 0 || act_sg > num_of_sgs {

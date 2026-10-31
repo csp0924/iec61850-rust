@@ -162,3 +162,12 @@ fn plain_value_sets_no_group_values() {
     assert_eq!(sv.snapshot(), MmsValue::Integer(9));
     assert!(sv.sgroup_values.is_empty());
 }
+
+/// `numOfSGs` is an INT8U (IEC 61850-7-2), so the parser already rejects one
+/// above 255 and accepts 255.
+#[test]
+fn num_of_sgs_above_255_is_rejected_by_the_parser() {
+    let sc = |n: u32| format!(r#"<SettingControl numOfSGs="{n}" actSG="1"/>"#);
+    assert!(iec61850_scl::parse_scl(&scl(&sc(256), "")).is_err());
+    assert!(iec61850_scl::parse_scl(&scl(&sc(255), "")).is_ok());
+}
