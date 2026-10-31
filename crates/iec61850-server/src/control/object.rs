@@ -1292,7 +1292,7 @@ mod tests {
             reason: SelectStateChangedReason,
         ) {
             assert_eq!(is_selected, reason == SelectStateChangedReason::Selected);
-            let _ = self.0.send((reason, action.conn_id, action.ctl_num()));
+            let _ = self.0.send((reason, action.conn_id(), action.ctl_num()));
         }
     }
 

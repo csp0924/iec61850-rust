@@ -234,10 +234,8 @@ pub struct ControlAction {
     interlock_check: bool,
     /// Whether this is a select rather than an Operate.
     is_select: bool,
-    /// Connection that issued this control request, or 0 when there is none. Used
-    /// when assembling LastApplError and CommandTermination.
-    #[allow(dead_code)]
-    pub(crate) conn_id: u64,
+    /// Connection that issued this control request, or 0 when there is none.
+    conn_id: u64,
 }
 
 impl ControlAction {
@@ -298,6 +296,15 @@ impl ControlAction {
     /// Returns whether this is a select rather than an Operate.
     pub fn is_select(&self) -> bool {
         self.is_select
+    }
+
+    /// Returns the identifier of the association that issued the request, or
+    /// 0 when no association issued it.
+    ///
+    /// A selection that ends without a request, by timeout or by the loss of
+    /// its association, reports the association that held the selection.
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
     }
 }
 
@@ -729,6 +736,7 @@ mod tests {
         assert!(action.interlock_check());
         assert!(!action.synchro_check());
         assert!(!action.is_select());
+        assert_eq!(action.conn_id(), 42);
     }
 
     fn six_element_oper(ctl_num: MmsValue, t: MmsValue, check: MmsValue) -> MmsValue {
