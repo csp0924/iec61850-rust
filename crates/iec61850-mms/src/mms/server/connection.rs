@@ -172,7 +172,9 @@ pub struct NegotiatedParams {
     pub max_serv_outstanding_calling: u16,
     /// Negotiated called outstanding ceiling, floored at `MIN_OUTSTANDING`.
     pub max_serv_outstanding_called: u16,
-    /// Negotiated dataStructureNestingLevel, capped at `SERVER_MAX_NESTING_LEVEL`.
+    /// Negotiated dataStructureNestingLevel, capped at `SERVER_MAX_NESTING_LEVEL`;
+    /// `SERVER_MAX_NESTING_LEVEL` when the peer proposed none, in which case the
+    /// Initiate response carries no negotiated value.
     pub data_structure_nesting_level: u8,
     /// The parameterCBB after the bitwise AND, padding byte included, 3 bytes.
     pub parameter_cbb: [u8; 3],

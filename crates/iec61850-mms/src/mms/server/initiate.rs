@@ -15,7 +15,8 @@
 //!   request without `localDetailCalling` takes the server maximum.
 //! - maxServOutstandingCalling and maxServOutstandingCalled are clamped to at
 //!   least 1, since 0 has no useful meaning.
-//! - dataStructureNestingLevel is clamped to 32.
+//! - dataStructureNestingLevel is clamped to 32. The response carries a
+//!   negotiated value only when the request proposed one.
 //! - A parameterCBB whose length is not 3 is refused.
 //! - A proposed version number below 1 is refused.
 //! - servicesSupportedCalling is recorded and logged but not enforced, so a peer
@@ -127,7 +128,8 @@ pub fn negotiate_initiate(incoming: &[u8], services_supported: [u8; 11]) -> Init
 
     // dataStructureNestingLevel, clamped to the server ceiling. Decoding already
     // rejects a value above MAX_NESTING_LEVEL; the minimum here keeps the negotiated
-    // value inside the ceiling, and an absent field takes the ceiling itself.
+    // value inside the ceiling, and an absent field takes the ceiling itself while
+    // the response carries no negotiated value.
     let proposed_nesting = req
         .proposed_data_structure_nesting_level
         .unwrap_or(SERVER_MAX_NESTING_LEVEL);
@@ -166,7 +168,9 @@ pub fn negotiate_initiate(incoming: &[u8], services_supported: [u8; 11]) -> Init
         local_detail_called: Some(params.max_pdu_size),
         negotiated_max_serv_outstanding_calling: params.max_serv_outstanding_calling,
         negotiated_max_serv_outstanding_called: params.max_serv_outstanding_called,
-        negotiated_data_structure_nesting_level: Some(params.data_structure_nesting_level),
+        negotiated_data_structure_nesting_level: req
+            .proposed_data_structure_nesting_level
+            .map(|_| params.data_structure_nesting_level),
         init_response_detail: InitResponseDetail {
             negotiated_version_number: 1, // always answered as 1
             negotiated_parameter_cbb: params.parameter_cbb,
@@ -408,6 +412,42 @@ mod tests {
                 assert_eq!(params.max_pdu_size, SERVER_MAX_PDU_SIZE);
                 let resp = crate::mms::InitiateResponsePdu::decode(&response_bytes).unwrap();
                 assert_eq!(resp.local_detail_called, Some(SERVER_MAX_PDU_SIZE));
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    /// The response carries a negotiated dataStructureNestingLevel only when the
+    /// request proposed one; the server still applies its ceiling internally.
+    #[test]
+    fn nesting_level_is_answered_only_when_proposed() {
+        let without = InitiateRequestPdu {
+            proposed_data_structure_nesting_level: None,
+            ..InitiateRequestPdu::default()
+        };
+        match negotiate_initiate(&encode_request(&without), SERVER_SERVICES_SUPPORTED) {
+            InitiateOutcome::Accepted {
+                params,
+                response_bytes,
+            } => {
+                assert_eq!(
+                    params.data_structure_nesting_level,
+                    SERVER_MAX_NESTING_LEVEL
+                );
+                let resp = crate::mms::InitiateResponsePdu::decode(&response_bytes).unwrap();
+                assert_eq!(resp.negotiated_data_structure_nesting_level, None);
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+
+        let with = InitiateRequestPdu {
+            proposed_data_structure_nesting_level: Some(4),
+            ..InitiateRequestPdu::default()
+        };
+        match negotiate_initiate(&encode_request(&with), SERVER_SERVICES_SUPPORTED) {
+            InitiateOutcome::Accepted { response_bytes, .. } => {
+                let resp = crate::mms::InitiateResponsePdu::decode(&response_bytes).unwrap();
+                assert_eq!(resp.negotiated_data_structure_nesting_level, Some(4));
             }
             other => panic!("expected Accepted, got {:?}", other),
         }
