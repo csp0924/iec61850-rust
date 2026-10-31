@@ -548,7 +548,8 @@ async fn a_client_write_of_an_unchanged_value_reports_only_a_data_update() {
 }
 
 /// A CreateDataSet member naming an object that does not exist, whether by
-/// its name, its functional constraint or its logical device, answers
+/// its name, a functional constraint it lacks or one that does not exist, or
+/// its logical device, answers
 /// definition object-undefined (IEC 61850-8-1 §8.1.3.4.3.4, table 23); a
 /// list name in a logical node that does not exist still answers access
 /// object-non-existent.
@@ -564,6 +565,7 @@ async fn an_undefined_member_answers_object_undefined() {
     let undefined = [
         DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$NoSuchDo"),
         DefineNamedVariableEntry::domain(DOM, "GGIO1$MX$Ind1"),
+        DefineNamedVariableEntry::domain(DOM, "GGIO1$XX$Ind1"),
         DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$Ind1$noSuchDa"),
         DefineNamedVariableEntry::domain("IED1NOLD", "GGIO1$ST$Ind1"),
     ];

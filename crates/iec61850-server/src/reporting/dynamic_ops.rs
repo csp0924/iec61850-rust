@@ -46,14 +46,14 @@ pub enum DatasetError {
         name: String,
     },
     /// The member path names a logical node, data object, or data attribute that is
-    /// not in the model.
+    /// not in the model, or a functional constraint that does not exist.
     MemberNotFound {
         /// The member path that did not resolve.
         path: String,
     },
-    /// The member path is malformed, with too few segments, an empty segment
-    /// or an unparseable functional constraint token, or it names an array of
-    /// data objects, which this server does not serve as a member.
+    /// The member path is malformed, with too few segments or an empty
+    /// segment, or it names an array of data objects, which this server does
+    /// not serve as a member.
     MemberInvalidPath {
         /// The malformed member path.
         path: String,

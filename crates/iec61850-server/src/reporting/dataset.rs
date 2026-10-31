@@ -172,11 +172,11 @@ impl DatasetEntry {
     /// # Errors
     ///
     /// - [`DatasetError::MemberInvalidPath`] when the path has fewer than three
-    ///   segments, an empty segment or an unknown functional constraint, or
-    ///   names an array of data objects or a node holding one.
-    /// - [`DatasetError::MemberNotFound`] when a node on the path is not in the
-    ///   model, or the data object holds no attribute of the functional
-    ///   constraint.
+    ///   segments or an empty segment, or names an array of data objects or a
+    ///   node holding one.
+    /// - [`DatasetError::MemberNotFound`] when the functional constraint is
+    ///   unknown, a node on the path is not in the model, or the data object
+    ///   holds no attribute of the functional constraint.
     /// - [`DatasetError::TooLarge`] when the node holds more than
     ///   [`DatasetEntry::MAX_LEAVES`] leaves.
     pub fn from_model(model: &IedModel, domain: &str, path: &str) -> Result<Self, DatasetError> {
@@ -191,7 +191,8 @@ impl DatasetEntry {
         if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
             return Err(invalid());
         }
-        let fc = FC::parse(parts[1]).map_err(|_| invalid())?;
+        // A functional constraint that does not parse names no MMS variable.
+        let fc = FC::parse(parts[1]).map_err(|_| not_found())?;
         let ln = model
             .ld_by_domain(domain)
             .and_then(|ld| ld.ln_by_name(parts[0]))
@@ -671,7 +672,7 @@ mod tests {
         let model = build_model();
         for (path, not_found) in [
             ("GGIO1$ST", false),
-            ("GGIO1$ZZ$Ind1", false),
+            ("GGIO1$ZZ$Ind1", true),
             ("GGIO1$$Ind1", false),
             ("GGIO1$MX$Ind1", true),
             ("GGIO1$ST$Ind9", true),
