@@ -51,7 +51,7 @@ fn the_demo_model_registers_two_report_instances() {
 
 /// `schema.icd`: one data set, `brcbSeq` with three instances, a log control
 /// block and a setting group control block; without `<ReportSettings>` the
-/// instances have no Owner.
+/// instances have neither Owner nor ResvTms.
 #[test]
 fn the_schema_model_registers_its_buffered_instances_and_log() {
     let server = server(schema::build_Schema_model());
@@ -80,6 +80,7 @@ fn the_schema_model_registers_its_buffered_instances_and_log() {
             .get_brcb(path)
             .expect("registered");
         assert!(!brcb.brcb.with_owner, "{path}");
+        assert!(!brcb.brcb.with_resv_tms, "{path}");
     }
     let logs = server.log_controls();
     let logs = logs.read().unwrap();

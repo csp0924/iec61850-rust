@@ -1,12 +1,13 @@
-//! The optional Owner attribute of report control blocks registered from an
-//! SCL model, over a real association: loopback TCP and the full ISO stack.
+//! The optional Owner and ResvTms attributes of report control blocks
+//! registered from an SCL model, over a real association: loopback TCP and the
+//! full ISO stack.
 //!
-//! Owner is a conditional attribute of both control block classes
-//! (IEC 61850-7-2 Tables 37 and 39). An SCL file gives it to the report control
-//! blocks of an access point with `<ReportSettings owner="true">`, the
-//! default being false (IEC 61850-6 §9.3.2). A control block without it lists,
-//! describes and reads without Owner, and naming Owner answers
-//! object-non-existent.
+//! Owner is a conditional attribute of both control block classes and ResvTms
+//! one of the buffered class (IEC 61850-7-2 Tables 37 and 39). An SCL file
+//! gives them to the report control blocks of an access point with
+//! `<ReportSettings owner="true" resvTms="true">`, both defaulting to false
+//! (IEC 61850-6 §9.3.2). A control block without one lists, describes and
+//! reads without it, and naming it answers object-non-existent.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ const URCB_MEMBERS: [&str; 11] = [
     "IntgPd", "GI",
 ];
 
-const BRCB_MEMBERS: [&str; 14] = [
+const BRCB_MEMBERS: [&str; 13] = [
     "RptID",
     "RptEna",
     "DatSet",
@@ -44,7 +45,6 @@ const BRCB_MEMBERS: [&str; 14] = [
     "PurgeBuf",
     "EntryID",
     "TimeofEntry",
-    "ResvTms",
 ];
 
 macro_rules! t {
@@ -148,12 +148,15 @@ fn member_names(spec: &TypeSpecification) -> Vec<String> {
 }
 
 /// Checks every service that shows the members of the two control blocks
-/// against `has_owner`.
-async fn check_owner(handle: &ServerHandle, has_owner: bool) {
+/// against `has_owner` and, for the BRCB, `has_resv_tms`.
+async fn check_attributes(handle: &ServerHandle, has_owner: bool, has_resv_tms: bool) {
     let mut c = mms(handle).await;
     let names = all_names(&mut c).await;
     for (rcb, base) in [(URCB, &URCB_MEMBERS[..]), (BRCB, &BRCB_MEMBERS[..])] {
         let mut expected: Vec<String> = base.iter().map(|m| m.to_string()).collect();
+        if rcb == BRCB && has_resv_tms {
+            expected.push("ResvTms".to_string());
+        }
         if has_owner {
             expected.push("Owner".to_string());
         }
@@ -197,6 +200,39 @@ async fn check_owner(handle: &ServerHandle, has_owner: bool) {
         }
     }
 
+    let resv_tms = format!("{BRCB}$ResvTms");
+    assert_eq!(
+        names.contains(&resv_tms),
+        has_resv_tms,
+        "{resv_tms} in {names:?}"
+    );
+    assert!(!names.contains(&format!("{URCB}$ResvTms")), "{names:?}");
+    let read = t!(c.read(DOM, &resv_tms));
+    if has_resv_tms {
+        assert_eq!(read.expect("ResvTms reads"), MmsData::Integer(0));
+    } else {
+        let write = t!(c.write(DOM, &resv_tms, MmsData::Integer(30)));
+        for (service, r) in [("read", read.map(|_| ())), ("write", write)] {
+            assert!(
+                matches!(
+                    r,
+                    Err(ClientError::DataAccessError(
+                        DataAccessError::ObjectNonExistent
+                    ))
+                ),
+                "{service} {resv_tms}: {r:?}"
+            );
+        }
+        // Without ResvTms the client that enables the BRCB reserves it.
+        t!(c.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true)))
+            .expect("enable the BRCB");
+        let mut other = mms(handle).await;
+        let taken = t!(other.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true)));
+        assert!(taken.is_err(), "{taken:?}");
+        t!(c.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(false)))
+            .expect("disable the BRCB");
+    }
+
     let conn = IedConnection::with_mms_client(
         MmsClientBuilder::new()
             .connect_timeout_ms(3_000)
@@ -207,14 +243,16 @@ async fn check_owner(handle: &ServerHandle, has_owner: bool) {
     for rcb in [URCB, BRCB] {
         let handle = t!(conn.get_rcb_values(&format!("{DOM}/{rcb}"))).expect("GetRCBValues");
         assert_eq!(handle.owner().is_some(), has_owner, "{rcb}");
+        assert_eq!(handle.has_resv_tms(), rcb == BRCB && has_resv_tms, "{rcb}");
     }
 }
 
-/// Without `<ReportSettings>` the control blocks have no Owner.
+/// Without `<ReportSettings>` the control blocks have neither Owner nor
+/// ResvTms.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn report_control_blocks_have_no_owner_by_default() {
+async fn report_control_blocks_have_no_optional_attributes_by_default() {
     let handle = start(&scl("", "")).await;
-    check_owner(&handle, false).await;
+    check_attributes(&handle, false, false).await;
     handle.stop().await;
 }
 
@@ -223,16 +261,28 @@ async fn report_control_blocks_have_no_owner_by_default() {
 async fn report_settings_owner_gives_report_control_blocks_owner() {
     let owner = r#"<Services><ReportSettings owner="true"/></Services>"#;
     let handle = start(&scl(owner, "")).await;
-    check_owner(&handle, true).await;
+    check_attributes(&handle, true, false).await;
+    handle.stop().await;
+}
+
+/// `<ReportSettings resvTms="true">` gives the buffered control block ResvTms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn report_settings_resv_tms_gives_buffered_control_blocks_resv_tms() {
+    let resv_tms = r#"<Services><ReportSettings resvTms="true"/></Services>"#;
+    let handle = start(&scl(resv_tms, "")).await;
+    check_attributes(&handle, false, true).await;
     handle.stop().await;
 }
 
 /// The `<ReportSettings>` of the access point replaces the IED-level one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn access_point_report_settings_replace_the_ied_level_ones() {
-    let owner = r#"<Services><ReportSettings owner="true"/></Services>"#;
-    let no_owner = r#"<Services><ReportSettings/></Services>"#;
-    let handle = start(&scl(owner, no_owner)).await;
-    check_owner(&handle, false).await;
+    let both = r#"<Services><ReportSettings owner="true" resvTms="true"/></Services>"#;
+    let neither = r#"<Services><ReportSettings/></Services>"#;
+    let handle = start(&scl(both, neither)).await;
+    check_attributes(&handle, false, false).await;
+    handle.stop().await;
+    let handle = start(&scl(neither, both)).await;
+    check_attributes(&handle, true, true).await;
     handle.stop().await;
 }

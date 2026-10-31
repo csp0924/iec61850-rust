@@ -78,13 +78,16 @@ pub struct RawAccessPoint {
 
 /// A `<ReportSettings>` element of `<Services>` (IEC 61850-6 §9.3.2).
 ///
-/// Only the attribute that shapes the served control blocks is read.
+/// Only the attributes that shape the served control blocks are read.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RawReportSettings {
     /// The `owner` attribute: whether report control blocks have the Owner
     /// attribute. Defaults to `false`.
     pub owner: bool,
+    /// The `resvTms` attribute: whether buffered report control blocks have
+    /// the ResvTms attribute. Defaults to `false`.
+    pub resv_tms: bool,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
 }

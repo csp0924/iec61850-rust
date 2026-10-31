@@ -64,6 +64,11 @@ pub struct ReportControlBlock {
     /// Tables 37 and 39). An SCL file decides it with the `owner` attribute of
     /// its `<ReportSettings>`, which defaults to false (IEC 61850-6 §9.3.2).
     pub has_owner: bool,
+    /// Whether a buffered block has the optional ResvTms attribute
+    /// (IEC 61850-7-2 Table 37, condition c3). An SCL file decides it with the
+    /// `resvTms` attribute of its `<ReportSettings>`, which defaults to false
+    /// (IEC 61850-6 §9.3.2). Ignored for an unbuffered block.
+    pub has_resv_tms: bool,
 }
 
 impl ReportControlBlock {
@@ -75,9 +80,9 @@ impl ReportControlBlock {
     /// `false`, `conf_rev` is 0, `rpt_id` is empty, `trg_ops` is
     /// [`TrgOps::NONE`], `opt_flds` is [`OptFlds::BUFFER_OVERFLOW`],
     /// `buf_tm_ms` and `intg_pd_ms` are 0, `indexed` is `true` and
-    /// `max_instances` is 1. `has_owner` is `true`, so a block built in code
-    /// keeps the Owner attribute; the SCL model builder sets it from
-    /// `<ReportSettings>`.
+    /// `max_instances` is 1. `has_owner` and `has_resv_tms` are `true`, so a
+    /// block built in code keeps the Owner and ResvTms attributes; the SCL
+    /// model builder sets both from `<ReportSettings>`.
     pub fn new(name: impl Into<String>, dataset_ref: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -92,6 +97,7 @@ impl ReportControlBlock {
             indexed: true,
             max_instances: 1,
             has_owner: true,
+            has_resv_tms: true,
         }
     }
 

@@ -1377,18 +1377,26 @@ fn build_access_point(
     })
 }
 
-/// Parses a `<ReportSettings>`: `owner` is optional and defaults to `false`.
+/// Parses a `<ReportSettings>`: `owner` and `resvTms` are optional and default
+/// to `false`.
 ///
 /// # Errors
 ///
-/// [`ErrorKind::AttributeValueInvalid`] when `owner` is not a boolean.
+/// [`ErrorKind::AttributeValueInvalid`] when `owner` or `resvTms` is not a
+/// boolean.
 fn build_report_settings(
     start: &BytesStart<'_>,
     span: SourceSpan,
     path: &str,
 ) -> Result<RawReportSettings, SclParseError> {
     let owner = parse_optional::<bool>(start.attributes(), "owner", span, path)?.unwrap_or(false);
-    Ok(RawReportSettings { owner, span })
+    let resv_tms =
+        parse_optional::<bool>(start.attributes(), "resvTms", span, path)?.unwrap_or(false);
+    Ok(RawReportSettings {
+        owner,
+        resv_tms,
+        span,
+    })
 }
 
 /// Parses an `<LDevice>`: `inst` is required; `ldName` and `desc` are optional.
@@ -3607,13 +3615,11 @@ mod tests {
         let raw = parse(xml).expect("Services must parse");
         let ied = &raw.ieds[0];
         assert!(ied.report_settings.as_ref().expect("IED level").owner);
+        assert!(!ied.report_settings.as_ref().unwrap().resv_tms);
         let ap1 = &ied.access_points[0];
-        assert!(
-            !ap1.report_settings
-                .as_ref()
-                .expect("access point level")
-                .owner
-        );
+        let ap_settings = ap1.report_settings.as_ref().expect("access point level");
+        assert!(!ap_settings.owner);
+        assert!(ap_settings.resv_tms);
         assert_eq!(
             ap1.server.as_ref().expect("server").logical_devices.len(),
             1

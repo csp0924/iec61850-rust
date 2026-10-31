@@ -30,13 +30,13 @@ use quote::{format_ident, quote};
 use iec61850_scl::__private::{
     attribute_type, dai_values, derives_setting_view, doi_children, element_count, fcda_do_path,
     gse_control_go_id, instance_children, ld_domain_name, ld_num_of_sgs, parse_fc,
-    report_instances, report_owner, sv_control_sv_id, template_initial_value, MmsValue,
+    report_instances, report_settings, sv_control_sv_id, template_initial_value, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawCount, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet,
     RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLogControl,
-    RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl,
-    RawSdi, RawSdoDef, RawSettingControl,
+    RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawReportSettings,
+    RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawSettingControl,
 };
 use iec61850_scl::ResolvedScl;
 
@@ -130,12 +130,12 @@ fn emit_ied_fn(
     let dtt = &raw.data_type_templates;
 
     // Collect every logical device, across all access points and servers,
-    // with whether the report control blocks of its access point have Owner.
-    let mut lds: Vec<(&RawLogicalDevice, bool)> = Vec::new();
+    // with the report settings of its access point.
+    let mut lds: Vec<(&RawLogicalDevice, Option<&RawReportSettings>)> = Vec::new();
     for ap in &ied.access_points {
         if let Some(server) = &ap.server {
             for ld in &server.logical_devices {
-                lds.push((ld, report_owner(ied, ap)));
+                lds.push((ld, report_settings(ied, ap)));
             }
         }
     }
@@ -153,7 +153,7 @@ fn emit_ied_fn(
     // fails too; the error is reported for this IED.
     let ld_exprs = lds
         .iter()
-        .map(|(ld, rcb_owner)| emit_ld_expr(ld, dtt, &ied.name, *rcb_owner, cfg))
+        .map(|(ld, settings)| emit_ld_expr(ld, dtt, &ied.name, *settings, cfg))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| match e {
             CompileError::BuildModel { source, .. } => CompileError::BuildModel {
@@ -190,7 +190,7 @@ fn emit_ld_expr(
     ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
     ied_name: &str,
-    rcb_owner: bool,
+    settings: Option<&RawReportSettings>,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let domain = ld_domain_name(ld, ied_name);
@@ -228,7 +228,7 @@ fn emit_ld_expr(
     let num_of_sgs = ld_num_of_sgs(ld);
     let ln_exprs = lns
         .iter()
-        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, num_of_sgs, rcb_owner, cfg))
+        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, num_of_sgs, settings, cfg))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
@@ -255,7 +255,7 @@ fn emit_ln_expr(
     ld_inst: &str,
     domain: &str,
     num_of_sgs: Option<u32>,
-    rcb_owner: bool,
+    settings: Option<&RawReportSettings>,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let prefix_lit = ln.prefix.as_deref().unwrap_or("");
@@ -291,7 +291,7 @@ fn emit_ln_expr(
     // The four control block kinds, sorted for determinism.
     let rcb_exprs = sorted_by_name(ln.report_controls.iter(), cfg, |r| r.name.as_str())
         .into_iter()
-        .map(|r| emit_rcb_expr(r, rcb_owner))
+        .map(|r| emit_rcb_expr(r, settings))
         .collect::<Result<Vec<_>, _>>()?;
     let gocb_exprs = sorted_by_name(ln.gse_controls.iter(), cfg, |g| g.name.as_str())
         .into_iter()
@@ -690,7 +690,12 @@ fn emit_fcda_expr(
 // 6. Control blocks
 // -----------------------------------------------------------------------------
 
-fn emit_rcb_expr(r: &RawReportControlBlock, has_owner: bool) -> Result<TokenStream, CompileError> {
+fn emit_rcb_expr(
+    r: &RawReportControlBlock,
+    settings: Option<&RawReportSettings>,
+) -> Result<TokenStream, CompileError> {
+    let has_owner = settings.is_some_and(|s| s.owner);
+    let has_resv_tms = settings.is_some_and(|s| s.resv_tms);
     let (indexed, max_instances) = report_instances(r, "ReportControl").map_err(model_error)?;
     let name = r.name.as_str();
     let is_buffered = r.buffered;
@@ -717,6 +722,7 @@ fn emit_rcb_expr(r: &RawReportControlBlock, has_owner: bool) -> Result<TokenStre
             __rcb.indexed = #indexed;
             __rcb.max_instances = #max_instances;
             __rcb.has_owner = #has_owner;
+            __rcb.has_resv_tms = #has_resv_tms;
             __rcb
         }
     })

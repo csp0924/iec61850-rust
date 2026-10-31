@@ -218,7 +218,8 @@ pub enum ApplyEntryIdError {
 ///
 /// Differs from the URCB `Rcb` in two ways: there is no `Resv` field, which only
 /// a URCB has, and the sequence number is 16 bits rather than 8. Both have the
-/// optional Owner attribute unless `with_owner` is cleared.
+/// optional Owner attribute unless `with_owner` is cleared, and a BRCB the
+/// optional ResvTms attribute unless `with_resv_tms` is cleared.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Brcb {
@@ -244,9 +245,12 @@ pub struct Brcb {
     pub buffer_capacity: usize,
     /// Pre-configured owner address; when set, ResvTms starts as `Preconfigured`.
     pub client_reservation: Option<IpAddr>,
-    /// Whether the Edition 2 ResvTms MMS field is exposed.
-    ///
-    /// TODO: not honored yet; ResvTms is always part of the MMS structure.
+    /// Whether the control block has the optional ResvTms attribute
+    /// (IEC 61850-7-2 Table 37, condition c3). Without it, ResvTms is absent
+    /// from the MMS structure, its type description and its name list, and
+    /// reading or writing it answers object-non-existent; the control block is
+    /// then reserved by its pre-configured owner or by the client that enables
+    /// it.
     pub with_resv_tms: bool,
     /// Whether the control block has the optional Owner attribute
     /// (IEC 61850-7-2 Table 37, condition c4). Without it, Owner is absent from
@@ -258,8 +262,10 @@ pub struct Brcb {
 impl Brcb {
     /// Creates a BRCB configuration with default field values.
     ///
-    /// The control block has the Owner attribute; a model built from SCL decides
-    /// it from `ReportSettings`, through [`with_owner`](Self::with_owner).
+    /// The control block has the Owner and ResvTms attributes, so a client can
+    /// reserve it ahead of enabling it; a model built from SCL decides both
+    /// from `ReportSettings`, through [`with_owner`](Self::with_owner) and
+    /// [`with_resv_tms`](Self::with_resv_tms).
     pub fn new(name: impl Into<String>, dataset_name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -329,7 +335,7 @@ impl Brcb {
         self
     }
 
-    /// Sets whether the ResvTms field is exposed.
+    /// Sets whether the control block has the ResvTms attribute.
     pub fn with_resv_tms(mut self, on: bool) -> Self {
         self.with_resv_tms = on;
         self

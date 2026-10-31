@@ -57,7 +57,8 @@ pub(crate) fn register_rcb_instances(
                 .with_opt_flds(rcb.opt_flds)
                 .with_buf_tm_ms(rcb.buf_tm_ms)
                 .with_intg_pd_ms(rcb.intg_pd_ms)
-                .with_owner(rcb.has_owner);
+                .with_owner(rcb.has_owner)
+                .with_resv_tms(rcb.has_resv_tms);
             server.register_brcb(
                 BufferedReportControl::new(path.clone(), brcb),
                 dataset.clone(),

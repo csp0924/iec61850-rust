@@ -615,10 +615,11 @@ pub fn handle_set_brcb_field(
             None => return Some(Err(DataAccessError::ObjectNonExistent)),
         }
     };
-    if field == RcbField::Owner && !brcb.brcb.with_owner {
+    if !brcb_has_field(&brcb, &field) {
         tracing::warn!(
             mms_path,
-            "SetBRCBValues: the control block has no Owner, answering ObjectNonExistent"
+            field = field.as_str(),
+            "SetBRCBValues: the control block does not have the attribute, answering ObjectNonExistent"
         );
         return Some(Err(DataAccessError::ObjectNonExistent));
     }
@@ -731,14 +732,26 @@ pub fn handle_get_brcb_field(
         let eng = engine.lock().ok()?;
         eng.get_brcb(mms_path)?
     };
-    if field == RcbField::Owner && !brcb.brcb.with_owner {
+    if !brcb_has_field(&brcb, &field) {
         return Some(AccessResult::Failure(DataAccessError::ObjectNonExistent));
     }
     brcb_field_value(&brcb, &field, &mut None).map(AccessResult::Success)
 }
 
+/// Whether the BRCB has the optional attribute `field`: Owner and ResvTms
+/// exist only when its configuration says so (IEC 61850-7-2 Table 37,
+/// conditions c3 and c4); every other field is answered by
+/// [`brcb_field_value`].
+fn brcb_has_field(brcb: &super::brcb::BufferedReportControl, field: &RcbField) -> bool {
+    match field {
+        RcbField::Owner => brcb.brcb.with_owner,
+        RcbField::ResvTms => brcb.brcb.with_resv_tms,
+        _ => true,
+    }
+}
+
 /// The attributes of a BRCB in the order of its MMS structure, IEC 61850-8-1
-/// Table 72; Owner is left out of a control block without it.
+/// Table 72; ResvTms and Owner are left out of a control block without them.
 pub(crate) const BRCB_STRUCTURE_FIELDS: [RcbField; 15] = [
     RcbField::RptId,
     RcbField::RptEna,
@@ -780,7 +793,7 @@ pub(crate) fn handle_get_brcb_values(
     let mut exposed: Option<(EntryId, u64)> = None;
     BRCB_STRUCTURE_FIELDS
         .iter()
-        .filter(|field| **field != RcbField::Owner || brcb.brcb.with_owner)
+        .filter(|field| brcb_has_field(&brcb, field))
         .map(|field| {
             brcb_field_value(&brcb, field, &mut exposed)
                 .ok_or_else(|| (Some(field.clone()), DataAccessError::HardwareFault))
@@ -858,7 +871,7 @@ fn brcb_field_value(
         }
         RcbField::IntgPd => MmsData::Unsigned(state_guard.intg_pd_ms as u64),
         RcbField::Gi => MmsData::Boolean(state_guard.gi),
-        RcbField::Owner if !brcb.brcb.with_owner => return None,
+        RcbField::Owner | RcbField::ResvTms if !brcb_has_field(brcb, field) => return None,
         // The pre-configured client, or the client that reserved or enabled the
         // BRCB; a free BRCB has no owner. IEC 61850-8-1 §17.1.2.
         RcbField::Owner => owner_octets(match state_guard.resv_tms {

@@ -762,7 +762,7 @@ fn domain_control_blocks(
 ) -> Vec<(String, crate::mapping::ControlBlockEntry)> {
     use crate::mapping::{ControlBlockEntry, ControlBlockKind};
     let mut out: Vec<(String, ControlBlockEntry)> = Vec::new();
-    let mut push = |item: &str, kind: ControlBlockKind, has_owner: bool| {
+    let mut push = |item: &str, kind: ControlBlockKind, has_owner: bool, has_resv_tms: bool| {
         let mut segments = item.split('$');
         let (Some(ln_name), Some(fc), Some(name), None) = (
             segments.next(),
@@ -785,6 +785,7 @@ fn domain_control_blocks(
                 kind,
                 name: name.to_string(),
                 has_owner,
+                has_resv_tms,
             },
         ));
     };
@@ -800,15 +801,15 @@ fn domain_control_blocks(
                             .get_rcb(&path)
                             .and_then(|rc| rc.lock().ok().map(|rc| rc.rcb.with_owner))
                             .unwrap_or(true);
-                        push(item, ControlBlockKind::Unbuffered, has_owner);
+                        push(item, ControlBlockKind::Unbuffered, has_owner, false);
                     }
                 }
                 for path in engine.brcb_paths() {
                     if let Some(item) = path.strip_prefix(&prefix) {
-                        let has_owner = engine
+                        let (has_owner, has_resv_tms) = engine
                             .get_brcb(&path)
-                            .is_none_or(|brcb| brcb.brcb.with_owner);
-                        push(item, ControlBlockKind::Buffered, has_owner);
+                            .map_or((true, true), |b| (b.brcb.with_owner, b.brcb.with_resv_tms));
+                        push(item, ControlBlockKind::Buffered, has_owner, has_resv_tms);
                     }
                 }
             }
@@ -823,7 +824,7 @@ fn domain_control_blocks(
         Ok(registry) => {
             for (d, item) in registry.keys() {
                 if d == domain && is_lcb_path(item) {
-                    push(item, ControlBlockKind::Log, false);
+                    push(item, ControlBlockKind::Log, false, false);
                 }
             }
         }
@@ -834,7 +835,7 @@ fn domain_control_blocks(
     }
     #[cfg(feature = "goose-mapping")]
     for item in gocb_registry.item_bases_in_domain(domain) {
-        push(&item, ControlBlockKind::Goose, false);
+        push(&item, ControlBlockKind::Goose, false, false);
     }
     out.sort_by(|(ln_a, a), (ln_b, b)| {
         let rank = |k: ControlBlockKind| {
@@ -2249,7 +2250,8 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
 /// structure, in the member order of
 /// [`ControlBlockKind::Buffered`](crate::mapping::ControlBlockKind): RptID,
 /// RptEna, DatSet, ConfRev, OptFlds, BufTm, SqNum, TrgOps, IntgPd, GI,
-/// PurgeBuf, EntryID, TimeofEntry, ResvTms, and Owner.
+/// PurgeBuf, EntryID, TimeofEntry, ResvTms, and Owner; ResvTms and Owner
+/// only when the control block has them.
 ///
 /// An attribute that cannot be read fails the whole structure, so it is never
 /// returned half-populated. EntryID and TimeofEntry describe the same entry.
