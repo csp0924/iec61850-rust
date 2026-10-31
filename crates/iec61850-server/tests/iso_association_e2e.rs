@@ -1,18 +1,20 @@
 //! The ISO upper layers of an association over real TCP: raw COTP, Session,
 //! Presentation and ACSE PDUs against the server, checking the presentation
-//! context identifiers it answers on and the PDUs that refuse an association.
+//! context identifiers it answers on, the PDUs that refuse an association, and
+//! the release of an association.
 
 use bytes::BytesMut;
-use iec61850_mms::iso::acse::{encode_aarq, AcseConnection, AcseIndication};
+use iec61850_mms::iso::acse::{encode_aarq, encode_rlrq, AcseConnection, AcseIndication};
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions};
 use iec61850_mms::iso::presentation::{
-    encode_connect as pres_encode_connect, encode_user_data, parse_reject, parse_user_data,
-    IsoPresentation, PresentationConnectionParameters,
+    encode_connect as pres_encode_connect, encode_user_data, encode_user_data_acse, parse_reject,
+    parse_user_data, IsoPresentation, PresentationConnectionParameters,
 };
 use iec61850_mms::iso::session::{
-    encode_connect as sess_encode_connect, encode_data, IsoParameters, IsoSession,
+    encode_connect as sess_encode_connect, encode_data, encode_finish, IsoParameters, IsoSession,
     SessionIndication,
 };
+use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_mms::mms::pdu::initiate::InitiateRequestPdu;
 use iec61850_mms::mms::pdu::read::{
     decode_confirmed_read_response, encode_confirmed_read_request, ReadRequest,
@@ -24,9 +26,10 @@ use iec61850_model::{
 };
 use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 /// ACSE presentation context item of the CP `encode_connect` writes: context
 /// identifier 1 and the ACSE abstract syntax.
@@ -476,5 +479,229 @@ async fn cp_without_an_mms_context_is_refused_by_the_provider() {
     assert_eq!(refusal.provider_reason, Some(0), "{refusal:?}");
     assert_eq!(refusal.results, vec![0, 2], "{refusal:?}");
     assert!(refusal.user_data.is_none(), "{refusal:?}");
+    handle.stop().await;
+}
+
+// ── Release ─────────────────────────────────────────────────────────────
+
+/// An ACSE RLRQ on presentation context `acse` inside a session FINISH.
+fn finish_with_rlrq(acse: u8) -> Vec<u8> {
+    let mut rlrq = [0u8; 5];
+    encode_rlrq(&mut rlrq);
+    let mut pres = IsoPresentation::new();
+    pres.acse_context_id = acse;
+    let mut ppdu = BytesMut::new();
+    encode_user_data_acse(&pres, &rlrq, &mut ppdu);
+    let mut spdu = BytesMut::new();
+    encode_finish(&ppdu, &mut spdu).unwrap();
+    spdu.to_vec()
+}
+
+/// Concludes an association opened with `cotp`, MMS on context `mms`, and
+/// checks the Conclude response.
+async fn conclude(cotp: &mut CotpConnection<TcpStream>, mms: u8) {
+    send_on_context(cotp, mms, &[0x8b, 0x00]).await;
+    let (ind, ud) = recv_spdu(cotp).await.expect("a conclude response");
+    assert_eq!(ind, SessionIndication::Data);
+    assert_eq!(pdv(&ud), (mms, vec![0x8c, 0x00]));
+}
+
+/// Reads every SPDU until the server closes the connection.
+async fn drain(cotp: &mut CotpConnection<TcpStream>) -> Vec<(SessionIndication, Vec<u8>)> {
+    let mut seen = Vec::new();
+    while let Some(spdu) = recv_spdu(cotp).await {
+        seen.push(spdu);
+    }
+    seen
+}
+
+/// After a Conclude the server sends nothing of its own; a FINISH carrying an
+/// RLRQ on the client's ACSE context is answered with a DISCONNECT carrying an
+/// RLRE on that context, and the server closes the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_with_rlrq_is_answered_with_rlre_in_a_disconnect() {
+    let handle = start_server().await;
+    for (acse, mms) in [(1u8, 3u8), (5, 7)] {
+        let mut cotp = connect_cotp(&handle).await;
+        cotp.send_data(&cn(&cp_with_context_ids(acse, mms)))
+            .await
+            .unwrap();
+        recv_spdu(&mut cotp).await.expect("an AC");
+        conclude(&mut cotp, mms).await;
+
+        cotp.send_data(&finish_with_rlrq(acse)).await.unwrap();
+        let seen = drain(&mut cotp).await;
+        assert_eq!(seen.len(), 1, "one SPDU answers the FINISH: {seen:02x?}");
+        let (ind, ud) = &seen[0];
+        assert_eq!(*ind, SessionIndication::Disconnect);
+        assert_eq!(
+            pdv(ud),
+            (acse, vec![0x63, 0x00]),
+            "an RLRE on the ACSE context"
+        );
+    }
+    handle.stop().await;
+}
+
+/// An RLRQ in a data transfer is a protocol error: the server answers with a
+/// session ABORT and closes the connection, sending no RLRE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rlrq_in_a_data_transfer_is_aborted() {
+    let handle = start_server().await;
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp())).await.unwrap();
+    recv_spdu(&mut cotp).await.expect("an AC");
+    conclude(&mut cotp, 3).await;
+
+    let mut rlrq = [0u8; 5];
+    encode_rlrq(&mut rlrq);
+    let mut ppdu = BytesMut::new();
+    encode_user_data_acse(&IsoPresentation::new(), &rlrq, &mut ppdu);
+    let mut spdu = BytesMut::new();
+    encode_data(&ppdu, &mut spdu);
+    cotp.send_data(&spdu).await.unwrap();
+
+    let seen = drain(&mut cotp).await;
+    assert_eq!(seen.len(), 1, "{seen:02x?}");
+    assert_eq!(seen[0].0, SessionIndication::Abort);
+    handle.stop().await;
+}
+
+/// A FINISH without an RLRQ is a protocol error answered with a session ABORT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_without_rlrq_is_aborted() {
+    let handle = start_server().await;
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp())).await.unwrap();
+    recv_spdu(&mut cotp).await.expect("an AC");
+    conclude(&mut cotp, 3).await;
+
+    let mut spdu = BytesMut::new();
+    encode_finish(&[], &mut spdu).unwrap();
+    cotp.send_data(&spdu).await.unwrap();
+
+    let seen = drain(&mut cotp).await;
+    assert_eq!(seen.len(), 1, "{seen:02x?}");
+    assert_eq!(seen[0].0, SessionIndication::Abort);
+    handle.stop().await;
+}
+
+/// Every TPKT a proxy forwarded, in each direction, and whether the server
+/// side has closed.
+#[derive(Default)]
+struct Recorded {
+    to_server: Vec<Vec<u8>>,
+    to_client: Vec<Vec<u8>>,
+    server_closed: bool,
+}
+
+async fn read_tpkt(s: &mut tokio::net::tcp::OwnedReadHalf) -> Option<Vec<u8>> {
+    let mut hdr = [0u8; 4];
+    s.read_exact(&mut hdr).await.ok()?;
+    let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+    let mut frame = hdr.to_vec();
+    frame.resize(len.max(4), 0);
+    s.read_exact(&mut frame[4..]).await.ok()?;
+    Some(frame)
+}
+
+/// Starts a one-shot TPKT proxy to `upstream` that records every frame.
+async fn start_recording_proxy(upstream: SocketAddr) -> (u16, Arc<Mutex<Recorded>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rec = Arc::new(Mutex::new(Recorded::default()));
+    let rec_task = Arc::clone(&rec);
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = TcpStream::connect(upstream).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        let rec_c2s = Arc::clone(&rec_task);
+        tokio::spawn(async move {
+            while let Some(f) = read_tpkt(&mut cr).await {
+                rec_c2s.lock().unwrap().to_server.push(f.clone());
+                if sw.write_all(&f).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sw.shutdown().await;
+        });
+        while let Some(f) = read_tpkt(&mut sr).await {
+            rec_task.lock().unwrap().to_client.push(f.clone());
+            if cw.write_all(&f).await.is_err() {
+                break;
+            }
+        }
+        rec_task.lock().unwrap().server_closed = true;
+        let _ = cw.shutdown().await;
+    });
+    (port, rec)
+}
+
+/// The SPDUs of the COTP data TPDUs among `frames`, each with its user data.
+fn spdus(frames: &[Vec<u8>]) -> Vec<(SessionIndication, Vec<u8>)> {
+    frames
+        .iter()
+        .filter(|f| f.len() > 7 && f[5] == 0xf0)
+        .map(|f| {
+            let mut s = IsoSession::new();
+            let ind = s.parse_message(&f[7..]).expect("the SPDU parses");
+            (ind, s.user_data(&f[7..]).to_vec())
+        })
+        .collect()
+}
+
+/// The iec61850-mms client releasing an association with the server, recorded
+/// at the TPKT level: Conclude request, Conclude response, FINISH with RLRQ,
+/// DISCONNECT with RLRE, and the server closes the connection. The server
+/// sends no FINISH of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_release_is_conclude_then_finish_and_disconnect() {
+    let handle = start_server().await;
+    let (port, rec) = start_recording_proxy(handle.bound_addr).await;
+    let mut client = MmsClientBuilder::new()
+        .connect_timeout_ms(2_000)
+        .request_timeout_ms(2_000)
+        .build();
+    client.connect("127.0.0.1", port).await.expect("connect");
+    client.disconnect().await.expect("release");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !rec.lock().unwrap().server_closed && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (up, down) = {
+        let rec = rec.lock().unwrap();
+        assert!(rec.server_closed, "the server closes after the release");
+        (spdus(&rec.to_server), spdus(&rec.to_client))
+    };
+    let up_tail = &up[up.len() - 2..];
+    let down_tail = &down[down.len() - 2..];
+
+    assert_eq!(up_tail[0].0, SessionIndication::Data);
+    assert_eq!(
+        pdv(&up_tail[0].1),
+        (3, vec![0x8b, 0x00]),
+        "conclude request"
+    );
+    assert_eq!(up_tail[1].0, SessionIndication::Finish);
+    let (ctx, rlrq) = pdv(&up_tail[1].1);
+    assert_eq!((ctx, rlrq.first()), (1, Some(&0x62)), "RLRQ: {rlrq:02x?}");
+
+    assert_eq!(down_tail[0].0, SessionIndication::Data);
+    assert_eq!(
+        pdv(&down_tail[0].1),
+        (3, vec![0x8c, 0x00]),
+        "conclude response"
+    );
+    assert_eq!(down_tail[1].0, SessionIndication::Disconnect);
+    assert_eq!(pdv(&down_tail[1].1), (1, vec![0x63, 0x00]), "RLRE");
+    assert!(
+        !down
+            .iter()
+            .any(|(ind, _)| *ind == SessionIndication::Finish),
+        "the server sent a FINISH: {down:02x?}"
+    );
     handle.stop().await;
 }

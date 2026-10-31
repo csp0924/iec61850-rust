@@ -36,8 +36,13 @@
 //!   `association_idle_timeout_ms`, 300 000 ms by default, is aborted.
 //! - A PDU the peer does not accept within `association_send_timeout_ms`,
 //!   10 000 ms by default, ends the connection without a further write.
-//! - After answering a Conclude the server waits for the Session finish for a
-//!   bounded time, 10 seconds by default, and then closes the socket itself.
+//! - After answering a Conclude the server sends nothing further of its own
+//!   and waits for the client to release the association: a Session FINISH
+//!   carrying an ACSE RLRQ is answered with a Session DISCONNECT carrying the
+//!   RLRE, and the socket closes. Without a FINISH within a bounded time, 10
+//!   seconds by default, the server closes the socket itself. A FINISH that
+//!   carries no RLRQ, and an ACSE PDU other than an abort in a data transfer,
+//!   are protocol errors answered with an ACSE A-ABORT.
 //! - However the connection ends, including a transport error, the
 //!   association's URCB reservations, control selects and setting group edit
 //!   session are released as the connection task ends. A BRCB the association
@@ -62,7 +67,7 @@ use iec61850_mms::iso::presentation::{
 };
 use iec61850_mms::iso::session::{
     encode_abort as sess_encode_abort, encode_accept as sess_encode_accept, encode_data,
-    encode_finish, encode_refuse_with_user_data, IsoSession, SessionError, SessionIndication,
+    encode_disconnect, encode_refuse_with_user_data, IsoSession, SessionError, SessionIndication,
 };
 use iec61850_mms::mms::pdu::common::WriteOutcome;
 use iec61850_mms::mms::pdu::information_report::{
@@ -846,18 +851,32 @@ where
                 // An ordinary MMS or ACSE PDU.
             }
             SessionIndication::Finish => {
-                // The peer wants to finish; answer with a disconnect and close.
-                tracing::debug!(
-                    conn_id,
-                    "session finish received, answering with a disconnect"
-                );
-                let mut dn = BytesMut::new();
-                use iec61850_mms::iso::session::encode_disconnect;
-                encode_disconnect(&[], &mut dn)?;
-                send_bounded(conn_id, send_timeout, &mut last_activity, async {
-                    cotp.send_data(&dn).await.map_err(ConnError::from)
-                })
-                .await?;
+                // A-RELEASE: the FINISH carries the RLRQ, the DISCONNECT the RLRE.
+                if is_release_request(&pres, local_session.user_data(&payload)) {
+                    tracing::debug!(
+                        conn_id,
+                        "release request received, answering with a release response"
+                    );
+                    send_bounded(
+                        conn_id,
+                        send_timeout,
+                        &mut last_activity,
+                        send_release_response(&mut cotp, &pres),
+                    )
+                    .await?;
+                } else {
+                    tracing::warn!(
+                        conn_id,
+                        "a session finish carries no release request, sending an abort and closing the socket"
+                    );
+                    send_bounded(
+                        conn_id,
+                        send_timeout,
+                        &mut last_activity,
+                        send_acse_abort(&mut cotp, &mut session, &mut pres),
+                    )
+                    .await?;
+                }
                 break;
             }
             SessionIndication::Abort => {
@@ -893,7 +912,8 @@ where
         // The context identifiers are the ones the client chose in its CP.
         match pres_result.context_id {
             id if id == pres.acse_context_id => {
-                // On the ACSE context the peer is releasing or aborting.
+                // A release travels in a session FINISH, never in a data
+                // transfer, so only an abort is accepted here.
                 let mut local_acse = AcseConnection::new(None);
                 let (acse_ind, _) = match local_acse.parse_message(&inner_payload) {
                     Ok(v) => v,
@@ -902,37 +922,23 @@ where
                         break;
                     }
                 };
-                match acse_ind {
-                    AcseIndication::ReleaseRequest => {
-                        // The release response is followed by a session finish
-                        // from the peer.
-                        tracing::debug!(
-                            conn_id,
-                            "acse release request received, answering with a release response"
-                        );
-                        let mut rlre = [0u8; 2];
-                        encode_rlre(&mut rlre);
-                        send_bounded(
-                            conn_id,
-                            send_timeout,
-                            &mut last_activity,
-                            send_user_data_acse(&mut cotp, &session, &pres, &rlre),
-                        )
-                        .await?;
-                    }
-                    AcseIndication::Abort => {
-                        tracing::debug!(conn_id, "acse abort received, closing the socket");
-                        break;
-                    }
-                    other => {
-                        tracing::warn!(
-                            conn_id,
-                            ?other,
-                            "unexpected indication on the acse context"
-                        );
-                        break;
-                    }
+                if acse_ind == AcseIndication::Abort {
+                    tracing::debug!(conn_id, "acse abort received, closing the socket");
+                    break;
                 }
+                tracing::warn!(
+                    conn_id,
+                    ?acse_ind,
+                    "acse pdu in a data transfer, sending an abort and closing the socket"
+                );
+                send_bounded(
+                    conn_id,
+                    send_timeout,
+                    &mut last_activity,
+                    send_acse_abort(&mut cotp, &mut session, &mut pres),
+                )
+                .await?;
+                break;
             }
             id if id == pres.mms_context_id => {
                 let outcome = client_conn
@@ -987,15 +993,8 @@ where
                             send_user_data_mms(&mut cotp, &session, &pres, &response_bytes),
                         )
                         .await?;
-                        // Starts the bounded wait for the session finish.
+                        // Starts the bounded wait for the client's release.
                         client_conn.with_mms_mut(|m| m.mark_concluded());
-                        // The session finish tells the peer to close as well.
-                        let mut fn_bytes = BytesMut::new();
-                        encode_finish(&[], &mut fn_bytes)?;
-                        send_bounded(conn_id, send_timeout, &mut last_activity, async {
-                            cotp.send_data(&fn_bytes).await.map_err(ConnError::from)
-                        })
-                        .await?;
                     }
                     MessageOutcome::SendInitiateErrorAndClose { error_bytes: _ } => {
                         tracing::warn!(conn_id, "a second initiate arrived on an established association, closing the socket");
@@ -1135,23 +1134,39 @@ where
     Ok(())
 }
 
-/// Wraps an ACSE PDU as presentation user data on the ACSE context, a session
-/// data TPDU, and a COTP data TPDU, and writes it.
-async fn send_user_data_acse<S>(
+/// Returns whether the user data of a session FINISH is an ACSE RLRQ on the
+/// ACSE presentation context.
+fn is_release_request(pres: &IsoPresentation, user_data: &[u8]) -> bool {
+    let mut local_pres = pres.clone();
+    let Ok(pdv) = parse_user_data(&mut local_pres, user_data) else {
+        return false;
+    };
+    if pdv.context_id != pres.acse_context_id {
+        return false;
+    }
+    matches!(
+        AcseConnection::new(None).parse_message(pdv.payload(user_data)),
+        Ok((AcseIndication::ReleaseRequest, _))
+    )
+}
+
+/// Answers a release request: an ACSE RLRE as presentation user data on the
+/// ACSE context, inside a session DISCONNECT and a COTP data TPDU.
+async fn send_release_response<S>(
     cotp: &mut CotpConnection<S>,
-    session: &IsoSession,
     pres: &IsoPresentation,
-    acse_bytes: &[u8],
 ) -> std::result::Result<(), ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut rlre = [0u8; 2];
+    encode_rlre(&mut rlre);
+
     let mut pres_buf = BytesMut::new();
-    encode_user_data_acse(pres, acse_bytes, &mut pres_buf);
+    encode_user_data_acse(pres, &rlre, &mut pres_buf);
 
     let mut sess_buf = BytesMut::new();
-    encode_data(&pres_buf, &mut sess_buf);
-    let _ = session;
+    encode_disconnect(&pres_buf, &mut sess_buf)?;
 
     cotp.send_data(&sess_buf).await?;
     Ok(())
