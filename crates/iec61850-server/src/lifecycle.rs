@@ -598,6 +598,10 @@ where
     let control_outbox = server.control_objects().outbox().clone();
     let mut deferred_rx = control_outbox.register(conn_id);
     let mut deferred_writes: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    // A closed channel is dropped from the select below rather than polled
+    // again, which would keep it ready forever and starve the socket.
+    let mut deferred_open = true;
+    let mut ct_open = true;
 
     // ── Reports ─────────────────────────────────────────────────────────
     //
@@ -678,7 +682,7 @@ where
         }
         let step = tokio::select! {
             biased;
-            done = deferred_rx.recv() => {
+            done = deferred_rx.recv(), if deferred_open => {
                 match done {
                     Some(done) => {
                         if let Some(invoke_id) = deferred_writes.remove(&done.id) {
@@ -732,11 +736,12 @@ where
                     }
                     None => {
                         tracing::warn!(conn_id, "the control outbox channel has closed");
+                        deferred_open = false;
                         Step::Continue
                     }
                 }
             }
-            ev = ct_rx.recv() => {
+            ev = ct_rx.recv(), if ct_open => {
                 match ev {
                     Some(event) => {
                         if let Err(e) = send_bounded(
@@ -752,6 +757,7 @@ where
                     }
                     None => {
                         tracing::warn!(conn_id, "the command termination channel has closed");
+                        ct_open = false;
                         Step::Continue
                     }
                 }
@@ -1565,5 +1571,109 @@ mod tests {
         }
         assert!(!task.is_finished());
         assert_eq!(server.connection_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod control_channel_tests {
+    use super::*;
+    use iec61850_mms::mms::client::MmsClient;
+    use iec61850_mms::mms::pdu::ObjectClass;
+    use iec61850_model::{IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Counts the events whose message mentions `needle`.
+    struct EventCounter {
+        needle: &'static str,
+        count: Arc<AtomicUsize>,
+    }
+
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for EventCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            if message.contains(self.needle) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// An association whose deferred-outcome and command-termination channels
+    /// have closed notices each closure once and keeps serving its requests.
+    #[tokio::test]
+    async fn closed_control_channels_are_not_polled_again() {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(EventCounter {
+            needle: "channel has closed",
+            count: closed.clone(),
+        });
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("TEST")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let server = IedServer::builder()
+            .model(Arc::new(model))
+            .bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .build()
+            .unwrap();
+        let (client, server_end) = tokio::io::duplex(4096);
+        let slot = server.try_acquire_connection_slot().expect("a free slot");
+        let task_server = server.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            handle_connection_inner(
+                task_server,
+                server_end,
+                "127.0.0.1:102".parse().unwrap(),
+                deadline,
+            )
+            .await;
+        });
+        let mut client = MmsClient::<tokio::io::DuplexStream>::from_transport(client)
+            .await
+            .expect("associate");
+
+        // Connection 1 is the first id the server hands out.
+        server.control_objects().outbox().deregister(1);
+        server.ct_sink().deregister(1);
+        for _ in 0..3 {
+            client
+                .get_name_list(ObjectClass::Domain, None, None)
+                .await
+                .expect("the association keeps serving");
+        }
+        assert!(!task.is_finished());
+        assert_eq!(
+            closed.load(Ordering::Relaxed),
+            2,
+            "each closed channel is noticed once"
+        );
     }
 }
