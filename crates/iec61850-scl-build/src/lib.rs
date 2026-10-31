@@ -87,8 +87,10 @@ impl CompileBuilder {
         self
     }
 
-    /// Selects which IED of a multi-IED `.scd` to generate a function for. It
-    /// can be omitted when the file holds a single IED.
+    /// Selects which IED of a multi-IED `.scd` to generate a function for.
+    ///
+    /// Without it, every IED of the file gets its own `build_<X>_model`
+    /// function, and every one of them has to build.
     pub fn ied_name(mut self, name: impl Into<String>) -> Self {
         self.ied_name = Some(name.into());
         self
@@ -370,6 +372,15 @@ mod tests {
             .expect_err("the IED expands to more than three nodes");
         assert!(matches!(err, CompileError::ResolveScl(_)), "{err:?}");
         assert!(compile_icd("unused.icd").generate(&xml).is_ok());
+    }
+
+    #[test]
+    fn every_ied_gets_its_own_function_when_none_is_selected() {
+        let pretty = compile_icd("unused.icd")
+            .generate(&scl(&[ied("A", "TotW"), ied("B", "TotW")]))
+            .expect("two valid IEDs generate");
+        assert!(pretty.contains("build_A_model"), "{pretty}");
+        assert!(pretty.contains("build_B_model"), "{pretty}");
     }
 
     #[test]
