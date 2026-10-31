@@ -70,9 +70,11 @@ pub(crate) fn rcb_ref_to_mms_ids(reference: &str) -> Option<(String, String)> {
 /// # Errors
 ///
 /// `InvalidArgument` for a malformed reference or a domain id longer than 64
-/// bytes, `NotConnected` if the association is not established, `Mms` for an
-/// error from the layer below, and `TypeMismatch` if the response does not
-/// have the shape of an RCB.
+/// bytes, `NotConnected` if the association is not established, the typed
+/// variant of an error from the layer below (`DataAccessError` when the server
+/// refuses the read, `Timeout`, `ConnectionLost`, `Transport`, `Service`,
+/// `Reject` and the like), and `TypeMismatch` if the response does not have the
+/// shape of an RCB.
 pub async fn get_rcb_values<T: AsyncTransport, Tm: Timer>(
     conn: &IedConnection<T, Tm>,
     rcb_ref: &str,
