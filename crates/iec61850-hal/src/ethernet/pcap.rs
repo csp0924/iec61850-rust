@@ -19,9 +19,16 @@
 //! documentation and license exposure can be split: the NPCAP license is not
 //! GPL compatible, while libpcap carries no such restriction.
 //!
-//! Implemented here: a wrapper over `pcap::Capture`, receive with the
-//! configured timeout mapped to [`EthernetError::Timeout`], send, promiscuous
-//! mode, interface lookup by name, and the duplex `EthernetSocket`.
+//! Implemented here: a wrapper over `pcap::Capture`, receive with a timeout
+//! mapped to [`EthernetError::Timeout`], send, promiscuous mode, interface
+//! lookup by name, and the duplex `EthernetSocket`.
+//!
+//! The libpcap read timeout is fixed when a capture is opened and, on some
+//! platforms, does not end a read on a quiet link at all. The capture is
+//! therefore opened in non-blocking mode, and `recv` polls it every
+//! [`POLL_INTERVAL`] until a frame arrives or its own timeout has passed. A
+//! timeout is honored per call, and a frame waits at most one poll interval
+//! before `recv` returns it.
 //! Multicast groups are not joined explicitly, because libpcap has no
 //! portable join API; the backend relies on the OS and NIC defaults.
 //!
@@ -31,11 +38,14 @@
 //!
 //! TODO: filter on EtherType with BPF to cut per-frame callback overhead.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::pcap::{Active, Capture, Device, Error as PcapError};
 
 use super::{EthernetAddr, EthernetConfig, EthernetError, EthernetSink, EthernetSource};
+
+/// Pause between two reads of a capture that had no frame.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The libpcap and NPCAP backend.
 ///
@@ -43,9 +53,9 @@ use super::{EthernetAddr, EthernetConfig, EthernetError, EthernetSink, EthernetS
 /// the underlying handle on [`Drop`].
 pub struct PcapSocket {
     cap: Capture<Active>,
-    /// The configured timeout. pcap fixes it when the capture is opened, so
-    /// it cannot be changed per receive.
-    open_timeout_ms: Option<i32>,
+    /// The receive timeout from [`EthernetConfig::recv_timeout`], used when
+    /// `recv` is given none.
+    recv_timeout: Option<Duration>,
     /// Hardware address of the interface, when the platform reports one.
     hw_addr: Option<EthernetAddr>,
     /// Copy of an outgoing frame whose source address is filled in.
@@ -55,7 +65,7 @@ pub struct PcapSocket {
 impl std::fmt::Debug for PcapSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PcapSocket")
-            .field("open_timeout_ms", &self.open_timeout_ms)
+            .field("recv_timeout", &self.recv_timeout)
             .field("hw_addr", &self.hw_addr)
             .finish()
     }
@@ -86,36 +96,19 @@ impl PcapSocket {
         let device = find_device(&cfg.interface)?;
         let hw_addr = interface_hw_addr(&device.name);
 
-        let timeout_ms = cfg
-            .recv_timeout
-            .map(|d| {
-                // pcap counts the timeout in milliseconds; clamp to i32.
-                let ms = d.as_millis();
-                if ms > i32::MAX as u128 {
-                    i32::MAX
-                } else {
-                    ms as i32
-                }
-            })
-            .unwrap_or(0); // 0 blocks until a frame arrives
-
-        let mut builder = Capture::from_device(device)
+        let cap = Capture::from_device(device)
             .map_err(|e| EthernetError::Os(format!("pcap from_device: {e}")))?
             .promisc(cfg.promiscuous)
             .immediate_mode(true)
-            .snaplen(65535);
-
-        if timeout_ms > 0 {
-            builder = builder.timeout(timeout_ms);
-        }
-
-        let cap = builder.open().map_err(map_pcap_open_err)?;
+            .snaplen(65535)
+            .open()
+            .map_err(map_pcap_open_err)?
+            .setnonblock()
+            .map_err(|e| EthernetError::Os(format!("pcap setnonblock: {e}")))?;
 
         Ok(Self {
             cap,
-            open_timeout_ms: cfg
-                .recv_timeout
-                .map(|d| d.as_millis().min(i32::MAX as u128) as i32),
+            recv_timeout: cfg.recv_timeout,
             hw_addr,
             send_scratch: Vec::new(),
         })
@@ -137,27 +130,64 @@ impl PcapSocket {
 impl EthernetSource for PcapSocket {
     /// Receives one frame.
     ///
-    /// A frame that does not fit `buf` is dropped and reported as
+    /// `timeout`, or the configured receive timeout when it is `None`, bounds
+    /// the wait, give or take one [`POLL_INTERVAL`]; with neither the call
+    /// waits for a frame. A frame that does not fit `buf` is dropped and reported as
     /// [`EthernetError::Os`] naming both lengths, so no truncated frame
     /// reaches a decoder.
-    fn recv(&mut self, buf: &mut [u8], _timeout: Option<Duration>) -> Result<usize, EthernetError> {
-        // The timeout is fixed when the capture is opened, so the argument
-        // cannot be honored here; callers set it through EthernetConfig.
-        match self.cap.next_packet() {
+    fn recv(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, EthernetError> {
+        let deadline = timeout.or(self.recv_timeout).map(|d| Instant::now() + d);
+        let cap = &mut self.cap;
+        let poll = || match cap.next_packet() {
             Ok(packet) => {
                 let n = packet.data.len();
                 let Some(dst) = buf.get_mut(..n) else {
-                    return Err(EthernetError::Os(format!(
+                    return Poll::Failed(EthernetError::Os(format!(
                         "dropped a {n} byte frame that does not fit the {} byte buffer",
                         buf.len()
                     )));
                 };
                 dst.copy_from_slice(packet.data);
-                Ok(n)
+                Poll::Frame(n)
             }
-            Err(PcapError::TimeoutExpired) => Err(EthernetError::Timeout),
-            Err(PcapError::NoMorePackets) => Ok(0),
-            Err(e) => Err(EthernetError::Os(format!("pcap recv: {e}"))),
+            Err(PcapError::TimeoutExpired) => Poll::Idle,
+            Err(PcapError::NoMorePackets) => Poll::Frame(0),
+            Err(e) => Poll::Failed(EthernetError::Os(format!("pcap recv: {e}"))),
+        };
+        wait_for_frame(deadline, Instant::now, std::thread::sleep, poll)
+    }
+}
+
+/// Outcome of one wait of the capture.
+enum Poll {
+    /// A frame of this many bytes was copied, or 0 when the capture has
+    /// nothing more to deliver.
+    Frame(usize),
+    /// No frame was pending.
+    Idle,
+    /// The receive failed.
+    Failed(EthernetError),
+}
+
+/// Repeats `poll`, pausing [`POLL_INTERVAL`] with `sleep` after each idle
+/// read, until it yields a frame or a failure, or until `now` reaches
+/// `deadline` after an idle read; no deadline waits indefinitely.
+fn wait_for_frame(
+    deadline: Option<Instant>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut poll: impl FnMut() -> Poll,
+) -> Result<usize, EthernetError> {
+    loop {
+        match poll() {
+            Poll::Frame(n) => return Ok(n),
+            Poll::Failed(e) => return Err(e),
+            Poll::Idle => {
+                if deadline.is_some_and(|d| now() >= d) {
+                    return Err(EthernetError::Timeout);
+                }
+                sleep(POLL_INTERVAL);
+            }
         }
     }
 }
@@ -335,5 +365,78 @@ mod tests {
             PcapSocket::open(&cfg),
             Err(EthernetError::InvalidConfig(_))
         ));
+    }
+}
+
+/// Timeout handling of `recv`, which needs no capture device.
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Runs `wait_for_frame` against a capture that is idle for `idle_reads`
+    /// reads and then yields `then`, on a clock that only the injected sleep
+    /// advances. Returns the result, the number of reads, and the time slept.
+    fn run(
+        deadline_after: Option<Duration>,
+        idle_reads: usize,
+        then: Poll,
+    ) -> (Result<usize, EthernetError>, usize, Duration) {
+        let start = Instant::now();
+        let slept = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let mut then = Some(then);
+        let r = wait_for_frame(
+            deadline_after.map(|d| start + d),
+            || start + slept.get(),
+            |d| slept.set(slept.get() + d),
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n < idle_reads {
+                    Poll::Idle
+                } else {
+                    then.take().unwrap_or(Poll::Idle)
+                }
+            },
+        );
+        (r, reads.get(), slept.get())
+    }
+
+    #[test]
+    fn a_deadline_ends_the_wait_after_an_idle_read() {
+        let (r, reads, slept) = run(Some(Duration::from_millis(5)), usize::MAX, Poll::Idle);
+        assert_eq!(r, Err(EthernetError::Timeout));
+        assert_eq!(reads, 6, "reads at 0 to 5 ms");
+        assert_eq!(slept, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn a_zero_timeout_reads_once() {
+        let (r, reads, slept) = run(Some(Duration::ZERO), usize::MAX, Poll::Idle);
+        assert_eq!(r, Err(EthernetError::Timeout));
+        assert_eq!(reads, 1);
+        assert_eq!(slept, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_frame_before_the_deadline_is_returned() {
+        let (r, reads, _) = run(Some(Duration::from_secs(1)), 2, Poll::Frame(60));
+        assert_eq!(r, Ok(60));
+        assert_eq!(reads, 3);
+    }
+
+    #[test]
+    fn no_deadline_keeps_waiting_through_idle_reads() {
+        let (r, reads, slept) = run(None, 50, Poll::Frame(64));
+        assert_eq!(r, Ok(64));
+        assert_eq!(reads, 51);
+        assert_eq!(slept, POLL_INTERVAL * 50);
+    }
+
+    #[test]
+    fn a_failure_ends_the_wait() {
+        let (r, _, _) = run(None, 1, Poll::Failed(EthernetError::Os("gone".into())));
+        assert_eq!(r, Err(EthernetError::Os("gone".into())));
     }
 }

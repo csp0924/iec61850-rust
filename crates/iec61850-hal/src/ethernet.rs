@@ -185,8 +185,10 @@ pub trait EthernetSource: Send {
     /// Reads one frame into `buf` and returns how many bytes were written,
     /// including the complete L2 header.
     ///
-    /// `timeout` overrides [`EthernetConfig::recv_timeout`]; `None` keeps the
-    /// value the socket was configured with.
+    /// `timeout` overrides [`EthernetConfig::recv_timeout`] for this call;
+    /// `None` keeps the value the socket was configured with. Every backend
+    /// honors it: AF_PACKET sets `SO_RCVTIMEO` per call, and the pcap backend
+    /// polls its non-blocking capture until the timeout has passed.
     ///
     /// # Errors
     ///
