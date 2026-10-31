@@ -324,7 +324,8 @@ includes, so that it announces exactly what the dispatcher answers.
 | Bit | Announced when |
 |---|---|
 | `status`, `getNameList`, `identify`, `read`, `write`, `getVariableAccessAttributes` | Always |
-| `defineNamedVariableList`, `getNamedVariableListAttributes`, `deleteNamedVariableList`, `informationReport` | The reporting subsystem is compiled in |
+| `defineNamedVariableList`, `getNamedVariableListAttributes`, `deleteNamedVariableList` | The reporting subsystem is compiled in |
+| `informationReport` | The reporting or the control subsystem is compiled in; the control subsystem sends `LastApplError` and command terminations as InformationReport |
 | `readJournal` | The logging subsystem is compiled in |
 | `writeJournal` | Never; the request is answered with an access error rather than served |
 | `conclude` | Always |

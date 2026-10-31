@@ -370,10 +370,13 @@ const SERVICES_READ_JOURNAL_BIT: u8 = 0x40;
 /// services this build actually serves.
 ///
 /// Starting from the baseline of the connection layer, a bit is cleared unless
-/// a handler answers it: `cancel` has no handler in any build,
-/// and data set creation, deletion and directory together with
-/// `informationReport` are cleared without the reporting subsystem. The
-/// baseline carries no journal service, so
+/// a handler answers it: `cancel` has no handler in any build, and data set
+/// creation, deletion and directory are cleared without the reporting
+/// subsystem. `informationReport` is cleared only when neither the reporting
+/// nor the control subsystem is compiled in, since the control subsystem also
+/// sends one, carrying `LastApplError` for a refused command or a command
+/// termination for an enhanced-security model. The baseline carries no journal
+/// service, so
 /// `readJournal` is set rather than cleared when the logging subsystem answers
 /// it; `writeJournal` stays clear, since that request is answered with an
 /// access error rather than served.
@@ -387,13 +390,15 @@ const SERVICES_READ_JOURNAL_BIT: u8 = 0x40;
 /// A client enables its own paths from this bitmap, so advertising a service
 /// that is not implemented leads it into a request that can only fail, and
 /// withholding one it does implement leaves that service unreachable.
-fn compute_services_supported(reporting: bool, logging: bool) -> [u8; 11] {
+fn compute_services_supported(reporting: bool, control: bool, logging: bool) -> [u8; 11] {
     use iec61850_mms::mms::server::connection::SERVER_SERVICES_SUPPORTED;
     let mut map = SERVER_SERVICES_SUPPORTED;
     map[10] &= !0x08; // cancel: a Cancel-RequestPDU is rejected at the PDU layer
     if !reporting {
         // define, getAttributes and delete NamedVariableList
         map[1] &= !(0x10 | 0x08 | 0x04);
+    }
+    if !reporting && !control {
         map[9] &= !0x01; // informationReport
     }
     if logging {
@@ -404,7 +409,11 @@ fn compute_services_supported(reporting: bool, logging: bool) -> [u8; 11] {
 
 impl MmsServiceDispatcher for MmsModelDispatcher {
     fn services_supported(&self) -> [u8; 11] {
-        compute_services_supported(cfg!(feature = "reporting"), cfg!(feature = "logging"))
+        compute_services_supported(
+            cfg!(feature = "reporting"),
+            cfg!(feature = "control"),
+            cfg!(feature = "logging"),
+        )
     }
 
     fn dispatch(&self, conn: &MmsServerConnection, req: ConfirmedRequest) -> ConfirmedResponse {
@@ -3450,66 +3459,101 @@ fn make_confirmed_error(invoke_id: u32, error_class: ErrorClass) -> ConfirmedRes
 
 #[cfg(test)]
 mod services_supported_tests {
-    use super::{compute_services_supported, SERVICES_JOURNAL_BYTE, SERVICES_READ_JOURNAL_BIT};
+    use super::{
+        compute_services_supported, MmsModelDispatcher, SERVICES_JOURNAL_BYTE,
+        SERVICES_READ_JOURNAL_BIT,
+    };
+    use crate::compat::Arc;
+    use crate::mapping::MmsDeviceModel;
+    use crate::policy::WriteAccessPolicies;
+    use iec61850_mms::mms::server::dispatcher::MmsServiceDispatcher;
+    use iec61850_model::{IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
 
-    /// The four combinations of the two subsystem flags, as
-    /// `(reporting, logging)`.
-    const ALL_BUILDS: [(bool, bool); 4] =
-        [(true, true), (true, false), (false, true), (false, false)];
+    /// The eight combinations of the three subsystem flags, as
+    /// `(reporting, control, logging)`.
+    const ALL_BUILDS: [(bool, bool, bool); 8] = [
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+    ];
 
     /// getNamedVariableListAttributes (`0xac`) is answered from the data set
     /// registry, so it is advertised exactly when the reporting subsystem is
     /// compiled in.
     #[test]
     fn reporting_gates_get_nvl_attributes() {
-        for logging in [true, false] {
+        for (reporting, control, logging) in ALL_BUILDS {
             assert_eq!(
-                compute_services_supported(true, logging)[1] & 0x08,
-                0x08,
-                "a reporting build must advertise getNamedVariableListAttributes"
-            );
-            assert_eq!(
-                compute_services_supported(false, logging)[1] & 0x08,
-                0,
-                "a build without reporting must not advertise getNamedVariableListAttributes"
+                compute_services_supported(reporting, control, logging)[1] & 0x08,
+                if reporting { 0x08 } else { 0 },
+                "getNamedVariableListAttributes is advertised exactly in a reporting build"
             );
         }
     }
 
-    /// Data set creation, deletion and directory and `informationReport` belong
-    /// to the reporting subsystem and are advertised only when it is enabled: a client
-    /// enables its own data set paths from this bitmap, and advertising a
-    /// service that is not implemented leads it into a request that can only
-    /// fail.
+    /// Data set creation, deletion and directory belong to the reporting
+    /// subsystem and are advertised only when it is enabled: a client enables
+    /// its own data set paths from this bitmap, and advertising a service that
+    /// is not implemented leads it into a request that can only fail.
     #[test]
-    fn reporting_gates_dataset_crud_and_information_report() {
-        let with = compute_services_supported(true, false);
-        assert_eq!(
-            with[1] & 0x10,
-            0x10,
-            "a reporting build must advertise defineNamedVariableList"
-        );
-        assert_eq!(
-            with[1] & 0x04,
-            0x04,
-            "a reporting build must advertise deleteNamedVariableList"
-        );
-        assert_eq!(
-            with[9] & 0x01,
-            0x01,
-            "a reporting build must advertise informationReport"
-        );
+    fn reporting_gates_dataset_crud() {
+        for (reporting, control, logging) in ALL_BUILDS {
+            let map = compute_services_supported(reporting, control, logging);
+            assert_eq!(
+                map[1] & 0x10,
+                if reporting { 0x10 } else { 0 },
+                "defineNamedVariableList is advertised exactly in a reporting build"
+            );
+            assert_eq!(
+                map[1] & 0x04,
+                if reporting { 0x04 } else { 0 },
+                "deleteNamedVariableList is advertised exactly in a reporting build"
+            );
+        }
+    }
 
-        let without = compute_services_supported(false, false);
-        assert_eq!(
-            without[1] & (0x10 | 0x08 | 0x04),
-            0,
-            "a build without reporting must not advertise data set services"
+    /// The reporting subsystem sends reports and the control subsystem sends
+    /// `LastApplError` and command terminations, all as InformationReport, so
+    /// the bit is advertised when either is compiled in and only then.
+    #[test]
+    fn information_report_follows_reporting_or_control() {
+        for (reporting, control, logging) in ALL_BUILDS {
+            assert_eq!(
+                compute_services_supported(reporting, control, logging)[9] & 0x01,
+                if reporting || control { 0x01 } else { 0 },
+                "informationReport with reporting={reporting}, control={control}, logging={logging}"
+            );
+        }
+    }
+
+    /// The dispatcher of this build announces `informationReport` exactly
+    /// when the build can send one.
+    #[test]
+    fn dispatcher_announces_information_report_when_it_sends_one() {
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
+        let dispatcher = MmsModelDispatcher::new(
+            Arc::new(model),
+            Arc::new(mms_model),
+            Arc::new(WriteAccessPolicies::default()),
         );
         assert_eq!(
-            without[9] & 0x01,
-            0,
-            "a build without reporting must not advertise informationReport"
+            dispatcher.services_supported()[9] & 0x01 != 0,
+            cfg!(any(feature = "reporting", feature = "control")),
+            "informationReport is announced exactly when reporting or control is compiled in"
         );
     }
 
@@ -3519,15 +3563,15 @@ mod services_supported_tests {
     /// client that enables its own paths from this bitmap.
     #[test]
     fn logging_gates_read_journal() {
-        for reporting in [true, false] {
-            let with = compute_services_supported(reporting, true);
+        for (reporting, control, _) in ALL_BUILDS {
+            let with = compute_services_supported(reporting, control, true);
             assert_eq!(
                 with[SERVICES_JOURNAL_BYTE] & SERVICES_READ_JOURNAL_BIT,
                 SERVICES_READ_JOURNAL_BIT,
                 "a logging build must advertise readJournal"
             );
 
-            let without = compute_services_supported(reporting, false);
+            let without = compute_services_supported(reporting, control, false);
             assert_eq!(
                 without[SERVICES_JOURNAL_BYTE], 0x00,
                 "a build without logging must advertise no journal service"
@@ -3542,8 +3586,8 @@ mod services_supported_tests {
     /// deliberately.
     #[test]
     fn never_advertises_write_journal() {
-        for (reporting, logging) in ALL_BUILDS {
-            let map = compute_services_supported(reporting, logging);
+        for (reporting, control, logging) in ALL_BUILDS {
+            let map = compute_services_supported(reporting, control, logging);
             assert_eq!(
                 map[SERVICES_JOURNAL_BYTE] & !SERVICES_READ_JOURNAL_BIT,
                 0,
@@ -3556,8 +3600,8 @@ mod services_supported_tests {
     /// advertised and cancel is not.
     #[test]
     fn advertises_status_never_cancel() {
-        for (reporting, logging) in ALL_BUILDS {
-            let map = compute_services_supported(reporting, logging);
+        for (reporting, control, logging) in ALL_BUILDS {
+            let map = compute_services_supported(reporting, control, logging);
             assert_eq!(
                 map[0] & 0x80,
                 0x80,
@@ -3574,8 +3618,8 @@ mod services_supported_tests {
     /// The services every build answers stay advertised in every build.
     #[test]
     fn baseline_bits_stable_across_builds() {
-        for (reporting, logging) in ALL_BUILDS {
-            let map = compute_services_supported(reporting, logging);
+        for (reporting, control, logging) in ALL_BUILDS {
+            let map = compute_services_supported(reporting, control, logging);
             assert_eq!(
                 map[0], 0xee,
                 "status, get-name-list, identify, read, write and get-variable-access-attributes are advertised"
@@ -3589,14 +3633,19 @@ mod services_supported_tests {
     #[test]
     fn full_bitmap_is_bit_exact() {
         assert_eq!(
-            compute_services_supported(true, true),
+            compute_services_supported(true, true, true),
             [0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10],
-            "a build with reporting and logging"
+            "a build with reporting, control and logging"
         );
         assert_eq!(
-            compute_services_supported(false, false),
+            compute_services_supported(false, true, false),
+            [0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10],
+            "a build with control alone"
+        );
+        assert_eq!(
+            compute_services_supported(false, false, false),
             [0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10],
-            "a build with neither"
+            "a build with none of the three"
         );
     }
 }
