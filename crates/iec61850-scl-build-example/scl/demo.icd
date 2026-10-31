@@ -60,6 +60,9 @@
   </DataTypeTemplates>
 
   <IED name="Demo">
+    <Services>
+      <ReportSettings owner="true"/>
+    </Services>
     <AccessPoint name="AP1">
       <Server>
         <LDevice inst="LD0">

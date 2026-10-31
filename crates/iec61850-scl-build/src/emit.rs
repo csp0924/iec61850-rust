@@ -30,7 +30,7 @@ use quote::{format_ident, quote};
 use iec61850_scl::__private::{
     attribute_type, dai_values, derives_setting_view, doi_children, element_count, fcda_do_path,
     gse_control_go_id, instance_children, ld_domain_name, ld_num_of_sgs, parse_fc,
-    report_instances, sv_control_sv_id, template_initial_value, MmsValue,
+    report_instances, report_owner, sv_control_sv_id, template_initial_value, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawCount, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet,
@@ -129,17 +129,18 @@ fn emit_ied_fn(
     let ied_name_lit = ied.name.as_str();
     let dtt = &raw.data_type_templates;
 
-    // Collect every logical device, across all access points and servers.
-    let mut lds: Vec<&RawLogicalDevice> = Vec::new();
+    // Collect every logical device, across all access points and servers,
+    // with whether the report control blocks of its access point have Owner.
+    let mut lds: Vec<(&RawLogicalDevice, bool)> = Vec::new();
     for ap in &ied.access_points {
         if let Some(server) = &ap.server {
             for ld in &server.logical_devices {
-                lds.push(ld);
+                lds.push((ld, report_owner(ied, ap)));
             }
         }
     }
     if cfg.is_deterministic() {
-        lds.sort_by(|a, b| a.inst.cmp(&b.inst));
+        lds.sort_by(|(a, _), (b, _)| a.inst.cmp(&b.inst));
     }
     if lds.is_empty() {
         return Err(CompileError::Emit(format!(
@@ -152,7 +153,7 @@ fn emit_ied_fn(
     // fails too; the error is reported for this IED.
     let ld_exprs = lds
         .iter()
-        .map(|ld| emit_ld_expr(ld, dtt, &ied.name, cfg))
+        .map(|(ld, rcb_owner)| emit_ld_expr(ld, dtt, &ied.name, *rcb_owner, cfg))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| match e {
             CompileError::BuildModel { source, .. } => CompileError::BuildModel {
@@ -189,6 +190,7 @@ fn emit_ld_expr(
     ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
     ied_name: &str,
+    rcb_owner: bool,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let domain = ld_domain_name(ld, ied_name);
@@ -226,7 +228,7 @@ fn emit_ld_expr(
     let num_of_sgs = ld_num_of_sgs(ld);
     let ln_exprs = lns
         .iter()
-        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, num_of_sgs, cfg))
+        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, num_of_sgs, rcb_owner, cfg))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
@@ -253,6 +255,7 @@ fn emit_ln_expr(
     ld_inst: &str,
     domain: &str,
     num_of_sgs: Option<u32>,
+    rcb_owner: bool,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let prefix_lit = ln.prefix.as_deref().unwrap_or("");
@@ -288,7 +291,7 @@ fn emit_ln_expr(
     // The four control block kinds, sorted for determinism.
     let rcb_exprs = sorted_by_name(ln.report_controls.iter(), cfg, |r| r.name.as_str())
         .into_iter()
-        .map(emit_rcb_expr)
+        .map(|r| emit_rcb_expr(r, rcb_owner))
         .collect::<Result<Vec<_>, _>>()?;
     let gocb_exprs = sorted_by_name(ln.gse_controls.iter(), cfg, |g| g.name.as_str())
         .into_iter()
@@ -687,7 +690,7 @@ fn emit_fcda_expr(
 // 6. Control blocks
 // -----------------------------------------------------------------------------
 
-fn emit_rcb_expr(r: &RawReportControlBlock) -> Result<TokenStream, CompileError> {
+fn emit_rcb_expr(r: &RawReportControlBlock, has_owner: bool) -> Result<TokenStream, CompileError> {
     let (indexed, max_instances) = report_instances(r, "ReportControl").map_err(model_error)?;
     let name = r.name.as_str();
     let is_buffered = r.buffered;
@@ -713,6 +716,7 @@ fn emit_rcb_expr(r: &RawReportControlBlock) -> Result<TokenStream, CompileError>
             __rcb.intg_pd_ms = #intg_pd_ms;
             __rcb.indexed = #indexed;
             __rcb.max_instances = #max_instances;
+            __rcb.has_owner = #has_owner;
             __rcb
         }
     })

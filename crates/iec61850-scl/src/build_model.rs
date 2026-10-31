@@ -37,10 +37,11 @@ use iec61850_model::{
 
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    DataTypeTemplates, OptionFieldsBits, RawBda, RawCount, RawDaDef, RawDaType, RawDai,
-    RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl,
-    RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock,
-    RawSampledValueControl, RawScl, RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
+    DataTypeTemplates, OptionFieldsBits, RawAccessPoint, RawBda, RawCount, RawDaDef, RawDaType,
+    RawDai, RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda,
+    RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode,
+    RawReportControlBlock, RawSampledValueControl, RawScl, RawSdoDef, RawSettingControl, RawVal,
+    TriggerOptionsBits,
 };
 
 /// Builds the runtime model of one IED. Called by
@@ -82,7 +83,7 @@ pub(crate) fn build_ied_model(
         };
         for raw_ld in &server.logical_devices {
             had_any_ld = true;
-            let ld = build_ld(raw_ld, dtt, ied_name, max_nodes)?;
+            let ld = build_ld(raw_ld, dtt, ied_name, report_owner(ied, ap), max_nodes)?;
             model_b = model_b.add_ld(ld).map_err(|e| {
                 SclParseError::at(
                     raw_ld.span,
@@ -157,6 +158,7 @@ fn build_ld(
     raw_ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
     ied_name: &str,
+    rcb_owner: bool,
     max_nodes: u64,
 ) -> Result<iec61850_model::LogicalDevice, SclParseError> {
     let mut ld_b = LogicalDeviceBuilder::new(raw_ld.inst.clone());
@@ -167,7 +169,15 @@ fn build_ld(
     let num_of_sgs = ld_num_of_sgs(raw_ld);
 
     for raw_ln in &raw_ld.logical_nodes {
-        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain, num_of_sgs, max_nodes)?;
+        let ln = build_ln(
+            raw_ln,
+            dtt,
+            &raw_ld.inst,
+            &domain,
+            num_of_sgs,
+            rcb_owner,
+            max_nodes,
+        )?;
         ld_b = ld_b.add_ln(ln);
     }
 
@@ -180,6 +190,23 @@ fn build_ld(
             },
         )
     })
+}
+
+/// Returns whether the report control blocks of the access point `ap` of
+/// `ied` have the Owner attribute.
+///
+/// The `owner` attribute of `<ReportSettings>` decides it: the one of the
+/// access point's own `<Services>` when it declares one, otherwise the one of
+/// the IED-level `<Services>`, and `false` when neither declares one
+/// (IEC 61850-6 §9.3.2).
+///
+/// Also used by the build-script path, so a generated model has the same
+/// control block attributes.
+pub fn report_owner(ied: &RawIed, ap: &RawAccessPoint) -> bool {
+    ap.report_settings
+        .as_ref()
+        .or(ied.report_settings.as_ref())
+        .is_some_and(|settings| settings.owner)
 }
 
 /// Returns the `numOfSGs` of the `<SettingControl>` of a logical device, if
@@ -201,6 +228,7 @@ fn build_ln(
     ld_inst: &str,
     domain: &str,
     num_of_sgs: Option<u32>,
+    rcb_owner: bool,
     max_nodes: u64,
 ) -> Result<iec61850_model::LogicalNode, SclParseError> {
     // Stage 2 has already checked that ln_type_ref resolves, so `expect` here
@@ -233,7 +261,7 @@ fn build_ln(
             "SCL/.../LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/ReportControl[name=\"{}\"]",
             ld_inst, raw_ln.ln_class, raw_ln.inst, raw_rcb.name
         );
-        ln_b = ln_b.add_rcb(build_rcb(raw_rcb, &path)?);
+        ln_b = ln_b.add_rcb(build_rcb(raw_rcb, rcb_owner, &path)?);
     }
 
     // GOOSE control blocks
@@ -980,12 +1008,14 @@ pub fn fcda_do_path(
 /// The trigger options, option fields, integrity period, buffer time and the
 /// instance count and naming are part of the model schema, so a model built
 /// from an `.icd` needs no further configuration; see [`report_instances`].
+/// `has_owner` is what [`report_owner`] decided for the access point.
 ///
 /// # Errors
 ///
 /// Whatever [`report_instances`] reports.
 fn build_rcb(
     raw_rcb: &RawReportControlBlock,
+    has_owner: bool,
     path: &str,
 ) -> Result<ReportControlBlock, SclParseError> {
     let (indexed, max_instances) = report_instances(raw_rcb, path)?;
@@ -1002,6 +1032,7 @@ fn build_rcb(
     rcb.intg_pd_ms = raw_rcb.intg_pd;
     rcb.indexed = indexed;
     rcb.max_instances = max_instances;
+    rcb.has_owner = has_owner;
     Ok(rcb)
 }
 
@@ -3648,6 +3679,56 @@ mod tests {
                 );
             }
             other => panic!("expected SemanticConflict, saw {:?}", other),
+        }
+    }
+
+    /// Report control blocks have Owner as `<ReportSettings owner>` says: the
+    /// access point's own `<Services>` first, then the IED-level one, and none
+    /// without either.
+    #[test]
+    fn report_owner_follows_report_settings() {
+        let scl = |ied_services: &str, ap_services: &str| {
+            format!(
+                r#"<SCL>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+    </DOType>
+  </DataTypeTemplates>
+  <IED name="IED1">
+    {ied_services}
+    <AccessPoint name="AP1">
+      <Server>
+        <LDevice inst="LD0">
+          <LN0 inst="" lnType="LLN0_T">
+            <ReportControl name="rcb" confRev="1"/>
+          </LN0>
+        </LDevice>
+      </Server>
+      {ap_services}
+    </AccessPoint>
+  </IED>
+</SCL>"#
+            )
+        };
+        let owner = "<Services><ReportSettings owner=\"true\"/></Services>";
+        let no_owner = "<Services><ReportSettings/></Services>";
+        for (ied_services, ap_services, expected) in [
+            ("", "", false),
+            (owner, "", true),
+            ("", owner, true),
+            (owner, no_owner, false),
+            (no_owner, owner, true),
+        ] {
+            let m = build(&scl(ied_services, ap_services), "IED1");
+            let rcb = &m.ld_by_inst("LD0").unwrap().lns[0].rcbs[0];
+            assert_eq!(
+                rcb.has_owner, expected,
+                "IED {ied_services:?}, access point {ap_services:?}"
+            );
         }
     }
 }

@@ -52,6 +52,9 @@ pub struct RawIed {
     pub manufacturer: Option<String>,
     /// The `configVersion` attribute.
     pub config_version: Option<String>,
+    /// The `<ReportSettings>` of the IED-level `<Services>`, which applies to
+    /// every access point that declares none of its own.
+    pub report_settings: Option<RawReportSettings>,
     /// The `<AccessPoint>` children.
     pub access_points: Vec<RawAccessPoint>,
     /// Where the element starts in the source XML.
@@ -66,6 +69,22 @@ pub struct RawAccessPoint {
     pub name: String,
     /// The `<Server>` child, if the access point declares one.
     pub server: Option<RawServer>,
+    /// The `<ReportSettings>` of the access point's own `<Services>`, which
+    /// replaces the IED-level one for this access point.
+    pub report_settings: Option<RawReportSettings>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// A `<ReportSettings>` element of `<Services>` (IEC 61850-6 §9.3.2).
+///
+/// Only the attribute that shapes the served control blocks is read.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawReportSettings {
+    /// The `owner` attribute: whether report control blocks have the Owner
+    /// attribute. Defaults to `false`.
+    pub owner: bool,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
 }

@@ -28,8 +28,8 @@ use crate::raw::{
     Header, OptionFieldsBits, RawAccessPoint, RawBda, RawCount, RawDaDef, RawDaType, RawDai,
     RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType,
     RawEnumValue, RawFcda, RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice,
-    RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef,
-    RawServer, RawVal, SmvOptsBits, TriggerOptionsBits,
+    RawLogicalNode, RawReportControlBlock, RawReportSettings, RawSampledValueControl, RawScl,
+    RawSdi, RawSdoDef, RawServer, RawVal, SmvOptsBits, TriggerOptionsBits,
 };
 
 /// Parses an SCL XML string into the stage 1 raw AST.
@@ -636,6 +636,22 @@ fn handle_start(
                 }
             }
             state.cur_ap = Some(ap);
+        }
+        // Of the service capabilities only ReportSettings is read; every other
+        // child of Services is skipped.
+        "Services" if matches!(parent_tag.as_deref(), Some("IED" | "AccessPoint")) => {}
+        "ReportSettings" if parent_tag.as_deref() == Some("Services") => {
+            let path = state.path_str();
+            let settings = build_report_settings(start, span, &path)?;
+            match (state.cur_ap.as_mut(), state.cur_ied.as_mut()) {
+                (Some(ap), _) => ap.report_settings = Some(settings),
+                (None, Some(ied)) => ied.report_settings = Some(settings),
+                (None, None) => {}
+            }
+            state.enter_skip(name.clone());
+        }
+        _ if parent_tag.as_deref() == Some("Services") => {
+            state.enter_skip(name.clone());
         }
         "Server" => {
             if state.cur_ap.is_none() {
@@ -1336,6 +1352,7 @@ fn build_ied(
         desc,
         manufacturer,
         config_version,
+        report_settings: None,
         access_points: Vec::new(),
         span,
     })
@@ -1355,8 +1372,23 @@ fn build_access_point(
     Ok(RawAccessPoint {
         name,
         server: None,
+        report_settings: None,
         span,
     })
+}
+
+/// Parses a `<ReportSettings>`: `owner` is optional and defaults to `false`.
+///
+/// # Errors
+///
+/// [`ErrorKind::AttributeValueInvalid`] when `owner` is not a boolean.
+fn build_report_settings(
+    start: &BytesStart<'_>,
+    span: SourceSpan,
+    path: &str,
+) -> Result<RawReportSettings, SclParseError> {
+    let owner = parse_optional::<bool>(start.attributes(), "owner", span, path)?.unwrap_or(false);
+    Ok(RawReportSettings { owner, span })
 }
 
 /// Parses an `<LDevice>`: `inst` is required; `ldName` and `desc` are optional.
@@ -3545,5 +3577,61 @@ mod tests {
             }
             other => panic!("expected Xml error, got {:?}", other),
         }
+    }
+
+    /// `<ReportSettings>` is read from the IED-level `<Services>` and from the
+    /// `<Services>` of an access point; `owner` defaults to false and every
+    /// other service capability is skipped.
+    #[test]
+    fn parses_report_settings_at_ied_and_access_point_level() {
+        let xml = r#"<SCL>
+  <IED name="IED1">
+    <Services>
+      <DynDataSet max="4"/>
+      <ReportSettings cbName="Conf" owner="true"/>
+      <ClientServices><TimeSyncProt sntp="true"/></ClientServices>
+    </Services>
+    <AccessPoint name="AP1">
+      <Server>
+        <LDevice inst="LD0">
+          <LN0 inst="" lnType="LLN0_T"/>
+        </LDevice>
+      </Server>
+      <Services>
+        <ReportSettings resvTms="true"/>
+      </Services>
+    </AccessPoint>
+    <AccessPoint name="AP2"/>
+  </IED>
+</SCL>"#;
+        let raw = parse(xml).expect("Services must parse");
+        let ied = &raw.ieds[0];
+        assert!(ied.report_settings.as_ref().expect("IED level").owner);
+        let ap1 = &ied.access_points[0];
+        assert!(
+            !ap1.report_settings
+                .as_ref()
+                .expect("access point level")
+                .owner
+        );
+        assert_eq!(
+            ap1.server.as_ref().expect("server").logical_devices.len(),
+            1
+        );
+        assert!(ied.access_points[1].report_settings.is_none());
+    }
+
+    #[test]
+    fn report_settings_owner_must_be_a_boolean() {
+        let xml = r#"<SCL>
+  <IED name="IED1">
+    <Services><ReportSettings owner="yes"/></Services>
+  </IED>
+</SCL>"#;
+        let err = parse(xml).expect_err("a non-boolean owner is refused");
+        assert!(
+            matches!(&*err.kind, ErrorKind::AttributeValueInvalid { name, .. } if name == "owner"),
+            "{err:?}"
+        );
     }
 }
