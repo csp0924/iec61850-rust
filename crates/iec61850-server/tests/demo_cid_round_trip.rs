@@ -401,9 +401,9 @@ impl ValueTree {
 
 /// Render every attribute of `ln` whose value differs from the type default.
 ///
-/// Values reach the runtime model only through `<DOI>` / `<SDI>` / `<DAI>`; a
-/// `<Val>` inside `DataTypeTemplates` is parsed but not applied, so it cannot
-/// carry a value across the round trip.
+/// A value set by a `<DAI>` and one taken from a `<Val>` inside
+/// `DataTypeTemplates` are both rendered as a `<DAI>`, so every non-default
+/// value crosses the round trip.
 fn collect_values(ln: &LogicalNode) -> Vec<String> {
     let mut roots: BTreeMap<String, ValueTree> = BTreeMap::new();
     for dobj in &ln.dos {

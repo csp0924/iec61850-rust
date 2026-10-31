@@ -285,8 +285,15 @@ mod tests {
     async fn a_refused_connection_is_drained_for_at_most_the_linger_time() {
         let (acceptor, connector) = refusing_pair();
         let _client = refuse(&acceptor, &connector).await;
+        // The clock is paused only once `refuse` has returned: a paused clock
+        // jumps to the next timer whenever the runtime has nothing to run, so
+        // a wait on the socket after the drain task exists would run out the
+        // linger time early. Under TLS 1.3 the client finishes its side before
+        // the server refuses, so `refuse` returns in the poll that spawns the
+        // drain task, and on this current-thread runtime that task is first
+        // polled at the yields below: its linger timer starts on the paused
+        // clock. Nothing may await between `refuse` and `pause`.
         tokio::time::pause();
-        // Lets the drain task start its wait on the paused clock.
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }

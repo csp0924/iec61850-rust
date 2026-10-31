@@ -59,7 +59,8 @@ pub struct IedServerConfig {
     /// `SP | SV | SE`.
     pub write_access_policies: WriteAccessPolicies,
 
-    /// Time quality reported with every timestamp the server generates.
+    /// Time quality carried by the `LActTm` timestamp of the setting group
+    /// control blocks; no other timestamp the server generates uses it.
     pub time_quality: TimeQuality,
 
     /// Vendor name returned by the Identify service. `None` selects the

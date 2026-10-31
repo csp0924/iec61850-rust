@@ -285,8 +285,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
 
     /// Queries a log over a time range (ACSI QueryLogByTime).
     ///
-    /// `log_ref` is an MMS path of the form `<domain>/<item>`, for example
-    /// `IED1LD0/MMXU1$LG$lcb01`. Returns the entries and whether more follow.
+    /// `log_ref` is the LogRef of a log control block in the form
+    /// `<domain>/<item>`, for example `IED1LD0/LLN0$GeneralLog`. Returns the
+    /// entries and whether more follow.
     pub async fn query_journal_by_time(
         &self,
         log_ref: &str,

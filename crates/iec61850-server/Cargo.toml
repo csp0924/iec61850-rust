@@ -87,9 +87,9 @@ embedded = [
 ]
 # `full-server` aggregates the IedServer runtime and every dispatcher
 # subsystem. A subfeature does not imply it, so subsets such as
-# `std,reporting` build on their own. The shared server bone (connection,
-# lifecycle, server and the integrated dispatcher) is gated on any of the
-# subfeatures rather than on a sixth umbrella.
+# `std,reporting` build on their own. The connection handle is available
+# under any subfeature; the integrated runtime (IedServer, its accept loop and
+# the from-model registration) needs `full-server` itself.
 full-server = ["reporting", "control", "logging", "goose-mapping", "setting-groups"]
 # reporting: URCB, BRCB, data sets and the ReportingEngine.
 reporting = []

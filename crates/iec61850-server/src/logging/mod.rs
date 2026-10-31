@@ -29,12 +29,11 @@ use std::sync::{Arc, RwLock};
 /// Shared registry of log control blocks, which the dispatcher uses to route a
 /// ReadJournal request.
 ///
-/// Entries are keyed by `(mms domain, mms item)`, matching the
-/// `journalName.domain-specific.{domainId, itemId}` of the request on the wire.
-///
-/// The usual key splits a `LogControl::mms_path` such as
-/// `IED1LD0/MMXU1$LG$lcb01` into `("IED1LD0", "MMXU1$LG$lcb01")`. A caller may
-/// also register a log-instance style key such as `("IED1LD0", "MMXU1$EventLog")`.
+/// Entries are keyed by the MMS domain and item of the control block: a
+/// `LogControl::mms_path` such as `IED1LD0/MMXU1$LG$lcb01` is the key
+/// `("IED1LD0", "MMXU1$LG$lcb01")`. The key names no journal; a ReadJournal
+/// request names its journal by the LogRef of a control block, and the
+/// dispatcher reads the log of the control block whose LogRef it names.
 ///
 /// `IedServerInner` and `MmsModelDispatcher` hold clones of the same `Arc`, so a
 /// runtime registration is visible to the dispatcher immediately.

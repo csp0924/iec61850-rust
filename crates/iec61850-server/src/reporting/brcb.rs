@@ -988,8 +988,9 @@ impl BufferedReportControl {
     /// The buffer overflow flag is not set here. Whatever the outcome, the
     /// first report after the client enables the control block carries
     /// `BufOvfl = true`, as `BrcbState::overflow_on_enable` makes it
-    /// (IEC 61850-7-2 §17.2.3.2.2.8); the backend flag reports only entries
-    /// lost while it is enabled.
+    /// (IEC 61850-7-2 §17.2.3.2.2.8). The backend flag starts set in a new
+    /// buffer and is set by every loss of an entry not yet formatted, enabled
+    /// or not; the next report formatted indicates it and clears it.
     ///
     /// # Errors
     ///

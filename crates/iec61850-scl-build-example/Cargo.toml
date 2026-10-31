@@ -14,7 +14,7 @@ publish = false
 # example cannot carry its own build script, and the SCL to Rust translation
 # has to happen at build time.
 [dependencies]
-# The generated IedModel is reached through the `__rt` re-export of
+# The generated IedModel is reached through the `__private` re-export of
 # iec61850-scl, so a consumer does not depend on iec61850-model directly.
 iec61850-scl    = { workspace = true }
 # iec61850-server is referenced by path rather than through a workspace alias,

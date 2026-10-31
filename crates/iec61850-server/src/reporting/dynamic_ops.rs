@@ -52,8 +52,9 @@ pub enum DatasetError {
         path: String,
     },
     /// The member path is malformed, with too few segments or an empty
-    /// segment, or it names an array of data objects, which this server does
-    /// not serve as a member.
+    /// segment; it names a member past an array, whose elements have no
+    /// names; or its array index is past the end of the array or selects no
+    /// array.
     MemberInvalidPath {
         /// The malformed member path.
         path: String,

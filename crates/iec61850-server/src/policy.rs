@@ -9,7 +9,8 @@ use iec61850_model::FC;
 
 /// Which functional constraints accept a remote Write, as a bitmask.
 ///
-/// Bit positions: `DC = 1`, `CF = 2`, `SP = 4`, `SV = 8`, `SE = 16`, `BL = 32`.
+/// Mask values, bits 0 to 5: `DC = 0x01`, `CF = 0x02`, `SP = 0x04`, `SV = 0x08`,
+/// `SE = 0x10`, `BL = 0x20`.
 ///
 /// Defaults to `SP | SV | SE` (0x1C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
