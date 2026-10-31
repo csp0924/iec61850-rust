@@ -538,10 +538,63 @@ fn member_entry(
     owner: &LogicalDevice,
     entry: &DataSetEntry,
 ) -> core::result::Result<DatasetEntry, &'static str> {
+    let names_no_device = || {
+        !entry.ld_inst.is_empty()
+            && model.ld_by_inst(&entry.ld_inst).is_none()
+            && model.ld_by_domain(&entry.ld_inst).is_none()
+    };
     DatasetEntry::from_data_set_entry(model, owner, entry).map_err(|e| match e {
+        DatasetError::MemberNotFound { .. } if names_no_device() => {
+            "names no logical device of the model"
+        }
         DatasetError::MemberNotFound { .. } => "does not resolve under its functional constraint",
         DatasetError::TooLarge { .. } => "holds more attributes than a member may",
         _ if entry.array_index.is_some() => "names an array element, which is not supported",
         _ => "is not a valid member path",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iec61850_model::{cdc, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, FC};
+
+    /// A member whose logical device does not exist says so, apart from one
+    /// whose device exists but whose node does not resolve.
+    #[test]
+    fn a_member_names_why_it_does_not_resolve() {
+        let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(cdc::sps("Ind1", cdc::CdcOptions::NONE))
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let owner = model.ld_by_inst("LD0").unwrap();
+        let entry = |ld_inst: &str, do_name: &str| {
+            let mut e = DataSetEntry::new("GGIO1", FC::St, vec![do_name.into()]);
+            e.ld_inst = ld_inst.into();
+            e
+        };
+        assert_eq!(
+            member_entry(&model, owner, &entry("LD9", "Ind1")).unwrap_err(),
+            "names no logical device of the model"
+        );
+        assert_eq!(
+            member_entry(&model, owner, &entry("LD0", "NoSuchDo")).unwrap_err(),
+            "does not resolve under its functional constraint"
+        );
+        assert_eq!(
+            member_entry(&model, owner, &entry("", "NoSuchDo")).unwrap_err(),
+            "does not resolve under its functional constraint"
+        );
+        assert!(member_entry(&model, owner, &entry("IED1LD0", "Ind1")).is_ok());
+    }
 }
