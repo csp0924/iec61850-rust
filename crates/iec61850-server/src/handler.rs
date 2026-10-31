@@ -170,12 +170,13 @@ pub trait ReadHandler: Send + Sync + core::fmt::Debug {
     /// Answers a read that covers the node this handler is registered
     /// against, `ctx.path`; the client named `ctx.requested`.
     ///
-    /// The server calls this while it holds the lock that keeps a read from
-    /// seeing part of a concurrent write, shared. The handler must not read or
-    /// write the model through the server, such as by calling
-    /// `handle_single_read`, `handle_single_read_with_budget` or
-    /// `handle_single_write`, from here: taking that lock again on the same
-    /// thread can deadlock.
+    /// The server calls this holding none of its locks: a read that consults
+    /// handlers asks them first and takes the values of the model afterwards,
+    /// under the lock that keeps it from seeing part of a concurrent write.
+    /// The handler may therefore call the server, `update_*` and
+    /// `lock_data_model` included. Each handler a read consults is asked once
+    /// for that read; the model values the read answers with are taken after
+    /// every handler has answered.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
 }
 

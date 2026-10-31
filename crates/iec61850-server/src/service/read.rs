@@ -47,6 +47,13 @@
 //! of its elements (IEC 61850-8-1 §8.1.2.7). Its elements have no names, so a
 //! flattened name ends at the array, and an alternate access selects an
 //! element, optionally followed by the components of a structured element.
+//!
+//! No read handler runs while the value lock is held. A read that consults
+//! handlers runs twice: first without the lock, asking the handlers and
+//! recording their outcomes, then, unless that run ended without a value,
+//! under the lock, taking the values and answering each consultation from the
+//! record. Each handler is asked once per read, and a handler may call the
+//! server, `update_*` and `lock_data_model` included.
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -58,6 +65,7 @@ use alloc::{
 use crate::compat::Arc;
 use crate::handler::{is_below, HandlerRegistry, ReadContext, ReadHandler, ReadOutcome};
 use crate::mapping::{bit_string_fits, declared_bit_string_size, MmsDeviceModel};
+use core::cell::RefCell;
 use iec61850_mms::mms::pdu::common::{
     AccessResult, AlternateAccess, AlternateAccessSelector, DataAccessError, MmsData, ObjectName,
 };
@@ -245,6 +253,20 @@ pub(crate) struct ReadHandlerScope {
     conn_id: u64,
     /// The path the client named, passed to every handler.
     requested: String,
+    /// The consultations of this read, in order.
+    record: RefCell<Record>,
+}
+
+/// How a scope answers a consultation.
+enum Record {
+    /// Asks the handler and appends the path and its outcome.
+    Asking(Vec<(String, ReadOutcome)>),
+    /// Answers from the outcomes an asking run recorded, in the same order,
+    /// `next` being the position of the next one.
+    Replaying {
+        outcomes: Vec<(String, ReadOutcome)>,
+        next: usize,
+    },
 }
 
 impl ReadHandlerScope {
@@ -254,6 +276,20 @@ impl ReadHandlerScope {
             handlers: Vec::new(),
             conn_id: 0,
             requested: String::new(),
+            record: RefCell::new(Record::Asking(Vec::new())),
+        }
+    }
+
+    /// The same scope, answering its consultations from the outcomes recorded
+    /// so far instead of asking the handlers again.
+    pub(crate) fn replaying(self) -> Self {
+        let outcomes = match self.record.into_inner() {
+            Record::Asking(outcomes) => outcomes,
+            Record::Replaying { outcomes, .. } => outcomes,
+        };
+        Self {
+            record: RefCell::new(Record::Replaying { outcomes, next: 0 }),
+            ..self
         }
     }
 
@@ -273,10 +309,11 @@ impl ReadHandlerScope {
             handlers,
             conn_id,
             requested,
+            record: RefCell::new(Record::Asking(Vec::new())),
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.handlers.is_empty()
     }
 
@@ -292,11 +329,38 @@ impl ReadHandlerScope {
         self.handlers.iter().any(|(key, _)| is_below(key, path))
     }
 
-    /// Asks the handler on `path`, if there is one.
+    /// Asks the handler on `path`, if there is one, or, when replaying,
+    /// answers what it answered for this consultation.
+    ///
+    /// A replay consults in the order the asking run did, since the handler
+    /// outcomes alone decide which handlers a read consults. One that departs
+    /// from the record is refused as temporarily unavailable rather than ask
+    /// a handler under the value lock.
     fn consult(&self, path: &str, fc: FC) -> Option<ReadOutcome> {
         let (_, handler) = self.handlers.iter().find(|(key, _)| key == path)?;
-        let ctx = ReadContext::new(path, fc, self.conn_id).with_requested(&self.requested);
-        Some(handler.read(&ctx))
+        let mut record = self.record.borrow_mut();
+        match &mut *record {
+            Record::Asking(outcomes) => {
+                let ctx = ReadContext::new(path, fc, self.conn_id).with_requested(&self.requested);
+                let outcome = handler.read(&ctx);
+                outcomes.push((path.to_string(), outcome.clone()));
+                Some(outcome)
+            }
+            Record::Replaying { outcomes, next } => {
+                let recorded = outcomes.get(*next).filter(|(key, _)| key == path);
+                *next += 1;
+                match recorded {
+                    Some((_, outcome)) => Some(outcome.clone()),
+                    None => {
+                        tracing::warn!(
+                            path,
+                            "read: a consultation departs from the recorded ones, answering temporarily-unavailable"
+                        );
+                        Some(ReadOutcome::Error(DataAccessError::TemporarilyUnavailable))
+                    }
+                }
+            }
+        }
     }
 
     /// Asks the handlers above the target, `ancestors[i]` naming the first
@@ -447,15 +511,38 @@ fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), D
     Ok(())
 }
 
+/// Runs `run` so that no read handler is asked while the value lock is held.
+///
+/// Without handlers in `scope`, `run` runs once under the lock. With them, a
+/// first run without the lock asks the handlers and records their outcomes;
+/// a result `has_value` rejects, a refusal or a value over the budget, stands
+/// as it is, as neither carries a value; otherwise `run` runs again under the
+/// lock, taking the values and answered the recorded outcomes.
+fn with_handlers_outside_the_value_lock<R>(
+    mms_model: &MmsDeviceModel,
+    scope: ReadHandlerScope,
+    has_value: impl Fn(&R) -> bool,
+    mut run: impl FnMut(&ReadHandlerScope) -> R,
+) -> R {
+    if !scope.is_empty() {
+        let first = run(&scope);
+        if !has_value(&first) {
+            return first;
+        }
+    }
+    let scope = scope.replaying();
+    let _values = crate::compat::rwlock_read(mms_model.value_lock());
+    run(&scope)
+}
+
 /// Passes `baseline`, the model value of the data attribute or data object
-/// `item_id` names in `domain`, through the read handlers of `registry`, as a
-/// read of that path would. A failure, and a path that does not resolve, pass
-/// unchanged.
+/// `item_id` names in `domain`, through the read handlers of `scope`, which
+/// `ReadHandlerScope::around` looked up for `item_id`, as a read of that path
+/// would. A failure, and a path that does not resolve, pass unchanged.
 #[cfg(feature = "reporting")]
 pub(crate) fn apply_read_handlers(
     ied_model: &IedModel,
-    registry: &HandlerRegistry,
-    conn_id: u64,
+    scope: &ReadHandlerScope,
     domain: &str,
     item_id: &str,
     baseline: AccessResult,
@@ -463,7 +550,6 @@ pub(crate) fn apply_read_handlers(
     let AccessResult::Success(value) = baseline else {
         return baseline;
     };
-    let scope = ReadHandlerScope::around(registry, item_id, conn_id);
     if scope.is_empty() {
         return AccessResult::Success(value);
     }
@@ -484,15 +570,15 @@ pub(crate) fn apply_read_handlers(
 
 /// Passes `baseline`, the model value of the array element `alt` selects in
 /// the array `array_item` names in `domain`, through the read handlers of
-/// `registry`, as a read of that array with that alternate access would: the
-/// handlers at, above and below the array decide the value of the whole
-/// array, from which the element is then selected. A failure, and a path that
-/// does not resolve to an array, pass unchanged.
+/// `scope`, which `ReadHandlerScope::around` looked up for `array_item`, as a
+/// read of that array with that alternate access would: the handlers at,
+/// above and below the array decide the value of the whole array, from which
+/// the element is then selected. A failure, and a path that does not resolve
+/// to an array, pass unchanged.
 #[cfg(feature = "reporting")]
 pub(crate) fn apply_read_handlers_to_element(
     ied_model: &IedModel,
-    registry: &HandlerRegistry,
-    conn_id: u64,
+    scope: &ReadHandlerScope,
     domain: &str,
     array_item: &str,
     alt: &AlternateAccess,
@@ -501,7 +587,7 @@ pub(crate) fn apply_read_handlers_to_element(
     if !matches!(baseline, AccessResult::Success(_)) {
         return baseline;
     }
-    if ReadHandlerScope::around(registry, array_item, conn_id).is_empty() {
+    if scope.is_empty() {
         return baseline;
     }
     let Some((fc, nodes)) = resolve_node_path(ied_model, domain, array_item) else {
@@ -514,7 +600,7 @@ pub(crate) fn apply_read_handlers_to_element(
         return baseline;
     }
     let whole = AccessResult::Success(mms_value_to_mms_data(&array.snapshot(fc)));
-    match apply_read_handlers(ied_model, registry, conn_id, domain, array_item, whole) {
+    match apply_read_handlers(ied_model, scope, domain, array_item, whole) {
         AccessResult::Success(data) => {
             select_element(array, fc, &mms_data_to_mms_value(&data), alt)
         }
@@ -578,6 +664,7 @@ pub enum LookupResult {
 
 /// Byte budget consumed during traversal; running past zero latches
 /// `exceeded`.
+#[derive(Clone)]
 struct BudgetGuard {
     /// Bytes still available. `None` means unbounded, which is the case before
     /// the association has negotiated a PDU size or when the caller passes no
@@ -1161,7 +1248,6 @@ pub(crate) fn read_ln_with_leading_members(
         return Some(not_found());
     };
 
-    let scope = services.scope(item_id);
     let mut guard = BudgetGuard::new(budget);
     let mut group = |fc: FC, guard: &mut BudgetGuard| -> Result<Option<MmsData>, LookupResult> {
         let lead = leading(ln, fc).map_err(|e| LookupResult::Result(AccessResult::Failure(e)))?;
@@ -1172,8 +1258,20 @@ pub(crate) fn read_ln_with_leading_members(
         }
         // The leading members are read by their own routes before the values
         // of the group are taken under the value lock.
-        let _values = crate::compat::rwlock_read(services.mms_model.value_lock());
-        expand_ln_for_fc(ln, fc, lead, &scope, guard).map_err(Halt::into_lookup)
+        let (expanded, spent) = with_handlers_outside_the_value_lock(
+            services.mms_model,
+            services.scope(item_id),
+            |(expanded, _): &(Result<Option<MmsData>, Halt>, BudgetGuard)| {
+                matches!(expanded, Ok(Some(_)))
+            },
+            |scope| {
+                let mut spent = guard.clone();
+                let expanded = expand_ln_for_fc(ln, fc, lead.clone(), scope, &mut spent);
+                (expanded, spent)
+            },
+        );
+        *guard = spent;
+        expanded.map_err(Halt::into_lookup)
     };
 
     let Some(fc_name) = fc_name else {
@@ -1262,7 +1360,8 @@ pub fn handle_single_read_with_budget(
 /// Reads one object name under a PDU byte budget, as the Read service does:
 /// once the path resolves, the read handlers of `services` that bear on it
 /// have their say, per the module rules. The values are taken under the
-/// shared value lock, so a concurrent write is seen whole or not at all.
+/// shared value lock, so a concurrent write is seen whole or not at all; the
+/// handlers are asked outside it.
 pub(crate) fn read_with_handlers(
     ied_model: &IedModel,
     name: &ObjectName,
@@ -1270,15 +1369,18 @@ pub(crate) fn read_with_handlers(
     budget: Option<usize>,
     services: ReadServices<'_>,
 ) -> LookupResult {
-    let mut guard = BudgetGuard::new(budget);
     match name {
-        ObjectName::DomainSpecific { domain_id, item_id } => {
-            let scope = services.scope(item_id);
-            let _values = crate::compat::rwlock_read(services.mms_model.value_lock());
-            lookup_domain_specific_value(
-                ied_model, domain_id, item_id, alt_access, &scope, &mut guard,
-            )
-        }
+        ObjectName::DomainSpecific { domain_id, item_id } => with_handlers_outside_the_value_lock(
+            services.mms_model,
+            services.scope(item_id),
+            |result| matches!(result, LookupResult::Result(AccessResult::Success(_))),
+            |scope| {
+                let mut guard = BudgetGuard::new(budget);
+                lookup_domain_specific_value(
+                    ied_model, domain_id, item_id, alt_access, scope, &mut guard,
+                )
+            },
+        ),
         ObjectName::VmdSpecific(n) => {
             tracing::warn!(name = n, "read: vmd-specific object names are not served");
             LookupResult::Result(AccessResult::Failure(
@@ -2562,8 +2664,7 @@ mod tests {
         assert_eq!(
             apply_read_handlers(
                 &model,
-                &registry,
-                7,
+                &ReadHandlerScope::around(&registry, "MMXU1$MX$A$phsA$cVal$mag", 7),
                 "IED1LD0",
                 "MMXU1$MX$A$phsA$cVal$mag",
                 AccessResult::Success(MmsData::Float32(1.0)),
@@ -2573,8 +2674,7 @@ mod tests {
         assert_eq!(
             apply_read_handlers(
                 &model,
-                &registry,
-                7,
+                &ReadHandlerScope::around(&registry, "MMXU1$MX$A$q", 7),
                 "IED1LD0",
                 "MMXU1$MX$A$q",
                 AccessResult::Success(quality()),

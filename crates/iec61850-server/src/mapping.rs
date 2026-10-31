@@ -175,7 +175,8 @@ pub struct MmsDeviceModel {
     /// constructed attribute whole or not at all.
     ///
     /// The reporting engine takes it under the engine lock, so whoever holds
-    /// it must not take the engine lock.
+    /// it must not take the engine lock; no read handler runs while it is
+    /// held.
     value_lock: Arc<RwLock<()>>,
     /// Where a write hands the leaves it stored, to raise their report and log
     /// triggers; unset for a view no server owns.

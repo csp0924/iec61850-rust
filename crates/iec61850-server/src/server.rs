@@ -2301,6 +2301,181 @@ mod tests {
         assert_eq!(brcb.lock_buffer().unwrap().len(), 1, "the GI entry");
     }
 
+    /// A read handler that, once released, updates `GGIO1$SP$Set$b` and
+    /// locks and releases the data model.
+    #[derive(Debug)]
+    struct UpdatingHandler {
+        server: IedServer,
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::handler::ReadHandler for UpdatingHandler {
+        fn read(&self, _ctx: &crate::handler::ReadContext<'_>) -> crate::handler::ReadOutcome {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self
+                .go
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30));
+            let model = self.server.model();
+            let r = iec61850_model::ObjectRef::parse_mms("TESTLD0/GGIO1$SP$Set$b").unwrap();
+            if let Some(iec61850_model::NodeRef::Da(b)) = model.node_by_object_ref(&r) {
+                self.server
+                    .update_int32(b, 7)
+                    .expect("update from the handler");
+            }
+            drop(
+                self.server
+                    .lock_data_model()
+                    .expect("lock from the handler"),
+            );
+            crate::handler::ReadOutcome::CacheMiss
+        }
+    }
+
+    /// Waits until `done` holds; the bound only reports a deadlock.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: deadlocked");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A read handler may call `update_*` and `lock_data_model` while an
+    /// integrity snapshot and a write are waiting, on a Read of the attribute
+    /// and on a GetDataSetValues of a data set holding it: the handler runs
+    /// while the read holds no value lock, so the snapshot, which takes the
+    /// value lock under the engine lock, the write queued for the value lock
+    /// and the handler waiting for the engine lock cannot wait on each other.
+    #[test]
+    fn a_read_handler_may_update_the_model_while_a_snapshot_and_a_write_wait() {
+        for data_set in [false, true] {
+            handler_updates_while_a_snapshot_and_a_write_wait(data_set);
+        }
+    }
+
+    fn handler_updates_while_a_snapshot_and_a_write_wait(data_set: bool) {
+        use crate::reporting::{Rcb, ReportControl};
+        use bytes::BytesMut;
+        use iec61850_mms::mms::pdu::read::ReadRequest;
+        use iec61850_mms::mms::pdu::write::WriteRequest;
+        use iec61850_mms::mms::server::connection::MmsServerConnection;
+        use iec61850_mms::mms::server::dispatcher::{ConfirmedRequest, ConfirmedResponse};
+        use iec61850_mms::MmsData;
+
+        let (server, ds, view, _b) = server_with_a_data_object_data_set();
+        let path = "TESTLD0/LLN0$RP$urcbSet";
+        server
+            .register_urcb(
+                ReportControl::new(
+                    path,
+                    Rcb::new("urcbSet", "LLN0$dsSet")
+                        .with_trg_ops(TriggerOptions::INTEGRITY)
+                        .with_intg_pd_ms(1_000),
+                ),
+                ds,
+            )
+            .expect("register_urcb");
+        let rc = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_rcb(path)
+            .expect("the URCB");
+        let now = Instant::now();
+        {
+            let rc = rc.lock().unwrap();
+            let mut state = rc.state.lock().unwrap();
+            state.rpt_ena = true;
+            state.client_conn_id = Some(1);
+            state.next_intg_report = Some(now);
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        server
+            .install_read_handler(
+                "GGIO1$SP$Set$a",
+                Arc::new(UpdatingHandler {
+                    server: server.clone(),
+                    entered: std::sync::Mutex::new(entered_tx),
+                    go: std::sync::Mutex::new(go_rx),
+                }),
+            )
+            .expect("install the read handler");
+        let dispatch = |body: BytesMut| {
+            let dispatcher = server.dispatcher();
+            std::thread::spawn(move || {
+                dispatcher.dispatch(
+                    &MmsServerConnection::new(),
+                    ConfirmedRequest {
+                        invoke_id: 1,
+                        service_body: body.freeze(),
+                    },
+                )
+            })
+        };
+
+        let mut read = BytesMut::new();
+        if data_set {
+            ReadRequest {
+                specification_with_result: false,
+                variable_access_spec:
+                    iec61850_mms::mms::pdu::VariableAccessSpecification::VariableListName(
+                        iec61850_mms::ObjectName::DomainSpecific {
+                            domain_id: "TESTLD0".into(),
+                            item_id: "LLN0$dsSet".into(),
+                        },
+                    ),
+            }
+            .encode(&mut read);
+        } else {
+            ReadRequest::single_domain("TESTLD0", "GGIO1$SP$Set$a").encode(&mut read);
+        }
+        let reader = dispatch(read);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("data set {data_set}: the read reaches its handler"));
+
+        let mut write = BytesMut::new();
+        WriteRequest::single_domain("TESTLD0", "GGIO1$SP$Set$b", MmsData::Integer(9))
+            .encode(&mut write);
+        let writer = dispatch(write);
+        wait_until("the write", || {
+            writer.is_finished() || view.value_lock().try_read().is_err()
+        });
+
+        let engine = server.reporting_engine();
+        let tick = std::thread::spawn({
+            let engine = Arc::clone(&engine);
+            move || engine.lock().unwrap().tick_at(now, 0)
+        });
+        wait_until("the tick", || {
+            tick.is_finished() || engine.try_lock().is_err()
+        });
+
+        go_tx.send(()).unwrap();
+        wait_until("the read, the write and the tick", || {
+            reader.is_finished() && writer.is_finished() && tick.is_finished()
+        });
+        assert!(matches!(
+            reader.join().unwrap(),
+            ConfirmedResponse::Response(_)
+        ));
+        assert!(matches!(
+            writer.join().unwrap(),
+            ConfirmedResponse::Response(_)
+        ));
+        tick.join().unwrap();
+        let rc = rc.lock().unwrap();
+        assert_ne!(
+            rc.state.lock().unwrap().next_intg_report,
+            Some(now),
+            "the integrity period restarts"
+        );
+    }
+
     /// The general interrogation and the integrity report of an unbuffered
     /// report control block take their snapshots under the value lock.
     #[test]

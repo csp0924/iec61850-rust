@@ -1101,55 +1101,102 @@ fn dispatch_read(
             // values are refused at the same size whichever way the read names
             // them.
             use crate::service::convert::mms_value_to_mms_data;
+            let baseline_of = |entry: &crate::reporting::DatasetEntry| match entry.read_value() {
+                Some(v) => AccessResult::Success(mms_value_to_mms_data(&v)),
+                None => AccessResult::Failure(DataAccessError::HardwareFault),
+            };
+            // The read handlers of every member are asked first, without the
+            // value lock, and their outcomes recorded; the members are then read
+            // under the lock and answered from the record, so no handler runs
+            // while the lock is held.
+            // Each member's domain, its reference within the domain, and the
+            // variable a read of it names: the member itself, or the array an
+            // element member lies in, with the alternate access selecting the
+            // element.
+            type Member = (
+                String,
+                String,
+                String,
+                Option<iec61850_mms::mms::pdu::common::AlternateAccess>,
+            );
+            let members: Vec<Option<Member>> = dataset
+                .entries
+                .iter()
+                .map(|entry| {
+                    let (domain_id, item_id) =
+                        get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref)?;
+                    let (variable, alt) =
+                        match get_named_variable_list_attrs::member_variable(&entry.attr_ref) {
+                            Some((
+                                iec61850_mms::ObjectName::DomainSpecific {
+                                    item_id: variable, ..
+                                },
+                                alt,
+                            )) => (variable, alt),
+                            _ => (item_id.clone(), None),
+                        };
+                    Some((domain_id, item_id, variable, alt))
+                })
+                .collect();
+            // A member of a closed edit buffer is refused without its handlers.
+            #[cfg(feature = "setting-groups")]
+            let closed = |domain_id: &str, item_id: &str| {
+                reads_closed_edit_buffer(
+                    setting_groups,
+                    &iec61850_mms::ObjectName::DomainSpecific {
+                        domain_id: domain_id.to_string(),
+                        item_id: item_id.to_string(),
+                    },
+                )
+            };
+            #[cfg(not(feature = "setting-groups"))]
+            let closed = |_: &str, _: &str| false;
+            // The handlers of a member decide its value as they would a read of
+            // the variable it names; an element is selected from its array.
+            let apply = |member: &Member,
+                         scope: &crate::service::read::ReadHandlerScope,
+                         baseline: AccessResult| {
+                let (domain_id, item_id, variable, alt) = member;
+                match alt {
+                    Some(alt) => crate::service::read::apply_read_handlers_to_element(
+                        ied_model, scope, domain_id, variable, alt, baseline,
+                    ),
+                    None => crate::service::read::apply_read_handlers(
+                        ied_model, scope, domain_id, item_id, baseline,
+                    ),
+                }
+            };
+            let mut scopes: Vec<crate::service::read::ReadHandlerScope> = members
+                .iter()
+                .map(|member| match member {
+                    Some((domain_id, item_id, variable, _)) if !closed(domain_id, item_id) => {
+                        crate::service::read::ReadHandlerScope::around(
+                            handler_registry,
+                            variable,
+                            conn_id,
+                        )
+                    }
+                    _ => crate::service::read::ReadHandlerScope::none(),
+                })
+                .collect();
+            for ((entry, member), scope) in dataset.entries.iter().zip(&members).zip(&scopes) {
+                if let (Some(member), false) = (member, scope.is_empty()) {
+                    apply(member, scope, baseline_of(entry));
+                }
+            }
+            scopes = scopes.into_iter().map(|scope| scope.replaying()).collect();
             let mut remaining_budget = read_results_budget(&req, negotiated_max_pdu_size);
             let mut results: Vec<AccessResult> = Vec::with_capacity(dataset.entries.len());
             // All members are taken under one shared value lock, so the data set
             // sees a concurrent write of several leaves whole or not at all.
             let _values = crate::compat::rwlock_read(mms_model.value_lock());
-            for entry in &dataset.entries {
-                let baseline = match entry.read_value() {
-                    Some(v) => AccessResult::Success(mms_value_to_mms_data(&v)),
-                    None => AccessResult::Failure(DataAccessError::HardwareFault),
-                };
-                let result = match get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref) {
-                    #[cfg(feature = "setting-groups")]
-                    Some((domain_id, item_id))
-                        if reads_closed_edit_buffer(
-                            setting_groups,
-                            &iec61850_mms::ObjectName::DomainSpecific {
-                                domain_id: domain_id.clone(),
-                                item_id: item_id.clone(),
-                            },
-                        ) =>
-                    {
+            for ((entry, member), scope) in dataset.entries.iter().zip(&members).zip(&scopes) {
+                let baseline = baseline_of(entry);
+                let result = match member {
+                    Some((domain_id, item_id, ..)) if closed(domain_id, item_id) => {
                         AccessResult::Failure(DataAccessError::TemporarilyUnavailable)
                     }
-                    Some((domain_id, item_id)) => {
-                        match get_named_variable_list_attrs::member_variable(&entry.attr_ref) {
-                            // A member naming an array element is read as its
-                            // array, selected by the alternate access.
-                            Some((
-                                iec61850_mms::ObjectName::DomainSpecific { item_id: array, .. },
-                                Some(alt),
-                            )) => crate::service::read::apply_read_handlers_to_element(
-                                ied_model,
-                                handler_registry,
-                                conn_id,
-                                &domain_id,
-                                &array,
-                                &alt,
-                                baseline,
-                            ),
-                            _ => crate::service::read::apply_read_handlers(
-                                ied_model,
-                                handler_registry,
-                                conn_id,
-                                &domain_id,
-                                &item_id,
-                                baseline,
-                            ),
-                        }
-                    }
+                    Some(member) => apply(member, scope, baseline),
                     None => baseline,
                 };
                 if let Some(b) = remaining_budget.as_mut() {
