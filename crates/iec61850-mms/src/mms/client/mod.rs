@@ -64,8 +64,10 @@ use iec61850_hal::time::TokioTimer;
 #[cfg(feature = "std")]
 use tokio::net::TcpStream;
 
-/// Outstanding request ceiling applied when the caller does not set one.
-const DEFAULT_MAX_OUTSTANDING: u32 = 5;
+/// Ceiling of the invokeID allocator. A service call holds one invokeID for
+/// its duration and calls are serialized by `&mut self`; the negotiated
+/// outstanding limit is enforced by the connection, not by the allocator.
+const INVOKE_ID_POOL: u32 = 5;
 
 // MmsClientBuilder
 
@@ -74,7 +76,7 @@ const DEFAULT_MAX_OUTSTANDING: u32 = 5;
 pub struct MmsClientBuilder {
     connect_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
-    max_outstanding: Option<u32>,
+    max_outstanding: Option<u16>,
     local_max_pdu_size: Option<u32>,
     iso_parameters: Option<IsoConnectionParameters>,
     max_pending_unconfirmed: Option<usize>,
@@ -98,8 +100,17 @@ impl MmsClientBuilder {
         self
     }
 
-    /// Sets how many requests may be outstanding at once.
-    pub fn max_outstanding(mut self, n: u32) -> Self {
+    /// Sets proposedMaxServOutstandingCalling, how many confirmed requests the
+    /// client proposes to have outstanding at once; 0 is proposed as 1.
+    ///
+    /// The server may negotiate fewer, and the negotiated value is enforced:
+    /// a request that timed out counts as outstanding until its late answer
+    /// arrives, and once such requests hold every slot the next request waits
+    /// up to the request timeout for a late answer before failing with
+    /// `ClientError::OutstandingCallLimit`. A request the peer discarded holds
+    /// its slot until the client reconnects. Without it
+    /// `DEFAULT_MAX_SERV_OUTSTANDING_CALLING`, 5, applies.
+    pub fn max_outstanding(mut self, n: u16) -> Self {
         self.max_outstanding = Some(n);
         self
     }
@@ -157,10 +168,10 @@ impl MmsClientBuilder {
         if let Some(n) = self.max_pending_unconfirmed {
             conn.max_pending_unconfirmed = n;
         }
-        let max_out = self.max_outstanding.unwrap_or(DEFAULT_MAX_OUTSTANDING);
+        conn.local_max_outstanding = self.max_outstanding;
         MmsClient {
             conn,
-            alloc: invoke_id::InvokeIdAllocator::new(max_out),
+            alloc: invoke_id::InvokeIdAllocator::new(INVOKE_ID_POOL),
         }
     }
 }
@@ -288,7 +299,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
         conn.connect_via(transport).await?;
         Ok(Self {
             conn,
-            alloc: invoke_id::InvokeIdAllocator::new(DEFAULT_MAX_OUTSTANDING),
+            alloc: invoke_id::InvokeIdAllocator::new(INVOKE_ID_POOL),
         })
     }
 

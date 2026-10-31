@@ -3,7 +3,8 @@
 //! Extends `MmsError` with the conditions connection management adds:
 //! - `PduTooLarge`: an encoded PDU exceeds the negotiated maximum size
 //! - `InvokeIdExhausted`: every invokeID is already in flight
-//! - `OutstandingCallLimit`: the outstanding request ceiling has been reached
+//! - `OutstandingCallLimit`: requests that timed out hold every slot of the
+//!   negotiated outstanding limit
 //! - `NotConnected`: a service was called while no association exists
 //! - `ConcludeRejected`: the peer refused the release with a Conclude-ErrorPDU
 //!   (`0xad`)
@@ -78,7 +79,12 @@ pub enum ClientError {
     #[error("invokeid collision: every pending invokeid is in use")]
     InvokeIdExhausted,
 
-    /// The negotiated ceiling on outstanding requests has been reached.
+    /// Requests that timed out unanswered hold every slot of the negotiated
+    /// outstanding limit, and no late answer freed one within the request
+    /// timeout, so the request was not sent. The association stays
+    /// established, and a late answer frees its slot; a peer that discarded
+    /// those requests never answers them, so their slots stay held until the
+    /// association is aborted or released and established again.
     #[error("the outstanding request limit has been reached")]
     OutstandingCallLimit,
 

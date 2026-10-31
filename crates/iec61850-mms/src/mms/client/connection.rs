@@ -154,7 +154,8 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     pub state: ConnectionState,
     /// Negotiated maximum PDU size in bytes.
     pub negotiated_max_pdu_size: usize,
-    /// Negotiated ceiling on outstanding calling requests.
+    /// Negotiated ceiling on the confirmed requests this client may have
+    /// outstanding at once; see [`Self::local_max_outstanding`].
     pub negotiated_max_calling: u16,
     /// Negotiated ceiling on outstanding called requests.
     pub negotiated_max_called: u16,
@@ -162,6 +163,17 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     pub connect_timeout_ms: u64,
     /// Request timeout in milliseconds.
     pub request_timeout_ms: u64,
+    /// proposedMaxServOutstandingCalling of the Initiate request. `None`
+    /// proposes `DEFAULT_MAX_SERV_OUTSTANDING_CALLING`, that is 5, and 0 is
+    /// proposed as 1.
+    ///
+    /// The negotiated value never exceeds this proposal, whatever the server
+    /// answers. A request that timed out counts as outstanding until its late
+    /// answer arrives, so once that many requests have timed out unanswered, the
+    /// next request first waits for a late answer; see
+    /// [`ClientError::OutstandingCallLimit`]. A request the peer discarded
+    /// holds its slot until a new association is established.
+    pub local_max_outstanding: Option<u16>,
     /// `localDetail` proposed in the Initiate request, the proposedMaxPduSize.
     /// `None` uses `DEFAULT_MAX_PDU_SIZE`, that is 65000. The negotiated size never
     /// exceeds this proposal, whatever the server answers.
@@ -208,6 +220,9 @@ pub struct MmsConnection<T, Tm> {
     pub connect_timeout_ms: u64,
     /// Request timeout in milliseconds.
     pub request_timeout_ms: u64,
+    /// proposedMaxServOutstandingCalling of the Initiate request; `None` uses
+    /// the default.
+    pub local_max_outstanding: Option<u16>,
     /// `localDetail` proposed in the Initiate request; `None` uses the default.
     pub local_max_pdu_size: Option<u32>,
     /// ISO addressing offered by the next association.
@@ -246,6 +261,7 @@ impl<T, Tm> MmsConnection<T, Tm> {
             negotiated_max_called: DEFAULT_MAX_SERV_OUTSTANDING_CALLED,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            local_max_outstanding: None,
             local_max_pdu_size: None,
             iso_parameters: IsoConnectionParameters::default(),
             max_pending_unconfirmed: DEFAULT_MAX_PENDING_UNCONFIRMED,
@@ -486,7 +502,10 @@ impl MmsConnection<TcpStream, TokioTimer> {
                 MmsPdu::InitiateResponse(resp) => {
                     self.negotiated_max_pdu_size =
                         negotiate_max_pdu_size(self.local_max_pdu_size, resp.local_detail_called);
-                    self.negotiated_max_calling = resp.negotiated_max_serv_outstanding_calling;
+                    self.negotiated_max_calling = negotiate_max_calling(
+                        self.proposed_max_calling(),
+                        resp.negotiated_max_serv_outstanding_calling,
+                    );
                     self.negotiated_max_called = resp.negotiated_max_serv_outstanding_called;
                     debug!(
                         max_pdu = self.negotiated_max_pdu_size,
@@ -602,6 +621,56 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         Ok(())
     }
 
+    /// Returns the proposedMaxServOutstandingCalling of the next Initiate
+    /// request, at least 1.
+    fn proposed_max_calling(&self) -> u16 {
+        self.local_max_outstanding
+            .unwrap_or(DEFAULT_MAX_SERV_OUTSTANDING_CALLING)
+            .max(1)
+    }
+
+    /// Waits until another confirmed request may be sent without exceeding
+    /// `negotiated_max_calling`.
+    ///
+    /// A request that timed out stays outstanding at the server until its late
+    /// answer arrives, so it counts against the limit together with the request
+    /// about to be sent. While the limit is reached, the connection reads on
+    /// within `request_timeout_ms`, discarding late answers and stashing
+    /// Unconfirmed PDUs, until a late answer frees a slot. With no request
+    /// timed out, it returns at once.
+    ///
+    /// # Errors
+    ///
+    /// - `OutstandingCallLimit` when no late answer frees a slot in time; the
+    ///   association stays established, but a slot held by a request the peer
+    ///   discarded is freed only by a new association.
+    /// - The receive errors of [`Self::recv_mms_pdu`].
+    pub(crate) async fn reserve_outstanding_slot(&mut self) -> Result<(), ClientError> {
+        let limit = usize::from(self.negotiated_max_calling.max(1));
+        if self.abandoned_invoke_ids.len() < limit {
+            return Ok(());
+        }
+        let timeout_ms = self.request_timeout_ms;
+        let timer = self.timer.clone();
+        match with_timeout(
+            &timer,
+            Duration::from_millis(timeout_ms),
+            self.await_outstanding_slot(limit),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    limit,
+                    timeout_ms,
+                    "every outstanding request slot is held by a request that timed out"
+                );
+                Err(ClientError::OutstandingCallLimit)
+            }
+        }
+    }
+
     /// Clears the per-association queues before a new association starts.
     fn reset_association_state(&mut self) {
         self.pending_unconfirmed.clear();
@@ -621,6 +690,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         if let Some(size) = self.local_max_pdu_size {
             init_req.local_detail_calling = Some(size);
         }
+        init_req.proposed_max_serv_outstanding_calling = self.proposed_max_calling();
         init_req.encode(&mut mms_buf);
 
         let mut acse_buf = BytesMut::new();
@@ -708,7 +778,10 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             MmsPdu::InitiateResponse(resp) => {
                 self.negotiated_max_pdu_size =
                     negotiate_max_pdu_size(self.local_max_pdu_size, resp.local_detail_called);
-                self.negotiated_max_calling = resp.negotiated_max_serv_outstanding_calling;
+                self.negotiated_max_calling = negotiate_max_calling(
+                    self.proposed_max_calling(),
+                    resp.negotiated_max_serv_outstanding_calling,
+                );
                 self.negotiated_max_called = resp.negotiated_max_serv_outstanding_called;
                 debug!(
                     max_pdu = self.negotiated_max_pdu_size,
@@ -1044,6 +1117,24 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         }
     }
 
+    async fn await_outstanding_slot(&mut self, limit: usize) -> Result<(), ClientError> {
+        while self.abandoned_invoke_ids.len() >= limit {
+            let pdu = self.recv_pdu().await?;
+            if let MmsPdu::Unconfirmed(inner) = pdu {
+                self.stash_unconfirmed(inner);
+                continue;
+            }
+            match response_invoke_id(&pdu) {
+                Ok(Some(id)) => self.discard_stray_answer(id, &pdu),
+                _ => warn!(
+                    tag = format!("0x{:02x}", pdu.tag_byte()),
+                    "discarding a pdu received while no request is outstanding"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     async fn await_unconfirmed(&mut self) -> Result<Bytes, ClientError> {
         loop {
             let pdu = self.recv_pdu().await?;
@@ -1374,6 +1465,12 @@ fn association_failed(context: &str, e: CotpError) -> ClientError {
     }
 }
 
+/// Returns the negotiated outstanding calling limit: the server's answer,
+/// never above the local proposal and never below 1.
+fn negotiate_max_calling(local_proposal: u16, server_answer: u16) -> u16 {
+    server_answer.clamp(1, local_proposal.max(1))
+}
+
 /// Returns the negotiated maximum PDU size: the smaller of the local proposal
 /// and the size the server answered. A server that omits `localDetailCalled`
 /// leaves the local proposal in force.
@@ -1506,6 +1603,14 @@ mod tests {
         assert!(!conn.take_abandoned(1), "the oldest invokeid is forgotten");
         assert!(conn.take_abandoned(count), "the newest invokeid is kept");
         assert!(!conn.take_abandoned(count), "an invokeid is taken once");
+    }
+
+    #[test]
+    fn negotiated_outstanding_limit_stays_within_the_proposal_and_above_zero() {
+        assert_eq!(negotiate_max_calling(5, 3), 3);
+        assert_eq!(negotiate_max_calling(5, 9), 5);
+        assert_eq!(negotiate_max_calling(5, 0), 1);
+        assert_eq!(negotiate_max_calling(0, 4), 1);
     }
 
     #[test]

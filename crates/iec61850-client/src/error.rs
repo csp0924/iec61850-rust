@@ -187,6 +187,15 @@ pub enum ClientError {
         error_code: u8,
     },
 
+    /// Requests that timed out unanswered hold every slot of the negotiated
+    /// outstanding limit, and no late answer freed one within the request
+    /// timeout, so the request was not sent. The association stays
+    /// established, and a late answer frees its slot; a peer that discarded
+    /// those requests never answers them, so their slots stay held until the
+    /// association is aborted or released and established again.
+    #[error("mms layer error: the outstanding request limit has been reached")]
+    OutstandingCallLimit,
+
     /// The encoded request exceeds the negotiated maximum PDU size, so it was
     /// not sent; the association stays usable.
     #[error(
@@ -257,6 +266,7 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::PduTooLarge { pdu_size, max_size } => {
                 ClientError::PduTooLarge { pdu_size, max_size }
             }
+            M::OutstandingCallLimit => ClientError::OutstandingCallLimit,
             M::NotConnected { .. } => ClientError::NotConnected,
             other => ClientError::Mms(other.to_string()),
         }
@@ -360,6 +370,14 @@ mod tests {
         assert_eq!(
             map(M::InitiateFailed { error_code: 2 }),
             ClientError::InitiateFailed { error_code: 2 }
+        );
+    }
+
+    #[test]
+    fn a_full_outstanding_limit_is_typed() {
+        assert_eq!(
+            map(M::OutstandingCallLimit),
+            ClientError::OutstandingCallLimit
         );
     }
 

@@ -39,6 +39,9 @@ struct Peer {
 enum Aare {
     /// result 0 with an Initiate response.
     Accept,
+    /// result 0 with an Initiate response negotiating this outstanding
+    /// calling limit.
+    AcceptWithMaxCalling(u16),
     /// An AARE whose result field is left out.
     WithoutResult,
 }
@@ -72,11 +75,15 @@ async fn accept(listener: &TcpListener, aare: Aare) -> Peer {
     assert_eq!(ind, AcseIndication::Associate);
 
     let mut init = BytesMut::new();
-    InitiateResponsePdu::default().encode(&mut init);
+    let mut init_resp = InitiateResponsePdu::default();
+    if let Aare::AcceptWithMaxCalling(n) = aare {
+        init_resp.negotiated_max_serv_outstanding_calling = n;
+    }
+    init_resp.encode(&mut init);
     let mut aare_buf = BytesMut::new();
     encode_aare(0, Some(&init), 3, &mut aare_buf);
     let aare_bytes = match aare {
-        Aare::Accept => aare_buf.to_vec(),
+        Aare::Accept | Aare::AcceptWithMaxCalling(_) => aare_buf.to_vec(),
         Aare::WithoutResult => without_element(&aare_buf, 0xa2),
     };
     let mut cpa = BytesMut::new();
@@ -580,4 +587,105 @@ async fn refused_tcp_connection_reports_its_kind() {
         }
         other => panic!("expected a transport error, got {other:?}"),
     }
+}
+
+async fn connected_with_max_calling(
+    request_timeout_ms: u64,
+    max_calling: u16,
+) -> (MmsClient, Peer) {
+    let (l, port) = listener().await;
+    let mut c = client(request_timeout_ms);
+    let (r, peer) = tokio::join!(
+        c.connect("127.0.0.1", port),
+        accept(&l, Aare::AcceptWithMaxCalling(max_calling))
+    );
+    r.expect("connect");
+    (c, peer)
+}
+
+#[tokio::test]
+async fn outstanding_limit_waits_for_the_late_answer() {
+    let (mut c, mut peer) = connected_with_max_calling(300, 1).await;
+    let (first, held_id) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
+    assert!(
+        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        "got {first:?}"
+    );
+
+    // the late answer frees the one slot, and only then is the next request sent
+    let server = async {
+        peer.send_read_response(held_id, vec![boolean(true)]).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        peer
+    };
+    let (second, _peer) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind2$stVal"), server);
+    assert_eq!(second.unwrap(), MmsData::Boolean(false));
+}
+
+#[tokio::test]
+async fn outstanding_limit_without_a_late_answer_refuses_to_send() {
+    let (mut c, mut peer) = connected_with_max_calling(300, 1).await;
+    let (first, _) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
+    assert!(
+        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        "got {first:?}"
+    );
+
+    let second = c.read("LD0", "GGIO1$ST$Ind2$stVal").await;
+    assert!(
+        matches!(second, Err(ClientError::OutstandingCallLimit)),
+        "got {second:?}"
+    );
+    assert_eq!(c.state(), ConnectionState::Connected);
+
+    // the next spdu the peer sees is the abort, so the refused read never left
+    let (r, next) = tokio::join!(c.abort(), peer.recv_spdu());
+    r.expect("abort");
+    let (ind, _) = next.expect("an spdu");
+    assert_eq!(ind, SessionIndication::Abort);
+}
+
+#[tokio::test]
+async fn outstanding_limit_with_a_free_slot_sends_at_once() {
+    let (mut c, mut peer) = connected_with_max_calling(300, 2).await;
+    let (first, held_id) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
+    assert!(
+        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        "got {first:?}"
+    );
+
+    // the second slot is free, so the request goes out before the late answer
+    let server = async {
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        peer.send_read_response(held_id, vec![boolean(true)]).await;
+        peer
+    };
+    let (second, _peer) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind2$stVal"), server);
+    assert_eq!(second.unwrap(), MmsData::Boolean(false));
+}
+
+#[tokio::test]
+async fn initiate_request_proposes_the_configured_outstanding_limit() {
+    let (l, port) = listener().await;
+    let mut c = MmsClientBuilder::new().max_outstanding(3).build();
+    let probe = async {
+        let (tcp, _) = l.accept().await.unwrap();
+        let mut cotp = CotpConnection::accept(tcp, CotpOptions::default())
+            .await
+            .unwrap();
+        let raw = cotp.recv_data().await.unwrap();
+        let mut session = IsoSession::new();
+        let mut pres = IsoPresentation::new();
+        session.parse_message(&raw).unwrap();
+        let cp = session.user_data(&raw).to_vec();
+        let connect = parse_connect(&mut pres, &cp).unwrap();
+        let aarq = connect.payload(&cp).to_vec();
+        let mut acse = AcseConnection::new(None);
+        let (_, init) = acse.parse_message(&aarq).unwrap();
+        iec61850_mms::mms::pdu::initiate::InitiateRequestPdu::decode(init).unwrap()
+    };
+    let (_, init) = tokio::join!(c.connect("127.0.0.1", port), probe);
+    assert_eq!(init.proposed_max_serv_outstanding_calling, 3);
 }

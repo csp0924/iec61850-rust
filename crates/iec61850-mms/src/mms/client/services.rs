@@ -134,7 +134,9 @@ fn strip_confirmed_wrapper(full: BytesMut) -> Result<Bytes, ClientError> {
 /// bound to it.
 ///
 /// `full` is the complete ConfirmedRequestPdu, outer `0xa0` included. The
-/// invokeID is released whatever the outcome.
+/// request is sent only once it fits within the negotiated outstanding limit,
+/// counting the requests that timed out unanswered. The invokeID is released
+/// whatever the outcome.
 async fn exchange<T: AsyncTransport, Tm: Timer>(
     conn: &mut MmsConnection<T, Tm>,
     alloc: &mut InvokeIdAllocator,
@@ -142,7 +144,7 @@ async fn exchange<T: AsyncTransport, Tm: Timer>(
     full: BytesMut,
 ) -> Result<MmsPdu, ClientError> {
     let result = match strip_confirmed_wrapper(full) {
-        Ok(inner) => match conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(inner)).await {
+        Ok(inner) => match send_within_limit(conn, MmsPdu::ConfirmedRequest(inner)).await {
             Ok(()) => conn.recv_confirmed_response(invoke_id).await,
             Err(e) => Err(e),
         },
@@ -150,6 +152,15 @@ async fn exchange<T: AsyncTransport, Tm: Timer>(
     };
     alloc.release(invoke_id);
     result
+}
+
+/// Sends `pdu` once a slot within the negotiated outstanding limit is free.
+async fn send_within_limit<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    pdu: MmsPdu,
+) -> Result<(), ClientError> {
+    conn.reserve_outstanding_slot().await?;
+    conn.send_mms_pdu(&pdu).await
 }
 
 // Service functions
