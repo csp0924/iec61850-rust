@@ -1819,10 +1819,10 @@ impl ReportingEngine {
                     return sent_count;
                 }
                 match push_segments(ch_sink, conn_id, pdus.into()) {
-                    Delivery::Complete { .. } => self.overflow_reported(brcb),
+                    Delivery::Complete { .. } => self.entry_formatted(brcb, entry.entry_id),
                     Delivery::Blocked { sent, rest } => {
                         if sent > 0 {
-                            self.overflow_reported(brcb);
+                            self.entry_formatted(brcb, entry.entry_id);
                         }
                         self.keep_partial(
                             &brcb.mms_path,
@@ -1855,7 +1855,7 @@ impl ReportingEngine {
                         return sent_count;
                     }
                     if n == 0 {
-                        self.overflow_reported(brcb);
+                        self.entry_formatted(brcb, entry.entry_id);
                     }
                 }
             }
@@ -1898,12 +1898,14 @@ impl ReportingEngine {
         }
     }
 
-    /// Clears the overflow flag of a BRCB once the first segment of an entry,
-    /// which carries the BufOvfl value, has been accepted (IEC 61850-7-2
-    /// §17.2.3.2.2.8).
-    fn overflow_reported(&self, brcb: &BufferedReportControl) {
+    /// Records that the first segment of the BRCB entry `entry_id`, which
+    /// carries the BufOvfl value, has been accepted: the overflow flag is
+    /// cleared, and the entry counts as formatted, so evicting it later does
+    /// not set the flag again (IEC 61850-7-2 §17.2.3.2.2.8, figures 30 and 31).
+    fn entry_formatted(&self, brcb: &BufferedReportControl, entry_id: super::buffer::EntryId) {
         if let Ok(mut buf) = brcb.lock_buffer() {
             buf.clear_overflow();
+            buf.mark_formatted(&entry_id);
         }
     }
 
@@ -4812,5 +4814,67 @@ mod tests {
         drain(&mut rx, &mut stale);
         engine.lock().unwrap().tick_at(Instant::now(), 2_000);
         assert!(rx.try_recv().is_err(), "no segment of the old report");
+    }
+
+    /// Evicting the entry still being sent in parts, which is already
+    /// formatted, does not make the next report claim an overflow (IEC 61850-7-2
+    /// §17.2.3.2.2.8, figure 30).
+    #[test]
+    fn evicting_the_entry_being_resumed_reports_no_overflow() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI | TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::BUFFER_OVERFLOW | OptFlds::DATA_REFERENCE)
+            .with_buffer_capacity(2);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(150))
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 200);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let small = |v: i64| {
+            let mut one = EnqueuedSnapshot::new(150);
+            one.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+            one.values[0] = Some(MmsValue::Integer(v));
+            one
+        };
+        let gi = eng.snapshot_full_dataset(path).unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(1_000, false, true, gi)
+            .unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(2_000, false, false, small(2))
+            .unwrap();
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        // The next entry evicts only the long one, which is being sent.
+        brcb_arc
+            .enqueue_entry_with_snapshot(3_000, false, false, small(3))
+            .unwrap();
+        assert!(!brcb_arc.lock_buffer().unwrap().is_overflow());
+
+        let mut pdus = Vec::new();
+        let mut sent = 0;
+        for _ in 0..20 {
+            drain(&mut rx, &mut pdus);
+            sent += eng.flush_brcb_pending(&brcb_arc, 5);
+            if sent == 3 {
+                break;
+            }
+        }
+        drain(&mut rx, &mut pdus);
+        assert_eq!(sent, 3);
+        let after = pdus.split_off(pdus.len() - 2);
+        assert!(!buf_ovfl(&after[0]), "nothing unsent was lost");
+        assert!(!buf_ovfl(&after[1]));
     }
 }

@@ -220,8 +220,13 @@ pub enum SeekResult {
 ///
 /// - `purge()` must clear the stored entries and the EntryID index together, so
 ///   no counter survives a purge and misreports the buffer contents.
-/// - `push()` on a full buffer applies the configured `OverflowStrategy` and must
-///   set `is_overflow`, so the next report carries `BufOvfl = true`.
+/// - `push()` on a full buffer applies the configured `OverflowStrategy`. It
+///   sets `is_overflow`, so the next report carries `BufOvfl = true`, whenever
+///   it loses an entry that was never formatted for transmission: the rejected
+///   new entry, or an evicted entry after the one `mark_formatted` last named.
+///   Evicting an entry already formatted loses nothing the client was not sent
+///   and leaves `is_overflow` alone (IEC 61850-7-2 §17.2.3.2.2.8, figures 30
+///   and 31).
 /// - `find_entry(id)` gives `EntryId::ZERO` no special meaning; the caller tests
 ///   `is_zero()` first.
 /// - `find_entry` returns an owned `Arc` rather than a borrow, so a backend whose
@@ -279,6 +284,13 @@ pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
 
     /// Clears the `BufOvfl` flag, once an entry has been transmitted.
     fn clear_overflow(&mut self);
+
+    /// Records that every entry up to and including `id` has been formatted
+    /// for transmission, so evicting one of them later does not set
+    /// `is_overflow`.
+    ///
+    /// The default does nothing, which makes every eviction set `is_overflow`.
+    fn mark_formatted(&mut self, _id: &EntryId) {}
 
     /// Returns every stored entry in insertion order.
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>>;
@@ -352,6 +364,9 @@ pub struct InMemoryReportBuffer {
     /// `BufOvfl` flag: set on overflow, cleared once an entry has been
     /// transmitted. A fresh buffer starts with it set.
     overflow: bool,
+    /// Numeric value of the newest EntryID formatted for transmission; zero
+    /// before any.
+    formatted_through: u64,
     /// Behavior when the buffer is full.
     strategy: OverflowStrategy,
     /// Engine-level `dropped_buffer_full` counter, injected by `register_brcb`.
@@ -378,6 +393,7 @@ impl InMemoryReportBuffer {
             enqueue_count: 0,
             // IEC 61850-7-2: a report buffer starts with isOverflow set.
             overflow: true,
+            formatted_through: 0,
             strategy,
             dropped_counter: None,
         }
@@ -405,6 +421,7 @@ impl ReportBufferBackend for InMemoryReportBuffer {
         }
 
         let mut evicted = false;
+        let mut lost_unformatted = false;
         // Full: apply the configured strategy.
         if self.entries.len() >= self.capacity {
             match self.strategy {
@@ -417,6 +434,9 @@ impl ReportBufferBackend for InMemoryReportBuffer {
                             // Every eviction counts as one dropped entry.
                             self.bump_dropped_counter();
                             evicted = true;
+                            if old.entry_id.as_u64() > self.formatted_through {
+                                lost_unformatted = true;
+                            }
                         } else {
                             break;
                         }
@@ -445,8 +465,9 @@ impl ReportBufferBackend for InMemoryReportBuffer {
         self.next_seq = self.next_seq.saturating_add(1);
         self.enqueue_count = self.enqueue_count.saturating_add(1);
 
-        if evicted {
-            // IEC 61850-7-2 enqueueReport: an eviction sets isOverflow.
+        if lost_unformatted {
+            // IEC 61850-7-2 enqueueReport: losing an entry not yet formatted
+            // sets isOverflow.
             self.overflow = true;
         }
         evicted
@@ -511,6 +532,10 @@ impl ReportBufferBackend for InMemoryReportBuffer {
 
     fn clear_overflow(&mut self) {
         self.overflow = false;
+    }
+
+    fn mark_formatted(&mut self, id: &EntryId) {
+        self.formatted_through = self.formatted_through.max(id.as_u64());
     }
 
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>> {
@@ -936,5 +961,33 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].entry_id, e1.entry_id);
         assert_eq!(v[1].entry_id, e2.entry_id);
+    }
+
+    /// Evicting an entry already formatted for transmission leaves BufOvfl
+    /// alone (IEC 61850-7-2 figure 30); evicting one never formatted sets it
+    /// (figure 31).
+    #[test]
+    fn only_an_evicted_unformatted_entry_sets_overflow() {
+        let mut buf = InMemoryReportBuffer::new(2);
+        buf.push(make_entry(1, 1));
+        buf.push(make_entry(2, 2));
+        buf.clear_overflow();
+        buf.mark_formatted(&EntryId::from_ms(1));
+        assert!(buf.push(make_entry(3, 3)), "entry 1 is evicted");
+        assert!(!buf.is_overflow(), "entry 1 was formatted");
+        assert!(buf.push(make_entry(4, 4)), "entry 2 is evicted");
+        assert!(buf.is_overflow(), "entry 2 was never formatted");
+    }
+
+    /// The rejected new entry of `DropNewest` was never formatted, so it sets
+    /// BufOvfl whatever was formatted before.
+    #[test]
+    fn a_rejected_entry_sets_overflow_after_everything_was_formatted() {
+        let mut buf = InMemoryReportBuffer::with_strategy(1, OverflowStrategy::DropNewest);
+        buf.push(make_entry(1, 1));
+        buf.clear_overflow();
+        buf.mark_formatted(&EntryId::from_ms(1));
+        assert!(buf.push(make_entry(2, 2)));
+        assert!(buf.is_overflow());
     }
 }

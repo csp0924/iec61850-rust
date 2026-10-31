@@ -141,6 +141,10 @@ struct SqliteInner {
     strategy: OverflowStrategy,
     brcb_id: String,
     overflow: bool,
+    /// Numeric value of the newest EntryID formatted for transmission; zero
+    /// before any. It is not persisted: after a restart every stored entry
+    /// counts as not yet formatted.
+    formatted_through: u64,
     dropped_counter: Option<Arc<AtomicU64>>,
 }
 
@@ -190,6 +194,7 @@ impl SqliteReportBuffer {
                 // A report buffer starts with isOverflow set, as the in-memory
                 // backend does.
                 overflow: true,
+                formatted_through: 0,
                 dropped_counter: None,
             }),
         })
@@ -211,6 +216,7 @@ impl SqliteReportBuffer {
                 strategy,
                 brcb_id: brcb_id.to_string(),
                 overflow: true,
+                formatted_through: 0,
                 dropped_counter: None,
             }),
         })
@@ -350,24 +356,25 @@ impl SqliteInner {
         )
     }
 
-    /// Evicts the oldest entry, for the `DropOldest` strategy. Returns whether a
-    /// row was actually deleted.
-    fn evict_oldest(&self) -> rusqlite::Result<bool> {
-        let oldest_seq: Option<i64> = self
+    /// Evicts the oldest entry, for the `DropOldest` strategy. Returns the
+    /// EntryID of the deleted row, or `None` when nothing was deleted.
+    fn evict_oldest(&self) -> rusqlite::Result<Option<EntryId>> {
+        let oldest: Option<(i64, Vec<u8>)> = self
             .conn
             .query_row(
-                "SELECT seq FROM report_entries WHERE brcb_id = ? ORDER BY seq ASC LIMIT 1",
+                "SELECT seq, entry_id FROM report_entries WHERE brcb_id = ? ORDER BY seq ASC LIMIT 1",
                 params![&self.brcb_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(seq) = oldest_seq else {
-            return Ok(false);
+        let Some((seq, entry_id)) = oldest else {
+            return Ok(None);
         };
+        let id = EntryId(Self::entry_id_from_blob(&entry_id)?);
         let n = self
             .conn
             .execute("DELETE FROM report_entries WHERE seq = ?", params![seq])?;
-        Ok(n > 0)
+        Ok((n > 0).then_some(id))
     }
 
     /// Increments the injected drop counter, when one has been injected.
@@ -479,6 +486,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         };
 
         let mut evicted = false;
+        let mut lost_unformatted = false;
         if count >= g.capacity {
             match g.strategy {
                 OverflowStrategy::DropOldest => {
@@ -489,11 +497,14 @@ impl ReportBufferBackend for SqliteReportBuffer {
                         c >= g.capacity
                     } {
                         match g.evict_oldest() {
-                            Ok(true) => {
+                            Ok(Some(id)) => {
                                 g.bump_dropped_counter();
                                 evicted = true;
+                                if id.as_u64() > g.formatted_through {
+                                    lost_unformatted = true;
+                                }
                             }
-                            Ok(false) => break,
+                            Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(error = %e, "sqlite report buffer eviction failed");
                                 break;
@@ -519,7 +530,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
             return false;
         }
 
-        if evicted {
+        if lost_unformatted {
             g.overflow = true;
         }
         evicted
@@ -635,6 +646,12 @@ impl ReportBufferBackend for SqliteReportBuffer {
     fn clear_overflow(&mut self) {
         if let Ok(mut g) = self.inner.lock() {
             g.overflow = false;
+        }
+    }
+
+    fn mark_formatted(&mut self, id: &EntryId) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.formatted_through = g.formatted_through.max(id.as_u64());
         }
     }
 
@@ -1202,5 +1219,21 @@ mod tests {
         assert_eq!(buf.len(), 0);
         // purge does not touch the overflow flag.
         assert!(buf.is_overflow());
+    }
+
+    /// Same rule as the in-memory backend: only an evicted entry that was never
+    /// formatted for transmission sets BufOvfl.
+    #[test]
+    fn only_an_evicted_unformatted_entry_sets_overflow() {
+        let mut buf =
+            SqliteReportBuffer::open_memory("brcb", 2, OverflowStrategy::DropOldest).unwrap();
+        buf.push(make_entry(1, 1));
+        buf.push(make_entry(2, 2));
+        buf.clear_overflow();
+        buf.mark_formatted(&EntryId::from_ms(1));
+        assert!(buf.push(make_entry(3, 3)), "entry 1 is evicted");
+        assert!(!buf.is_overflow(), "entry 1 was formatted");
+        assert!(buf.push(make_entry(4, 4)), "entry 2 is evicted");
+        assert!(buf.is_overflow(), "entry 2 was never formatted");
     }
 }
