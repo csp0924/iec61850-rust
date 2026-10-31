@@ -708,9 +708,10 @@ async fn second_handshake_resumed(
 const BOTH_VERSIONS: [TlsVersion; 2] = [TlsVersion::Tls12, TlsVersion::Tls13];
 
 #[tokio::test]
-async fn enabled_resumption_resumes_tls12_and_tls13_sessions() {
+async fn resumption_with_tls13_tickets_resumes_tls12_and_tls13_sessions() {
+    let server = |leaf: &Leaf| server_with(leaf).tls13_session_tickets(2);
     for max in BOTH_VERSIONS {
-        let resumed = second_handshake_resumed(server_with, max).await;
+        let resumed = second_handshake_resumed(server, max).await;
         assert!(resumed, "{max:?} session did not resume");
     }
 }
@@ -718,8 +719,15 @@ async fn enabled_resumption_resumes_tls12_and_tls13_sessions() {
 #[tokio::test]
 async fn disabled_resumption_disables_tls12_and_tls13_resumption() {
     for max in BOTH_VERSIONS {
-        let resumed =
-            second_handshake_resumed(|leaf| server_with(leaf).session_resumption(false), max).await;
+        let resumed = second_handshake_resumed(
+            |leaf| {
+                server_with(leaf)
+                    .tls13_session_tickets(2)
+                    .session_resumption(false)
+            },
+            max,
+        )
+        .await;
         assert!(!resumed, "{max:?} session resumed");
     }
 }
@@ -728,6 +736,7 @@ async fn disabled_resumption_disables_tls12_and_tls13_resumption() {
 async fn resumption_lifetime_keeps_disabled_resumption_off() {
     let server = |leaf: &Leaf| {
         server_with(leaf)
+            .tls13_session_tickets(2)
             .session_resumption(false)
             .session_resumption_lifetime(Duration::from_secs(7200))
     };
@@ -739,8 +748,11 @@ async fn resumption_lifetime_keeps_disabled_resumption_off() {
 
 #[tokio::test]
 async fn resumption_lifetime_keeps_sessions_resumable_within_it() {
-    let server =
-        |leaf: &Leaf| server_with(leaf).session_resumption_lifetime(Duration::from_secs(3600));
+    let server = |leaf: &Leaf| {
+        server_with(leaf)
+            .tls13_session_tickets(2)
+            .session_resumption_lifetime(Duration::from_secs(3600))
+    };
     for max in BOTH_VERSIONS {
         let resumed = second_handshake_resumed(server, max).await;
         assert!(resumed, "{max:?} session did not resume");
@@ -749,7 +761,11 @@ async fn resumption_lifetime_keeps_sessions_resumable_within_it() {
 
 #[tokio::test]
 async fn zero_resumption_lifetime_disables_resumption() {
-    let server = |leaf: &Leaf| server_with(leaf).session_resumption_lifetime(Duration::ZERO);
+    let server = |leaf: &Leaf| {
+        server_with(leaf)
+            .tls13_session_tickets(2)
+            .session_resumption_lifetime(Duration::ZERO)
+    };
     for max in BOTH_VERSIONS {
         let resumed = second_handshake_resumed(server, max).await;
         assert!(!resumed, "{max:?} session resumed");
@@ -761,16 +777,19 @@ fn resumption_lifetime_leaves_the_ticket_count_unchanged() {
     let ca = Ca::new();
     let leaf = ca.leaf(SERVER_NAME, 1);
     let default_count = server_with(&leaf)
+        .tls13_session_tickets(2)
         .build_server()
         .unwrap()
         .inner()
         .send_tls13_tickets;
     let with_lifetime = server_with(&leaf)
+        .tls13_session_tickets(2)
         .session_resumption_lifetime(Duration::from_secs(36_000))
         .build_server()
         .unwrap()
         .inner()
         .send_tls13_tickets;
+    assert_eq!(default_count, 2);
     assert_eq!(with_lifetime, default_count);
 }
 
@@ -860,26 +879,34 @@ async fn tls13_tickets_received(server: impl Fn(&Leaf) -> TlsConfigBuilder) -> u
 }
 
 #[tokio::test]
-async fn default_server_sends_tls13_tickets() {
+async fn default_server_sends_no_tls13_ticket() {
     let received = tls13_tickets_received(server_with).await;
-    assert_eq!(received, 2);
-}
-
-#[tokio::test]
-async fn tls13_session_tickets_sets_the_ticket_count() {
-    let received = tls13_tickets_received(|leaf| server_with(leaf).tls13_session_tickets(1)).await;
-    assert_eq!(received, 1);
-}
-
-#[tokio::test]
-async fn zero_tls13_session_tickets_sends_no_tls13_ticket() {
-    let received = tls13_tickets_received(|leaf| server_with(leaf).tls13_session_tickets(0)).await;
     assert_eq!(received, 0);
 }
 
 #[tokio::test]
-async fn zero_tls13_session_tickets_disables_only_tls13_resumption() {
-    let server = |leaf: &Leaf| server_with(leaf).tls13_session_tickets(0);
+async fn tls13_session_tickets_sets_the_ticket_count() {
+    for n in [1, 2] {
+        let received =
+            tls13_tickets_received(|leaf| server_with(leaf).tls13_session_tickets(n)).await;
+        assert_eq!(received, n);
+    }
+}
+
+#[tokio::test]
+async fn zero_tls13_session_tickets_sends_no_tls13_ticket() {
+    let received = tls13_tickets_received(|leaf| {
+        server_with(leaf)
+            .tls13_session_tickets(2)
+            .tls13_session_tickets(0)
+    })
+    .await;
+    assert_eq!(received, 0);
+}
+
+#[tokio::test]
+async fn default_server_resumes_tls12_but_not_tls13_sessions() {
+    let server = server_with;
     assert!(
         second_handshake_resumed(server, TlsVersion::Tls12).await,
         "Tls12 session did not resume"

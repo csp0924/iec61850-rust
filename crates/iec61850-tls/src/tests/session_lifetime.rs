@@ -106,6 +106,7 @@ async fn resumed_after(max: TlsVersion, lifetime: Duration, advance: Duration) -
         .with_cert_pem(p.leaf_pem.as_bytes(), p.leaf_key_pem.as_bytes())
         .unwrap()
         .session_resumption_lifetime(lifetime)
+        .tls13_session_tickets(2)
         .with_session_clock(clock.clock())
         .build_server()
         .unwrap();

@@ -6,8 +6,9 @@
 //!
 //! Defaults: validity-time validation on, allow-only-known peers off, client
 //! authentication requested but not required when trust anchors are set,
-//! session resumption on, and TLS 1.2 as the minimum version, which
-//! IEC 62351-3 mandates. Chain validation always runs.
+//! session resumption on with no TLS 1.3 session ticket sent, so only TLS 1.2
+//! sessions resume, and TLS 1.2 as the minimum version, which IEC 62351-3
+//! mandates. Chain validation always runs.
 //!
 //! Client authentication on the server is mandatory when
 //! [`TlsConfigBuilder::require_client_auth`] or
@@ -172,9 +173,8 @@ pub struct TlsConfigBuilder {
     session_resumption_lifetime: Option<Duration>,
     /// Time source of the server session store.
     session_clock: SessionClock,
-    /// TLS 1.3 tickets the server sends per handshake; `None` keeps the
-    /// rustls default.
-    tls13_session_tickets: Option<usize>,
+    /// TLS 1.3 tickets the server sends per handshake. Defaults to 0.
+    tls13_session_tickets: usize,
 
     // Renegotiation
     /// Requested renegotiation interval in milliseconds. Not applied: no
@@ -211,7 +211,7 @@ impl TlsConfigBuilder {
             session_resumption: true,
             session_resumption_lifetime: None,
             session_clock: system_clock(),
-            tls13_session_tickets: None,
+            tls13_session_tickets: 0,
             renegotiation_interval_ms: 0,
             event_handler: Arc::new(DefaultTracingHandler),
         }
@@ -385,6 +385,10 @@ impl TlsConfigBuilder {
 
     /// Enables or disables session resumption. Defaults to true.
     ///
+    /// When enabled, TLS 1.2 sessions resume through session IDs; TLS 1.3
+    /// sessions resume only when the server sends tickets, which it does
+    /// not unless [`Self::tls13_session_tickets`] is set.
+    ///
     /// When disabled, the server keeps no session state and issues no TLS 1.3
     /// ticket, so neither TLS 1.2 nor TLS 1.3 sessions resume, and the client
     /// offers no session to resume. This takes precedence over
@@ -409,13 +413,14 @@ impl TlsConfigBuilder {
     /// Sets how many TLS 1.3 session tickets the server sends after each
     /// handshake.
     ///
-    /// Without this setting the server sends the rustls default of two. Zero
-    /// sends no TLS 1.3 ticket, so TLS 1.3 sessions do not resume, while TLS
-    /// 1.2 session ID resumption keeps working. `session_resumption(false)`
-    /// and a zero [`Self::session_resumption_lifetime`] take precedence: either
-    /// sends no ticket whatever this value. Has no effect on `build_client`.
+    /// Defaults to 0: the server sends no TLS 1.3 ticket, so TLS 1.3 sessions
+    /// do not resume, while TLS 1.2 session ID resumption keeps working. Keep
+    /// it at 0 when serving TLS 1.3 clients that close the connection on
+    /// receiving a ticket. `session_resumption(false)` and a zero
+    /// [`Self::session_resumption_lifetime`] take precedence: either sends no
+    /// ticket whatever this value. Has no effect on `build_client`.
     pub fn tls13_session_tickets(mut self, n: usize) -> Self {
-        self.tls13_session_tickets = Some(n);
+        self.tls13_session_tickets = n;
         self
     }
 
@@ -641,9 +646,7 @@ impl TlsConfigBuilder {
                     self.session_clock,
                 ));
             }
-            if let Some(n) = self.tls13_session_tickets {
-                cfg.send_tls13_tickets = n;
-            }
+            cfg.send_tls13_tickets = self.tls13_session_tickets;
         }
 
         Ok(TlsServerConfig {
