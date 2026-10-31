@@ -238,8 +238,15 @@ impl ControlHandler for Gate {
     }
 }
 
-/// Control handler that records every control value it receives.
-struct Recorder(Arc<Mutex<Vec<MmsValue>>>);
+/// Control handler that records every control value it receives and signals
+/// each run.
+struct Recorder(Arc<Mutex<Vec<MmsValue>>>, Arc<Notify>);
+
+impl Recorder {
+    fn new(seen: &Arc<Mutex<Vec<MmsValue>>>) -> Self {
+        Self(seen.clone(), Arc::new(Notify::new()))
+    }
+}
 
 impl ControlHandler for Recorder {
     fn operate<'a>(
@@ -249,6 +256,7 @@ impl ControlHandler for Recorder {
         _t: bool,
     ) -> OperateFuture<'a> {
         self.0.lock().unwrap().push(v.clone());
+        self.1.notify_one();
         Box::pin(async { Ok(()) })
     }
 }
@@ -435,6 +443,7 @@ async fn a_second_select_by_the_same_client_is_refused() {
 async fn accepted_requests_send_no_last_appl_error() {
     let s = server();
     let obj = object("SPCSO2", ControlModel::SboNormal);
+    let mut changes = observe(&obj);
     register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
     let h = start(&s).await;
     let mut a = connect(&h).await;
@@ -448,6 +457,15 @@ async fn accepted_requests_send_no_last_appl_error() {
         .await
         .expect("operate");
     assert_eq!(queued_report(&mut a).await, None);
+    // The command runs on its own task after the response.
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Selected
+    );
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::OperateDone
+    );
     assert_eq!(obj.state(), ControlState::Unselected);
     h.stop().await;
 }
@@ -701,11 +719,13 @@ async fn oper_timeout_ends_the_command_with_time_limit_over() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operate_with_a_ctl_val_of_the_wrong_type_is_type_inconsistent() {
     let seen: Arc<Mutex<Vec<MmsValue>>> = Arc::default();
+    let recorder = Recorder::new(&seen);
+    let ran = recorder.1.clone();
     let s = server();
     register(
         &s,
         object("SPCSO1", ControlModel::DirectNormal),
-        Arc::new(Recorder(seen.clone())),
+        Arc::new(recorder),
     );
     let h = start(&s).await;
     let mut a = connect(&h).await;
@@ -743,6 +763,10 @@ async fn operate_with_a_ctl_val_of_the_wrong_type_is_type_inconsistent() {
     a.write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 1))
         .await
         .expect("a well-typed Oper");
+    // The command runs on its own task after the response.
+    tokio::time::timeout(WAIT, ran.notified())
+        .await
+        .expect("the control handler runs");
     assert_eq!(*seen.lock().unwrap(), vec![MmsValue::Boolean(true)]);
     h.stop().await;
 }
@@ -1176,7 +1200,7 @@ async fn an_operate_whose_association_closes_before_its_response_does_not_run() 
     s.control_objects().register(
         ControlObjectEntry::new(obj.clone())
             .with_wait(Arc::new(check) as Arc<dyn WaitForExecutionHandler>)
-            .with_operate(Arc::new(Recorder(seen.clone())) as Arc<dyn ControlHandler>),
+            .with_operate(Arc::new(Recorder::new(&seen)) as Arc<dyn ControlHandler>),
     );
     let h = start(&s).await;
     let mut conn = raw_connect(&h).await;
@@ -1341,7 +1365,7 @@ async fn operate_with_an_activation_time_is_refused_with_not_supported() {
     let seen: Arc<Mutex<Vec<MmsValue>>> = Arc::default();
     let s = server();
     let obj = object("SPCSO5", ControlModel::DirectEnhanced);
-    register(&s, obj.clone(), Arc::new(Recorder(seen.clone())));
+    register(&s, obj.clone(), Arc::new(Recorder::new(&seen)));
     let h = start(&s).await;
     let mut a = connect(&h).await;
 
