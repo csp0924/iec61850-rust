@@ -343,6 +343,10 @@ name = "scl_setting_view_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "scl_trg_ops_gi_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "scl_values_e2e"
 required-features = ["full-server"]
 

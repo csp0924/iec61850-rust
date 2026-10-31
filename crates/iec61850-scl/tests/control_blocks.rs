@@ -103,7 +103,66 @@ fn report_control_schema_is_unchanged() {
     assert!(rcb.is_buffered);
     assert_eq!(rcb.buf_tm_ms, 50);
     assert_eq!(rcb.intg_pd_ms, 1000);
-    assert_eq!(rcb.trg_ops, TrgOps::DCHG | TrgOps::INTEGRITY);
+    assert_eq!(rcb.trg_ops, TrgOps::DCHG | TrgOps::INTEGRITY | TrgOps::GI);
+}
+
+/// A `<TrgOps>` that leaves `gi` out enables general interrogation on a
+/// report control block, buffered or not, as IEC 61850-6 §9.3.8 defaults it;
+/// `gi="false"` disables it.
+#[test]
+fn report_trg_ops_default_gi_to_true() {
+    let m = build(&wrap(
+        r#"<ReportControl name="urcb" datSet="ds1" confRev="1"><TrgOps dchg="true"/></ReportControl>
+           <ReportControl name="brcb" datSet="ds1" confRev="1" buffered="true"><TrgOps dchg="true"/></ReportControl>
+           <ReportControl name="noGi" datSet="ds1" confRev="1"><TrgOps dchg="true" gi="false"/></ReportControl>
+           <ReportControl name="bare" datSet="ds1" confRev="1"><TrgOps/></ReportControl>"#,
+    ));
+    let rcbs = rcbs(&m);
+    assert_eq!(rcbs[0].trg_ops, TrgOps::DCHG | TrgOps::GI);
+    assert_eq!(rcbs[1].trg_ops, TrgOps::DCHG | TrgOps::GI);
+    assert_eq!(rcbs[2].trg_ops, TrgOps::DCHG);
+    assert_eq!(rcbs[3].trg_ops, TrgOps::GI);
+}
+
+/// A report or log control block without a `<TrgOps>` element has no
+/// trigger option at all.
+#[test]
+fn absent_trg_ops_element_enables_nothing() {
+    let m = build(&wrap(
+        r#"<ReportControl name="urcb" datSet="ds1" confRev="1"/>
+           <LogControl name="lcb1" datSet="ds1" logName="Log"/>"#,
+    ));
+    assert_eq!(rcbs(&m)[0].trg_ops, TrgOps::NONE);
+    assert_eq!(lcbs(&m)[0].trg_ops, TrgOps::NONE);
+}
+
+/// The `gi` default does not reach a log control block, to which general
+/// interrogation does not apply.
+#[test]
+fn log_trg_ops_drop_the_gi_default() {
+    let m = build(&wrap(
+        r#"<LogControl name="lcb1" datSet="ds1" logName="Log"><TrgOps dchg="true"/></LogControl>"#,
+    ));
+    assert_eq!(lcbs(&m)[0].trg_ops, TrgOps::DCHG);
+}
+
+/// The raw `<TrgOps>` of a report and a log control block both carry the
+/// `gi` default.
+#[test]
+fn raw_trg_ops_carry_the_gi_default() {
+    let raw = iec61850_scl::parse_scl(&wrap(
+        r#"<ReportControl name="urcb" datSet="ds1"><TrgOps dchg="true"/></ReportControl>
+           <LogControl name="lcb1" datSet="ds1" logName="Log"><TrgOps qchg="true"/></LogControl>"#,
+    ))
+    .expect("parse");
+    let ln0 = &raw.ieds[0].access_points[0]
+        .server
+        .as_ref()
+        .expect("server")
+        .logical_devices[0]
+        .logical_nodes[0];
+    assert!(ln0.report_controls[0].trg_ops.gi);
+    assert!(ln0.log_controls[0].trg_ops.gi);
 }
 
 /// The raw `<LogControl>` already applies the schema default of

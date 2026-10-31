@@ -153,6 +153,10 @@ pub(crate) fn parse_data_fc(
 
 /// Parses the five boolean attributes of a `<TrgOps>` element.
 ///
+/// An attribute left out takes its default from IEC 61850-6 §9.3.8: `gi`
+/// defaults to true and the other four to false, so `<TrgOps dchg="true"/>`
+/// enables data change and general interrogation.
+///
 /// This covers the case where the element is present. When `<TrgOps>` is
 /// absent entirely, the caller applies
 /// [`TriggerOptionsBits::default_when_missing`], which leaves every bit clear.
@@ -200,7 +204,7 @@ pub fn parse_trg_ops(
         quality_change: lookup_bool("qchg", false)?,
         data_update: lookup_bool("dupd", false)?,
         period: lookup_bool("period", false)?,
-        gi: lookup_bool("gi", false)?,
+        gi: lookup_bool("gi", true)?,
     })
 }
 
@@ -314,8 +318,9 @@ pub fn parse_smv_opts(
 impl TriggerOptionsBits {
     /// The value to use when the `<TrgOps>` element is absent entirely.
     ///
-    /// Every bit is clear. IEC 61850-6 defines no default here, so general
-    /// interrogation has to be requested explicitly rather than assumed.
+    /// Every bit is clear. IEC 61850-6 gives attribute defaults only for an
+    /// element that is present, so a control block without `<TrgOps>` has no
+    /// trigger option, general interrogation included.
     pub fn default_when_missing() -> Self {
         Self::default()
     }
@@ -408,11 +413,35 @@ mod tests {
     }
 
     #[test]
-    fn trg_ops_all_false_when_no_attrs() {
+    fn trg_ops_without_attrs_enables_only_gi() {
         let s = BytesStart::new("TrgOps");
         let bits = parse_trg_ops(s.attributes(), span(), "/").unwrap();
         assert!(!bits.data_change && !bits.quality_change && !bits.data_update);
-        assert!(!bits.period && !bits.gi);
+        assert!(!bits.period);
+        assert!(bits.gi, "gi defaults to true");
+    }
+
+    #[test]
+    fn trg_ops_dchg_only_keeps_the_gi_default() {
+        let s = BytesStart::new("TrgOps").with_attributes([("dchg", "true")]);
+        let bits = parse_trg_ops(s.attributes(), span(), "/").unwrap();
+        assert!(bits.data_change && bits.gi);
+        assert!(!bits.quality_change && !bits.data_update && !bits.period);
+    }
+
+    #[test]
+    fn trg_ops_explicit_gi_false_overrides_default() {
+        let s = BytesStart::new("TrgOps").with_attributes([("dchg", "true"), ("gi", "false")]);
+        let bits = parse_trg_ops(s.attributes(), span(), "/").unwrap();
+        assert!(bits.data_change);
+        assert!(!bits.gi);
+    }
+
+    #[test]
+    fn trg_ops_invalid_gi_value_is_rejected() {
+        let s = BytesStart::new("TrgOps").with_attributes([("gi", "yes")]);
+        let err = parse_trg_ops(s.attributes(), span(), "/").unwrap_err();
+        assert!(format!("{err}").contains("yes"));
     }
 
     #[test]
@@ -452,7 +481,7 @@ mod tests {
     #[test]
     fn missing_element_helpers_return_safe_defaults() {
         let trg = TriggerOptionsBits::default_when_missing();
-        assert!(!trg.gi, "general interrogation is not defaulted on");
+        assert!(!trg.gi, "an absent element enables no trigger option");
 
         let opt = OptionFieldsBits::default_when_missing();
         assert!(opt.buffer_overflow);

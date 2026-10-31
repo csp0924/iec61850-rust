@@ -67,10 +67,16 @@ fn generated_control_blocks_carry_the_schema() {
         lln0.rcbs[0].instance_names(),
         ["brcbSeq01", "brcbSeq02", "brcbSeq03"]
     );
+    // `<TrgOps dchg="true" period="true"/>` leaves `gi` at its default, true.
+    assert_eq!(
+        lln0.rcbs[0].trg_ops,
+        TrgOps::DCHG | TrgOps::INTEGRITY | TrgOps::GI
+    );
     let lcb = &lln0.lcbs[0];
     assert!(lcb.log_ena);
     assert!(!lcb.reason_code);
     assert_eq!(lcb.intg_pd_ms, 2000);
+    assert_eq!(lcb.trg_ops, TrgOps::DCHG | TrgOps::INTEGRITY);
 }
 
 #[test]
