@@ -545,6 +545,75 @@ impl ReportBufferBackend for InMemoryReportBuffer {
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Buffer backends for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{EntryId, ReportBufferBackend, ReportEntry, SeekResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A backend that counts how often each read path is taken and, on every
+    /// read, stands for a buffer one entry newer than at the previous read, as if
+    /// an entry had been enqueued in between.
+    #[derive(Debug, Default)]
+    pub(crate) struct CountingBuffer {
+        /// Calls of `iter_entries` so far.
+        pub(crate) iter_calls: Arc<AtomicUsize>,
+        /// Calls of `newest_entry` so far.
+        pub(crate) newest_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBuffer {
+        /// The newest entry after `n` reads.
+        pub(crate) fn entry(n: usize) -> Arc<ReportEntry> {
+            let ms = 1_700_000_000_000 + n as u64;
+            Arc::new(ReportEntry::new(
+                EntryId::from_ms(ms),
+                ms,
+                false,
+                false,
+                bytes::Bytes::new(),
+            ))
+        }
+
+        fn reads(&self) -> usize {
+            self.iter_calls.load(Ordering::SeqCst) + self.newest_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ReportBufferBackend for CountingBuffer {
+        fn push(&mut self, _entry: Arc<ReportEntry>) -> bool {
+            false
+        }
+        fn find_entry(&self, _id: &EntryId) -> Option<Arc<ReportEntry>> {
+            None
+        }
+        fn seek_to_after_entry_id(&self, _id: &EntryId) -> SeekResult {
+            SeekResult::NotFound
+        }
+        fn purge(&mut self) -> usize {
+            0
+        }
+        fn len(&self) -> usize {
+            1
+        }
+        fn is_overflow(&self) -> bool {
+            false
+        }
+        fn clear_overflow(&mut self) {}
+        fn iter_entries(&self) -> Vec<Arc<ReportEntry>> {
+            let n = self.reads();
+            self.iter_calls.fetch_add(1, Ordering::SeqCst);
+            vec![Self::entry(n)]
+        }
+        fn newest_entry(&self) -> Option<Arc<ReportEntry>> {
+            let n = self.reads();
+            self.newest_calls.fetch_add(1, Ordering::SeqCst);
+            Some(Self::entry(n))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

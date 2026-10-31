@@ -665,28 +665,93 @@ pub fn handle_get_brcb_field(
     mms_path: &str,
     field: RcbField,
 ) -> Option<iec61850_mms::mms::pdu::common::AccessResult> {
-    use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+    use iec61850_mms::mms::pdu::common::AccessResult;
 
     let brcb = {
         let eng = engine.lock().ok()?;
         eng.get_brcb(mms_path)?
     };
+    brcb_field_value(&brcb, &field, &mut None).map(AccessResult::Success)
+}
+
+/// The attributes of a BRCB in the order of its MMS structure, IEC 61850-8-1
+/// Table 72.
+pub(crate) const BRCB_STRUCTURE_FIELDS: [RcbField; 15] = [
+    RcbField::RptId,
+    RcbField::RptEna,
+    RcbField::DatSet,
+    RcbField::ConfRev,
+    RcbField::OptFlds,
+    RcbField::BufTm,
+    RcbField::SqNum,
+    RcbField::TrgOps,
+    RcbField::IntgPd,
+    RcbField::Gi,
+    RcbField::PurgeBuf,
+    RcbField::EntryId,
+    RcbField::TimeOfEntry,
+    RcbField::ResvTms,
+    RcbField::Owner,
+];
+
+/// Reads every attribute of a BRCB, in the order of `BRCB_STRUCTURE_FIELDS`.
+///
+/// EntryID and TimeofEntry come from one look at the buffer, so the time is the
+/// one of the exposed entry, per IEC 61850-7-2.
+///
+/// # Errors
+///
+/// Returns ObjectNonExistent when no BRCB is registered under `mms_path`, and
+/// HardwareFault, with the attribute concerned, when a lock is poisoned.
+pub(crate) fn handle_get_brcb_values(
+    engine: &Arc<Mutex<ReportingEngine>>,
+    mms_path: &str,
+) -> Result<Vec<iec61850_mms::mms::pdu::common::MmsData>, (Option<RcbField>, DataAccessError)> {
+    let brcb = {
+        let eng = engine
+            .lock()
+            .map_err(|_| (None, DataAccessError::HardwareFault))?;
+        eng.get_brcb(mms_path)
+            .ok_or((None, DataAccessError::ObjectNonExistent))?
+    };
+    let mut exposed: Option<(EntryId, u64)> = None;
+    BRCB_STRUCTURE_FIELDS
+        .iter()
+        .map(|field| {
+            brcb_field_value(&brcb, field, &mut exposed)
+                .ok_or_else(|| (Some(field.clone()), DataAccessError::HardwareFault))
+        })
+        .collect()
+}
+
+/// Reads one BRCB attribute; `None` when the attribute does not exist on a BRCB
+/// or a lock is poisoned.
+///
+/// `exposed` caches the entry `exposed_entry` returns, so the EntryID and the
+/// TimeofEntry of one read describe the same entry.
+fn brcb_field_value(
+    brcb: &super::brcb::BufferedReportControl,
+    field: &RcbField,
+    exposed: &mut Option<(EntryId, u64)>,
+) -> Option<iec61850_mms::mms::pdu::common::MmsData> {
+    use iec61850_mms::mms::pdu::common::MmsData;
 
     // EntryID and TimeofEntry may need the buffer, whose lock is never held
     // together with the state lock.
-    match field {
-        RcbField::EntryId => {
-            let (id, _) = exposed_entry(&brcb)?;
-            return Some(AccessResult::Success(MmsData::OctetString(id.0.to_vec())));
-        }
-        RcbField::TimeOfEntry => {
+    if matches!(field, RcbField::EntryId | RcbField::TimeOfEntry) {
+        let (id, ms) = match *exposed {
+            Some(e) => e,
+            None => {
+                let e = exposed_entry(brcb)?;
+                *exposed = Some(e);
+                e
+            }
+        };
+        return Some(match field {
+            RcbField::EntryId => MmsData::OctetString(id.0.to_vec()),
             // BinaryTime6 wire format; the stored value is host-order milliseconds.
-            let (_, ms) = exposed_entry(&brcb)?;
-            return Some(AccessResult::Success(MmsData::BinaryTime(
-                encode_binary_time6_bytes(ms),
-            )));
-        }
-        _ => {}
+            _ => MmsData::BinaryTime(encode_binary_time6_bytes(ms)),
+        });
     }
 
     // The other fields come from the runtime state.
@@ -748,7 +813,7 @@ pub fn handle_get_brcb_field(
         RcbField::Unknown(_) => return None,
     };
 
-    Some(AccessResult::Success(data))
+    Some(data)
 }
 
 /// Returns the EntryID a GetBRCBValues response exposes, with its TimeOfEntry
@@ -1182,6 +1247,7 @@ fn encode_binary_time6_bytes(ms: u64) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::flags::{OptFlds, TriggerOptions};
+    use crate::reporting::buffer::testing::CountingBuffer;
     use crate::reporting::dataset::{Dataset, DatasetEntry};
     use crate::reporting::rcb::Rcb;
     use iec61850_model::MmsValue;
@@ -2402,62 +2468,6 @@ mod tests {
             read(time_of_entry()),
             MmsData::BinaryTime(encode_binary_time6_bytes(1_700_000_000_500))
         );
-    }
-
-    /// A buffer backend that counts how often each read path is taken and, on
-    /// every `newest_entry` call, stands for a buffer one entry newer than at the
-    /// previous call, as if an entry had been enqueued in between.
-    #[derive(Debug, Default)]
-    struct CountingBuffer {
-        iter_calls: Arc<std::sync::atomic::AtomicUsize>,
-        newest_calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl CountingBuffer {
-        fn entry(n: usize) -> Arc<super::super::buffer::ReportEntry> {
-            let ms = 1_700_000_000_000 + n as u64;
-            Arc::new(super::super::buffer::ReportEntry::new(
-                EntryId::from_ms(ms),
-                ms,
-                false,
-                false,
-                bytes::Bytes::new(),
-            ))
-        }
-    }
-
-    impl super::super::buffer::ReportBufferBackend for CountingBuffer {
-        fn push(&mut self, _entry: Arc<super::super::buffer::ReportEntry>) -> bool {
-            false
-        }
-        fn find_entry(&self, _id: &EntryId) -> Option<Arc<super::super::buffer::ReportEntry>> {
-            None
-        }
-        fn seek_to_after_entry_id(&self, _id: &EntryId) -> super::super::buffer::SeekResult {
-            super::super::buffer::SeekResult::NotFound
-        }
-        fn purge(&mut self) -> usize {
-            0
-        }
-        fn len(&self) -> usize {
-            1
-        }
-        fn is_overflow(&self) -> bool {
-            false
-        }
-        fn clear_overflow(&mut self) {}
-        fn iter_entries(&self) -> Vec<Arc<super::super::buffer::ReportEntry>> {
-            use std::sync::atomic::Ordering;
-            let n = self.iter_calls.fetch_add(1, Ordering::SeqCst)
-                + self.newest_calls.load(Ordering::SeqCst);
-            vec![Self::entry(n)]
-        }
-        fn newest_entry(&self) -> Option<Arc<super::super::buffer::ReportEntry>> {
-            use std::sync::atomic::Ordering;
-            let n = self.newest_calls.fetch_add(1, Ordering::SeqCst)
-                + self.iter_calls.load(Ordering::SeqCst);
-            Some(Self::entry(n))
-        }
     }
 
     /// Registers a disabled BRCB backed by a `CountingBuffer` and returns the

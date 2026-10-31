@@ -2069,54 +2069,23 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
 /// PurgeBuf, EntryID, TimeofEntry, ResvTms, and Owner.
 ///
 /// An attribute that cannot be read fails the whole structure, so it is never
-/// returned half-populated.
+/// returned half-populated. EntryID and TimeofEntry describe the same entry.
 #[cfg(feature = "reporting")]
 fn read_brcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> AccessResult {
-    use crate::reporting::service::{handle_get_brcb_field, RcbField};
     use iec61850_mms::mms::pdu::common::MmsData;
 
-    let fields = [
-        RcbField::RptId,
-        RcbField::RptEna,
-        RcbField::DatSet,
-        RcbField::ConfRev,
-        RcbField::OptFlds,
-        RcbField::BufTm,
-        RcbField::SqNum,
-        RcbField::TrgOps,
-        RcbField::IntgPd,
-        RcbField::Gi,
-        RcbField::PurgeBuf,
-        RcbField::EntryId,
-        RcbField::TimeOfEntry,
-        RcbField::ResvTms,
-        RcbField::Owner,
-    ];
-    let mut members: Vec<MmsData> = Vec::with_capacity(fields.len());
-    for field in fields {
-        let name = field.as_str().to_string();
-        match handle_get_brcb_field(engine, mms_path, field) {
-            Some(AccessResult::Success(d)) => members.push(d),
-            Some(AccessResult::Failure(e)) => {
-                tracing::warn!(
-                    mms_path,
-                    field = name,
-                    ?e,
-                    "read: a buffered report control block attribute could not be read"
-                );
-                return AccessResult::Failure(e);
-            }
-            None => {
-                tracing::warn!(
-                    mms_path,
-                    field = name,
-                    "read: a buffered report control block attribute has no value"
-                );
-                return AccessResult::Failure(DataAccessError::HardwareFault);
-            }
+    match crate::reporting::service::handle_get_brcb_values(engine, mms_path) {
+        Ok(members) => AccessResult::Success(MmsData::Structure(members)),
+        Err((field, e)) => {
+            tracing::warn!(
+                mms_path,
+                field = field.as_ref().map(|f| f.as_str()),
+                ?e,
+                "read: a buffered report control block attribute could not be read"
+            );
+            AccessResult::Failure(e)
         }
     }
-    AccessResult::Success(MmsData::Structure(members))
 }
 
 /// The MMS components of a log control block, in the order of its MMS
@@ -5361,5 +5330,42 @@ mod log_control_name_tests {
             "an empty logical node is not an LCB"
         );
         assert!(!is_lcb_path("LLN0"), "a bare logical node is not an LCB");
+    }
+}
+
+#[cfg(all(test, feature = "reporting"))]
+mod brcb_structure_tests {
+    use super::*;
+    use crate::reporting::brcb::{Brcb, BufferedReportControl};
+    use crate::reporting::buffer::testing::CountingBuffer;
+    use iec61850_mms::mms::pdu::common::MmsData;
+
+    /// A whole GetBRCBValues takes EntryID and TimeofEntry from one look at the
+    /// buffer, even when a newer entry is enqueued while the structure is read.
+    #[test]
+    fn whole_brcb_read_pairs_entry_id_with_its_time_of_entry() {
+        let mut engine = ReportingEngine::new(Arc::new(crate::reporting::NullReportSink));
+        let path = "IED1LD0/LLN0$BR$brcbCount";
+        engine
+            .register_brcb(BufferedReportControl::with_backend(
+                path,
+                Brcb::new("brcbCount", "LLN0$ds1"),
+                Box::new(CountingBuffer::default()),
+            ))
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let AccessResult::Success(MmsData::Structure(members)) = read_brcb_structure(&engine, path)
+        else {
+            panic!("expected a structure");
+        };
+        let entry = CountingBuffer::entry(0);
+        assert_eq!(members[11], MmsData::OctetString(entry.entry_id.0.to_vec()));
+        assert_eq!(
+            members[12],
+            MmsData::BinaryTime(
+                iec61850_mms::binary_time6_from_epoch_ms(entry.time_of_entry_ms).to_vec()
+            )
+        );
     }
 }
