@@ -207,9 +207,9 @@ sudo setcap cap_net_raw+ep target/debug/examples/goose_publisher
 
 ## `no_std`
 
-Six crates build for `thumbv7em-none-eabihf` with `--no-default-features` plus
-an `alloc` or `embedded` feature: `iec61850-asn1`, `iec61850-model`,
-`iec61850-hal`, `iec61850-mms`, and `iec61850-client` and `iec61850-server` at
+Six crates build for `thumbv7em-none-eabihf` with `--no-default-features`:
+`iec61850-asn1` and `iec61850-hal` with `alloc`, `iec61850-model` and
+`iec61850-mms` with `embedded`, and `iec61850-client` and `iec61850-server` at
 their `minimal,embedded` feature set. On that path `hashbrown` replaces the
 standard collections, `spin::RwLock` replaces `std::sync::RwLock`, and the MMS
 stack runs over the `AsyncTransport` and `Timer` traits of `iec61850-hal` rather

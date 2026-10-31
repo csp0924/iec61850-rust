@@ -193,10 +193,12 @@ convention.
 
 **Environment selection.** `std` is a default feature everywhere, so an
 unqualified `cargo build` on a desktop target is the standard-library build and
-is unaffected by the embedded path existing. `alloc` is the `no_std` path with
-an allocator. `embedded` adds what a `no_std` target needs beyond that:
-`hashbrown` in place of the standard collections and `spin::RwLock` in place of
-`std::sync::RwLock`. `spin` is never enabled on a standard-library target, where
+is unaffected by the embedded path existing. `alloc` is the allocator base
+that `std` and `embedded` share; on its own it is a `no_std` build only for
+`iec61850-asn1` and `iec61850-hal`. `embedded` adds what a `no_std` target
+needs beyond that: `hashbrown` in place of the standard collections and
+`spin::RwLock` in place of `std::sync::RwLock`. From `iec61850-model` upward a
+`no_std` build selects `embedded`. `spin` is never enabled on a standard-library target, where
 busy-waiting would saturate a processor.
 
 `iec61850-asn1`, `iec61850-model` and `iec61850-hal` build for

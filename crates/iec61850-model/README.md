@@ -54,7 +54,9 @@ Default: `std`.
 
 - `std` (default) - the std collections and `std::sync::RwLock`. A desktop
   build needs no other flag.
-- `alloc` - the `no_std` base.
+- `alloc` - the allocator base that `std` and `embedded` share. It does not
+  build on its own, since the `no_std` collections and lock come with
+  `embedded`.
 - `embedded` - the `no_std` path: `hashbrown` replaces `std::HashMap` and
   `std::HashSet`, and `spin::RwLock` replaces `std::sync::RwLock`. An embedded
   target builds with `--no-default-features --features embedded`.

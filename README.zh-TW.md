@@ -133,7 +133,7 @@ sudo setcap cap_net_raw+ep target/debug/examples/goose_publisher
 
 ## `no_std`
 
-六個 crate 可在 `--no-default-features` 搭配 `alloc` 或 `embedded` feature 的條件下建置到 `thumbv7em-none-eabihf`：`iec61850-asn1`、`iec61850-model`、`iec61850-hal`、`iec61850-mms`，以及採用 `minimal,embedded` feature 集合的 `iec61850-client` 與 `iec61850-server`。在這條路徑上，`hashbrown` 取代標準函式庫的集合型別，`spin::RwLock` 取代 `std::sync::RwLock`，MMS 堆疊則跑在 `iec61850-hal` 的 `AsyncTransport` 與 `Timer` trait 之上，而不直接綁定 `tokio`。`CONTRIBUTING.md` 列出這六道指令。
+六個 crate 可在 `--no-default-features` 下建置到 `thumbv7em-none-eabihf`：`iec61850-asn1` 與 `iec61850-hal` 搭配 `alloc`，`iec61850-model` 與 `iec61850-mms` 搭配 `embedded`，`iec61850-client` 與 `iec61850-server` 採用 `minimal,embedded` feature 集合。在這條路徑上，`hashbrown` 取代標準函式庫的集合型別，`spin::RwLock` 取代 `std::sync::RwLock`，MMS 堆疊則跑在 `iec61850-hal` 的 `AsyncTransport` 與 `Timer` trait 之上，而不直接綁定 `tokio`。`CONTRIBUTING.md` 列出這六道指令。
 
 `std` 在每個 crate 都是 default feature，因此桌面環境的建置不受影響。client 與 server 標示為部分支援，是因為兩者各只有一部分能跨過去：server 的 `full-server` runtime 與 client 的報告分派器需要一個 runtime 與一個位址型別，仍留在 `std` 這條路徑上。
 

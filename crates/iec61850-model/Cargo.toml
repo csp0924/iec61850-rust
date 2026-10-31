@@ -18,6 +18,8 @@ categories = ["network-programming", "data-structures", "no-std"]
 # no_std + hashbrown + spin path.
 default  = ["std"]
 std      = ["alloc", "thiserror/std", "tracing/std", "tracing/attributes"]
+# Allocator base shared by std and embedded; not a build of its own, since the
+# no_std collections and lock come with embedded.
 alloc    = []
 # Embedded path: hashbrown replaces std::HashMap/HashSet and spin::RwLock
 # replaces std::sync::RwLock. spin must never be enabled on a std target, where

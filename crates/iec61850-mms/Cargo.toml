@@ -31,8 +31,9 @@ std = [
     "tracing/attributes",
 ]
 
-# alloc-only path: no_std + alloc. Every upper-layer type stays available; only
-# the std::io and tokio entry points are absent.
+# Allocator base shared by std and embedded. It does not build on its own: the
+# no_std path of iec61850-model and the hal transport traits come with
+# embedded.
 alloc = []
 
 # Embedded environment: alloc plus the hal transport traits, with the

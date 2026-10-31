@@ -56,8 +56,8 @@ Default: `std`.
 
 - `std` (default) - the tokio backend, through the `transport-tokio` feature of
   `iec61850-hal`.
-- `alloc` - the `no_std` plus `alloc` path. Every upper-layer type stays
-  available; only the `std::io` and tokio entry points are absent.
+- `alloc` - the allocator base that `std` and `embedded` share. It does not
+  build on its own; a `no_std` build selects `embedded`.
 - `embedded` - `alloc` plus the hal transport traits, with the downstream
   crates switched to `no_std`. The concrete backend comes from the
   `transport-embassy` feature of the hal.
