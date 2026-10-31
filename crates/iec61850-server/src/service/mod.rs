@@ -2609,7 +2609,7 @@ fn handle_write_with_routing(
                     return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
                 }
                 if let Some(field) = target.field.clone() {
-                    use crate::reporting::service::handle_set_brcb_field_for_connection;
+                    use crate::reporting::service::handle_set_brcb_field;
                     let rcb_value = match (field.as_str(), data) {
                         // ResvTms is an INT16; the field handler takes its
                         // non-negative range as an Unsigned.
@@ -2635,7 +2635,7 @@ fn handle_write_with_routing(
                             return WriteOutcome::Failure(e);
                         }
                     };
-                    if let Some(res) = handle_set_brcb_field_for_connection(
+                    if let Some(res) = handle_set_brcb_field(
                         reporting_engine,
                         &target.mms_path,
                         field,

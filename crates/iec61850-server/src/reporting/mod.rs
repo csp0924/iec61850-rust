@@ -52,8 +52,8 @@ pub use pdu::{
 };
 pub use rcb::{PendingReport, Rcb, RcbMetrics, RcbMetricsSnapshot, RcbState, ReportControl};
 pub use service::{
-    handle_get_brcb_field, handle_get_rcb_field, handle_set_brcb_field,
-    handle_set_brcb_field_for_connection, handle_set_rcb_field, RcbField, RcbWriteValue,
+    handle_get_brcb_field, handle_get_rcb_field, handle_set_brcb_field, handle_set_rcb_field,
+    RcbField, RcbWriteValue,
 };
 pub use sink::{ChannelReportSink, SendOutcome, REPORT_CHANNEL_CAP};
 #[cfg(feature = "sqlite-backend")]
