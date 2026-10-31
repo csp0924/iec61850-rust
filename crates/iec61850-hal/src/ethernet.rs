@@ -217,6 +217,40 @@ pub trait EthernetSocket: EthernetSource + EthernetSink {}
 
 impl<T: EthernetSource + EthernetSink> EthernetSocket for T {}
 
+/// Opens an L2 socket on the backend this build provides: AF_PACKET on Linux
+/// with `ethernet-linux-afpacket`, otherwise libpcap or NPCAP with
+/// `ethernet-pcap` or `ethernet-windows-npcap`.
+///
+/// # Errors
+///
+/// [`EthernetError::BackendNotSupported`] when no backend is compiled in for
+/// this target, and any error the selected backend's `open` reports.
+pub fn open_socket(cfg: &EthernetConfig) -> Result<Box<dyn EthernetSocket>, EthernetError> {
+    #[cfg(all(feature = "ethernet-linux-afpacket", target_os = "linux"))]
+    {
+        Ok(Box::new(linux::AfPacketSocket::open(cfg)?))
+    }
+    #[cfg(all(
+        any(feature = "ethernet-pcap", feature = "ethernet-windows-npcap"),
+        not(all(feature = "ethernet-linux-afpacket", target_os = "linux"))
+    ))]
+    {
+        Ok(Box::new(pcap::PcapSocket::open(cfg)?))
+    }
+    #[cfg(not(any(
+        all(feature = "ethernet-linux-afpacket", target_os = "linux"),
+        feature = "ethernet-pcap",
+        feature = "ethernet-windows-npcap"
+    )))]
+    {
+        let _ = cfg;
+        Err(EthernetError::BackendNotSupported(
+            "no L2 backend is enabled for this target; enable ethernet-linux-afpacket \
+             on Linux, or ethernet-pcap or ethernet-windows-npcap",
+        ))
+    }
+}
+
 // --- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
@@ -268,6 +302,19 @@ mod tests {
         assert_eq!(cfg.multicast_groups.len(), 2);
         assert!(cfg.promiscuous);
         assert_eq!(cfg.recv_timeout, Some(Duration::from_millis(100)));
+    }
+
+    #[cfg(not(any(
+        all(feature = "ethernet-linux-afpacket", target_os = "linux"),
+        feature = "ethernet-pcap",
+        feature = "ethernet-windows-npcap"
+    )))]
+    #[test]
+    fn open_socket_without_a_backend_reports_it() {
+        assert!(matches!(
+            open_socket(&EthernetConfig::new("eth0")),
+            Err(EthernetError::BackendNotSupported(_))
+        ));
     }
 
     /// The traits stay dyn-compatible: receivers hold their backend as
