@@ -570,3 +570,83 @@ async fn dat_set_write_increments_conf_rev_even_when_unchanged() {
     conn.disconnect().await.expect("disconnect");
     handle.stop().await;
 }
+
+/// A server configured for Ed2.1 refuses GoID and DatSet writes with
+/// object-access-denied, as IEC 61850-8-1 §18.1.1.1.1 Table 83 makes both
+/// read-only, and leaves the publisher untouched; GoEna stays writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ed2_1_server_refuses_go_id_and_dat_set_writes() {
+    use iec61850_mms::mms::client::error::ClientError;
+    use iec61850_mms::mms::pdu::DataAccessError;
+    use iec61850_server::Edition;
+
+    let mut config = IedServerConfig::default();
+    config.edition = Edition::Ed2_1;
+    let (handle, publisher) = start_server(config).await;
+    let mut client = connect(&handle).await;
+
+    for (component, value) in [
+        ("GoID", MmsData::VisibleString("changed".into())),
+        ("DatSet", MmsData::VisibleString("TESTLD0/LLN0$ds2".into())),
+    ] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write(DOMAIN, &format!("{GOCB_ITEM}${component}"), value),
+        )
+        .await
+        .expect("timeout");
+        assert!(
+            matches!(
+                r,
+                Err(ClientError::DataAccessError(
+                    DataAccessError::ObjectAccessDenied
+                ))
+            ),
+            "{component}: expected object-access-denied, got {r:?}"
+        );
+    }
+    {
+        let p = publisher.lock().unwrap();
+        assert_eq!(p.go_id(), Some("goid01"));
+        assert_eq!(p.data_set_ref(), "TESTLD0/LLN0$ds1");
+        assert_eq!(p.conf_rev(), 7);
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.write(
+            DOMAIN,
+            &format!("{GOCB_ITEM}$GoEna"),
+            MmsData::Boolean(true),
+        ),
+    )
+    .await
+    .expect("timeout")
+    .expect("GoEna stays writable");
+    assert!(publisher.lock().unwrap().enabled());
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+/// The default edition, Ed2, accepts a GoID write while the GoCB is disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ed2_server_accepts_go_id_writes_while_disabled() {
+    let (handle, publisher) = start_server(IedServerConfig::default()).await;
+    let mut client = connect(&handle).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.write(
+            DOMAIN,
+            &format!("{GOCB_ITEM}$GoID"),
+            MmsData::VisibleString("changed".into()),
+        ),
+    )
+    .await
+    .expect("timeout")
+    .expect("GoID write");
+    assert_eq!(publisher.lock().unwrap().go_id(), Some("changed"));
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}

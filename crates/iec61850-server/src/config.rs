@@ -47,6 +47,12 @@ pub struct IedServerConfig {
     pub max_dynamic_datasets_per_association: usize,
 
     /// IEC 61850 edition the server presents. Defaults to `Ed2`.
+    ///
+    /// The only behavior that depends on it is which GOOSE control block
+    /// components a client may write: under `Ed2_1`, GoID and DatSet are
+    /// read-only (IEC 61850-8-1 §18.1.1.1.1 Table 83); under `Ed2`, and under
+    /// `Ed1`, which behaves as `Ed2`, both are writable while the control
+    /// block is disabled (IEC 61850-7-2 §18.2.1 Table 42).
     pub edition: Edition,
 
     /// Functional constraints a remote client may write. Defaults to
@@ -87,6 +93,8 @@ impl Default for IedServerConfig {
 }
 
 /// IEC 61850 edition the server conforms to.
+///
+/// See [`IedServerConfig::edition`] for the behavior that depends on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Edition {

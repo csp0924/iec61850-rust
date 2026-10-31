@@ -1426,8 +1426,9 @@ impl IedServerBuilder<Bound> {
             ),
         );
 
-        let gocb_registry: Arc<crate::goose_mapping::GoCBRegistry> =
-            Arc::new(crate::goose_mapping::GoCBRegistry::new());
+        let gocb_registry: Arc<crate::goose_mapping::GoCBRegistry> = Arc::new(
+            crate::goose_mapping::GoCBRegistry::with_edition(self.config.edition),
+        );
 
         let dispatcher: Arc<dyn MmsServiceDispatcher> = match self.dispatcher {
             Some(d) => d,

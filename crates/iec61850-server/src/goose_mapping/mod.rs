@@ -10,8 +10,8 @@
 //! | Component | FC | Type | Access |
 //! |---|---|---|---|
 //! | GoEna | GO | BOOLEAN | read and write |
-//! | GoID | GO | VisibleString | read and write |
-//! | DatSet | GO | VisibleString | read and write |
+//! | GoID | GO | VisibleString | read; write up to Ed2 |
+//! | DatSet | GO | VisibleString | read; write up to Ed2 |
 //! | ConfRev | GO | UINT32 | read |
 //! | NdsCom | GO | BOOLEAN | read |
 //! | DstAddress | GO | PhyComAddress structure | read |
@@ -21,6 +21,11 @@
 //!
 //! The GoCB reference is the name of the variable, not a component. MinTime,
 //! MaxTime and FixedOffs are optional in Table 83 and always present here.
+//!
+//! The registry's [`Edition`] decides whether GoID and DatSet are writable:
+//! `Ed2_1` follows Table 83, which makes both read-only, while `Ed2` and `Ed1`
+//! follow IEC 61850-7-2 §18.2.1 Table 42, which lets a client write both while
+//! the GoCB is disabled. The behavior of `Ed1` is that of `Ed2`.
 //!
 //! The publisher is the only source of every value: a read takes GoEna, goID,
 //! datSet, confRev, ndsCom and the destination address from the publisher, and
@@ -51,6 +56,7 @@ use std::sync::{Arc, Mutex};
 use iec61850_goose::GoosePublisher;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, WriteOutcome};
 
+use crate::config::Edition;
 use crate::mapping::{ControlBlockKind, MmsTypeSpec};
 
 // GoCB handle
@@ -145,16 +151,37 @@ impl GoCBHandle {
 ///
 /// `IedServer` holds an `Arc<GoCBRegistry>` and the dispatcher shares that `Arc`.
 /// Entries are keyed by `(domain, item_base)`, for example
-/// `("IED1LD0", "LLN0$GO$gcb01")`.
-#[derive(Debug, Default)]
+/// `("IED1LD0", "LLN0$GO$gcb01")`. The registry carries the edition the server
+/// presents, which decides the writable components.
+#[derive(Debug)]
 pub struct GoCBRegistry {
     inner: std::sync::RwLock<HashMap<(String, String), Arc<GoCBHandle>>>,
+    edition: Edition,
+}
+
+impl Default for GoCBRegistry {
+    fn default() -> Self {
+        Self::with_edition(Edition::Ed2)
+    }
 }
 
 impl GoCBRegistry {
-    /// Creates an empty registry.
+    /// Creates an empty registry for the default edition, `Ed2`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty registry for `edition`.
+    pub fn with_edition(edition: Edition) -> Self {
+        Self {
+            inner: std::sync::RwLock::default(),
+            edition,
+        }
+    }
+
+    /// Returns the edition the registry's control blocks follow.
+    pub fn edition(&self) -> Edition {
+        self.edition
     }
 
     /// Registers a GoCB. An entry with the same key is replaced, and the call then
@@ -387,11 +414,14 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 // Write service helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Applies an MMS write to one GoCB component.
+/// Applies an MMS write to one GoCB component under `edition`.
 ///
-/// GoEna, a boolean, and GoID and DatSet, visible strings, are writable; GoID
-/// and DatSet only while the publisher is disabled, and otherwise they are
-/// refused with `TemporarilyUnavailable` (IEC 61850-7-2 §18.2.2.6.3).
+/// GoEna, a boolean, is always writable. Under `Edition::Ed2_1`, GoID and
+/// DatSet are read-only and refused with `ObjectAccessDenied`
+/// (IEC 61850-8-1 §18.1.1.1.1 Table 83). Under `Ed2` and `Ed1`, GoID and
+/// DatSet, visible strings, are writable while the publisher is disabled, and
+/// otherwise they are refused with `TemporarilyUnavailable`
+/// (IEC 61850-7-2 §18.2.2.6.3).
 ///
 /// A DatSet write takes a data set reference with or without its domain and
 /// stores it qualified with the control block's domain. Every accepted DatSet
@@ -404,7 +434,12 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 /// refused with `ObjectAccessDenied`, and so is a member below a component,
 /// such as `DstAddress$APPID`. An unknown component is refused with
 /// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
-pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> WriteOutcome {
+pub fn apply_gocb_write(
+    handle: &GoCBHandle,
+    edition: Edition,
+    da_name: &str,
+    value: &MmsData,
+) -> WriteOutcome {
     if da_name.contains('$') {
         return match encode_gocb_da(handle, da_name) {
             Ok(_) => {
@@ -416,6 +451,10 @@ pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> 
             }
             Err(e) => WriteOutcome::Failure(e),
         };
+    }
+    if edition == Edition::Ed2_1 && matches!(da_name, "GoID" | "DatSet") {
+        tracing::warn!(da_name, "write refused: read-only in IEC 61850-8-1 Ed2.1");
+        return WriteOutcome::Failure(DataAccessError::ObjectAccessDenied);
     }
     match da_name {
         "GoEna" => {
@@ -755,7 +794,7 @@ mod tests {
     fn write_go_ena_true_succeeds_and_publisher_enabled() {
         let h = sample_handle();
         assert!(!h.enabled());
-        let r = apply_gocb_write(&h, "GoEna", &MmsData::Boolean(true));
+        let r = apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
         assert_eq!(r, WriteOutcome::Success);
         assert!(h.enabled());
         assert!(h.publisher.lock().unwrap().enabled());
@@ -764,9 +803,9 @@ mod tests {
     #[test]
     fn write_go_ena_false_after_true_disables() {
         let h = sample_handle();
-        apply_gocb_write(&h, "GoEna", &MmsData::Boolean(true));
+        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
         assert!(h.enabled());
-        apply_gocb_write(&h, "GoEna", &MmsData::Boolean(false));
+        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(false));
         assert!(!h.enabled());
         assert!(!h.publisher.lock().unwrap().enabled());
     }
@@ -774,7 +813,7 @@ mod tests {
     #[test]
     fn write_go_ena_wrong_type_rejects() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, "GoEna", &MmsData::Unsigned(1));
+        let r = apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Unsigned(1));
         assert_eq!(
             r,
             WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
@@ -784,7 +823,12 @@ mod tests {
     #[test]
     fn write_go_id_succeeds() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, "GoID", &MmsData::VisibleString("MyGoID".into()));
+        let r = apply_gocb_write(
+            &h,
+            Edition::Ed2,
+            "GoID",
+            &MmsData::VisibleString("MyGoID".into()),
+        );
         assert_eq!(r, WriteOutcome::Success);
         assert_eq!(read(&h, "GoID"), MmsData::VisibleString("MyGoID".into()));
         assert_eq!(h.publisher.lock().unwrap().go_id(), Some("MyGoID"));
@@ -793,7 +837,7 @@ mod tests {
     #[test]
     fn write_go_id_wrong_type_rejects() {
         let h = sample_handle();
-        let r = apply_gocb_write(&h, "GoID", &MmsData::Boolean(true));
+        let r = apply_gocb_write(&h, Edition::Ed2, "GoID", &MmsData::Boolean(true));
         assert_eq!(
             r,
             WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
@@ -811,7 +855,7 @@ mod tests {
             "MaxTime",
             "FixedOffs",
         ] {
-            let r = apply_gocb_write(&h, da, &MmsData::Boolean(true));
+            let r = apply_gocb_write(&h, Edition::Ed2, da, &MmsData::Boolean(true));
             assert_eq!(
                 r,
                 WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
@@ -829,7 +873,12 @@ mod tests {
             // The same value again still counts as a change.
             ("IED1LD0/LLN0$ds3", "IED1LD0/LLN0$ds3", 8),
         ] {
-            let r = apply_gocb_write(&h, "DatSet", &MmsData::VisibleString(written.into()));
+            let r = apply_gocb_write(
+                &h,
+                Edition::Ed2,
+                "DatSet",
+                &MmsData::VisibleString(written.into()),
+            );
             assert_eq!(r, WriteOutcome::Success, "{written}");
             assert_eq!(read(&h, "DatSet"), MmsData::VisibleString(stored.into()));
             assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(conf_rev));
@@ -840,7 +889,12 @@ mod tests {
     fn write_dat_set_skips_the_reserved_conf_rev() {
         let h = sample_handle();
         h.publisher.lock().unwrap().set_conf_rev(u32::MAX);
-        let r = apply_gocb_write(&h, "DatSet", &MmsData::VisibleString("ds2".into()));
+        let r = apply_gocb_write(
+            &h,
+            Edition::Ed2,
+            "DatSet",
+            &MmsData::VisibleString("ds2".into()),
+        );
         assert_eq!(r, WriteOutcome::Success);
         assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(1));
     }
@@ -854,13 +908,18 @@ mod tests {
             MmsData::VisibleString("x".repeat(130)),
         ] {
             assert_eq!(
-                apply_gocb_write(&h, "DatSet", &bad),
+                apply_gocb_write(&h, Edition::Ed2, "DatSet", &bad),
                 WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
             );
         }
-        apply_gocb_write(&h, "GoEna", &MmsData::Boolean(true));
+        apply_gocb_write(&h, Edition::Ed2, "GoEna", &MmsData::Boolean(true));
         assert_eq!(
-            apply_gocb_write(&h, "DatSet", &MmsData::VisibleString("ds2".into())),
+            apply_gocb_write(
+                &h,
+                Edition::Ed2,
+                "DatSet",
+                &MmsData::VisibleString("ds2".into())
+            ),
             WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable)
         );
         assert_eq!(
@@ -871,10 +930,57 @@ mod tests {
     }
 
     #[test]
+    fn ed2_1_refuses_go_id_and_dat_set_writes() {
+        let h = sample_handle();
+        for (da, value) in [
+            ("GoID", MmsData::VisibleString("x".into())),
+            ("DatSet", MmsData::VisibleString("ds2".into())),
+        ] {
+            assert_eq!(
+                apply_gocb_write(&h, Edition::Ed2_1, da, &value),
+                WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+                "{da}"
+            );
+        }
+        assert_eq!(
+            read(&h, "GoID"),
+            MmsData::VisibleString("IED1LD0/LLN0$GO$gcb01".into())
+        );
+        assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(5));
+        assert_eq!(
+            apply_gocb_write(&h, Edition::Ed2_1, "GoEna", &MmsData::Boolean(true)),
+            WriteOutcome::Success
+        );
+    }
+
+    #[test]
+    fn ed1_writes_like_ed2() {
+        let h = sample_handle();
+        assert_eq!(
+            apply_gocb_write(
+                &h,
+                Edition::Ed1,
+                "GoID",
+                &MmsData::VisibleString("x".into())
+            ),
+            WriteOutcome::Success
+        );
+    }
+
+    #[test]
+    fn registry_carries_its_edition() {
+        assert_eq!(GoCBRegistry::new().edition(), Edition::Ed2);
+        assert_eq!(
+            GoCBRegistry::with_edition(Edition::Ed2_1).edition(),
+            Edition::Ed2_1
+        );
+    }
+
+    #[test]
     fn write_unknown_da_returns_nonexistent() {
         let h = sample_handle();
         for da in ["NoSuchDA", "GoCBRef"] {
-            let r = apply_gocb_write(&h, da, &MmsData::Boolean(true));
+            let r = apply_gocb_write(&h, Edition::Ed2, da, &MmsData::Boolean(true));
             assert_eq!(r, WriteOutcome::Failure(DataAccessError::ObjectNonExistent));
         }
     }
@@ -934,11 +1040,11 @@ mod tests {
     fn write_member_of_dst_address_is_denied() {
         let h = sample_handle();
         assert_eq!(
-            apply_gocb_write(&h, "DstAddress$APPID", &MmsData::Unsigned(1)),
+            apply_gocb_write(&h, Edition::Ed2, "DstAddress$APPID", &MmsData::Unsigned(1)),
             WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
         );
         assert_eq!(
-            apply_gocb_write(&h, "DstAddress$Nope", &MmsData::Unsigned(1)),
+            apply_gocb_write(&h, Edition::Ed2, "DstAddress$Nope", &MmsData::Unsigned(1)),
             WriteOutcome::Failure(DataAccessError::ObjectNonExistent)
         );
     }
