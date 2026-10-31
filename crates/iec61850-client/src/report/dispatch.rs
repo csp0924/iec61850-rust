@@ -35,6 +35,10 @@ use crate::sync::RwLock;
 /// report has been applied, so it may be moved into another task or held
 /// across an await point. A callback returning `()` cannot propagate an error;
 /// use a channel or shared state for that.
+///
+/// A segmented report invokes the callback once per segment, in arrival
+/// order, with `ClientReport::included` and `ClientReport::segmentation`
+/// describing that segment.
 pub type ReportCallback = Arc<dyn Fn(Arc<ClientReport>) + Send + Sync + 'static>;
 
 /// One registered handler together with the report state it accumulates.

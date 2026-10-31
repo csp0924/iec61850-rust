@@ -163,7 +163,8 @@ pub struct ParsedReport {
     /// Present with OptFlds SEGMENTATION.
     pub segmentation: Option<Segmentation>,
 
-    /// Always present; one bit per data set member.
+    /// Always present; one bit per data set member, set for each member whose
+    /// value this report, or this segment of a segmented report, carries.
     pub inclusion_bits: Vec<bool>,
 
     /// Present with OptFlds DATA_REFERENCE, in the order of the included

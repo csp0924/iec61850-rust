@@ -1,12 +1,14 @@
-//! End-to-end test of the reasons a report subscription exposes.
+//! End-to-end tests of the inclusion and the reasons a report subscription
+//! exposes.
 //!
 //! A URCB reports a data set of `Pos.stVal` (`dchg`) and `Pos.q` (`qchg`). A
 //! `stVal` change is reported first, then a `q` change alone. The second
 //! report carries only `q`, so the subscription state keeps the previous
-//! `stVal` value but gives `stVal` no reason for inclusion.
+//! `stVal` value but marks `stVal` as not included and gives it no reason.
 //!
 //! A scripted server sends a report whose ReasonCode is seven bits long, with
-//! bit 6 set, which a report does not define.
+//! bit 6 set, which a report does not define, and a report split into two
+//! segments, each delivered with its own inclusion.
 
 mod support;
 
@@ -145,12 +147,14 @@ async fn member_omitted_from_a_report_has_no_reason() {
     };
     server.update_bit_string_from_int(&st_val, 2).unwrap();
     let first = wait_for_reports(&conn, &seen, 1).await;
+    assert_eq!(first.included, vec![true, false]);
     assert_eq!(first.data_set_values[0], Some(dbpos_on.clone()));
     assert_eq!(first.reasons[0], ReasonForInclusion::DATA_CHANGE);
     assert_eq!(first.reasons[1], ReasonForInclusion::empty());
 
     server.update_bit_string(&q, &[0x60, 0x00], 3).unwrap();
     let second = wait_for_reports(&conn, &seen, 2).await;
+    assert_eq!(second.included, vec![false, true]);
     assert_eq!(second.reasons[1], ReasonForInclusion::QUALITY_CHANGE);
     assert_eq!(
         second.data_set_values[1],
@@ -257,5 +261,155 @@ async fn seven_bit_reason_code_is_accepted_and_bit_six_ignored() {
 
     let report = wait_for_reports(&conn, &seen, 1).await;
     assert_eq!(report.data_set_values[0], Some(MmsValue::Boolean(true)));
+    assert_eq!(report.included, vec![true]);
     assert_eq!(report.reasons[0], ReasonForInclusion::QUALITY_CHANGE);
+}
+
+/// Wraps the access results of an unbuffered report `RPT` in an
+/// InformationReport PDU.
+fn information_report(values: &[MmsData]) -> Bytes {
+    let mut results = BytesMut::new();
+    for v in values {
+        v.encode(&mut results);
+    }
+    let mut name = BytesMut::new();
+    tlv(0x80, b"RPT", &mut name);
+    let mut body = BytesMut::new();
+    tlv(0xa1, &name, &mut body);
+    tlv(0xa0, &results, &mut body);
+    let mut combined = BytesMut::new();
+    tlv(0xa0, &body, &mut combined);
+    let mut pdu = BytesMut::new();
+    tlv(0xa3, &combined, &mut pdu);
+    pdu.freeze()
+}
+
+/// Encodes a three-member inclusion bitstring.
+fn inclusion3(bits: [bool; 3]) -> MmsData {
+    let byte = bits
+        .iter()
+        .enumerate()
+        .fold(0u8, |acc, (i, &b)| if b { acc | (0x80 >> i) } else { acc });
+    MmsData::BitString {
+        padding: 5,
+        data: vec![byte],
+    }
+}
+
+/// One segment of a general-interrogation report of a three-member data set,
+/// with SeqNum 5 and the reason for inclusion.
+fn gi_segment(
+    rpt_id: &str,
+    sub_seq_num: u64,
+    more: bool,
+    bits: [bool; 3],
+    values: &[i64],
+) -> Bytes {
+    // ReasonCode, six bits: general-interrogation is wire bit 5.
+    let gi = MmsData::BitString {
+        padding: 2,
+        data: vec![0x04],
+    };
+    let mut items = vec![
+        MmsData::VisibleString(rpt_id.to_string()),
+        // OptFlds, ten bits: sequence-number is wire bit 1, reason-for-
+        // inclusion bit 3 and segmentation bit 9.
+        MmsData::BitString {
+            padding: 6,
+            data: vec![0x50, 0x40],
+        },
+        MmsData::Unsigned(5),
+        MmsData::Unsigned(sub_seq_num),
+        MmsData::Boolean(more),
+        inclusion3(bits),
+    ];
+    items.extend(values.iter().map(|&v| MmsData::Integer(v)));
+    items.extend(values.iter().map(|_| gi.clone()));
+    information_report(&items)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn segmented_report_is_delivered_per_segment_with_its_own_inclusion() {
+    const RPT_ID: &str = "rptSeg";
+    // Any Read is answered with a boolean, followed by both segments.
+    let port = support::start(Arc::new(|mms: &[u8], _seq: u32| {
+        let (invoke_id, _) = decode_confirmed_read_request(mms).ok()?;
+        let mut buf = BytesMut::new();
+        encode_confirmed_read_response(
+            invoke_id,
+            &ReadResponse {
+                variable_access_spec: None,
+                list_of_access_result: vec![AccessResult::Success(MmsData::Boolean(true))],
+            },
+            &mut buf,
+        );
+        Some(Plan {
+            reply: Some(buf.freeze()),
+            after: vec![
+                gi_segment(RPT_ID, 0, true, [true, true, false], &[1, 2]),
+                gi_segment(RPT_ID, 1, false, [false, false, true], &[3]),
+            ],
+            ..Plan::default()
+        })
+    }))
+    .await;
+
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    let seen: Arc<Mutex<Vec<Arc<ClientReport>>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let cb: ReportCallback = Arc::new(move |snap: Arc<ClientReport>| {
+        sink.lock().unwrap().push(snap);
+    });
+    conn.install_report_handler(
+        Some(RPT_ID.to_string()),
+        "IED1LD0/LLN0$RP$urcbSeg",
+        None,
+        cb,
+    )
+    .await
+    .expect("install handler");
+    conn.read_object("IED1LD0/LLN0.Beh.stVal", iec61850_model::FC::St)
+        .await
+        .expect("read");
+
+    let first = wait_for_reports(&conn, &seen, 1).await;
+    let seg = first.segmentation.expect("segmentation");
+    assert_eq!((seg.sub_seq_num, seg.more_segments_follow), (0, true));
+    assert_eq!(first.seq_num, Some(5));
+    assert_eq!(first.included, vec![true, true, false]);
+    assert_eq!(
+        first.data_set_values,
+        vec![Some(MmsValue::Integer(1)), Some(MmsValue::Integer(2)), None]
+    );
+
+    let second = wait_for_reports(&conn, &seen, 2).await;
+    let seg = second.segmentation.expect("segmentation");
+    assert_eq!((seg.sub_seq_num, seg.more_segments_follow), (1, false));
+    assert_eq!(second.seq_num, Some(5));
+    // The inclusion and the reasons are those of this segment; the values the
+    // first segment carried are kept.
+    assert_eq!(second.included, vec![false, false, true]);
+    assert_eq!(
+        second.reasons,
+        vec![
+            ReasonForInclusion::empty(),
+            ReasonForInclusion::empty(),
+            ReasonForInclusion::GI
+        ]
+    );
+    assert_eq!(
+        second.data_set_values,
+        vec![
+            Some(MmsValue::Integer(1)),
+            Some(MmsValue::Integer(2)),
+            Some(MmsValue::Integer(3))
+        ]
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }

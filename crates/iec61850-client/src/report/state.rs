@@ -6,6 +6,15 @@
 //! matches how `MmsValue` is handled everywhere else. The data set size is
 //! learned from the first report and fixed from then on: a later report of a
 //! different size is rejected instead of silently resizing the state.
+//!
+//! A report split into segments is applied one segment at a time, as each
+//! segment arrives; the segments are not reassembled. Each segment carries its
+//! own inclusion bitstring naming the members it holds, so after a segment is
+//! applied `ClientReport::included` describes that segment alone.
+//! `ClientReport::segmentation` gives SubSeqNum and MoreSegmentsFollow, from
+//! which an application that needs the whole report tells when it is
+//! complete: the segments of one report share SeqNum, SubSeqNum counts them
+//! from zero, and the last one has MoreSegmentsFollow false.
 
 use thiserror::Error;
 
@@ -44,12 +53,20 @@ pub struct ClientReport {
     pub entry_id: Option<Vec<u8>>,
     /// Configuration revision of the latest report, when it carried one.
     pub conf_rev: Option<u32>,
-    /// Segmentation header of the latest report, when it carried one.
+    /// Segmentation header of the latest report, when it carried one: the
+    /// latest report is then one segment of a report split across several
+    /// PDUs, and every per-member field below describes that segment.
     pub segmentation: Option<Segmentation>,
 
     /// One entry per data set member: `Some(value)` once a report has carried
     /// it, keeping the previous value for a member the latest report omitted.
+    /// `included` tells a value the latest report carried from one it kept.
     pub data_set_values: Vec<Option<MmsValue>>,
+
+    /// One entry per data set member: whether the inclusion bitstring of the
+    /// latest report, or of the latest segment of a segmented one, set the
+    /// member's bit, so that report carried its value.
+    pub included: Vec<bool>,
 
     /// One entry per data set member: the reason the latest report gives for
     /// it, or empty flags when that report omits the member or carries no
@@ -76,6 +93,7 @@ impl ClientReport {
             conf_rev: None,
             segmentation: None,
             data_set_values: Vec::new(),
+            included: Vec::new(),
             reasons: Vec::new(),
             data_references: Vec::new(),
         }
@@ -120,6 +138,7 @@ pub enum StateError {
 ///
 /// Members the report omits keep their previous value and data reference and
 /// have their reason cleared; those it includes are replaced outright.
+/// `included` is replaced by the report's inclusion bitstring.
 ///
 /// # Errors
 ///
@@ -132,6 +151,7 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
         None => {
             state.dataset_size = Some(dataset_size);
             state.data_set_values = vec![None; dataset_size];
+            state.included = vec![false; dataset_size];
             state.reasons = vec![ReasonForInclusion::empty(); dataset_size];
             state.data_references = vec![None; dataset_size];
         }
@@ -170,6 +190,7 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
     state.entry_id = parsed.entry_id;
     state.conf_rev = parsed.conf_rev;
     state.segmentation = parsed.segmentation;
+    state.included.clone_from(&parsed.inclusion_bits);
 
     // A reason describes only the report that carries it.
     state
@@ -353,6 +374,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.reasons[0], ReasonForInclusion::empty());
+    }
+
+    #[test]
+    fn included_follows_the_latest_inclusion_bitstring() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            make_parsed(
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(s.included, vec![true, true]);
+        apply_report(
+            &mut s,
+            make_parsed(vec![false, true], vec![MmsValue::Integer(3)], vec![]),
+        )
+        .unwrap();
+        // The first member keeps its value, but this report did not carry it.
+        assert_eq!(s.included, vec![false, true]);
+        assert_eq!(s.data_set_values[0], Some(MmsValue::Integer(1)));
+        assert_eq!(s.data_set_values[1], Some(MmsValue::Integer(3)));
+    }
+
+    #[test]
+    fn segments_are_applied_one_at_a_time() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        let mut first = make_parsed(
+            vec![true, true, false],
+            vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+            vec![ReasonForInclusion::GI, ReasonForInclusion::GI],
+        );
+        first.segmentation = Some(Segmentation {
+            sub_seq_num: 0,
+            more_segments_follow: true,
+        });
+        apply_report(&mut s, first).unwrap();
+        assert_eq!(s.included, vec![true, true, false]);
+        assert_eq!(s.data_set_values[2], None);
+
+        let mut second = make_parsed(
+            vec![false, false, true],
+            vec![MmsValue::Integer(3)],
+            vec![ReasonForInclusion::GI],
+        );
+        second.segmentation = Some(Segmentation {
+            sub_seq_num: 1,
+            more_segments_follow: false,
+        });
+        apply_report(&mut s, second).unwrap();
+        // The inclusion and the reasons are those of the second segment; the
+        // values of the first segment are kept.
+        assert_eq!(s.included, vec![false, false, true]);
+        assert_eq!(
+            s.reasons,
+            vec![
+                ReasonForInclusion::empty(),
+                ReasonForInclusion::empty(),
+                ReasonForInclusion::GI
+            ]
+        );
+        assert_eq!(
+            s.data_set_values,
+            vec![
+                Some(MmsValue::Integer(1)),
+                Some(MmsValue::Integer(2)),
+                Some(MmsValue::Integer(3))
+            ]
+        );
+        assert_eq!(
+            s.segmentation,
+            Some(Segmentation {
+                sub_seq_num: 1,
+                more_segments_follow: false,
+            })
+        );
     }
 
     #[test]
