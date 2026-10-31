@@ -785,6 +785,49 @@ mod tests {
     }
 
     #[test]
+    fn counter_wraps_are_accepted_by_a_receiver() {
+        use crate::receiver::GooseReceiver;
+        use crate::subscriber::{GooseEvent, GooseSubscriberBuilder};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<(u32, u32, bool)>>> = Arc::new(Mutex::new(vec![]));
+        let clone = seen.clone();
+        let sub = GooseSubscriberBuilder::new()
+            .gocb_ref("A/L$GO$gcb")
+            .listener(move |e| {
+                if let GooseEvent::NewState { state, .. }
+                | GooseEvent::Retransmission { state, .. } = e
+                {
+                    clone
+                        .lock()
+                        .unwrap()
+                        .push((state.st_num, state.sq_num, state.state_valid));
+                }
+            })
+            .build();
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut rx = rx.start();
+
+        let mut p = sample_publisher();
+        p.st_num = u32::MAX;
+        p.sq_num = u32::MAX;
+        rx.handle_message(&p.publish(&sample_data()).unwrap());
+        rx.handle_message(&p.publish(&sample_data()).unwrap());
+        p.increase_st_num();
+        rx.handle_message(&p.publish(&sample_data()).unwrap());
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (u32::MAX, u32::MAX, true),
+                (u32::MAX, 1, true),
+                (1, 0, true)
+            ]
+        );
+    }
+
+    #[test]
     fn st_num_increase_normal() {
         let mut p = sample_publisher();
         assert_eq!(p.st_num(), 1);

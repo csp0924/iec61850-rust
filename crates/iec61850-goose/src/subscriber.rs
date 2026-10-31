@@ -406,8 +406,10 @@ impl GooseSubscriber {
     /// A higher stNum, or the first publication, raises `NewState`; the same
     /// stNum raises `Retransmission`. An stNum that moves backwards, or an
     /// sqNum that does not advance within a state, clears `state_valid` while
-    /// the listener is still called. A change of confRev is passed as
-    /// `Err(ConfRevMismatch)` in `parse_result`.
+    /// the listener is still called. Both counters skip 0 when they overflow
+    /// (IEC 61850-8-1 §18.1.2.5.2), so a step from 4294967295 to 1 is an
+    /// advance. A change of confRev is passed as `Err(ConfRevMismatch)` in
+    /// `parse_result`.
     pub(crate) fn update_and_dispatch(&mut self, new_state: GooseSubscriberState) {
         let slot = self
             .streams
@@ -424,7 +426,8 @@ impl GooseSubscriber {
         let new_sq_num = new_state.sq_num;
         let new_conf_rev = new_state.conf_rev;
 
-        let st_num_rollback = prev.is_some() && new_st_num < prev_st_num;
+        let st_num_wrapped = prev.is_some() && is_wrap_to_one(prev_st_num, new_st_num);
+        let st_num_rollback = prev.is_some() && new_st_num < prev_st_num && !st_num_wrapped;
         if st_num_rollback {
             tracing::warn!(
                 "goose subscriber gocbref={:?}: stnum went backwards from {} to {}",
@@ -437,7 +440,8 @@ impl GooseSubscriber {
         let sq_num_rollback = !st_num_rollback
             && prev.is_some()
             && new_st_num == prev_st_num
-            && new_sq_num <= prev_sq_num;
+            && new_sq_num <= prev_sq_num
+            && !is_wrap_to_one(prev_sq_num, new_sq_num);
         if sq_num_rollback {
             tracing::warn!(
                 "goose subscriber gocbref={:?}: stnum={} sqnum {} did not advance past {}",
@@ -472,18 +476,19 @@ impl GooseSubscriber {
             ..new_state
         });
 
-        let event = if st_num_rollback || new_st_num > prev_st_num || prev_st_num == 0 {
-            GooseEvent::NewState {
-                prev_st_num,
-                state: final_state.clone(),
-                parse_result,
-            }
-        } else {
-            GooseEvent::Retransmission {
-                state: final_state.clone(),
-                parse_result,
-            }
-        };
+        let event =
+            if st_num_rollback || st_num_wrapped || new_st_num > prev_st_num || prev_st_num == 0 {
+                GooseEvent::NewState {
+                    prev_st_num,
+                    state: final_state.clone(),
+                    parse_result,
+                }
+            } else {
+                GooseEvent::Retransmission {
+                    state: final_state.clone(),
+                    parse_result,
+                }
+            };
 
         self.clock = self.clock.wrapping_add(1);
         let clock = self.clock;
@@ -557,6 +562,12 @@ impl GooseSubscriber {
             }
         }
     }
+}
+
+/// Returns whether a counter stepped from its maximum to 1, the overflow of
+/// stNum and sqNum (IEC 61850-8-1 §18.1.2.5.2).
+fn is_wrap_to_one(prev: u32, new: u32) -> bool {
+    prev == u32::MAX && new == 1
 }
 
 /// Milliseconds from the arrival of `state` to `now`, zero when `now` is
@@ -850,6 +861,59 @@ mod tests {
         let vals = events.lock().unwrap();
         assert!(vals[0], "first publication is valid");
         assert!(!vals[1], "a lower stnum is invalid");
+    }
+
+    /// Records `(is_new_state, state_valid)` of each event.
+    type EventLog = Arc<Mutex<Vec<(bool, bool)>>>;
+
+    fn recording_subscriber() -> (GooseSubscriber, EventLog) {
+        let events: EventLog = Arc::new(Mutex::new(vec![]));
+        let ev_clone = events.clone();
+        let sub = GooseSubscriberBuilder::new()
+            .gocb_ref("IED1/LLN0$GO$gcb")
+            .listener(move |e| match &e {
+                GooseEvent::NewState { state, .. } => {
+                    ev_clone.lock().unwrap().push((true, state.state_valid))
+                }
+                GooseEvent::Retransmission { state, .. } => {
+                    ev_clone.lock().unwrap().push((false, state.state_valid))
+                }
+                _ => {}
+            })
+            .build();
+        (sub, events)
+    }
+
+    #[test]
+    fn sq_num_wrap_to_one_is_a_retransmission_in_sequence() {
+        let (mut sub, events) = recording_subscriber();
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 5, u32::MAX, 1, 1000));
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 5, 1, 1, 1000));
+        assert_eq!(*events.lock().unwrap(), vec![(true, true), (false, true)]);
+    }
+
+    #[test]
+    fn st_num_wrap_to_one_is_a_new_state() {
+        let (mut sub, events) = recording_subscriber();
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", u32::MAX, 3, 1, 1000));
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 1, 0, 1, 1000));
+        assert_eq!(*events.lock().unwrap(), vec![(true, true), (true, true)]);
+    }
+
+    #[test]
+    fn sq_num_zero_after_max_is_still_out_of_sequence() {
+        let (mut sub, events) = recording_subscriber();
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 5, u32::MAX, 1, 1000));
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 5, 0, 1, 1000));
+        assert_eq!(*events.lock().unwrap(), vec![(true, true), (false, false)]);
+    }
+
+    #[test]
+    fn st_num_two_after_max_is_a_rollback() {
+        let (mut sub, events) = recording_subscriber();
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", u32::MAX, 0, 1, 1000));
+        sub.update_and_dispatch(make_state("IED1/LLN0$GO$gcb", 2, 0, 1, 1000));
+        assert_eq!(*events.lock().unwrap(), vec![(true, true), (true, false)]);
     }
 
     #[test]
