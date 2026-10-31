@@ -42,7 +42,8 @@ fn data_change_pending(time_of_entry_ms: u64) -> PendingReport {
 fn round_trip_time_of_entry(time_of_entry_ms: u64) -> u64 {
     let ds = single_entry_dataset();
     let pending = data_change_pending(time_of_entry_ms);
-    let mut params = ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending);
+    let mut params =
+        ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending, 65000);
     params.opt_flds = OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON;
     params.sq_num = 1;
     params.time_of_entry_ms = time_of_entry_ms;
@@ -106,7 +107,8 @@ fn time_of_entry_round_trips_at_the_last_millisecond_of_a_day() {
 fn wire_field_holds_the_1984_day_count_and_milliseconds_of_day() {
     let ds = single_entry_dataset();
     let pending = data_change_pending(INJECTED_TIME_OF_ENTRY_MS);
-    let mut params = ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending);
+    let mut params =
+        ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending, 65000);
     params.opt_flds = OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON;
     params.sq_num = 1;
     params.time_of_entry_ms = INJECTED_TIME_OF_ENTRY_MS;

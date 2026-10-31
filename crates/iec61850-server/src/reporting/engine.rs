@@ -22,6 +22,7 @@ use crate::connection::ConnectionId;
 use crate::error::{Result, ServerError};
 use crate::flags::{InclusionFlag, TriggerOptions};
 use bytes::Bytes;
+use iec61850_mms::mms::server::connection::SERVER_MAX_PDU_SIZE;
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -124,9 +125,9 @@ pub struct ReportingEngine {
     /// Engine-level metrics. `dropped_buffer_full` is incremented by the buffer
     /// backends themselves when an entry has to be discarded.
     metrics: Arc<ReportingEngineMetrics>,
-    /// Peer address of every open association, which identifies the owner of a
-    /// BRCB reservation across connections.
-    peers: HashMap<ConnectionId, IpAddr>,
+    /// Every open association: its peer address, which identifies the owner of
+    /// a BRCB reservation across connections, and its negotiated PDU size.
+    peers: HashMap<ConnectionId, Peer>,
     /// Data sets a DatSet write may name, shared with the server.
     dataset_registry: Option<super::DatasetRegistry>,
     /// Attribute reference of every member a DatSet write bound a control
@@ -186,6 +187,19 @@ impl ValueIndex {
         (weak.strong_count() > 0 && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(value)))
             .then(|| attr_ref.clone())
     }
+}
+
+/// Largest report PDU sent to a connection whose association is not
+/// registered, in bytes: the largest MMS PDU size the server negotiates.
+const UNREGISTERED_MAX_PDU_SIZE_BYTES: usize = SERVER_MAX_PDU_SIZE as usize;
+
+/// What the engine keeps about one open association.
+#[derive(Debug, Clone, Copy)]
+struct Peer {
+    /// Address of the remote end.
+    ip: IpAddr,
+    /// max_mms_pdu_size negotiated by Initiate, in bytes.
+    max_pdu_size_bytes: usize,
 }
 
 /// Buffer-time accumulation state for one BRCB.
@@ -1064,10 +1078,26 @@ impl ReportingEngine {
 
     // ─── Association peers ────────────────────────────────────────────────────
 
-    /// Records the peer address of association `conn_id`.
+    /// Records the peer address of association `conn_id` and the
+    /// max_mms_pdu_size it negotiated, in bytes.
+    ///
+    /// Every report PDU sent to the association stays within that size, per
+    /// IEC 61850-8-1 §6.2.2.2 (b): the whole MMSpdu counts, the Session and
+    /// Presentation envelope does not.
     #[cfg(any(feature = "full-server", test))]
-    pub(crate) fn register_peer(&mut self, conn_id: ConnectionId, peer: IpAddr) {
-        self.peers.insert(conn_id, peer);
+    pub(crate) fn register_peer(
+        &mut self,
+        conn_id: ConnectionId,
+        peer: IpAddr,
+        max_pdu_size_bytes: usize,
+    ) {
+        self.peers.insert(
+            conn_id,
+            Peer {
+                ip: peer,
+                max_pdu_size_bytes,
+            },
+        );
     }
 
     /// Forgets the peer address of association `conn_id`.
@@ -1078,7 +1108,17 @@ impl ReportingEngine {
 
     /// Returns the peer address of association `conn_id`, when it is known.
     pub(crate) fn peer(&self, conn_id: ConnectionId) -> Option<IpAddr> {
-        self.peers.get(&conn_id).copied()
+        self.peers.get(&conn_id).map(|p| p.ip)
+    }
+
+    /// Returns the largest report PDU association `conn_id` accepts, in bytes.
+    ///
+    /// An association that was never registered gets the largest size the
+    /// server negotiates.
+    fn max_pdu_size_bytes(&self, conn_id: ConnectionId) -> usize {
+        self.peers
+            .get(&conn_id)
+            .map_or(UNREGISTERED_MAX_PDU_SIZE_BYTES, |p| p.max_pdu_size_bytes)
     }
 
     // ─── Connection loss ──────────────────────────────────────────────────────
@@ -1146,6 +1186,8 @@ impl ReportingEngine {
 
     /// Sends every PDU segment of one pending report, honoring backpressure.
     ///
+    /// The report is segmented at the PDU size the association negotiated.
+    ///
     /// With a `ChannelReportSink` injected, each PDU goes through `try_send_pdu` and
     /// the `SendOutcome` decides what happens:
     ///
@@ -1172,7 +1214,7 @@ impl ReportingEngine {
         pending: PendingReport,
         now_ms: u64,
     ) -> Option<ConnectionId> {
-        let (rpt_id, opt_flds, sq_num, dat_set, conf_rev, dataset_clone, max_pdu) = {
+        let (rpt_id, opt_flds, sq_num, dat_set, conf_rev, dataset_clone) = {
             let Ok(mut state) = rc.state.lock() else {
                 return None;
             };
@@ -1194,7 +1236,6 @@ impl ReportingEngine {
                 state.dat_set.clone(),
                 state.conf_rev,
                 dataset_clone,
-                65000usize, // TODO: take this from the connection negotiated max PDU size
             )
         };
 
@@ -1207,7 +1248,7 @@ impl ReportingEngine {
             conf_rev,
             dataset: &dataset_clone,
             pending: &pending,
-            max_pdu_size_bytes: max_pdu,
+            max_pdu_size_bytes: self.max_pdu_size_bytes(conn_id),
         };
 
         // A PduTooSmall result is a fatal configuration error: the report is dropped
@@ -1313,7 +1354,9 @@ impl ReportingEngine {
     /// - `WaitingForNext`: the trigger path failed to run the `on_enqueue` hook; this
     ///   is logged as an error and nothing is sent
     ///
-    /// Each entry is encoded, then sent segment by segment. `sq_num`, the transmit
+    /// Each entry is encoded, segmented at the PDU size the association
+    /// negotiated, then sent segment by segment. Every segment of an entry
+    /// carries the EntryID of that entry. `sq_num`, the transmit
     /// anchor, and the overflow flag advance only once the last segment of an entry
     /// has been accepted, so a partial send is retried from the same entry. A
     /// `WouldBlock` leaves the anchor untouched for the next attempt; a closed or
@@ -1394,7 +1437,7 @@ impl ReportingEngine {
             None => self.brcb_dataset_or_empty(&snap.dat_set),
         };
         let dataset = &dataset_clone;
-        let max_pdu = 65000usize;
+        let max_pdu = self.max_pdu_size_bytes(conn_id);
         let mut sent_count: usize = 0;
 
         for entry in entries.iter() {
@@ -3389,5 +3432,118 @@ mod tests {
             buffered_at,
             "the same instant TimeofEntry reads back"
         );
+    }
+
+    /// A data set of `n` members with long references, so a general
+    /// interrogation report over it takes several segments of a small PDU.
+    fn wide_ds(n: usize) -> Dataset {
+        let tail = "x".repeat(60);
+        let mut ds = Dataset::new("ds1");
+        for i in 0..n {
+            ds.push(make_entry(
+                &format!("IED1LD0/GGIO1$ST$Ind{i:03}$stVal_{tail}"),
+                MmsValue::Integer(i as i64),
+            ));
+        }
+        ds
+    }
+
+    /// Runs one URCB general interrogation for association 3 and returns the
+    /// PDUs it produced; `max_pdu` registers the association with that size.
+    fn urcb_gi_pdus(max_pdu: Option<usize>) -> Vec<Bytes> {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+        let rc = ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb);
+        engine.register_rcb(rc, wide_ds(30)).unwrap();
+        if let Some(size) = max_pdu {
+            engine.register_peer(3, "10.0.0.3".parse().unwrap(), size);
+        }
+        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        enable_rcb(&rc_arc, 3);
+        rc_arc.lock().unwrap().state.lock().unwrap().gi = true;
+        engine.tick_at(Instant::now(), 1_000_000);
+        let pdus = sink.pdus.lock().unwrap();
+        pdus.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    #[test]
+    fn urcb_report_is_segmented_at_the_negotiated_pdu_size() {
+        let pdus = urcb_gi_pdus(Some(400));
+        assert!(pdus.len() >= 3, "{} pdus", pdus.len());
+        for pdu in &pdus {
+            assert!(pdu.len() <= 400, "a {} byte pdu", pdu.len());
+        }
+        // The same report fits one PDU for an association that is not
+        // registered.
+        let whole = urcb_gi_pdus(None);
+        assert_eq!(whole.len(), 1);
+        assert!(whole[0].len() > 400);
+    }
+
+    /// Flushes one BRCB general interrogation entry to association 5 and
+    /// returns the PDUs it produced.
+    fn brcb_gi_pdus(max_pdu: Option<usize>) -> Vec<Bytes> {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let sink = Arc::new(CollectReportSink::default());
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE | OptFlds::ENTRY_ID);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(30))
+            .unwrap();
+        if let Some(size) = max_pdu {
+            eng.register_peer(5, "10.0.0.5".parse().unwrap(), size);
+        }
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+            s.gi = true;
+        }
+        eng.tick_brcb(Instant::now(), 1_000_000);
+        let pdus = sink.pdus.lock().unwrap();
+        pdus.iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    #[test]
+    fn brcb_report_is_segmented_at_the_negotiated_pdu_size() {
+        let pdus = brcb_gi_pdus(Some(400));
+        assert!(pdus.len() >= 3, "{} pdus", pdus.len());
+        for pdu in &pdus {
+            assert!(pdu.len() <= 400, "a {} byte pdu", pdu.len());
+        }
+        // Every segment of the entry carries its EntryID.
+        let entry_id = {
+            let first = &pdus[0];
+            let at = first
+                .windows(2)
+                .position(|w| w == [0x89, 0x08])
+                .expect("EntryID");
+            first[at..at + 10].to_vec()
+        };
+        assert!(pdus.iter().all(|p| contains(p, &entry_id)));
+        let whole = brcb_gi_pdus(None);
+        assert_eq!(whole.len(), 1);
+        assert!(whole[0].len() > 400);
+    }
+
+    #[test]
+    fn deregistered_association_no_longer_limits_its_reports() {
+        let mut engine = ReportingEngine::new_null();
+        engine.register_peer(9, "10.0.0.9".parse().unwrap(), 512);
+        assert_eq!(engine.max_pdu_size_bytes(9), 512);
+        assert_eq!(engine.peer(9), Some("10.0.0.9".parse().unwrap()));
+        engine.deregister_peer(9);
+        assert_eq!(
+            engine.max_pdu_size_bytes(9),
+            UNREGISTERED_MAX_PDU_SIZE_BYTES
+        );
+        assert_eq!(engine.peer(9), None);
     }
 }

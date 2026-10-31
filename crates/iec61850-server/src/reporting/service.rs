@@ -2008,7 +2008,7 @@ mod tests {
         engine
             .lock()
             .unwrap()
-            .register_peer(1, "10.0.0.1".parse().unwrap());
+            .register_peer(1, "10.0.0.1".parse().unwrap(), 65000);
         let owner = || match handle_get_rcb_field(&engine, &path, RcbField::Owner) {
             Some(AccessResult::Success(MmsData::OctetString(o))) => o,
             other => panic!("expected an OctetString, got {other:?}"),
@@ -3134,9 +3134,9 @@ mod tests {
             .register_brcb(BufferedReportControl::new(&path, brcb))
             .unwrap();
         let owner_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        engine.register_peer(OWNER, owner_ip);
-        engine.register_peer(OWNER_AGAIN, owner_ip);
-        engine.register_peer(OTHER, "10.0.0.2".parse().unwrap());
+        engine.register_peer(OWNER, owner_ip, 65000);
+        engine.register_peer(OWNER_AGAIN, owner_ip, 65000);
+        engine.register_peer(OTHER, "10.0.0.2".parse().unwrap(), 65000);
         (Arc::new(Mutex::new(engine)), path)
     }
 

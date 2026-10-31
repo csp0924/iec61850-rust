@@ -631,10 +631,14 @@ where
     } = established;
 
     // ── Register the association with the server ────────────────────────
+    // Reports to this association stay within the PDU size it negotiated.
+    let max_pdu_size = mms_conn
+        .negotiated_max_pdu_size()
+        .unwrap_or(iec61850_mms::mms::server::connection::SERVER_MAX_PDU_SIZE);
     let client_conn = ClientConnection::new(conn_id, peer, mms_conn);
     server.add_connection(client_conn.clone());
     if let Ok(mut engine) = server.reporting_engine().lock() {
-        engine.register_peer(conn_id, peer.ip());
+        engine.register_peer(conn_id, peer.ip(), max_pdu_size as usize);
     }
 
     // ── Command terminations ────────────────────────────────────────────

@@ -52,10 +52,17 @@
 //! sets `moreFollows` on every segment but the last. The inclusion bitstring of
 //! a segment marks only the members that segment carries, per IEC 61850-8-1
 //! §17.2.1, so the segments of a report mark disjoint sets of members whose
-//! union is the whole report. The limit is the smaller of the maximum PDU size
-//! the caller passes and 65535 bytes. The size of a PDU is computed before it
-//! is encoded, so a report larger than the limit is split rather than emitted
-//! as one oversized PDU, and a client is never handed a PDU it cannot receive.
+//! union is the whole report. Each segment holds as many of the remaining
+//! members as fit.
+//!
+//! The limit is the smaller of `max_pdu_size_bytes` and 65535 bytes. The caller
+//! passes the max_mms_pdu_size the association negotiated, which IEC 61850-8-1
+//! §6.2.2.2 (b) defines as the size of the whole encoded MMSpdu: the outer
+//! `0xa3` tag and length count, the Session and Presentation envelope does not.
+//! The size of a PDU is computed before it is encoded, so a report larger than
+//! the limit is split rather than emitted as one oversized PDU. A report with a
+//! member that does not fit in a segment on its own is not sent at all; see
+//! `ReportEncodeError::PduTooSmall`.
 //!
 //! ## variableAccessSpecification
 //!
@@ -102,10 +109,11 @@ pub const MIN_REPORT_OVERHEAD_BYTES: usize = 30;
 /// Why a report PDU could not be encoded.
 ///
 /// When the negotiated maximum PDU size cannot hold even a single data set
-/// element, encoding fails instead of silently dropping the report. The caller
-/// (`flush_pending` or `flush_brcb_pending`) treats that as a fatal configuration
-/// error: it logs the failure and leaves the transmit anchor and sqNum untouched,
-/// so the entry is retried once the configuration is corrected rather than lost.
+/// element, encoding fails instead of sending an oversized PDU. The reporting
+/// engine logs the failure and leaves SqNum where it was. A URCB report is
+/// dropped. A BRCB entry stays at the transmit anchor and is tried again on
+/// every flush, so it is not lost and goes out once an association with a
+/// large enough PDU size enables the control block.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReportEncodeError {
@@ -144,21 +152,24 @@ pub struct ReportEncodeParams<'a> {
     pub dataset: &'a Dataset,
     /// Pending report: inclusion flags and the value snapshot.
     pub pending: &'a PendingReport,
-    /// Negotiated maximum MMS PDU size, in bytes.
+    /// max_mms_pdu_size negotiated by the association the report goes to, in
+    /// bytes; no PDU of the report exceeds it.
     pub max_pdu_size_bytes: usize,
 }
 
 impl<'a> ReportEncodeParams<'a> {
     /// Creates the parameters of a report with identifier `rpt_id` on the data
-    /// set `dat_set`, carrying the values of `dataset` that `pending` marks.
+    /// set `dat_set`, carrying the values of `dataset` that `pending` marks,
+    /// for an association that negotiated `max_pdu_size_bytes`.
     ///
-    /// `opt_flds` is empty, `sq_num`, `time_of_entry_ms` and `conf_rev` are
-    /// 0, and `max_pdu_size_bytes` is 65000.
+    /// `opt_flds` is empty, and `sq_num`, `time_of_entry_ms` and `conf_rev` are
+    /// 0.
     pub fn new(
         rpt_id: &'a str,
         dat_set: &'a str,
         dataset: &'a Dataset,
         pending: &'a PendingReport,
+        max_pdu_size_bytes: usize,
     ) -> Self {
         Self {
             rpt_id,
@@ -169,7 +180,7 @@ impl<'a> ReportEncodeParams<'a> {
             conf_rev: 0,
             dataset,
             pending,
-            max_pdu_size_bytes: 65000,
+            max_pdu_size_bytes,
         }
     }
 }
@@ -712,23 +723,26 @@ pub struct BrcbReportEncodeParams<'a> {
     pub dataset: &'a Dataset,
     /// Pending report: value snapshot and inclusion flags.
     pub pending: &'a PendingReport,
-    /// Negotiated maximum MMS PDU size, in bytes.
+    /// max_mms_pdu_size negotiated by the association the report goes to, in
+    /// bytes; no PDU of the report exceeds it.
     pub max_pdu_size_bytes: usize,
 }
 
 impl<'a> BrcbReportEncodeParams<'a> {
     /// Creates the parameters of the buffered entry `entry_id`, reported with
     /// identifier `rpt_id` on the data set `dat_set` and carrying the values
-    /// of `dataset` that `pending` marks.
+    /// of `dataset` that `pending` marks, for an association that negotiated
+    /// `max_pdu_size_bytes`.
     ///
     /// `opt_flds` is empty, `sq_num`, `time_of_entry_ms` and `conf_rev` are
-    /// 0, `is_overflow` is `false`, and `max_pdu_size_bytes` is 65000.
+    /// 0, and `is_overflow` is `false`.
     pub fn new(
         rpt_id: &'a str,
         dat_set: &'a str,
         entry_id: EntryId,
         dataset: &'a Dataset,
         pending: &'a PendingReport,
+        max_pdu_size_bytes: usize,
     ) -> Self {
         Self {
             rpt_id,
@@ -741,7 +755,7 @@ impl<'a> BrcbReportEncodeParams<'a> {
             is_overflow: false,
             dataset,
             pending,
-            max_pdu_size_bytes: 65000,
+            max_pdu_size_bytes,
         }
     }
 }
