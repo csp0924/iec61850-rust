@@ -229,7 +229,7 @@ async fn well_formed_name_list_walk_completes() {
 async fn name_list_walk_that_does_not_advance_is_an_error() {
     let conn = connect("REPEAT").await;
     let r = conn.get_server_directory(false).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert_eq!(r, Err(ClientError::NameListNotAdvancing));
 }
 
 /// A page whose names sort before the continuation is accepted: no order is
@@ -290,7 +290,7 @@ async fn name_list_walk_that_repeats_the_continuation_yields_each_name_once() {
 async fn name_list_walk_that_ends_on_its_continuation_is_an_error() {
     let conn = connect("STUCKEND").await;
     let r = conn.get_server_directory(false).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert_eq!(r, Err(ClientError::NameListNotAdvancing));
     assert_eq!(STUCKEND_REQUESTS.load(Ordering::SeqCst), 2);
 }
 
@@ -404,5 +404,5 @@ async fn completed_disconnect_drops_the_device_model() {
 async fn name_list_walk_without_new_names_is_an_error() {
     let conn = connect("RECYCLE").await;
     let r = conn.get_server_directory(false).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert_eq!(r, Err(ClientError::NameListNotAdvancing));
 }

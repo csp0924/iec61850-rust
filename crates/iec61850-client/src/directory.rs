@@ -104,10 +104,11 @@ pub const DEFAULT_MAX_NAME_LIST_NAMES: usize = 1_000_000;
 ///
 /// # Errors
 ///
-/// `NotConnected` if the association is not established, `Mms` if a page that
-/// reports more names ends on the continuation it was asked for or brings no
-/// name not yet received, `NameListLimit` if the walk exceeds the
-/// connection's name limit, and the error the MMS layer reports.
+/// `NotConnected` if the association is not established,
+/// `NameListNotAdvancing` if a page that reports more names ends on the
+/// continuation it was asked for or brings no name not yet received,
+/// `NameListLimit` if the walk exceeds the connection's name limit, and the
+/// error the MMS layer reports.
 async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     conn: &IedConnection<T, Tm>,
     object_class: ObjectClass,
@@ -155,10 +156,7 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
                 continue_after = continue_after.as_deref(),
                 "getnamelist page does not move the walk on, abandoning it"
             );
-            return Err(ClientError::Mms(format!(
-                "getnamelist reports more names but brings none new after '{}'",
-                continue_after.as_deref().unwrap_or_default()
-            )));
+            return Err(ClientError::NameListNotAdvancing);
         };
         continue_after = Some(last);
     }

@@ -119,6 +119,13 @@ pub enum ClientError {
         limit: usize,
     },
 
+    /// A GetNameList walk of the directory services did not advance: the
+    /// server reported more names but a page ended on the name it continued
+    /// after or brought no name not yet received. Following `moreFollows`
+    /// would repeat the same request forever.
+    #[error("the server reported more names but sent none not yet received")]
+    NameListNotAdvancing,
+
     /// A journal read by `IedConnection::query_journal_all` did not advance:
     /// the server reported that more entries follow but sent none past the
     /// last entry received, or a continuation began before the entry it
