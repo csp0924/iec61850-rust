@@ -129,6 +129,13 @@ pub enum SimulationFilter {
     /// Accepts only publications that are not simulated.
     NonSimulated,
     /// Accepts only simulated publications.
+    ///
+    /// This is a plain filter, not the LPHD.Sim behavior of IEC 61850-7-4:
+    /// with Sim set, a subscriber keeps using the original publication until
+    /// a simulated one has been received, whereas this filter drops original
+    /// publications from the start, so they are never delivered and their
+    /// supervision is not fed. LPHD.Sim is built with [`Any`](Self::Any) and
+    /// an application that switches on `simulation` or `frame_simulation`.
     Simulated,
 }
 
