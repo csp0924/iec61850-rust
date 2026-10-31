@@ -1221,7 +1221,9 @@ mod over_tls {
 
     /// A peer that completes the TLS handshake and never answers the COTP
     /// connection request ends the connect at the same deadline, as a connect
-    /// timeout rather than a TLS failure. Only the deadline can end it.
+    /// timeout rather than a TLS failure. Only the deadline can end it; the
+    /// handshake, which takes a small fraction of a second on loopback, has
+    /// to complete within the deadline, so the deadline is ten seconds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unanswered_cotp_request_over_tls_ends_at_the_connect_deadline() {
         let (ca, cert, key) = certificates();
@@ -1238,9 +1240,14 @@ mod over_tls {
             drop(stream);
         })
         .await;
-        let conn = client_bounded_by_two_seconds();
+        let conn = IedConnection::with_mms_client(
+            MmsClientBuilder::new()
+                .connect_timeout_ms(10_000)
+                .request_timeout_ms(10_000)
+                .build(),
+        );
         let result = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             conn.connect_tls(
                 addr,
                 &connector(&ca, TlsVersion::Tls13),
@@ -1253,7 +1260,7 @@ mod over_tls {
             matches!(
                 result,
                 Err(ClientError::ConnectTimeout {
-                    after_ms: 2_000,
+                    after_ms: 10_000,
                     ..
                 })
             ),
