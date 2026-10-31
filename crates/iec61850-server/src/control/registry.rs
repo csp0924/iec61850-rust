@@ -17,7 +17,7 @@
 use super::dispatch::ControlOutbox;
 use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
 use super::model::ControlModel;
-use super::object::ControlObject;
+use super::object::{ControlObject, ObserverSlot};
 use super::service::CommandTerminationSink;
 use iec61850_model::IedModel;
 use std::collections::HashMap;
@@ -125,6 +125,7 @@ pub struct ControlObjectsRegistry {
     inner: Arc<RwLock<HashMap<ControlObjectKey, ControlObjectEntry>>>,
     ct_sink: Arc<dyn CommandTerminationSink>,
     outbox: Arc<ControlOutbox>,
+    observer: ObserverSlot,
 }
 
 impl std::fmt::Debug for ControlObjectsRegistry {
@@ -149,6 +150,7 @@ impl ControlObjectsRegistry {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ct_sink: Arc::new(super::service::NoOpCommandTermination),
             outbox: Arc::default(),
+            observer: Arc::default(),
         }
     }
 
@@ -158,6 +160,7 @@ impl ControlObjectsRegistry {
             inner: Arc::new(RwLock::new(HashMap::new())),
             ct_sink,
             outbox: Arc::default(),
+            observer: Arc::default(),
         }
     }
 
@@ -178,11 +181,24 @@ impl ControlObjectsRegistry {
         &self.outbox
     }
 
+    /// Installs the observer every object registered with this registry, before
+    /// or after, reports a change of its selection to.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn set_selection_observer(&self, observer: super::object::SelectionObserver) {
+        match self.observer.write() {
+            Ok(mut g) => *g = Some(observer),
+            Err(_) => {
+                tracing::warn!("control object observer lock poisoned, observer not installed")
+            }
+        }
+    }
+
     /// Registers one control object with its handlers.
     ///
     /// An entry with the same key is replaced. Returns `true` when the entry is new
     /// and `false` when it replaced an existing one.
     pub fn register(&self, entry: ControlObjectEntry) -> bool {
+        entry.object.watch_selection(Arc::clone(&self.observer));
         let key = ControlObjectKey::new(
             &entry.object.config.domain,
             &entry.object.config.ln_name,
@@ -239,6 +255,7 @@ impl ControlObjectsRegistry {
                         return registered;
                     };
                     if let std::collections::hash_map::Entry::Vacant(slot) = g.entry(key) {
+                        object.watch_selection(Arc::clone(&self.observer));
                         slot.insert(ControlObjectEntry::new(object));
                         registered += 1;
                     }

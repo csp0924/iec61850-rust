@@ -13,7 +13,9 @@
 //! object. A selection expires on a timer task of the current tokio runtime,
 //! whose clock a test can pause; without a runtime it expires when the next
 //! request finds its timeout elapsed. Every change of the selection of a
-//! select-before-operate object is reported to the selection change handler.
+//! select-before-operate object is reported to the registry the object is
+//! registered with, which inside an `IedServer` keeps `stSeld`, and then to the
+//! selection change handler.
 
 use super::handler::{SelectStateChangedHandler, SelectStateChangedReason};
 use super::model::{
@@ -363,7 +365,19 @@ pub struct ControlObject {
 
     /// Selection change handler, installed by `set_select_state_handler`.
     pub select_state_handler: Arc<Mutex<Option<Arc<dyn SelectStateChangedHandler>>>>,
+
+    /// The observer of the registry the object is registered with, told of
+    /// every change of the selection before the handler.
+    observer: Arc<Mutex<Option<ObserverSlot>>>,
 }
+
+/// Told that the selection of a control object changed, with whether it is
+/// now selected.
+pub(crate) type SelectionObserver = Arc<dyn Fn(&ControlObjectConfig, bool) + Send + Sync>;
+
+/// The observer a registry shares with the objects registered with it; empty
+/// until one is installed.
+pub(crate) type ObserverSlot = Arc<RwLock<Option<SelectionObserver>>>;
 
 impl std::fmt::Debug for ControlObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,6 +398,7 @@ impl ControlObject {
             inner: Arc::new(Mutex::new(ControlObjectInner::new())),
             binding: Arc::new(OnceLock::new()),
             select_state_handler: Arc::new(Mutex::new(None)),
+            observer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -468,6 +483,15 @@ impl ControlObject {
     pub fn set_select_state_handler(&self, h: Arc<dyn SelectStateChangedHandler>) {
         if let Ok(mut g) = self.select_state_handler.lock() {
             *g = Some(h);
+        }
+    }
+
+    /// Reports every later change of the selection to the observer `slot`
+    /// holds, replacing the slot of a registry the object was registered with
+    /// before.
+    pub(crate) fn watch_selection(&self, slot: ObserverSlot) {
+        if let Ok(mut g) = self.observer.lock() {
+            *g = Some(slot);
         }
     }
 
@@ -981,6 +1005,15 @@ impl ControlObject {
     // ─── Select state notification ───────────────────────────────────────
 
     fn notify(&self, change: SelectionChange) {
+        let observer = self
+            .observer
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .and_then(|slot| slot.read().ok().and_then(|g| g.clone()));
+        if let Some(observe) = observer {
+            observe(&self.config, change.is_selected);
+        }
         let handler = self
             .select_state_handler
             .lock()

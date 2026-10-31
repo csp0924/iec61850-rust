@@ -100,8 +100,9 @@ pub trait ControlHandler: Send + Sync {
 /// Every change of the selection is reported, once, after the state has
 /// changed: a select, a Cancel, the select timeout, a lost connection, the end
 /// of an operate-once command, and an Operate refused in a way that ends the
-/// selection. The server does not write `stSeld`; an application that models it
-/// updates it from here, per the selected state of IEC 61850-7-3.
+/// selection. Inside an `IedServer` the server has already written the new
+/// state to `stSeld` of the data object, when the model declares it
+/// (IEC 61850-7-3), through the same update path as `IedServer::update_*`.
 pub trait SelectStateChangedHandler: Send + Sync {
     /// Reports that the selection state changed.
     fn on_select_state_changed(

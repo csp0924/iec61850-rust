@@ -1321,6 +1321,34 @@ impl IedServer {
         })
     }
 
+    /// Writes the selection state of a control object to the `stSeld` of its
+    /// data object, under FC=ST or, for an analogue or binary step control,
+    /// FC=MX (IEC 61850-7-3), when the model declares one.
+    fn update_st_seld(&self, object: &crate::control::ControlObjectConfig, selected: bool) {
+        let st_seld = self
+            .inner
+            .model
+            .ld_by_domain(&object.domain)
+            .and_then(|ld| ld.ln_by_name(&object.ln_name))
+            .and_then(|ln| ln.do_by_name(&object.name))
+            .and_then(|dobj| match dobj.child_by_name("stSeld", None) {
+                Some(iec61850_model::DoChild::Da(da)) => Some(da),
+                _ => None,
+            });
+        let Some(da) = st_seld else {
+            return;
+        };
+        if let Err(e) = self.update_boolean(da, selected) {
+            tracing::warn!(
+                domain = %object.domain,
+                ln = %object.ln_name,
+                data_object = %object.name,
+                error = %e,
+                "stSeld is not a boolean and was not updated"
+            );
+        }
+    }
+
     /// Writes `value`, of whatever variant the attribute holds, through the
     /// update path, so it triggers reports and log entries as an `update_*`
     /// call does; for values the server itself loads.
@@ -1783,9 +1811,17 @@ impl IedServerBuilder<Bound> {
 
 impl IedServer {
     /// Routes the values the server writes on its own, the setting group
-    /// values, through the update path. The hooks hold the server weakly, so
-    /// they do not keep it alive.
+    /// values and the `stSeld` of the control objects, through the update
+    /// path. The hooks hold the server weakly, so they do not keep it alive.
     fn install_value_hooks(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.control_objects.set_selection_observer(Arc::new(
+            move |object: &crate::control::ControlObjectConfig, selected: bool| {
+                if let Some(inner) = weak.upgrade() {
+                    (IedServer { inner }).update_st_seld(object, selected);
+                }
+            },
+        ));
         let weak = Arc::downgrade(&self.inner);
         self.inner.setting_groups.set_writer(Arc::new(
             move |da: &DataAttribute, value: MmsValue| {
