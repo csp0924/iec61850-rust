@@ -1413,3 +1413,162 @@ async fn a_data_set_member_naming_an_element_is_served_as_that_element() {
     .await
     .expect("timed out");
 }
+
+/// A read handler on the array that supplies its value decides a data set
+/// member naming one element: GetDataSetValues answers the element the
+/// member's alternate access selects from the handler's array, as a Read of
+/// the array with that alternate access does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_handler_value_answers_the_element_a_member_names() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (handle, mut client) = serve_with(model(), |server| {
+            register_lims_element(server);
+            server
+                .install_read_handler(
+                    "GGIO1$SP$Arr$cfg$lims",
+                    Arc::new(Fixed(MmsValue::Array(vec![
+                        MmsValue::Integer(70),
+                        MmsValue::Integer(71),
+                        MmsValue::Integer(72),
+                    ]))),
+                )
+                .expect("install_read_handler");
+        })
+        .await;
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$Lims"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(values, vec![AccessResult::Success(MmsData::Integer(71))]);
+        assert_eq!(
+            read_element(&mut client, "GGIO1$SP$Arr$cfg$lims", 1, None)
+                .await
+                .expect("lims(1)"),
+            MmsData::Integer(71)
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A SetDataSetValues writing a member that names an array element is
+/// decided by the write handler on the array, as a Write of the element is:
+/// the handler sees the array with the element replaced, and its refusal
+/// fails the member and leaves the element as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handler_on_an_array_decides_a_data_set_write_of_an_element() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let refuse = Arc::new(Recording {
+            seen: std::sync::Mutex::new(Vec::new()),
+            outcome: WriteOutcome::Reject(DataAccessError::ObjectAccessDenied),
+        });
+        let handler = Arc::clone(&refuse);
+        let (handle, mut client) = serve_with(model(), move |server| {
+            register_lims_element(server);
+            server
+                .install_write_access_handler("GGIO1$SP$Arr$cfg$lims", handler)
+                .expect("install_write_access_handler");
+        })
+        .await;
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write_named_variable_list_values(DOMAIN, "LLN0$Lims", vec![MmsData::Integer(4)]),
+        )
+        .await
+        .expect("timeout")
+        .expect("SetDataSetValues");
+        assert_eq!(
+            outcomes,
+            vec![iec61850_mms::mms::pdu::common::WriteOutcome::Failure(
+                DataAccessError::ObjectAccessDenied
+            )]
+        );
+        assert_eq!(
+            *refuse.seen.lock().unwrap(),
+            vec![(
+                "GGIO1$SP$Arr$cfg$lims".to_string(),
+                MmsValue::Array(vec![
+                    MmsValue::Integer(-3),
+                    MmsValue::Integer(4),
+                    MmsValue::Integer(0),
+                ])
+            )]
+        );
+        assert_eq!(
+            read_element(&mut client, "GGIO1$SP$Arr$cfg$lims", 1, None)
+                .await
+                .expect("lims(1)"),
+            MmsData::Integer(0)
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A client writing a data set member that names an array element triggers
+/// the report of that member to a control block bound to the data set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_set_write_of_an_element_is_reported() {
+    use iec61850_server::{OptFlds, Rcb, ReportControl, TriggerOptions};
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (handle, mut client) = serve_with(model(), |server| {
+            let model = server.model();
+            let r = ObjectRef::parse(&format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)")).unwrap();
+            let Some(NodeRef::Da(lim)) = model.node_by_object_ref(&r) else {
+                panic!("the element resolves to an attribute");
+            };
+            let mut ds = iec61850_server::Dataset::new("LLN0$Lims");
+            ds.push(iec61850_server::DatasetEntry::new(
+                format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)"),
+                Arc::clone(&lim.value),
+            ));
+            let rcb = Rcb::new("urcbLims", "LLN0$Lims")
+                .with_trg_ops(TriggerOptions::DATA_CHANGED)
+                .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+            server
+                .register_urcb(
+                    ReportControl::new(format!("{DOMAIN}/LLN0$RP$urcbLims"), rcb),
+                    ds,
+                )
+                .expect("register_urcb");
+        })
+        .await;
+        for field in ["Resv", "RptEna"] {
+            write(
+                &mut client,
+                &format!("LLN0$RP$urcbLims${field}"),
+                MmsData::Boolean(true),
+            )
+            .await
+            .expect("enable the control block");
+        }
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write_named_variable_list_values(DOMAIN, "LLN0$Lims", vec![MmsData::Integer(5)]),
+        )
+        .await
+        .expect("timeout")
+        .expect("SetDataSetValues");
+        assert_eq!(
+            outcomes,
+            vec![iec61850_mms::mms::pdu::common::WriteOutcome::Success]
+        );
+        assert_eq!(
+            next_report_with_references(&mut client).await,
+            (
+                vec![true],
+                vec![format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)")],
+                vec![MmsValue::Integer(5)],
+            )
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
