@@ -17,7 +17,7 @@ const DST: [u8; 6] = [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01];
 
 fn pdu(gocb: &str, st: u32, sq: u32) -> GoosePdu {
     let mut pdu = GoosePdu::new(gocb, "LD/LLN0$ds", vec![MmsValue::Boolean(true)]);
-    pdu.go_id = Some("id".into());
+    pdu.go_id = "id".into();
     pdu.st_num = st;
     pdu.sq_num = sq;
     pdu.num_dataset_entries = 1;

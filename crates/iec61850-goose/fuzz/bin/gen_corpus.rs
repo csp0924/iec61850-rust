@@ -56,7 +56,7 @@ fn make_pdu_basic() -> GoosePdu {
         vec![MmsValue::Boolean(true)],
     );
     pdu.time_allowed_to_live = 1000;
-    pdu.go_id = Some("gid".to_string());
+    pdu.go_id = "gid".to_string();
     pdu.num_dataset_entries = 1;
     pdu
 }
@@ -95,7 +95,7 @@ fn make_pdu_long_strings() -> GoosePdu {
     let mut pdu = make_pdu_basic();
     pdu.gocb_ref = "A".repeat(120);
     pdu.dat_set = "B".repeat(120);
-    pdu.go_id = Some("C".repeat(120));
+    pdu.go_id = "C".repeat(120);
     pdu
 }
 

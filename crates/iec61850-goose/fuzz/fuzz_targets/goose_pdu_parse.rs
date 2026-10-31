@@ -40,11 +40,10 @@ fuzz_target!(|data: &[u8]| {
     // Secondary contract: the wire form reaches a fixed point after the second
     // encode.
     //
-    // The comparison is deliberately over bytes rather than `pdu1 == pdu2`:
-    // `go_id: Option<String>` is lossy by design, because `None` is encoded as
-    // gocbRef and decodes back as `Some(gocb_ref)`. That happens exactly once;
-    // everything already on the wire is canonical, so the second encode must
-    // reproduce the first byte for byte.
+    // The comparison is over bytes rather than `pdu1 == pdu2`, because a NaN
+    // float in allData never compares equal to itself. Decoding normalizes
+    // the input once, so the second encode must reproduce the first byte for
+    // byte.
     //
     // Any drift would mean the encoder is not deterministic, that decode and
     // encode fail to normalize arbitrary input, or that one PDU has two valid

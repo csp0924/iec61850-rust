@@ -107,10 +107,9 @@ pub struct GoosePdu {
     pub time_allowed_to_live: u32,
     /// `[0x82]` datSet, the data set object reference.
     pub dat_set: String,
-    /// `[0x83]` goID. The field is always present on the wire; when this is
-    /// `None`, `gocb_ref` is encoded in its place. `decode_ber` always sets it,
-    /// since a PDU without goID is rejected.
-    pub go_id: Option<String>,
+    /// `[0x83]` goID, a mandatory member of the IECGoosePdu (IEC 61850-8-1
+    /// Annex A).
+    pub go_id: String,
     /// `[0x84]` t, a UTC time of exactly 8 bytes.
     pub t: [u8; 8],
     /// `[0x85]` stNum, the state number; 0 is reserved and never sent.
@@ -543,8 +542,8 @@ impl GoosePdu {
     /// `num_dataset_entries` is the length of `all_data`. The other fields
     /// take the values of the first frame a freshly configured publisher
     /// sends: `time_allowed_to_live` is 2000 ms (twice the default Tmax of
-    /// [`RetransIntervals`](crate::RetransIntervals)), `go_id` is `None` so
-    /// `gocb_ref` is encoded in its place, `t` is all zero, `st_num` is 1,
+    /// [`RetransIntervals`](crate::RetransIntervals)), `go_id` equals
+    /// `gocb_ref`, `t` is all zero, `st_num` is 1,
     /// `sq_num` is 0, `conf_rev` is 1, and `simulation` and `nds_com` are
     /// `false`.
     pub fn new(
@@ -552,11 +551,12 @@ impl GoosePdu {
         dat_set: impl Into<String>,
         all_data: Vec<MmsValue>,
     ) -> Self {
+        let gocb_ref = gocb_ref.into();
         Self {
-            gocb_ref: gocb_ref.into(),
+            go_id: gocb_ref.clone(),
+            gocb_ref,
             time_allowed_to_live: 2000,
             dat_set: dat_set.into(),
-            go_id: None,
             t: [0; 8],
             st_num: 1,
             sq_num: 0,
@@ -570,9 +570,8 @@ impl GoosePdu {
 
     /// BER encodes the PDU into `buf` and returns the number of bytes written.
     ///
-    /// goID is always emitted; when `go_id` is `None` the encoder writes
-    /// `gocb_ref` under tag `0x83`. `numDatSetEntries` is written as given, so
-    /// an inconsistent value is only caught on decode.
+    /// `numDatSetEntries` is written as given, so an inconsistent value is only
+    /// caught on decode.
     ///
     /// # Errors
     ///
@@ -593,9 +592,8 @@ impl GoosePdu {
         // [0x82] datSet
         write_string_tlv(&mut pdu, TAG_DAT_SET, &self.dat_set);
 
-        // [0x83] goID, defaulting to gocbRef
-        let go_id_str = self.go_id.as_deref().unwrap_or(&self.gocb_ref);
-        write_string_tlv(&mut pdu, TAG_GO_ID, go_id_str);
+        // [0x83] goID
+        write_string_tlv(&mut pdu, TAG_GO_ID, &self.go_id);
 
         // [0x84] t, 8-byte UTC time
         write_tlv(&mut pdu, TAG_T, &self.t);
@@ -766,10 +764,10 @@ impl GoosePdu {
         let time_allowed_to_live =
             time_allowed_to_live.ok_or(GooseError::UnknownTag(TAG_TIME_ALLOWED))?;
         let dat_set = dat_set.ok_or(GooseError::UnknownTag(TAG_DAT_SET))?;
-        if go_id.is_none() {
+        let go_id = go_id.ok_or_else(|| {
             tracing::warn!("goose pdu is missing goid");
-            return Err(GooseError::UnknownTag(TAG_GO_ID));
-        }
+            GooseError::UnknownTag(TAG_GO_ID)
+        })?;
         let t = t.ok_or_else(|| {
             tracing::warn!("goose pdu is missing timestamp field t");
             GooseError::MissingTimestamp
@@ -838,7 +836,7 @@ mod tests {
             gocb_ref: "A/L$GO$gcb".to_string(),
             time_allowed_to_live: 2000,
             dat_set: "A/L$DS".to_string(),
-            go_id: None, // encoded as gocb_ref
+            go_id: "A/L$GO$gcb".to_string(),
             t: [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
             st_num: 1,
             sq_num: 1,
@@ -860,8 +858,7 @@ mod tests {
         assert_eq!(decoded.gocb_ref, pdu.gocb_ref);
         assert_eq!(decoded.time_allowed_to_live, pdu.time_allowed_to_live);
         assert_eq!(decoded.dat_set, pdu.dat_set);
-        // A None go_id is sent as gocbRef and decodes back as Some.
-        assert_eq!(decoded.go_id, Some("A/L$GO$gcb".to_string()));
+        assert_eq!(decoded.go_id, pdu.go_id);
         assert_eq!(decoded.t, pdu.t);
         assert_eq!(decoded.st_num, pdu.st_num);
         assert_eq!(decoded.sq_num, pdu.sq_num);
@@ -875,12 +872,12 @@ mod tests {
     #[test]
     fn encode_decode_round_trip_with_go_id() {
         let mut pdu = sample_pdu();
-        pdu.go_id = Some("MyGoID".to_string());
+        pdu.go_id = "MyGoID".to_string();
         let mut buf = BytesMut::new();
         pdu.encode_ber(&mut buf).unwrap();
 
         let decoded = GoosePdu::decode_ber(&buf).unwrap();
-        assert_eq!(decoded.go_id, Some("MyGoID".to_string()));
+        assert_eq!(decoded.go_id, "MyGoID");
     }
 
     #[test]
@@ -941,13 +938,32 @@ mod tests {
     }
 
     #[test]
-    fn go_id_none_fills_gocb_ref_on_wire() {
-        let pdu = sample_pdu();
+    fn new_takes_go_id_from_gocb_ref() {
+        let pdu = GoosePdu::new("A/L$GO$gcb", "A/L$DS", vec![]);
+        assert_eq!(pdu.go_id, "A/L$GO$gcb");
+    }
+
+    #[test]
+    fn missing_go_id_rejected() {
+        let mut pdu_inner = BytesMut::new();
+        write_string_tlv(&mut pdu_inner, TAG_GOCB_REF, "A/L$GO$gcb");
+        write_u32_tlv(&mut pdu_inner, TAG_TIME_ALLOWED, 2000);
+        write_string_tlv(&mut pdu_inner, TAG_DAT_SET, "A/L$DS");
+        write_tlv(&mut pdu_inner, TAG_T, &[0u8; 8]);
+        write_u32_tlv(&mut pdu_inner, TAG_ST_NUM, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_SQ_NUM, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_CONF_REV, 1);
+        write_u32_tlv(&mut pdu_inner, TAG_NUM_DATASET_ENTRIES, 0);
+        write_tlv(&mut pdu_inner, TAG_ALL_DATA, &[]);
         let mut buf = BytesMut::new();
-        pdu.encode_ber(&mut buf).unwrap();
-        let decoded = GoosePdu::decode_ber(&buf).unwrap();
-        // The decoded goID equals the gocbRef that was substituted.
-        assert_eq!(decoded.go_id, Some(pdu.gocb_ref.clone()));
+        buf.extend_from_slice(&[TAG_GOOSE_PDU]);
+        encode_length(pdu_inner.len(), &mut buf);
+        buf.extend_from_slice(&pdu_inner);
+
+        assert_eq!(
+            GoosePdu::decode_ber(&buf),
+            Err(GooseError::UnknownTag(TAG_GO_ID))
+        );
     }
 
     #[test]

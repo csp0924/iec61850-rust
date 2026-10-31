@@ -485,7 +485,7 @@ impl GoosePublisher {
             gocb_ref: self.gocb_ref.clone(),
             time_allowed_to_live: self.time_allowed_to_live_ms(),
             dat_set: self.data_set_ref.clone(),
-            go_id: self.go_id.clone(),
+            go_id: self.go_id.clone().unwrap_or_else(|| self.gocb_ref.clone()),
             t: self.timestamp_8,
             st_num: self.st_num,
             // Encoded before the increment, so per IEC 61850-8-1 §A.3 the first
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(pdu.gocb_ref, "A/L$GO$gcb");
         assert_eq!(pdu.dat_set, "A/L$DS");
         // A None goID is sent as gocbRef.
-        assert_eq!(pdu.go_id, Some("A/L$GO$gcb".to_string()));
+        assert_eq!(pdu.go_id, "A/L$GO$gcb");
         assert_eq!(pdu.st_num, 1);
         // The first frame carries sqNum 0.
         assert_eq!(pdu.sq_num, 0);
@@ -920,7 +920,7 @@ mod tests {
         let frame = p.publish(&sample_data()).unwrap();
         let goose_frame = GooseFrame::decode(&frame).unwrap();
         let pdu = GoosePdu::decode_ber(&goose_frame.pdu_bytes).unwrap();
-        assert_eq!(pdu.go_id, Some("MyGoID".to_string()));
+        assert_eq!(pdu.go_id, "MyGoID");
     }
 
     #[test]
