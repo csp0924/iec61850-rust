@@ -1,8 +1,8 @@
 //! MMS service dispatcher for the model-backed server.
 //!
 //! `MmsModelDispatcher` implements the `MmsServiceDispatcher` trait and routes
-//! a ConfirmedRequest by its service tag: `0xa1` GetNameList, `0xa6`
-//! GetVariableAccessAttributes, `0xa4` Read, `0xa5` Write, `0x82` Identify,
+//! a ConfirmedRequest by its service tag: `0x80` Status, `0xa1` GetNameList,
+//! `0xa6` GetVariableAccessAttributes, `0xa4` Read, `0xa5` Write, `0x82` Identify,
 //! `0xab` DefineNamedVariableList, `0xac` GetNamedVariableListAttributes,
 //! `0xad` DeleteNamedVariableList, and the long-form `0xbf 0x41` ReadJournal.
 //!
@@ -61,6 +61,10 @@ use iec61850_mms::mms::pdu::{
     service_error::{
         subcode::{access, resource},
         ErrorClass, ServiceError,
+    },
+    status::{
+        decode_status_request, encode_confirmed_status_response, StatusResponse, VmdLogicalStatus,
+        VmdPhysicalStatus, SERVICE_TAG_STATUS_REQUEST,
     },
     write::{encode_confirmed_write_response, WriteRequest, WriteResponse, SERVICE_TAG_WRITE},
 };
@@ -359,16 +363,14 @@ const SERVICES_JOURNAL_BYTE: usize = 8;
 /// `readJournal` within [`SERVICES_JOURNAL_BYTE`].
 ///
 /// The bit string is numbered from its most significant bit, so service 65 is
-/// the second bit of byte 8. `DEFAULT_SERVICES_SUPPORTED_CLIENT` carries `0x79`
-/// in that byte, the four consecutive journal services followed by
-/// `getCapabilityList`, which fixes `readJournal` at `0x40`.
+/// the second bit of byte 8, `0x40`.
 const SERVICES_READ_JOURNAL_BIT: u8 = 0x40;
 
 /// Builds the `servicesSupportedCalled` bitmap of the Initiate-Response for the
 /// services this build actually serves.
 ///
 /// Starting from the baseline of the connection layer, a bit is cleared unless
-/// a handler answers it: `status` and `cancel` have no handler in any build,
+/// a handler answers it: `cancel` has no handler in any build,
 /// and data set creation, deletion and directory together with
 /// `informationReport` are cleared without the reporting subsystem. The
 /// baseline carries no journal service, so
@@ -388,7 +390,6 @@ const SERVICES_READ_JOURNAL_BIT: u8 = 0x40;
 fn compute_services_supported(reporting: bool, logging: bool) -> [u8; 11] {
     use iec61850_mms::mms::server::connection::SERVER_SERVICES_SUPPORTED;
     let mut map = SERVER_SERVICES_SUPPORTED;
-    map[0] &= !0x80; // status
     map[10] &= !0x08; // cancel: a Cancel-RequestPDU is rejected at the PDU layer
     if !reporting {
         // define, getAttributes and delete NamedVariableList
@@ -493,6 +494,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 #[cfg(feature = "logging")]
                 &self.log_controls,
             ),
+            SERVICE_TAG_STATUS_REQUEST => dispatch_status(invoke_id, &body),
             SERVICE_TAG_IDENTIFY_REQUEST => dispatch_identify(invoke_id, &self.identification),
             SERVICE_TAG_READ => dispatch_read(
                 invoke_id,
@@ -1818,6 +1820,30 @@ fn dispatch_identify(invoke_id: u32, ident: &IdentificationStrings) -> Confirmed
     );
     let mut buf = BytesMut::new();
     encode_confirmed_identify_response(invoke_id, &resp, &mut buf);
+    ConfirmedResponse::Response(buf.freeze())
+}
+
+/// Dispatches a Status request (`0x80`), per ISO 9506-2.
+///
+/// The server answers `state-changes-allowed` and `operational` without
+/// localDetail, whether or not extendedDerivation is requested. A request
+/// whose BOOLEAN is malformed is answered with a ConfirmedError `access`
+/// other.
+fn dispatch_status(invoke_id: u32, body: &Bytes) -> ConfirmedResponse {
+    if let Err(e) = decode_status_request(body) {
+        tracing::warn!(
+            invoke_id,
+            error = %e,
+            "status request failed to decode, answering confirmed-error"
+        );
+        return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
+    }
+    let resp = StatusResponse::new(
+        VmdLogicalStatus::StateChangesAllowed,
+        VmdPhysicalStatus::Operational,
+    );
+    let mut buf = BytesMut::new();
+    encode_confirmed_status_response(invoke_id, &resp, &mut buf);
     ConfirmedResponse::Response(buf.freeze())
 }
 
@@ -3526,15 +3552,16 @@ mod services_supported_tests {
         }
     }
 
-    /// No build answers status or cancel, so no build may advertise them.
+    /// Every build answers status and none answers cancel, so status is
+    /// advertised and cancel is not.
     #[test]
-    fn never_advertises_status_or_cancel() {
+    fn advertises_status_never_cancel() {
         for (reporting, logging) in ALL_BUILDS {
             let map = compute_services_supported(reporting, logging);
             assert_eq!(
                 map[0] & 0x80,
-                0,
-                "status has no handler and must not be advertised"
+                0x80,
+                "status has a handler in every build and must be advertised"
             );
             assert_eq!(
                 map[10] & 0x08,
@@ -3550,8 +3577,8 @@ mod services_supported_tests {
         for (reporting, logging) in ALL_BUILDS {
             let map = compute_services_supported(reporting, logging);
             assert_eq!(
-                map[0], 0x6e,
-                "get-name-list, identify, read, write and get-variable-access-attributes are advertised, status is not"
+                map[0], 0xee,
+                "status, get-name-list, identify, read, write and get-variable-access-attributes are advertised"
             );
             assert_eq!(map[10], 0x10, "conclude is advertised, cancel is not");
         }
@@ -3563,12 +3590,12 @@ mod services_supported_tests {
     fn full_bitmap_is_bit_exact() {
         assert_eq!(
             compute_services_supported(true, true),
-            [0x6e, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10],
+            [0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10],
             "a build with reporting and logging"
         );
         assert_eq!(
             compute_services_supported(false, false),
-            [0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10],
+            [0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10],
             "a build with neither"
         );
     }
@@ -3675,7 +3702,7 @@ mod tests {
     /// A service the bitmap does not advertise is still answered, with a
     /// Reject, when a client sends it anyway. Advertising honestly and
     /// answering everything are one pair: without the first a client walks into
-    /// a dead end, without the second it waits forever. `0x80` is Status,
+    /// a dead end, without the second it waits forever. `0xa3` is Rename,
     /// which no build serves.
     #[test]
     fn dispatcher_unadvertised_services_return_reject_not_silence() {
@@ -3683,12 +3710,62 @@ mod tests {
         let conn = make_conn();
         let req = ConfirmedRequest {
             invoke_id: 7,
-            service_body: Bytes::copy_from_slice(&[0x80, 0x00]),
+            service_body: Bytes::copy_from_slice(&[0xa3, 0x00]),
         };
         let resp = dispatcher.dispatch(&conn, req);
         assert!(
             matches!(resp, ConfirmedResponse::Reject),
-            "status must be rejected, neither ignored nor panicked on"
+            "rename must be rejected, neither ignored nor panicked on"
+        );
+    }
+
+    /// Status (`0x80`) reaches its handler and answers the state the server
+    /// holds, for both values of extendedDerivation.
+    #[test]
+    fn dispatcher_status_returns_response() {
+        use iec61850_mms::mms::pdu::status::decode_confirmed_status_response;
+
+        let dispatcher = build_dispatcher();
+        let conn = make_conn();
+        for flag in [0x00u8, 0xff] {
+            let req = ConfirmedRequest {
+                invoke_id: 9,
+                service_body: Bytes::copy_from_slice(&[0x80, 0x01, flag]),
+            };
+            match dispatcher.dispatch(&conn, req) {
+                ConfirmedResponse::Response(bytes) => {
+                    assert_eq!(
+                        &bytes[..],
+                        &[
+                            0xa1, 0x0b, 0x02, 0x01, 0x09, 0xa0, 0x06, 0x80, 0x01, 0x00, 0x81, 0x01,
+                            0x00,
+                        ],
+                        "state-changes-allowed and operational, no localDetail"
+                    );
+                    let (id, resp) = decode_confirmed_status_response(&bytes).unwrap();
+                    assert_eq!(id, 9);
+                    assert_eq!(resp.logical_status, VmdLogicalStatus::StateChangesAllowed);
+                    assert_eq!(resp.physical_status, VmdPhysicalStatus::Operational);
+                    assert_eq!(resp.local_detail, None);
+                }
+                other => panic!("status must answer with a response, got {:?}", other),
+            }
+        }
+    }
+
+    /// A Status request whose BOOLEAN is not one octet is answered with a
+    /// ConfirmedError rather than a status.
+    #[test]
+    fn dispatcher_malformed_status_returns_confirmed_error() {
+        let dispatcher = build_dispatcher();
+        let conn = make_conn();
+        let req = ConfirmedRequest {
+            invoke_id: 7,
+            service_body: Bytes::copy_from_slice(&[0x80, 0x00]),
+        };
+        assert!(
+            matches!(dispatcher.dispatch(&conn, req), ConfirmedResponse::Error(_)),
+            "a malformed status request must be answered with a confirmed error"
         );
     }
 
