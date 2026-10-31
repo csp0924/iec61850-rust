@@ -59,10 +59,18 @@ pub struct Rcb {
     /// Pre-configured owner address; when set, only a client at this address may
     /// use the control block.
     pub client_reservation: Option<IpAddr>,
+    /// Whether the control block has the optional Owner attribute
+    /// (IEC 61850-7-2 Table 39, condition c3). Without it, Owner is absent from
+    /// the MMS structure, its type description and its name list, and reading
+    /// or writing it answers object-non-existent.
+    pub with_owner: bool,
 }
 
 impl Rcb {
     /// Creates a URCB configuration with default field values.
+    ///
+    /// The control block has the Owner attribute; a model built from SCL decides
+    /// it from `ReportSettings`, through [`with_owner`](Self::with_owner).
     pub fn new(name: impl Into<String>, dataset_name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
@@ -74,6 +82,7 @@ impl Rcb {
             buf_tm_ms: 0,
             intg_pd_ms: 0,
             client_reservation: None,
+            with_owner: true,
             name,
         }
     }
@@ -111,6 +120,12 @@ impl Rcb {
     /// Sets IntgPd, in milliseconds.
     pub fn with_intg_pd_ms(mut self, ms: u32) -> Self {
         self.intg_pd_ms = ms;
+        self
+    }
+
+    /// Sets whether the control block has the Owner attribute.
+    pub fn with_owner(mut self, on: bool) -> Self {
+        self.with_owner = on;
         self
     }
 }

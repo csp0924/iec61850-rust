@@ -315,6 +315,10 @@ name = "rcb_attribute_services_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "rcb_owner_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "register_from_model_e2e"
 required-features = ["full-server"]
 

@@ -205,6 +205,13 @@ pub fn handle_set_rcb_field(
             );
             return Err(DataAccessError::ObjectAccessDenied);
         }
+        RcbField::Owner if !rc.rcb.with_owner => {
+            tracing::warn!(
+                mms_path,
+                "SetURCBValues: the control block has no Owner, answering ObjectNonExistent"
+            );
+            return Err(DataAccessError::ObjectNonExistent);
+        }
         RcbField::Owner => {
             tracing::warn!(
                 mms_path,
@@ -512,6 +519,7 @@ pub fn handle_get_rcb_field(
         }
         RcbField::IntgPd => MmsData::Unsigned(state.intg_pd_ms as u64),
         RcbField::Gi => MmsData::Boolean(state.gi),
+        RcbField::Owner if !rc.rcb.with_owner => return None,
         // The pre-configured client, or the client holding the reservation; an
         // unreserved URCB has no owner. IEC 61850-8-1 §17.1.2.
         RcbField::Owner => owner_octets(
@@ -607,6 +615,13 @@ pub fn handle_set_brcb_field(
             None => return Some(Err(DataAccessError::ObjectNonExistent)),
         }
     };
+    if field == RcbField::Owner && !brcb.brcb.with_owner {
+        tracing::warn!(
+            mms_path,
+            "SetBRCBValues: the control block has no Owner, answering ObjectNonExistent"
+        );
+        return Some(Err(DataAccessError::ObjectNonExistent));
+    }
     if let Err(e) = claim_brcb(&brcb, conn_id, writer_ip) {
         return Some(Err(e));
     }
@@ -716,11 +731,14 @@ pub fn handle_get_brcb_field(
         let eng = engine.lock().ok()?;
         eng.get_brcb(mms_path)?
     };
+    if field == RcbField::Owner && !brcb.brcb.with_owner {
+        return Some(AccessResult::Failure(DataAccessError::ObjectNonExistent));
+    }
     brcb_field_value(&brcb, &field, &mut None).map(AccessResult::Success)
 }
 
 /// The attributes of a BRCB in the order of its MMS structure, IEC 61850-8-1
-/// Table 72.
+/// Table 72; Owner is left out of a control block without it.
 pub(crate) const BRCB_STRUCTURE_FIELDS: [RcbField; 15] = [
     RcbField::RptId,
     RcbField::RptEna,
@@ -762,6 +780,7 @@ pub(crate) fn handle_get_brcb_values(
     let mut exposed: Option<(EntryId, u64)> = None;
     BRCB_STRUCTURE_FIELDS
         .iter()
+        .filter(|field| **field != RcbField::Owner || brcb.brcb.with_owner)
         .map(|field| {
             brcb_field_value(&brcb, field, &mut exposed)
                 .ok_or_else(|| (Some(field.clone()), DataAccessError::HardwareFault))
@@ -839,6 +858,7 @@ fn brcb_field_value(
         }
         RcbField::IntgPd => MmsData::Unsigned(state_guard.intg_pd_ms as u64),
         RcbField::Gi => MmsData::Boolean(state_guard.gi),
+        RcbField::Owner if !brcb.brcb.with_owner => return None,
         // The pre-configured client, or the client that reserved or enabled the
         // BRCB; a free BRCB has no owner. IEC 61850-8-1 §17.1.2.
         RcbField::Owner => owner_octets(match state_guard.resv_tms {

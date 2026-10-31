@@ -21,8 +21,9 @@ fn server(model: IedModel) -> IedServer {
 }
 
 /// `demo.icd`: one data set and `urcb01` with `<RptEnabled max="2">`, indexed
-/// by default, so two instances; `CSWI1.Pos` declares no `ctlModel` and is no
-/// control object.
+/// by default, so two instances, which have Owner through
+/// `<ReportSettings owner="true">`; `CSWI1.Pos` declares no `ctlModel` and is
+/// no control object.
 #[test]
 fn the_demo_model_registers_two_report_instances() {
     let server = server(build_Demo_model());
@@ -37,10 +38,20 @@ fn the_demo_model_registers_two_report_instances() {
         paths,
         vec!["DemoLD0/LLN0$RP$urcb0101", "DemoLD0/LLN0$RP$urcb0102"]
     );
+    for path in &paths {
+        let rc = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_rcb(path)
+            .expect("registered");
+        assert!(rc.lock().unwrap().rcb.with_owner, "{path}");
+    }
 }
 
 /// `schema.icd`: one data set, `brcbSeq` with three instances, a log control
-/// block and a setting group control block.
+/// block and a setting group control block; without `<ReportSettings>` the
+/// instances have no Owner.
 #[test]
 fn the_schema_model_registers_its_buffered_instances_and_log() {
     let server = server(schema::build_Schema_model());
@@ -61,6 +72,15 @@ fn the_schema_model_registers_its_buffered_instances_and_log() {
             "SchemaLD0/LLN0$BR$brcbSeq03",
         ]
     );
+    for path in &paths {
+        let brcb = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_brcb(path)
+            .expect("registered");
+        assert!(!brcb.brcb.with_owner, "{path}");
+    }
     let logs = server.log_controls();
     let logs = logs.read().unwrap();
     let lcb = logs

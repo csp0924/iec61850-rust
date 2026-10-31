@@ -56,7 +56,8 @@ pub(crate) fn register_rcb_instances(
                 .with_trg_ops(trg_ops)
                 .with_opt_flds(rcb.opt_flds)
                 .with_buf_tm_ms(rcb.buf_tm_ms)
-                .with_intg_pd_ms(rcb.intg_pd_ms);
+                .with_intg_pd_ms(rcb.intg_pd_ms)
+                .with_owner(rcb.has_owner);
             server.register_brcb(
                 BufferedReportControl::new(path.clone(), brcb),
                 dataset.clone(),
@@ -68,7 +69,8 @@ pub(crate) fn register_rcb_instances(
                 .with_trg_ops(trg_ops)
                 .with_opt_flds(rcb.opt_flds.mask_urcb())
                 .with_buf_tm_ms(rcb.buf_tm_ms)
-                .with_intg_pd_ms(rcb.intg_pd_ms);
+                .with_intg_pd_ms(rcb.intg_pd_ms)
+                .with_owner(rcb.has_owner);
             server.register_urcb(ReportControl::new(path.clone(), urcb), dataset.clone())?;
         }
     }

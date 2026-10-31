@@ -709,7 +709,7 @@ fn runtime_extras(
                 let group = format!("{ln}${}", block.kind.fc().as_str());
                 out.extend(crate::mapping::flat_paths(
                     &format!("{group}${}", block.name),
-                    &block.kind.type_spec(),
+                    &block.type_spec(),
                 ));
                 out.push(group);
             }
@@ -762,7 +762,7 @@ fn domain_control_blocks(
 ) -> Vec<(String, crate::mapping::ControlBlockEntry)> {
     use crate::mapping::{ControlBlockEntry, ControlBlockKind};
     let mut out: Vec<(String, ControlBlockEntry)> = Vec::new();
-    let mut push = |item: &str, kind: ControlBlockKind| {
+    let mut push = |item: &str, kind: ControlBlockKind, has_owner: bool| {
         let mut segments = item.split('$');
         let (Some(ln_name), Some(fc), Some(name), None) = (
             segments.next(),
@@ -784,6 +784,7 @@ fn domain_control_blocks(
             ControlBlockEntry {
                 kind,
                 name: name.to_string(),
+                has_owner,
             },
         ));
     };
@@ -795,12 +796,19 @@ fn domain_control_blocks(
             Ok(engine) => {
                 for path in engine.rcb_paths() {
                     if let Some(item) = path.strip_prefix(&prefix) {
-                        push(item, ControlBlockKind::Unbuffered);
+                        let has_owner = engine
+                            .get_rcb(&path)
+                            .and_then(|rc| rc.lock().ok().map(|rc| rc.rcb.with_owner))
+                            .unwrap_or(true);
+                        push(item, ControlBlockKind::Unbuffered, has_owner);
                     }
                 }
                 for path in engine.brcb_paths() {
                     if let Some(item) = path.strip_prefix(&prefix) {
-                        push(item, ControlBlockKind::Buffered);
+                        let has_owner = engine
+                            .get_brcb(&path)
+                            .is_none_or(|brcb| brcb.brcb.with_owner);
+                        push(item, ControlBlockKind::Buffered, has_owner);
                     }
                 }
             }
@@ -815,7 +823,7 @@ fn domain_control_blocks(
         Ok(registry) => {
             for (d, item) in registry.keys() {
                 if d == domain && is_lcb_path(item) {
-                    push(item, ControlBlockKind::Log);
+                    push(item, ControlBlockKind::Log, false);
                 }
             }
         }
@@ -826,7 +834,7 @@ fn domain_control_blocks(
     }
     #[cfg(feature = "goose-mapping")]
     for item in gocb_registry.item_bases_in_domain(domain) {
-        push(&item, ControlBlockKind::Goose);
+        push(&item, ControlBlockKind::Goose, false);
     }
     out.sort_by(|(ln_a, a), (ln_b, b)| {
         let rank = |k: ControlBlockKind| {
@@ -2161,7 +2169,8 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
     use crate::reporting::service::{handle_get_rcb_field, RcbField};
     use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
 
-    // Field order of an unbuffered control block, IEC 61850-8-1 Table 30.
+    // Field order of an unbuffered control block, IEC 61850-8-1 Table 73; Owner
+    // is left out of a control block without it.
     let fields = [
         RcbField::RptId,
         RcbField::RptEna,
@@ -2179,7 +2188,7 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
 
     // Existence is checked once up front, so the structure is never returned
     // half-populated.
-    {
+    let with_owner = {
         let eng = match engine.lock() {
             Ok(e) => e,
             Err(_) => {
@@ -2190,17 +2199,28 @@ fn read_rcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> A
                 return AccessResult::Failure(DataAccessError::HardwareFault);
             }
         };
-        if eng.get_rcb(mms_path).is_none() {
+        let Some(rc) = eng.get_rcb(mms_path) else {
             tracing::warn!(
                 mms_path,
                 "read: no such report control block, answering object-non-existent"
             );
             return AccessResult::Failure(DataAccessError::ObjectNonExistent);
-        }
-    }
+        };
+        let Ok(rc) = rc.lock() else {
+            tracing::warn!(
+                mms_path,
+                "read: the report control block lock is poisoned, answering hardware-fault"
+            );
+            return AccessResult::Failure(DataAccessError::HardwareFault);
+        };
+        rc.rcb.with_owner
+    };
 
     let mut data_vec: Vec<MmsData> = Vec::with_capacity(fields.len());
-    for field in &fields {
+    for field in fields
+        .iter()
+        .filter(|f| **f != RcbField::Owner || with_owner)
+    {
         match handle_get_rcb_field(engine, mms_path, field.clone()) {
             Some(AccessResult::Success(d)) => data_vec.push(d),
             Some(AccessResult::Failure(e)) => {

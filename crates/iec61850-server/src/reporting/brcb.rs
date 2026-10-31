@@ -216,9 +216,9 @@ pub enum ApplyEntryIdError {
 
 /// Static BRCB configuration, read-only once built.
 ///
-/// Differs from the URCB `Rcb` in three ways: there is no `Resv` field, which only
-/// a URCB has; `with_resv_tms` and `with_owner` decide whether the Edition 2 fields
-/// are exposed; and the sequence number is 16 bits rather than 8.
+/// Differs from the URCB `Rcb` in two ways: there is no `Resv` field, which only
+/// a URCB has, and the sequence number is 16 bits rather than 8. Both have the
+/// optional Owner attribute unless `with_owner` is cleared.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Brcb {
@@ -245,13 +245,21 @@ pub struct Brcb {
     /// Pre-configured owner address; when set, ResvTms starts as `Preconfigured`.
     pub client_reservation: Option<IpAddr>,
     /// Whether the Edition 2 ResvTms MMS field is exposed.
+    ///
+    /// TODO: not honored yet; ResvTms is always part of the MMS structure.
     pub with_resv_tms: bool,
-    /// Whether the Edition 2 Owner MMS field is exposed.
+    /// Whether the control block has the optional Owner attribute
+    /// (IEC 61850-7-2 Table 37, condition c4). Without it, Owner is absent from
+    /// the MMS structure, its type description and its name list, and reading
+    /// or writing it answers object-non-existent.
     pub with_owner: bool,
 }
 
 impl Brcb {
     /// Creates a BRCB configuration with default field values.
+    ///
+    /// The control block has the Owner attribute; a model built from SCL decides
+    /// it from `ReportSettings`, through [`with_owner`](Self::with_owner).
     pub fn new(name: impl Into<String>, dataset_name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -269,7 +277,7 @@ impl Brcb {
             buffer_capacity: 64, // 64 buffered entries by default
             client_reservation: None,
             with_resv_tms: true,
-            with_owner: false,
+            with_owner: true,
         }
     }
 
@@ -327,7 +335,7 @@ impl Brcb {
         self
     }
 
-    /// Sets whether the Owner field is exposed.
+    /// Sets whether the control block has the Owner attribute.
     pub fn with_owner(mut self, on: bool) -> Self {
         self.with_owner = on;
         self

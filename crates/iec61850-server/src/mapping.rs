@@ -870,6 +870,24 @@ pub(crate) struct ControlBlockEntry {
     pub(crate) kind: ControlBlockKind,
     /// The control block name, the member name within its group.
     pub(crate) name: String,
+    /// Whether a report control block has the optional Owner attribute;
+    /// ignored for the other kinds.
+    pub(crate) has_owner: bool,
+}
+
+#[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
+impl ControlBlockEntry {
+    /// The MMS structure of the control block: that of its kind, without
+    /// `Owner` when the control block does not have it.
+    pub(crate) fn type_spec(&self) -> MmsTypeSpec {
+        match self.kind.type_spec() {
+            MmsTypeSpec::Structure(mut members) if !self.has_owner => {
+                members.retain(|m| m.name != "Owner");
+                MmsTypeSpec::Structure(members)
+            }
+            spec => spec,
+        }
+    }
 }
 
 /// Returns the structure of a logical node with its run-time control blocks
@@ -895,7 +913,7 @@ pub(crate) fn ln_spec_with_control_blocks(
             .filter(|b| b.kind.fc() == fc)
             .map(|b| NamedVariableSpec {
                 name: b.name.clone(),
-                type_spec: b.kind.type_spec(),
+                type_spec: b.type_spec(),
             })
             .collect();
         if let Some(group) = groups.iter().find(|g| g.name == fc.as_str()) {
