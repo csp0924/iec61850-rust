@@ -7,7 +7,9 @@ The emit layer turns values into tokens and re-derives no semantics: every
 type lookup, functional-constraint parse and trigger-option composition is
 the run-time parser's, so a compiled model matches what
 [iec61850-scl](https://crates.io/crates/iec61850-scl) would build at run
-time from the same file.
+time from the same file. The build script also builds each covered IED
+through that run-time path, so a file it rejects fails the build instead of
+producing a model function that panics when called.
 
 Part of [iec61850-rust](https://github.com/csp0924/iec61850-rust), an
 independent Rust implementation of IEC 61850 (MMS, GOOSE, Sampled Values,
