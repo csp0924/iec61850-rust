@@ -266,9 +266,10 @@ mod tests {
     fn negotiated_pdu_size_visible_after_negotiation() {
         use iec61850_mms::mms::server::NegotiatedParams;
         let mut mms = MmsServerConnection::new();
-        mms.set_negotiated(NegotiatedParams {
-            max_pdu_size: 4096,
-            ..Default::default()
+        mms.set_negotiated({
+            let mut params = NegotiatedParams::default();
+            params.max_pdu_size = 4096;
+            params
         });
         let conn = ClientConnection::new(1, dummy_addr(), mms);
         assert_eq!(conn.negotiated_max_pdu_size(), Some(4096));

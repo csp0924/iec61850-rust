@@ -59,6 +59,7 @@ use super::initiate::{negotiate_initiate, InitiateOutcome};
 /// The caller uses it to decide which wire bytes to send, whether to mark the
 /// association concluded, and whether to close the transport.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MessageOutcome {
     /// The Initiate request was accepted: send the Initiate response bytes and pass
     /// `params` to `MmsServerConnection::set_negotiated`.

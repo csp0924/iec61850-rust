@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// Errors of the COTP layer, ISO 8073 class 0 over RFC 1006.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CotpError {
     /// The TPKT version is not 0x03, or the reserved byte is not 0x00.
     #[error("invalid tpkt header (version={version}, reserved={reserved})")]
@@ -152,6 +153,7 @@ impl From<iec61850_hal::transport::TransportError> for CotpError {
 
 /// Errors of the ISO stack: COTP, Session, Presentation and ACSE.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IsoError {
     #[error("cotp error: {0}")]
     /// A COTP layer error.

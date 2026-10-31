@@ -42,6 +42,7 @@ pub const MAX_IDENTIFIER_LEN: usize = 64;
 /// The eleven standard codes 0 to 11, each encoded as a single-byte BER INTEGER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum DataAccessError {
     /// The object has been invalidated.
     ObjectInvalidated = 0,

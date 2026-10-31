@@ -9,6 +9,7 @@ use thiserror::Error;
 
 /// Errors raised while encoding or decoding MMS PDUs.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MmsError {
     /// A BER tag differs from the expected one.
     #[error("ber tag mismatch: expected=0x{expected:02X}, actual=0x{actual:02X}")]

@@ -973,6 +973,10 @@ where
                     MessageOutcome::Silent => {
                         // Nothing to send, as for a received Reject PDU.
                     }
+                    _ => {
+                        tracing::warn!(conn_id, "unhandled message outcome on an established association, closing the socket");
+                        break;
+                    }
                 }
             }
             other => {

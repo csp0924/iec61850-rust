@@ -31,6 +31,7 @@ use tracing::warn;
 
 /// Errors raised by the Presentation layer.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PresentationError {
     /// The outer BER tag is not the expected CP/CPA tag 0x31.
     #[error("presentation pdu tag 0x{tag:02X} is not the expected 0x{expected:02X}")]
@@ -226,6 +227,7 @@ impl PSelector {
 /// The payload is not stored here: parse functions return offsets into the input
 /// buffer, which keeps this type free of borrows.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IsoPresentation {
     /// Local Presentation Selector (Calling P-SEL).
     pub calling_p_sel: PSelector,
@@ -265,6 +267,7 @@ impl Default for IsoPresentation {
 /// Carries the byte offset range of the user-data, that is the ACSE AARQ or
 /// AARE payload, inside the input buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectResult {
     /// Offset of the ACSE or MMS payload within the input buffer.
     pub payload_start: usize,
@@ -281,6 +284,7 @@ impl ConnectResult {
 
 /// Successful result of `parse_user_data`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UserDataResult {
     /// presentation-context-identifier: 1 for ACSE, 3 for MMS.
     pub context_id: u8,
@@ -302,6 +306,7 @@ impl UserDataResult {
 /// Every field of CPR normal-mode-parameters is OPTIONAL, so an absent one
 /// stays `None` or empty rather than being defaulted.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PresentationReject {
     /// provider-reason `[10]`. Names are available from
     /// [`provider_reason_name`].
@@ -351,6 +356,7 @@ pub fn provider_reason_name(reason: u8) -> Option<&'static str> {
 
 /// Connection parameters required by `encode_connect`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PresentationConnectionParameters {
     /// Local Presentation Selector (Calling P-SEL).
     pub local_p_sel: PSelector,

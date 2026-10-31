@@ -61,6 +61,7 @@ const TAG_OBJECT_IDENTIFIER: u8 = 0x06;
 /// An MMS Identify-Response: the vendor, model and revision of the responding
 /// implementation, and optionally the abstract syntaxes it supports.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct IdentifyResponse {
     /// vendorName.
     pub vendor_name: String,

@@ -85,6 +85,7 @@ const LI_MAX: usize = 255;
 
 /// Errors raised by the Session layer.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionError {
     /// The message is too short: fewer than 2 bytes, or an LI beyond what remains.
     #[error("session message too short (len={len})")]
@@ -197,6 +198,7 @@ impl Default for SSelector {
 
 /// Connection parameters passed to `encode_connect`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IsoParameters {
     /// Local Session Selector (Calling SS-SEL).
     pub local_selector: SSelector,
@@ -218,6 +220,7 @@ impl Default for IsoParameters {
 
 /// The outcome of parsing one SPDU.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionIndication {
     /// A CN SPDU, a connection request. `user_data_range` locates the PGI 0xC1
     /// payload inside the input slice.
@@ -244,6 +247,7 @@ pub enum SessionIndication {
 /// CPR PPDU the presentation layer rejected the connection with; it is located
 /// by offset into the SPDU rather than copied.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct RefuseInfo {
     /// Reason code, PI 50. Names are available from [`refuse_reason_name`].
     pub reason_code: Option<u8>,

@@ -27,6 +27,7 @@ use tracing::warn;
 
 /// Errors raised by the ACSE layer.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcseError {
     /// The PDU is shorter than a tag plus one length byte.
     #[error("acse pdu too short (len={len}, at least 2 bytes required)")]
@@ -114,6 +115,7 @@ pub enum AcseConnectionState {
 ///
 /// Returned by [`AcseConnection::parse_message`] on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcseIndication {
     /// An AARQ that parsed and authenticated, or an AARE with result 0.
     Associate,
@@ -131,6 +133,7 @@ pub enum AcseIndication {
 ///
 /// The `Debug` output of a password gives its length, never its content.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcseAuth {
     /// No authentication; the mechanism fields are absent.
     None,

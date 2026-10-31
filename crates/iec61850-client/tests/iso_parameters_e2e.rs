@@ -251,17 +251,15 @@ async fn custom_iso_parameters_reach_the_peer() {
         let relay = CapturingRelay::start(handle.bound_addr);
 
         let title: ApTitle = "1.3.9999.13".parse().expect("ap-title");
-        let params = IsoConnectionParameters {
-            local_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel"),
-            remote_p_sel: PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel"),
-            local_s_sel: SSelector::from_slice(&[0x00, 0x02]).expect("s-sel"),
-            remote_s_sel: SSelector::from_slice(&[0x00, 0x02]).expect("s-sel"),
-            local_ap_title: Some(title.clone()),
-            remote_ap_title: Some(title.clone()),
-            local_ae_qualifier: Some(1),
-            remote_ae_qualifier: Some(1),
-            ..IsoConnectionParameters::default()
-        };
+        let mut params = IsoConnectionParameters::default();
+        params.local_p_sel = PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel");
+        params.remote_p_sel = PSelector::from_slice(&[0x00, 0x00, 0x00, 0x02]).expect("p-sel");
+        params.local_s_sel = SSelector::from_slice(&[0x00, 0x02]).expect("s-sel");
+        params.remote_s_sel = SSelector::from_slice(&[0x00, 0x02]).expect("s-sel");
+        params.local_ap_title = Some(title.clone());
+        params.remote_ap_title = Some(title.clone());
+        params.local_ae_qualifier = Some(1);
+        params.remote_ae_qualifier = Some(1);
 
         let conn = IedConnection::with_iso_parameters(params);
         conn.connect("127.0.0.1", relay.port)

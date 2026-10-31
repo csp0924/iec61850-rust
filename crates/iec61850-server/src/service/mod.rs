@@ -3952,9 +3952,10 @@ mod tests {
         let dispatcher = build_dispatcher();
         let mut conn = MmsServerConnection::new();
         // A maximum below the frame overhead makes expansion overrun at once.
-        conn.set_negotiated(NegotiatedParams {
-            max_pdu_size: 32,
-            ..NegotiatedParams::default()
+        conn.set_negotiated({
+            let mut params = NegotiatedParams::default();
+            params.max_pdu_size = 32;
+            params
         });
 
         let read_req = ReadRequest::single_domain("IED1LD0", "MMXU1");
@@ -4286,9 +4287,10 @@ mod tests {
         use iec61850_mms::mms::server::connection::NegotiatedParams;
 
         let mut conn = MmsServerConnection::new();
-        conn.set_negotiated(NegotiatedParams {
-            data_structure_nesting_level: level,
-            ..NegotiatedParams::default()
+        conn.set_negotiated({
+            let mut params = NegotiatedParams::default();
+            params.data_structure_nesting_level = level;
+            params
         });
         conn
     }
@@ -4459,9 +4461,10 @@ mod tests {
 
         let dispatch_with_max = |max_pdu_size: u32| {
             let mut conn = MmsServerConnection::new();
-            conn.set_negotiated(NegotiatedParams {
-                max_pdu_size,
-                ..NegotiatedParams::default()
+            conn.set_negotiated({
+                let mut params = NegotiatedParams::default();
+                params.max_pdu_size = max_pdu_size;
+                params
             });
             dispatcher.dispatch(
                 &conn,
@@ -4570,9 +4573,10 @@ mod tests {
         use iec61850_mms::mms::server::connection::NegotiatedParams;
 
         let mut conn = MmsServerConnection::new();
-        conn.set_negotiated(NegotiatedParams {
-            max_pdu_size,
-            ..NegotiatedParams::default()
+        conn.set_negotiated({
+            let mut params = NegotiatedParams::default();
+            params.max_pdu_size = max_pdu_size;
+            params
         });
         conn
     }

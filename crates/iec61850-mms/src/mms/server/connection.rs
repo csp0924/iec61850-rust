@@ -161,6 +161,7 @@ pub const MIN_OUTSTANDING: u16 = 1;
 ///
 /// Written once per connection, when Initiate completes, and read-only thereafter.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NegotiatedParams {
     /// Negotiated maximum PDU size: the smaller proposal, floored at `MIN_PDU_SIZE`.
     pub max_pdu_size: u32,

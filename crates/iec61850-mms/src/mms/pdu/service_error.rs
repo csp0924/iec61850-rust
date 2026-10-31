@@ -379,6 +379,7 @@ impl ErrorClass {
 /// (0x82 ... )    -- additionalDescription [2] IMPLICIT VisibleString, OPTIONAL
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServiceError {
     /// errorClass `[0]` EXPLICIT, the one mandatory field.
     pub error_class: ErrorClass,
@@ -396,6 +397,18 @@ impl ServiceError {
             additional_code: None,
             additional_description: None,
         }
+    }
+
+    /// Sets the additionalCode.
+    pub fn with_additional_code(mut self, code: i32) -> Self {
+        self.additional_code = Some(code);
+        self
+    }
+
+    /// Sets the additionalDescription.
+    pub fn with_additional_description(mut self, description: impl Into<String>) -> Self {
+        self.additional_description = Some(description.into());
+        self
     }
 
     /// Encodes the content of a ServiceError, without the outer MmsPdu tag.

@@ -37,6 +37,7 @@ use bytes::BytesMut;
 
 /// The outcome of negotiating an Initiate request.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum InitiateOutcome {
     /// The request was accepted: `response_bytes` holds the encoded Initiate response
     /// and `params` the values the caller writes into `MmsServerConnection`.
@@ -60,6 +61,7 @@ pub enum InitiateOutcome {
 /// Local diagnostic reason for refusing an Initiate request; it does not affect the
 /// bytes sent.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InitiateRejectReason {
     /// The Initiate request itself failed to decode.
     ParseFailed(MmsError),

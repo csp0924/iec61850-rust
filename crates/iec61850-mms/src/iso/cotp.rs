@@ -166,6 +166,7 @@ impl Default for TpduSize {
 
 /// COTP connection options.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CotpOptions {
     /// Calling T-Selector, naming the local TSAP.
     pub tsel_src: TSelector,
@@ -806,6 +807,7 @@ pub enum CotpPdu<'a> {
 /// Options summary returned by PDU dispatch, which keeps `CotpOptions` free of a
 /// `Clone` bound.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CotpOptionsSummary {
     /// Calling T-Selector, naming the peer that sent the PDU.
     pub tsel_src: TSelector,

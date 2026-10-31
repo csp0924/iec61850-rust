@@ -21,6 +21,7 @@ pub struct ConfirmedRequest {
 
 /// What a dispatcher returns.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ConfirmedResponse {
     /// Content of a ConfirmedResponse PDU; the caller adds the outer `0xa1 <len>`.
     Response(Bytes),

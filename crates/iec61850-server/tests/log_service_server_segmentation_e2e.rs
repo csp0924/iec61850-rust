@@ -87,9 +87,10 @@ fn build_dispatcher_with_prefilled_lcb(
 fn make_negotiated_conn(max_pdu_size: u32) -> MmsServerConnection {
     let mut c = MmsServerConnection::new();
     c.set_connection_id(1);
-    c.set_negotiated(NegotiatedParams {
-        max_pdu_size,
-        ..Default::default()
+    c.set_negotiated({
+        let mut params = NegotiatedParams::default();
+        params.max_pdu_size = max_pdu_size;
+        params
     });
     c
 }

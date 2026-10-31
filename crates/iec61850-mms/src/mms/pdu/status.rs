@@ -56,6 +56,7 @@ const TAG_LOCAL_DETAIL: u8 = 0x82;
 
 /// vmdLogicalStatus: which services the VMD currently permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum VmdLogicalStatus {
     /// `state-changes-allowed (0)`.
     StateChangesAllowed,
@@ -95,6 +96,7 @@ impl VmdLogicalStatus {
 
 /// vmdPhysicalStatus: the operational condition of the real device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum VmdPhysicalStatus {
     /// `operational (0)`.
     Operational,
@@ -137,6 +139,7 @@ impl VmdPhysicalStatus {
 /// An MMS Status-Response: the logical and physical status of the VMD, and
 /// optionally implementation-specific detail bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StatusResponse {
     /// vmdLogicalStatus.
     pub logical_status: VmdLogicalStatus,

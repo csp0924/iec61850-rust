@@ -66,6 +66,7 @@ const OID_MAX_ARC_OCTETS: usize = 5;
 
 /// Errors raised while parsing or decoding an AP-title.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApTitleError {
     /// Fewer than the two arcs an OBJECT IDENTIFIER requires.
     #[error("ap-title needs at least two arcs, got {count}")]
@@ -270,6 +271,7 @@ fn write_base128(mut value: u32, out: &mut Vec<u8>) {
 ///
 /// Every field is OPTIONAL; a `None` field is not written to the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AarqAddressing {
     /// called-AP-title `[2]`.
     pub called_ap_title: Option<ApTitle>,
@@ -290,6 +292,7 @@ pub struct AarqAddressing {
 /// association; the default AP-titles and AE-qualifiers are the values IEDs
 /// customarily expect.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IsoConnectionParameters {
     /// Calling T-Selector, at most 4 bytes.
     pub local_t_sel: TSelector,

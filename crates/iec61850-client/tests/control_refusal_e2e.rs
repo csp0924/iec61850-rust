@@ -188,11 +188,7 @@ fn script_write(invoke_id: u32, item: &str, value: &MmsData, seq: u32) -> Plan {
             let mut buf = BytesMut::new();
             encode_confirmed_error_pdu(
                 invoke_id,
-                &ServiceError {
-                    error_class: ErrorClass::Access(3),
-                    additional_code: None,
-                    additional_description: None,
-                },
+                &ServiceError::new(ErrorClass::Access(3)),
                 &mut buf,
             );
             Plan {

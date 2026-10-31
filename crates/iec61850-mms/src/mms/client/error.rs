@@ -55,6 +55,7 @@ pub fn session_refused_message(
 
 /// Errors raised by MMS client operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// The encoded PDU exceeds the negotiated maximum size, so it is not sent.
     ///
