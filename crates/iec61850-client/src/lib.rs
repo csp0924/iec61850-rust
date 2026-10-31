@@ -60,6 +60,7 @@ pub mod connection;
 pub mod directory;
 pub mod identity;
 pub mod object_io;
+pub mod server_status;
 
 #[cfg(feature = "control")]
 pub mod control;
@@ -97,6 +98,7 @@ pub use error::ClientError;
 #[cfg(feature = "reporting")]
 pub use gocb::{GoCBValues, GoCBValuesWrite, PhyComAddress};
 pub use identity::ServerIdentity;
+pub use server_status::ServerStatus;
 // Re-exported so that the per-entry result of `read_objects` and
 // `get_data_set_values` can be named without depending on `iec61850-mms`
 // directly.
@@ -115,6 +117,9 @@ pub use journal::{
     parse_journal_ref, wire_entry_to_client, ClientJournalEntry, ClientJournalEntryData,
     ClientJournalEntryId, JournalQuery, QueryJournalNotImplemented,
 };
+// Re-exported so that the fields of `ServerStatus` can be named without
+// depending on `iec61850-mms` directly.
+pub use iec61850_mms::mms::pdu::{VmdLogicalStatus, VmdPhysicalStatus};
 pub use object_io::{
     parse_data_set_ref, parse_iec_object_path, ArrayElement, DataSetRef, IecObjectPath,
 };
