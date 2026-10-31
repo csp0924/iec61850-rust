@@ -192,6 +192,8 @@ pub struct GoosePublisher {
     /// Caller override for timeAllowedToLive; `None` derives it from the phase.
     time_allowed_to_live_override: Option<u32>,
 
+    /// Communication parameters the frame header was built from.
+    comm: CommParameters,
     /// Prebuilt Ethernet and GOOSE header bytes. The Length field holds a
     /// placeholder that each publication overwrites in the output copy.
     frame_header_bytes: Vec<u8>,
@@ -267,6 +269,7 @@ impl GoosePublisher {
             needs_commission: false,
             timestamp_8: [0u8; 8],
             time_allowed_to_live_override: None,
+            comm,
             frame_header_bytes,
             length_field_offset,
             retrans_intervals: RetransIntervals::default(),
@@ -289,6 +292,46 @@ impl GoosePublisher {
     /// Returns the configured goID, or `None` when gocbRef is sent instead.
     pub fn go_id(&self) -> Option<&str> {
         self.go_id.as_deref()
+    }
+
+    /// Returns the gocbRef carried in every publication.
+    pub fn gocb_ref(&self) -> &str {
+        &self.gocb_ref
+    }
+
+    /// Returns the datSet carried in every publication.
+    pub fn data_set_ref(&self) -> &str {
+        &self.data_set_ref
+    }
+
+    /// Replaces the datSet carried in every publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FieldTooLong(0)` when `data_set_ref` is empty, as `new` does,
+    /// and leaves the current value in place.
+    pub fn set_data_set_ref(&mut self, data_set_ref: impl Into<String>) -> Result<(), GooseError> {
+        let data_set_ref = data_set_ref.into();
+        if data_set_ref.is_empty() {
+            return Err(GooseError::FieldTooLong(0));
+        }
+        self.data_set_ref = data_set_ref;
+        Ok(())
+    }
+
+    /// Returns the confRev carried in every publication.
+    pub fn conf_rev(&self) -> u32 {
+        self.conf_rev
+    }
+
+    /// Returns the ndsCom flag carried in every publication.
+    pub fn needs_commission(&self) -> bool {
+        self.needs_commission
+    }
+
+    /// Returns the communication parameters the frame header was built from.
+    pub fn comm_parameters(&self) -> &CommParameters {
+        &self.comm
     }
 
     /// Sets the simulation bit, called `test` in IEC 61850-8-1.
@@ -616,6 +659,43 @@ mod tests {
     fn new_rejects_empty_data_set_ref() {
         let r = GoosePublisher::new(sample_comm(), "A/L$GO$gcb", None, "", 1);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn getters_report_the_configured_header_fields() {
+        let comm = sample_comm().with_vlan(VlanTag {
+            priority: VlanPriority::new(4).unwrap(),
+            vlan_id: 100,
+        });
+        let mut p = GoosePublisher::new(comm.clone(), "A/L$GO$gcb", None, "A/L$DS", 7).unwrap();
+        assert_eq!(p.gocb_ref(), "A/L$GO$gcb");
+        assert_eq!(p.data_set_ref(), "A/L$DS");
+        assert_eq!(p.conf_rev(), 7);
+        assert!(!p.needs_commission());
+        assert_eq!(p.comm_parameters(), &comm);
+
+        p.set_conf_rev(8);
+        p.set_needs_commission(true);
+        assert_eq!(p.conf_rev(), 8);
+        assert!(p.needs_commission());
+    }
+
+    #[test]
+    fn set_data_set_ref_changes_the_published_dat_set() {
+        let mut p = sample_publisher();
+        p.set_data_set_ref("A/L$DS2").unwrap();
+        assert_eq!(p.data_set_ref(), "A/L$DS2");
+        let frame = p.publish(&sample_data()).unwrap();
+        let pdu = GoosePdu::decode_ber(&GooseFrame::decode(&frame).unwrap().pdu_bytes).unwrap();
+        assert_eq!(pdu.dat_set, "A/L$DS2");
+    }
+
+    #[test]
+    fn set_data_set_ref_rejects_empty_and_keeps_the_value() {
+        let mut p = sample_publisher();
+        let before = p.data_set_ref().to_string();
+        assert!(p.set_data_set_ref("").is_err());
+        assert_eq!(p.data_set_ref(), before);
     }
 
     #[test]
