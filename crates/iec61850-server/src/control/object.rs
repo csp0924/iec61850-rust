@@ -202,8 +202,8 @@ impl ControlObject {
     /// Selects the object for a connection, moving it from unselected to ready.
     ///
     /// Returns `Ok(true)` when the object is now selected, `Ok(false)` when the
-    /// request was refused because another connection holds it or the state does
-    /// not allow a select.
+    /// request was refused because the object is already selected, by this or
+    /// another connection, or the state does not allow a select.
     ///
     /// # Errors
     ///
@@ -227,19 +227,15 @@ impl ControlObject {
                 Ok(true)
             }
             ControlState::Ready => {
-                if g.owner_conn_id == conn_id {
-                    // The same connection selecting again refreshes the timeout.
-                    g.select_time = Some(Instant::now());
-                    Ok(true)
-                } else {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        owner = g.owner_conn_id,
-                        requester = conn_id,
-                        "select refused: the object is selected by another connection"
-                    );
-                    Ok(false)
-                }
+                // Already selected, whichever connection asks; IEC 61850-7-2
+                // Table 47.
+                tracing::warn!(
+                    name = %self.config.name,
+                    owner = g.owner_conn_id,
+                    requester = conn_id,
+                    "select refused: the object is already selected"
+                );
+                Ok(false)
             }
             other => {
                 tracing::warn!(
@@ -938,6 +934,17 @@ mod tests {
         let timed_out = obj.check_sbo_timeout();
         assert!(timed_out, "the select timeout must fire");
         assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    // ── A selected object refuses a second select ────────────────────────
+
+    #[test]
+    fn select_of_a_selected_object_is_refused_for_every_connection() {
+        let obj = ControlObject::new(make_config(ControlModel::SboNormal));
+        assert!(obj.try_select(1).unwrap());
+        assert!(!obj.try_select(1).unwrap(), "the same connection");
+        assert!(!obj.try_select(2).unwrap(), "another connection");
+        assert_eq!(obj.state(), ControlState::Ready);
     }
 
     // ── Cancel is refused while a command executes ───────────────────────

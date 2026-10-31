@@ -98,11 +98,11 @@ async fn sbo_normal_select_then_operate_succeeds() {
     assert_eq!(obj.state(), ControlState::Unselected);
 }
 
-// Re-selecting from the owning connection succeeds and refreshes the select
-// timer.
+// Re-selecting from the owning connection is refused as already selected,
+// IEC 61850-7-2 Table 47, and keeps the selection.
 
 #[tokio::test]
-async fn sbo_normal_double_select_same_conn_ok() {
+async fn sbo_normal_double_select_same_conn_fails() {
     let obj = make_obj(5000);
     let check_h: Arc<dyn CheckHandler> = Arc::new(AlwaysAcceptCheckHandler);
 
@@ -111,8 +111,8 @@ async fn sbo_normal_double_select_same_conn_ok() {
 
     let r2 = handle_read_sbo(&obj, 1, Some(&check_h));
     assert!(
-        r2.is_some(),
-        "a repeated select from the owner must succeed"
+        r2.is_none(),
+        "a repeated select from the owner must be refused"
     );
     assert_eq!(obj.state(), ControlState::Ready);
 }

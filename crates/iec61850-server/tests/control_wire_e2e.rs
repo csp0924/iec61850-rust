@@ -408,6 +408,29 @@ async fn sbow_on_a_selected_object_reports_object_already_selected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_select_by_the_same_client_is_refused() {
+    let s = server();
+    let obj = object("SPCSO2", ControlModel::SboNormal);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let sel = a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("select");
+    assert_eq!(
+        sel,
+        MmsData::VisibleString(format!("{DOMAIN}/GGIO1$CO$SPCSO2"))
+    );
+    // A refused select answers an empty string, IEC 61850-8-1 Table 95.
+    let again = a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("read");
+    assert_eq!(again, MmsData::VisibleString(String::new()));
+    assert_eq!(obj.state(), ControlState::Ready, "the selection is kept");
+    a.write(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 1))
+        .await
+        .expect("operate under the first selection");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_requests_send_no_last_appl_error() {
     let s = server();
     let obj = object("SPCSO2", ControlModel::SboNormal);
