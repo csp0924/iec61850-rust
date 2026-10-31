@@ -524,6 +524,7 @@ dependencies = [
  "iec61850-hal",
  "iec61850-mms",
  "iec61850-model",
+ "iec61850-scl",
  "iec61850-server",
  "iec61850-tls",
  "rcgen",

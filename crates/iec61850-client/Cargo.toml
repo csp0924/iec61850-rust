@@ -107,6 +107,8 @@ tokio          = { workspace = true, features = ["sync", "rt", "macros", "rt-mul
 # the client/server dev-dependency cycle out of the publish graph.
 iec61850-server = { path = "../iec61850-server" }
 iec61850-model  = { workspace = true }
+# Parses the SCL model of the end-to-end test that runs every service.
+iec61850-scl    = { workspace = true }
 # Certificates for the TLS end-to-end tests, which run under feature `tls`.
 rcgen           = { workspace = true }
 
