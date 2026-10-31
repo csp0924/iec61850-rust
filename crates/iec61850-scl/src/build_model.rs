@@ -1738,7 +1738,8 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
 /// a 24-bit binary fraction of a second, and a time quality octet of 0.
 ///
 /// A value without a time zone is taken as UTC; a `Z` or `±hh:mm` suffix is
-/// honored. Fraction digits beyond the ninth are ignored.
+/// honored. `24:00:00` is the start of the next day, as xs:dateTime defines
+/// it. Fraction digits beyond the ninth are ignored.
 ///
 /// # Errors
 ///
@@ -1792,7 +1793,11 @@ fn parse_timestamp(text: &str) -> Result<[u8; 8], String> {
         2 => 28,
         _ => return Err(malformed()),
     };
-    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+    // xs:dateTime spells the end of a day as 24:00:00, which is the start of
+    // the next day; any other time past 23:59:59 is malformed.
+    let end_of_day =
+        hour == 24 && minute == 0 && second == 0 && fraction.bytes().all(|b| b == b'0');
+    if day < 1 || day > days_in_month || (hour > 23 && !end_of_day) || minute > 59 || second > 59 {
         return Err(malformed());
     }
 
@@ -2143,12 +2148,28 @@ mod tests {
             "2007-12-31 21:01:12",
             "2007-13-01T00:00:00",
             "2023-02-29T00:00:00",
-            "2007-12-31T24:00:00",
+            "2007-12-31T24:00:01",
+            "2007-12-31T24:01:00",
+            "2007-12-31T24:00:00.5",
+            "2007-12-31T25:00:00",
             "1969-12-31T23:59:59",
             "2007-12-31T21:01:12.",
             "07-12-31T21:01:12",
         ] {
             assert!(parse_timestamp(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    /// `24:00:00` is the start of the next day, across a month and a year
+    /// boundary too.
+    #[test]
+    fn timestamp_end_of_day_is_the_next_midnight() {
+        for (end, next) in [
+            ("2007-12-30T24:00:00", "2007-12-31T00:00:00"),
+            ("2007-12-31T24:00:00", "2008-01-01T00:00:00"),
+            ("2024-02-29T24:00:00.000Z", "2024-03-01T00:00:00"),
+        ] {
+            assert_eq!(parse_timestamp(end), parse_timestamp(next), "{end}");
         }
     }
 
