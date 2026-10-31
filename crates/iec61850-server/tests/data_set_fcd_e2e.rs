@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use iec61850_client::mms_compat::mms_data_to_mms_value;
 use iec61850_client::report::parse::{parse_report, ParsedReport, ReasonForInclusion};
 use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
-use iec61850_mms::mms::pdu::common::{AccessResult, DataAccessError, ObjectName};
+use iec61850_mms::mms::pdu::common::{AccessResult, DataAccessError, ObjectName, WriteOutcome};
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
 use iec61850_mms::mms::pdu::{DefineNamedVariableEntry, ReadJournalRequest};
 use iec61850_mms::mms::MmsData;
@@ -431,17 +431,28 @@ async fn a_segmented_report_keeps_each_member_whole() {
 
 // ── Client writes ────────────────────────────────────────────────────────
 
-/// Registers `LLN0$dsLim`, holding the FCD `Lim` and `Ind3.stVal`, binds the
-/// URCB to it, and logs it through an enabled log control block.
+/// Registers `LLN0$dsLim`, holding the FCD `Lim` and `Ind3.stVal`, and logs
+/// it through an enabled log control block.
 fn register_lim(server: &IedServer) -> Arc<dyn LogStorage> {
+    register_logged(
+        server,
+        "LLN0$dsLim",
+        &["GGIO1$SP$Lim", "GGIO1$ST$Ind3$stVal"],
+    )
+}
+
+/// Registers the data set `name` of `members` and logs it through an enabled
+/// log control block.
+fn register_logged(server: &IedServer, name: &str, members: &[&str]) -> Arc<dyn LogStorage> {
     let m = server.model();
-    let mut ds = Dataset::new("LLN0$dsLim");
-    ds.push(DatasetEntry::from_model(&m, DOM, "GGIO1$SP$Lim").unwrap());
-    ds.push(DatasetEntry::from_model(&m, DOM, "GGIO1$ST$Ind3$stVal").unwrap());
+    let mut ds = Dataset::new(name);
+    for member in members {
+        ds.push(DatasetEntry::from_model(&m, DOM, member).unwrap());
+    }
     server.register_dataset(DOM, ds);
     let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
     let block = LogControlBlock::new("evlog")
-        .with_dataset("LLN0$dsLim")
+        .with_dataset(name)
         .with_trg_ops(TriggerOptions::DATA_CHANGED)
         .with_log_ref(format!("{DOM}/{LOG}"));
     let lc = LogControl::new(format!("{DOM}/LLN0$LG$evlog"), block).with_storage(storage.clone());
@@ -597,5 +608,63 @@ async fn an_undefined_member_answers_object_undefined() {
         other => panic!("{other:?}"),
     }
     define(&mut mms, "LLN0$dynGood", &["GGIO1$ST$Ind1"]).await;
+    handle.stop().await;
+}
+
+/// A SetDataSetValues writing a structure to an FCD member and a value to a
+/// leaf member stores every leaf and raises all their triggers as one batch:
+/// one report and one log entry carry both members. The next report is that
+/// of the next write, so the request raised no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_set_write_of_a_data_object_member_reports_once() {
+    const UPD_V: &str = "IED1LD0/GGIO1$SP$Upd$v";
+    let server = server();
+    let storage = register_logged(&server, "LLN0$dsSet", &["GGIO1$SP$Lim", "GGIO1$SP$Upd$v"]);
+    let handle = server.start().await.unwrap();
+    let mut mms = connect(&handle, None).await;
+    enable_urcb(&mut mms, "IED1LD0/LLN0$dsSet").await;
+
+    let outcomes = mms
+        .write_named_variable_list_values(
+            DOM,
+            "LLN0$dsSet",
+            vec![
+                MmsData::Structure(vec![MmsData::Integer(11), MmsData::Integer(12)]),
+                MmsData::Integer(3),
+            ],
+        )
+        .await
+        .expect("SetDataSetValues");
+    assert!(
+        outcomes.iter().all(|o| *o == WriteOutcome::Success),
+        "{outcomes:?}"
+    );
+    assert_eq!(storage.count(), 1, "one log entry for the request");
+    let r = next_report(&mut mms).await;
+    assert_eq!(r.data_references, [LIM, UPD_V]);
+    assert_eq!(
+        r.reasons,
+        [
+            ReasonForInclusion::DATA_CHANGE,
+            ReasonForInclusion::DATA_UPDATE
+        ]
+    );
+    assert_eq!(
+        r.data_values,
+        [
+            MmsValue::Structure(vec![MmsValue::Integer(11), MmsValue::Integer(12)]),
+            MmsValue::Integer(3)
+        ]
+    );
+    assert_eq!(
+        mms.read(DOM, "GGIO1$SP$Lim").await.expect("read Lim"),
+        MmsData::Structure(vec![MmsData::Integer(11), MmsData::Integer(12)])
+    );
+
+    mms.write(DOM, "GGIO1$SP$Upd$v", MmsData::Integer(4))
+        .await
+        .expect("write v");
+    let r = next_report(&mut mms).await;
+    assert_eq!(r.data_references, [UPD_V], "no other report of the request");
     handle.stop().await;
 }
