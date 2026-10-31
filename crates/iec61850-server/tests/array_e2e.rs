@@ -1019,12 +1019,27 @@ async fn an_array_update_is_reported_as_one_batch() {
     .expect("timed out");
 }
 
+/// Entries in the buffer of `brcbHst`.
+fn brcb_hst_entries(server: &IedServer) -> usize {
+    let brcb = server
+        .reporting_engine()
+        .lock()
+        .unwrap()
+        .get_brcb(&format!("{DOMAIN}/LLN0$BR$brcbHst"))
+        .expect("brcbHst is registered");
+    let entries = brcb.lock_buffer().unwrap().len();
+    entries
+}
+
 /// While the data model is locked, the triggers of an array update wait for
-/// the release and then go out as one report.
+/// the release and then go out as one report. With no buffer time a trigger
+/// is buffered as it is raised, so the buffer staying as it was while the
+/// lock is held shows that the triggers were held back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_array_update_under_the_model_lock_is_reported_on_release() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let (server, handle, mut client) = start_reporting().await;
+        let before = brcb_hst_entries(&server);
 
         let guard = server.lock_data_model().expect("lock the data model");
         with_hst_val(&server, |hst| {
@@ -1038,7 +1053,17 @@ async fn an_array_update_under_the_model_lock_is_reported_on_release() {
             )
         })
         .expect("update_array");
+        assert_eq!(
+            brcb_hst_entries(&server),
+            before,
+            "nothing is buffered while the model is locked"
+        );
         drop(guard);
+        assert_eq!(
+            brcb_hst_entries(&server),
+            before + 1,
+            "the release buffers the update as one entry"
+        );
         assert_eq!(
             next_report(&mut client).await,
             (
