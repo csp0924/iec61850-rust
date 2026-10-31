@@ -5,6 +5,7 @@
 //! modes, session resumption, name checking, revocation and the events each
 //! outcome raises.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -771,6 +772,179 @@ fn resumption_lifetime_leaves_the_ticket_count_unchanged() {
         .inner()
         .send_tls13_tickets;
     assert_eq!(with_lifetime, default_count);
+}
+
+/// Client session store that counts the TLS 1.3 tickets it receives.
+#[derive(Debug)]
+struct TicketCounter {
+    inner: rustls::client::ClientSessionMemoryCache,
+    tls13_tickets: AtomicUsize,
+}
+
+impl TicketCounter {
+    fn new() -> Self {
+        Self {
+            inner: rustls::client::ClientSessionMemoryCache::new(32),
+            tls13_tickets: AtomicUsize::new(0),
+        }
+    }
+
+    fn tls13_tickets(&self) -> usize {
+        self.tls13_tickets.load(Ordering::SeqCst)
+    }
+}
+
+impl rustls::client::ClientSessionStore for TicketCounter {
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: rustls::NamedGroup) {
+        self.inner.set_kx_hint(server_name, group);
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+
+    fn set_tls12_session(
+        &self,
+        server_name: ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.inner.set_tls12_session(server_name, value);
+    }
+
+    fn tls12_session(
+        &self,
+        server_name: &ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.inner.tls12_session(server_name)
+    }
+
+    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name);
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.tls13_tickets.fetch_add(1, Ordering::SeqCst);
+        self.inner.insert_tls13_ticket(server_name, value);
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.inner.take_tls13_ticket(server_name)
+    }
+}
+
+/// Runs one TLS 1.3 handshake against an RSA server built by `server` and
+/// returns how many TLS 1.3 tickets the client received.
+async fn tls13_tickets_received(server: impl Fn(&Leaf) -> TlsConfigBuilder) -> usize {
+    let ca = Ca::new();
+    let leaf = rsa_leaf(&ca, SERVER_NAME);
+    let acceptor = TlsAcceptor::new(server(&leaf).build_server().unwrap());
+    let store = Arc::new(TicketCounter::new());
+    let built = client_trusting(&ca)
+        .min_version(TlsVersion::Tls13)
+        .build_client()
+        .unwrap();
+    let mut client = (*built.inner()).clone();
+    client.resumption = rustls::client::Resumption::store(store.clone());
+    let (srv, cli) = handshake(acceptor, &TlsConnector::from_rustls(Arc::new(client))).await;
+    assert!(srv.is_ok(), "server={srv:?}");
+    let cli = cli.expect("client side");
+    assert_eq!(cli.version, Some(rustls::ProtocolVersion::TLSv1_3));
+    store.tls13_tickets()
+}
+
+#[tokio::test]
+async fn default_server_sends_tls13_tickets() {
+    let received = tls13_tickets_received(server_with).await;
+    assert_eq!(received, 2);
+}
+
+#[tokio::test]
+async fn tls13_session_tickets_sets_the_ticket_count() {
+    let received = tls13_tickets_received(|leaf| server_with(leaf).tls13_session_tickets(1)).await;
+    assert_eq!(received, 1);
+}
+
+#[tokio::test]
+async fn zero_tls13_session_tickets_sends_no_tls13_ticket() {
+    let received = tls13_tickets_received(|leaf| server_with(leaf).tls13_session_tickets(0)).await;
+    assert_eq!(received, 0);
+}
+
+#[tokio::test]
+async fn zero_tls13_session_tickets_disables_only_tls13_resumption() {
+    let server = |leaf: &Leaf| server_with(leaf).tls13_session_tickets(0);
+    assert!(
+        second_handshake_resumed(server, TlsVersion::Tls12).await,
+        "Tls12 session did not resume"
+    );
+    assert!(
+        !second_handshake_resumed(server, TlsVersion::Tls13).await,
+        "Tls13 session resumed"
+    );
+}
+
+#[tokio::test]
+async fn disabled_resumption_overrides_tls13_session_tickets() {
+    let disabled = tls13_tickets_received(|leaf| {
+        server_with(leaf)
+            .tls13_session_tickets(3)
+            .session_resumption(false)
+    })
+    .await;
+    assert_eq!(disabled, 0);
+    let zero_lifetime = tls13_tickets_received(|leaf| {
+        server_with(leaf)
+            .session_resumption_lifetime(Duration::ZERO)
+            .tls13_session_tickets(3)
+    })
+    .await;
+    assert_eq!(zero_lifetime, 0);
+}
+
+#[test]
+fn disabled_resumption_leaves_a_zero_ticket_count_whatever_tls13_session_tickets() {
+    let ca = Ca::new();
+    let leaf = ca.leaf(SERVER_NAME, 1);
+    let count =
+        |builder: TlsConfigBuilder| builder.build_server().unwrap().inner().send_tls13_tickets;
+    assert_eq!(
+        count(
+            server_with(&leaf)
+                .tls13_session_tickets(3)
+                .session_resumption(false)
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            server_with(&leaf)
+                .tls13_session_tickets(3)
+                .session_resumption_lifetime(Duration::ZERO)
+        ),
+        0
+    );
+    assert_eq!(count(server_with(&leaf).tls13_session_tickets(3)), 3);
+}
+
+#[tokio::test]
+async fn tls13_session_tickets_combines_with_a_resumption_lifetime() {
+    let server = |leaf: &Leaf| {
+        server_with(leaf)
+            .session_resumption_lifetime(Duration::from_secs(3600))
+            .tls13_session_tickets(1)
+    };
+    assert_eq!(tls13_tickets_received(server).await, 1);
+    for max in BOTH_VERSIONS {
+        let resumed = second_handshake_resumed(server, max).await;
+        assert!(resumed, "{max:?} session did not resume");
+    }
 }
 
 // -----------------------------------------------------------------------------

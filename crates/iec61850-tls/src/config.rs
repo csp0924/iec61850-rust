@@ -172,6 +172,9 @@ pub struct TlsConfigBuilder {
     session_resumption_lifetime: Option<Duration>,
     /// Time source of the server session store.
     session_clock: SessionClock,
+    /// TLS 1.3 tickets the server sends per handshake; `None` keeps the
+    /// rustls default.
+    tls13_session_tickets: Option<usize>,
 
     // Renegotiation
     /// Requested renegotiation interval in milliseconds. Not applied: no
@@ -208,6 +211,7 @@ impl TlsConfigBuilder {
             session_resumption: true,
             session_resumption_lifetime: None,
             session_clock: system_clock(),
+            tls13_session_tickets: None,
             renegotiation_interval_ms: 0,
             event_handler: Arc::new(DefaultTracingHandler),
         }
@@ -384,7 +388,8 @@ impl TlsConfigBuilder {
     /// When disabled, the server keeps no session state and issues no TLS 1.3
     /// ticket, so neither TLS 1.2 nor TLS 1.3 sessions resume, and the client
     /// offers no session to resume. This takes precedence over
-    /// [`Self::session_resumption_lifetime`].
+    /// [`Self::session_resumption_lifetime`] and
+    /// [`Self::tls13_session_tickets`].
     pub fn session_resumption(mut self, v: bool) -> Self {
         self.session_resumption = v;
         self
@@ -398,6 +403,19 @@ impl TlsConfigBuilder {
     /// 256 sessions with no time limit. Has no effect on `build_client`.
     pub fn session_resumption_lifetime(mut self, d: Duration) -> Self {
         self.session_resumption_lifetime = Some(d);
+        self
+    }
+
+    /// Sets how many TLS 1.3 session tickets the server sends after each
+    /// handshake.
+    ///
+    /// Without this setting the server sends the rustls default of two. Zero
+    /// sends no TLS 1.3 ticket, so TLS 1.3 sessions do not resume, while TLS
+    /// 1.2 session ID resumption keeps working. `session_resumption(false)`
+    /// and a zero [`Self::session_resumption_lifetime`] take precedence: either
+    /// sends no ticket whatever this value. Has no effect on `build_client`.
+    pub fn tls13_session_tickets(mut self, n: usize) -> Self {
+        self.tls13_session_tickets = Some(n);
         self
     }
 
@@ -615,12 +633,17 @@ impl TlsConfigBuilder {
         if !self.session_resumption || lifetime.is_some_and(|d| d.is_zero()) {
             cfg.session_storage = Arc::new(NoServerSessionStorage {});
             cfg.send_tls13_tickets = 0;
-        } else if let Some(lifetime) = lifetime {
-            cfg.session_storage = Arc::new(ExpiringSessionStore::new(
-                lifetime,
-                SESSION_CACHE_CAPACITY,
-                self.session_clock,
-            ));
+        } else {
+            if let Some(lifetime) = lifetime {
+                cfg.session_storage = Arc::new(ExpiringSessionStore::new(
+                    lifetime,
+                    SESSION_CACHE_CAPACITY,
+                    self.session_clock,
+                ));
+            }
+            if let Some(n) = self.tls13_session_tickets {
+                cfg.send_tls13_tickets = n;
+            }
         }
 
         Ok(TlsServerConfig {
