@@ -561,9 +561,10 @@ async fn rlrq_in_a_data_transfer_is_aborted() {
     encode_data(&ppdu, &mut spdu);
     cotp.send_data(&spdu).await.unwrap();
 
-    let seen = drain(&mut cotp).await;
+    let seen = drain_raw(&mut cotp).await;
     assert_eq!(seen.len(), 1, "{seen:02x?}");
-    assert_eq!(seen[0].0, SessionIndication::Abort);
+    assert_eq!(seen[0][0], 0x19, "a session ABORT: {seen:02x?}");
+    assert_eq!(abrt_source(&seen[0]), Some(1), "a provider abort");
     handle.stop().await;
 }
 
@@ -580,9 +581,58 @@ async fn finish_without_rlrq_is_aborted() {
     encode_finish(&[], &mut spdu).unwrap();
     cotp.send_data(&spdu).await.unwrap();
 
-    let seen = drain(&mut cotp).await;
+    let seen = drain_raw(&mut cotp).await;
     assert_eq!(seen.len(), 1, "{seen:02x?}");
-    assert_eq!(seen[0].0, SessionIndication::Abort);
+    assert_eq!(seen[0][0], 0x19, "a session ABORT: {seen:02x?}");
+    assert_eq!(abrt_source(&seen[0]), Some(1), "a provider abort");
+    handle.stop().await;
+}
+
+/// Returns the abort-source of the ACSE ABRT inside a session ABORT.
+fn abrt_source(spdu: &[u8]) -> Option<u8> {
+    let at = spdu
+        .windows(4)
+        .position(|w| w == [0x64, 0x03, 0x80, 0x01])?;
+    spdu.get(at + 4).copied()
+}
+
+/// Reads every TSDU, unparsed, until the server closes the connection.
+async fn drain_raw(cotp: &mut CotpConnection<TcpStream>) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    loop {
+        let r = tokio::time::timeout(Duration::from_secs(5), cotp.recv_data())
+            .await
+            .expect("the server answers or closes in time");
+        match r {
+            Ok(raw) => seen.push(raw.to_vec()),
+            Err(_) => return seen,
+        }
+    }
+}
+
+/// An abort the server application requests names the ACSE service user as
+/// its source; the protocol errors above name the service provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requested_abort_names_the_user_as_its_source() {
+    let server = IedServer::builder()
+        .model(model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .config(IedServerConfig::default())
+        .build()
+        .expect("build server");
+    let handle = server.start().await.expect("start server");
+    let mut cotp = connect_cotp(&handle).await;
+    cotp.send_data(&cn(&cp())).await.unwrap();
+    recv_spdu(&mut cotp).await.expect("an AC");
+    // An answered request means the association is registered with the server.
+    send_on_context(&mut cotp, 3, &[0xa0, 0x05, 0x02, 0x01, 0x01, 0x82, 0x00]).await;
+    recv_spdu(&mut cotp).await.expect("an identify response");
+    assert_eq!(server.abort_all_connections(), 1);
+
+    let seen = drain_raw(&mut cotp).await;
+    assert_eq!(seen.len(), 1, "{seen:02x?}");
+    assert_eq!(seen[0][0], 0x19, "a session ABORT: {seen:02x?}");
+    assert_eq!(abrt_source(&seen[0]), Some(0), "a user abort");
     handle.stop().await;
 }
 

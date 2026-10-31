@@ -29,7 +29,9 @@
 //!   AARE with a rejected result before the socket closes. The AARE of a
 //!   refused Initiate carries the Initiate-ErrorPDU as its user information.
 //! - An abort sends an ACSE A-ABORT, wrapped in a Session abort and a COTP data
-//!   TPDU, before the socket closes.
+//!   TPDU, before the socket closes. Its abort-source is acse-service-user when
+//!   the server decides to abort (the idle timeout, `abort_connection`,
+//!   shutdown) and acse-service-provider for a protocol error.
 //! - Once the Initiate exchange completes, a TSDU larger than the negotiated
 //!   maximum PDU size plus 8192 bytes of envelope closes the connection.
 //! - An association that neither receives nor sends a PDU for
@@ -597,8 +599,8 @@ where
 {
     let Established {
         mut cotp,
-        mut session,
-        mut pres,
+        session,
+        pres,
         mms_conn,
     } = established;
 
@@ -667,7 +669,7 @@ where
                 conn_id,
                 send_timeout,
                 &mut last_activity,
-                send_acse_abort(&mut cotp, &mut session, &mut pres),
+                send_acse_abort(&mut cotp, &pres, AbortSource::User),
             )
             .await?;
             break;
@@ -687,7 +689,7 @@ where
                     conn_id,
                     send_timeout,
                     &mut last_activity,
-                    send_acse_abort(&mut cotp, &mut session, &mut pres),
+                    send_acse_abort(&mut cotp, &pres, AbortSource::User),
                 )
                 .await?;
                 break;
@@ -873,7 +875,7 @@ where
                         conn_id,
                         send_timeout,
                         &mut last_activity,
-                        send_acse_abort(&mut cotp, &mut session, &mut pres),
+                        send_acse_abort(&mut cotp, &pres, AbortSource::Provider),
                     )
                     .await?;
                 }
@@ -935,7 +937,7 @@ where
                     conn_id,
                     send_timeout,
                     &mut last_activity,
-                    send_acse_abort(&mut cotp, &mut session, &mut pres),
+                    send_acse_abort(&mut cotp, &pres, AbortSource::Provider),
                 )
                 .await?;
                 break;
@@ -1297,18 +1299,28 @@ fn cause_to_i32(c: ControlAddCause) -> i32 {
     c as i32
 }
 
-/// Sends an ACSE A-ABORT with the provider as its source, wrapped outwards
+/// The abort-source of an ACSE A-ABORT the server sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortSource {
+    /// acse-service-user: the server application decided to abort, as on the
+    /// idle timeout, `abort_connection` or shutdown.
+    User,
+    /// acse-service-provider: the protocol machine detected a protocol error.
+    Provider,
+}
+
+/// Sends an ACSE A-ABORT with `source` as its abort-source, wrapped outwards
 /// through a presentation abort, a session abort, and a COTP data TPDU.
 async fn send_acse_abort<S>(
     cotp: &mut CotpConnection<S>,
-    _session: &mut IsoSession,
-    pres: &mut IsoPresentation,
+    pres: &IsoPresentation,
+    source: AbortSource,
 ) -> std::result::Result<(), ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut abrt = [0u8; 5];
-    encode_abrt(true, &mut abrt);
+    encode_abrt(source == AbortSource::Provider, &mut abrt);
 
     let mut pres_buf = BytesMut::new();
     pres_encode_abort(pres, &abrt, &mut pres_buf);
@@ -1527,6 +1539,26 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_secs(300));
         assert_eq!(server.connection_count(), 0);
+    }
+
+    /// Returns the abort-source of the ACSE ABRT inside a session ABORT.
+    fn abrt_source(spdu: &[u8]) -> Option<u8> {
+        let at = spdu
+            .windows(4)
+            .position(|w| w == [0x64, 0x03, 0x80, 0x01])?;
+        spdu.get(at + 4).copied()
+    }
+
+    /// The abort the idle timeout sends names the ACSE service user, the
+    /// server application, as its source.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_abort_names_the_user_as_its_source() {
+        let server = build_server(IedServerConfig::default());
+        let (client, _task) = spawn_connection(&server, 4096);
+        let mut cotp = associate(client).await;
+        let abort = cotp.recv_data().await.expect("the abort");
+        assert_eq!(abort[0], 0x19, "a session ABORT: {abort:02x?}");
+        assert_eq!(abrt_source(&abort), Some(0), "{abort:02x?}");
     }
 
     /// Completes the association offering `max_pdu_size` and waits for the
