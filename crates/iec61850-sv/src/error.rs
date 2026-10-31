@@ -138,5 +138,5 @@ pub enum SvError {
     /// Platform error surfaced by an `EthernetSink` or `EthernetSource`, such as
     /// a failed raw socket send or receive. It maps no Sampled Values clause.
     #[error("sv platform error: {0}")]
-    Other(String),
+    Platform(#[from] iec61850_hal::ethernet::EthernetError),
 }

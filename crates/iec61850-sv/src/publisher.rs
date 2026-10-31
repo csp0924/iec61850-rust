@@ -127,7 +127,7 @@ pub trait EthernetSink {
     ///
     /// # Errors
     ///
-    /// Returns `SvError::Other` carrying the platform error on failure.
+    /// Returns `SvError::Platform` carrying the platform error on failure.
     fn send(&mut self, frame: &[u8]) -> Result<(), SvError>;
 }
 
@@ -794,6 +794,27 @@ mod tests {
             .unwrap();
         let pub_ = builder.setup_complete().unwrap();
         (pub_, h)
+    }
+
+    #[test]
+    fn sink_failure_carries_the_platform_error() {
+        use iec61850_hal::ethernet::EthernetError;
+
+        struct DownLink;
+        impl EthernetSink for DownLink {
+            fn send(&mut self, _frame: &[u8]) -> Result<(), SvError> {
+                Err(EthernetError::Os("link down".into()))?
+            }
+        }
+
+        let (p, _) = build_single_asdu_publisher(8);
+        let err = p.publish_with_sink(&mut DownLink).unwrap_err();
+        assert_eq!(
+            err,
+            SvError::Platform(EthernetError::Os("link down".into()))
+        );
+        let source = std::error::Error::source(&err).expect("the platform error is the source");
+        assert_eq!(source.to_string(), "os error: link down");
     }
 
     #[test]

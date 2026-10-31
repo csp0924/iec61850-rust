@@ -96,7 +96,7 @@ pub mod ethertype {
 // --- Error --------------------------------------------------------------------
 
 /// An error raised by an L2 socket operation.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EthernetError {
     /// The interface does not exist, or opening it is not permitted.
