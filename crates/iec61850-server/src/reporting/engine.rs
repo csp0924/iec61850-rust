@@ -2502,7 +2502,8 @@ impl BatchValues<'_> {
 /// starting from the value it holds, or from its current value when it holds
 /// none, with the parts of the other attributes of `batch` beneath it set to
 /// their batch values, so the triggers of several attributes beneath one
-/// member accumulate in one value of the state the batch left.
+/// member accumulate in one value of the state the batch left. A batch value
+/// outside the member costs a comparison of its reference with the member's.
 #[allow(clippy::too_many_arguments)]
 fn fill_member(
     ds: &Dataset,

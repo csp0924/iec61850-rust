@@ -98,11 +98,16 @@ impl MemberNode {
     }
 
     fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a DatasetLeaf>) {
+        self.visit_leaves(&mut |leaf| out.push(leaf));
+    }
+
+    /// Calls `f` on every leaf beneath the node, in member order.
+    fn visit_leaves<'a>(&'a self, f: &mut impl FnMut(&'a DatasetLeaf)) {
         match self {
-            MemberNode::Leaf(leaf) => out.push(leaf),
+            MemberNode::Leaf(leaf) => f(leaf),
             MemberNode::Structure(children) | MemberNode::Array(children) => {
                 for child in children {
-                    child.collect_leaves(out);
+                    child.visit_leaves(f);
                 }
             }
         }
@@ -352,10 +357,13 @@ impl DatasetEntry {
         match &self.node {
             MemberNode::Leaf(leaf) => leaf.attr_ref == leaf_ref,
             MemberNode::Structure(_) | MemberNode::Array(_) => {
-                leaf_ref
-                    .strip_prefix(self.attr_ref.as_str())
-                    .is_some_and(|rest| rest.starts_with('$') || rest.starts_with('('))
-                    && self.leaves().iter().any(|l| l.attr_ref == leaf_ref)
+                if !self.may_hold(leaf_ref) {
+                    return false;
+                }
+                let mut found = false;
+                self.node
+                    .visit_leaves(&mut |l| found |= l.attr_ref == leaf_ref);
+                found
             }
         }
     }
@@ -366,7 +374,8 @@ impl DatasetEntry {
     /// `held` is the member value to start from; `None` starts from the
     /// current value. Returns `held` unchanged when the leaf is not part of
     /// the member, and `None` when no value is held and a value lock is
-    /// poisoned.
+    /// poisoned. A reference outside the member's own reference is passed
+    /// over without walking the member.
     pub(crate) fn value_with(
         &self,
         held: Option<MmsValue>,
@@ -384,33 +393,26 @@ impl DatasetEntry {
             Some(v) => v,
             None => self.read_value()?,
         };
-        self.node.replace_leaf(&mut value, leaf_ref, new_value);
+        if self.may_hold(leaf_ref) {
+            self.node.replace_leaf(&mut value, leaf_ref, new_value);
+        }
         Some(value)
     }
 
-    /// Returns whether the leaf whose value lock is `cell` is part of the
-    /// member.
-    #[cfg(feature = "full-server")]
-    pub(crate) fn holds_cell(&self, cell: &Arc<RwLock<MmsValue>>) -> bool {
-        self.leaves().iter().any(|l| Arc::ptr_eq(&l.value, cell))
+    /// Returns whether `leaf_ref` extends the member's reference by a
+    /// component or an element index, the only way a leaf beneath the member
+    /// is named.
+    fn may_hold(&self, leaf_ref: &str) -> bool {
+        leaf_ref
+            .strip_prefix(self.attr_ref.as_str())
+            .is_some_and(|rest| rest.starts_with('$') || rest.starts_with('('))
     }
 
-    /// Returns the value of the member with the leaf whose value lock is
-    /// `cell` replaced by `new_value`, starting from `held` as
-    /// [`DatasetEntry::value_with`] does. `None` also when the leaf is not
-    /// part of the member.
+    /// Calls `f` on every leaf of the member, in member order, without
+    /// collecting them.
     #[cfg(feature = "full-server")]
-    pub(crate) fn value_with_cell(
-        &self,
-        held: Option<MmsValue>,
-        cell: &Arc<RwLock<MmsValue>>,
-        new_value: &MmsValue,
-    ) -> Option<(DataAttributeRef, MmsValue)> {
-        let leaves = self.leaves();
-        let leaf = leaves.iter().find(|l| Arc::ptr_eq(&l.value, cell))?;
-        let leaf_ref = leaf.attr_ref.clone();
-        let value = self.value_with(held, &leaf_ref, new_value)?;
-        Some((leaf_ref, value))
+    pub(crate) fn for_each_leaf<'a>(&'a self, mut f: impl FnMut(&'a DatasetLeaf)) {
+        self.node.visit_leaves(&mut f);
     }
 }
 

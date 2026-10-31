@@ -853,6 +853,13 @@ impl IedServer {
         let Some(controls) = self.unique_log_controls() else {
             return;
         };
+        // Positions in the batch of the updates of each attribute, keyed by
+        // its shared value, so a member finds the updates beneath it by
+        // walking its own leaves once.
+        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::with_capacity(triggers.len());
+        for (i, t) in triggers.iter().enumerate() {
+            by_cell.entry(t.key()).or_default().push(i);
+        }
         let mut now_ms: Option<u64> = None;
         for lc in controls {
             let (data_set, trg_ops) = match lc.state.lock() {
@@ -874,49 +881,39 @@ impl IedServer {
             let Some(ds) = self.log_data_set(&lc, data_set) else {
                 continue;
             };
-            // Member position to its value and reason code, over the batch. A
-            // member takes every value of the batch beneath it, the values of
-            // updates with no reason included, the first time it is reached.
-            let mut members: Vec<(usize, MmsValue, u8)> = Vec::new();
-            for t in triggers {
-                let reason_code = log_reason(t.flag, trg_ops);
+            // Each member in data set order, with the updates of the batch
+            // beneath it. A member an update with an enabled reason reaches
+            // takes every value of the batch beneath it in batch order, the
+            // values of updates with no reason included.
+            let mut data: Vec<(String, MmsValue, u8)> = Vec::new();
+            let mut beneath: Vec<(usize, &str)> = Vec::new();
+            for entry in &ds.entries {
+                beneath.clear();
+                entry.for_each_leaf(|leaf| {
+                    let key = Arc::as_ptr(&leaf.value) as usize;
+                    if let Some(positions) = by_cell.get(&key) {
+                        beneath.extend(positions.iter().map(|&i| (i, leaf.attr_ref.as_str())));
+                    }
+                });
+                let reason_code = beneath.iter().fold(0, |code, &(i, _)| {
+                    code | log_reason(triggers[i].flag, trg_ops)
+                });
                 if reason_code == 0 {
                     continue;
                 }
-                for (idx, entry) in ds.entries.iter().enumerate() {
-                    if !entry.holds_cell(&t.cell) {
-                        continue;
-                    }
-                    if let Some(s) = members.iter().position(|(i, ..)| *i == idx) {
-                        members[s].2 |= reason_code;
-                        continue;
-                    }
-                    let mut value = entry.read_value();
-                    for b in triggers {
-                        if entry.holds_cell(&b.cell) {
-                            value = value.and_then(|v| {
-                                entry
-                                    .value_with_cell(Some(v), &b.cell, &b.value)
-                                    .map(|(_, v)| v)
-                            });
-                        }
-                    }
-                    let Some(value) = value else {
-                        continue;
-                    };
-                    members.push((idx, value, reason_code));
+                beneath.sort_unstable_by_key(|&(i, _)| i);
+                let mut value = entry.read_value();
+                for &(i, leaf_ref) in &beneath {
+                    value = entry.value_with(value, leaf_ref, &triggers[i].value);
                 }
+                let Some(value) = value else {
+                    continue;
+                };
+                data.push((entry.attr_ref.clone(), value, reason_code));
             }
-            if members.is_empty() {
+            if data.is_empty() {
                 continue;
             }
-            members.sort_by_key(|(idx, ..)| *idx);
-            let data: Vec<(String, MmsValue, u8)> = members
-                .into_iter()
-                .map(|(idx, value, reason_code)| {
-                    (ds.entries[idx].attr_ref.clone(), value, reason_code)
-                })
-                .collect();
             let time_ms = *now_ms.get_or_insert_with(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
