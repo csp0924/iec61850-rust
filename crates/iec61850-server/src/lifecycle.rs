@@ -165,12 +165,13 @@ impl IedServer {
     }
 }
 
-/// Drives the periodic report triggers on a 1 ms interval.
+/// Drives the periodic report and log triggers on a 1 ms interval.
 ///
 /// Every tick advances the buffer time, integrity period, and general
 /// interrogation timers of both the unbuffered and the buffered report control
-/// blocks. While the data model is locked these wait, so none of them sees part
-/// of a batch of updates. Once per second the tick also releases expired buffered-report and setting
+/// blocks, and writes the integrity log entries that are due. While the data
+/// model is locked these wait, so none of them sees part of a batch of updates.
+/// Once per second the tick also releases expired buffered-report and setting
 /// group reservations; an accumulated millisecond count carries that period, so
 /// jitter in the 1 ms interval cannot skip a sweep.
 ///
@@ -204,6 +205,7 @@ async fn run_tick_loop(server: IedServer, mut shutdown_rx: watch::Receiver<bool>
                             tracing::warn!("tick loop: the reporting engine lock is poisoned, skipping this tick");
                         }
                     }
+                    server.tick_log_integrity(now, now_ms);
                 }
                 reservation_accum_ms = reservation_accum_ms.saturating_add(1);
                 if reservation_accum_ms >= 1000 {

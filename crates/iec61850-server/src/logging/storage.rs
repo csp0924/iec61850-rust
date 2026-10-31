@@ -139,6 +139,30 @@ pub trait LogStorage: std::fmt::Debug + Send + Sync {
         reason_code: u8,
     ) -> Result<(), LogStorageError>;
 
+    /// Writes a whole entry, its time and every data point, as one unit, and
+    /// returns its identifier.
+    ///
+    /// The default implementation writes the header with `add_entry` and then
+    /// each data point with `add_entry_data`, so it can leave part of an entry
+    /// behind when a later call fails. A backend that can fail between those
+    /// calls overrides it to write the entry at once; the in-memory backend
+    /// does, and leaves nothing behind on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LogStorageError::Backend` when the backend fails.
+    fn add_entry_with_data(
+        &self,
+        time_ms: u64,
+        data: &[JournalEntryData],
+    ) -> Result<EntryId, LogStorageError> {
+        let id = self.add_entry(time_ms)?;
+        for d in data {
+            self.add_entry_data(id, &d.data_ref, d.value.clone(), d.reason_code)?;
+        }
+        Ok(id)
+    }
+
     /// Visits the entries in a time range, both endpoints included.
     ///
     /// # Errors
@@ -233,6 +257,14 @@ impl Default for InMemoryLogStorage {
 
 impl LogStorage for InMemoryLogStorage {
     fn add_entry(&self, time_ms: u64) -> Result<EntryId, LogStorageError> {
+        self.add_entry_with_data(time_ms, &[])
+    }
+
+    fn add_entry_with_data(
+        &self,
+        time_ms: u64,
+        data: &[JournalEntryData],
+    ) -> Result<EntryId, LogStorageError> {
         let mut g = self
             .inner
             .write()
@@ -250,7 +282,7 @@ impl LogStorage for InMemoryLogStorage {
         g.entries.push_back(JournalEntry {
             entry_id: id,
             time_ms,
-            variables: Vec::new(),
+            variables: data.to_vec(),
         });
         Ok(id)
     }
@@ -371,6 +403,31 @@ impl LogEntryVisitor for CollectingVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whole_entry_is_stored_at_once() {
+        let s = InMemoryLogStorage::with_capacity(1);
+        s.add_entry(1).unwrap();
+        let id = s
+            .add_entry_with_data(
+                2,
+                &[
+                    JournalEntryData::new("a", MmsValue::Boolean(true), 0x10),
+                    JournalEntryData::new("b", MmsValue::Integer(7), 0x10),
+                ],
+            )
+            .unwrap();
+        let mut v = CollectingVisitor::new();
+        s.query_by_time(0, 9999, &mut v).unwrap();
+        assert_eq!(v.entries.len(), 1, "the full log evicts its oldest entry");
+        assert_eq!(v.entries[0].entry_id, id);
+        let refs: Vec<_> = v.entries[0]
+            .variables
+            .iter()
+            .map(|d| d.data_ref.as_str())
+            .collect();
+        assert_eq!(refs, ["a", "b"]);
+    }
 
     #[test]
     fn add_entry_and_query_round_trip() {

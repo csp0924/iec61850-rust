@@ -7,9 +7,10 @@
 //! table 21).
 //! Report control blocks and log control blocks act on the same triggers,
 //! each on those its TrgOps enable. Under the data model lock the triggers
-//! are held back and raised as one batch when the lock is released. Reports
-//! are received on a raw MMS association and decoded without client-side
-//! report state.
+//! are held back and raised as one batch when the lock is released. Integrity
+//! log entries are written every IntgPd, driven here with clock readings of
+//! the test's own. Reports are received on a raw MMS association and decoded
+//! without client-side report state.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -862,6 +863,126 @@ async fn updates_under_the_data_model_lock_are_logged_on_release() {
     assert_eq!(journal(&resp), [vec![(IND1, 0x02)], vec![(IND2, 0x02)]]);
     assert_eq!(resp.entries[1].variables[0].value, MmsData::Boolean(true));
     c.disconnect().await.ok();
+    handle.stop().await;
+}
+
+/// A log control block with integrity writes one entry holding every member
+/// of its data set each IntgPd, and an update is still logged once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrity_writes_the_whole_data_set_each_intg_pd() {
+    const INTG_PD_MS: u32 = 3_600_000;
+    let m = model();
+    let srv = server(m.clone());
+    let storage = register_lcb(
+        &srv,
+        &m,
+        TriggerOptions::DATA_CHANGED | TriggerOptions::INTEGRITY,
+        INTG_PD_MS,
+    );
+    let handle = srv.start().await.unwrap();
+
+    srv.update_boolean(da(&m, 2), true).unwrap();
+    assert_eq!(storage.count(), 1, "an update writes one entry");
+
+    // Entry times after the update's, so the journal lists them in order.
+    let period = Duration::from_millis(u64::from(INTG_PD_MS));
+    let due = Instant::now() + period;
+    let due_ms = wall_ms() + u64::from(INTG_PD_MS);
+    assert_eq!(srv.tick_log_integrity(due, due_ms), 1);
+    assert_eq!(srv.tick_log_integrity(due, due_ms), 0);
+    assert_eq!(
+        srv.tick_log_integrity(due + period - Duration::from_millis(1), due_ms + 1),
+        0
+    );
+    assert_eq!(
+        srv.tick_log_integrity(due + period, due_ms + u64::from(INTG_PD_MS)),
+        1
+    );
+
+    let mut c = connect(&handle).await;
+    let resp = read_journal(&mut c).await;
+    let whole = vec![(IND1, 0x10), (IND2, 0x10), (IND3, 0x10), (MAG, 0x10)];
+    assert_eq!(journal(&resp), [vec![(IND3, 0x02)], whole.clone(), whole]);
+    let integrity = &resp.entries[1];
+    assert_eq!(integrity.occurence_time_ms, due_ms);
+    let values: Vec<_> = integrity
+        .variables
+        .iter()
+        .map(|v| v.value.clone())
+        .collect();
+    assert_eq!(
+        values,
+        [
+            MmsData::Boolean(false),
+            MmsData::Boolean(false),
+            MmsData::Boolean(true),
+            MmsData::Float32(1.5),
+        ]
+    );
+    c.disconnect().await.ok();
+    handle.stop().await;
+}
+
+/// General interrogation writes no log entry, and integrity needs both the
+/// trigger and a period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn general_interrogation_and_a_zero_period_write_no_integrity_entry() {
+    let later = Instant::now() + Duration::from_secs(7_200);
+    for (trg_ops, intg_pd_ms) in [(TriggerOptions::GI, 1_000), (TriggerOptions::INTEGRITY, 0)] {
+        let m = model();
+        let srv = server(m.clone());
+        let storage = register_lcb(&srv, &m, trg_ops, intg_pd_ms);
+        assert_eq!(srv.tick_log_integrity(later, 1), 0);
+        assert_eq!(storage.count(), 0);
+    }
+}
+
+/// Polls `storage` until it holds at least `n` entries; fails after four
+/// seconds.
+async fn wait_for_entries(storage: &Arc<dyn LogStorage>, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while storage.count() < n {
+        assert!(
+            Instant::now() < deadline,
+            "the tick loop wrote no integrity entry"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The tick loop of a started server writes the integrity entries that fall
+/// due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tick_loop_writes_integrity_entries() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage = register_lcb(&srv, &m, TriggerOptions::INTEGRITY, 50);
+    let handle = srv.start().await.unwrap();
+    wait_for_entries(&storage, 1).await;
+    handle.stop().await;
+}
+
+/// While the data model is locked the tick loop writes no integrity entry,
+/// and it writes the one that fell due once the lock is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrity_entries_wait_for_the_data_model_lock() {
+    let m = model();
+    let srv = server(m.clone());
+    let storage = register_lcb(&srv, &m, TriggerOptions::INTEGRITY, 50);
+    let handle = srv.start().await.unwrap();
+    let held = {
+        let _guard = srv.lock_data_model().unwrap();
+        let before = storage.count();
+        // Six integrity periods pass while the lock is held.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            storage.count(),
+            before,
+            "no integrity entry is written while the model is locked"
+        );
+        before
+    };
+    wait_for_entries(&storage, held + 1).await;
     handle.stop().await;
 }
 

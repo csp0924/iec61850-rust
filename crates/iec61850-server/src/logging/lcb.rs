@@ -25,6 +25,7 @@
 use super::storage::{EntryId, LogEntryVisitor, LogStorage, LogStorageError};
 use crate::flags::TriggerOptions;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The LogEna attribute of a log control block.
 ///
@@ -161,6 +162,9 @@ pub struct LogControlState {
     pub trg_ops: TriggerOptions,
     /// Current integrity period, in milliseconds.
     pub intg_period_ms: u32,
+    /// Start of the current integrity period: when the control block was
+    /// enabled or last wrote an integrity entry.
+    intg_since: Option<Instant>,
 }
 
 impl LogControl {
@@ -174,6 +178,7 @@ impl LogControl {
             data_set: lcb.dataset_name.clone(),
             trg_ops: lcb.trg_ops,
             intg_period_ms: lcb.intg_period_ms,
+            intg_since: None,
         };
         Self {
             mms_path: mms_path.into(),
@@ -197,6 +202,7 @@ impl LogControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if default_enabled && state.data_set.is_some() {
             state.log_ena = LogState::Enabled;
+            state.intg_since = Some(Instant::now());
         }
         self
     }
@@ -223,9 +229,13 @@ impl LogControl {
             if self.storage.is_none() {
                 return Err("LogEna cannot be set while no storage backend is bound");
             }
-            s.log_ena = LogState::Enabled;
+            if s.log_ena != LogState::Enabled {
+                s.log_ena = LogState::Enabled;
+                s.intg_since = Some(Instant::now());
+            }
         } else {
             s.log_ena = LogState::NotEnabled;
+            s.intg_since = None;
         }
         Ok(())
     }
@@ -243,8 +253,9 @@ impl LogControl {
     ///
     /// A disabled control block writes nothing and returns `Ok(None)`. A control
     /// block with no storage bound logs a warning and returns `Ok(None)` rather
-    /// than failing. Otherwise the entry and its data are added to storage and its
-    /// identifier is returned.
+    /// than failing. Otherwise the entry is written with
+    /// `LogStorage::add_entry_with_data`, as one unit, and its identifier is
+    /// returned.
     ///
     /// # Errors
     ///
@@ -266,11 +277,45 @@ impl LogControl {
             );
             return Ok(None);
         };
-        let id = storage.add_entry(time_ms)?;
-        for (data_ref, value) in data {
-            storage.add_entry_data(id, data_ref, value.clone(), reason_code)?;
+        let data: Vec<super::storage::JournalEntryData> = data
+            .iter()
+            .map(|(data_ref, value)| {
+                super::storage::JournalEntryData::new(data_ref.clone(), value.clone(), reason_code)
+            })
+            .collect();
+        storage.add_entry_with_data(time_ms, &data).map(Some)
+    }
+
+    /// Reports whether an integrity entry is due at `now`; when it is, returns
+    /// the data set to log and starts the next integrity period from `now`.
+    ///
+    /// An entry is due when the control block is enabled, its TrgOps hold
+    /// integrity, its IntgPd is above zero, and IntgPd milliseconds have passed
+    /// since it was enabled or last wrote an integrity entry. While it is
+    /// enabled but not set up for integrity, its period keeps restarting from
+    /// `now`, so the first entry comes one IntgPd after integrity is set up.
+    #[cfg(any(feature = "full-server", test))]
+    pub(crate) fn integrity_due(&self, now: Instant) -> Option<String> {
+        let mut s = self.state.lock().ok()?;
+        if s.log_ena != LogState::Enabled {
+            return None;
         }
-        Ok(Some(id))
+        if !s.trg_ops.contains(TriggerOptions::INTEGRITY) || s.intg_period_ms == 0 {
+            s.intg_since = Some(now);
+            return None;
+        }
+        let period = std::time::Duration::from_millis(u64::from(s.intg_period_ms));
+        match s.intg_since {
+            Some(since) if now >= since + period => {
+                s.intg_since = Some(now);
+                s.data_set.clone()
+            }
+            Some(_) => None,
+            None => {
+                s.intg_since = Some(now);
+                None
+            }
+        }
     }
 
     /// Visits the entries within a time range.
@@ -320,8 +365,9 @@ impl LogControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::storage::{CollectingVisitor, InMemoryLogStorage};
+    use crate::logging::storage::{CollectingVisitor, InMemoryLogStorage, JournalEntryData};
     use iec61850_model::MmsValue;
+    use std::time::Duration;
 
     /// A control block with a data set and storage whose definition clears
     /// LogEna, so it starts disabled.
@@ -362,6 +408,66 @@ mod tests {
     #[test]
     fn cleared_log_ena_starts_disabled() {
         assert!(!make_lcb_with_storage().is_enabled());
+    }
+
+    fn integrity_lcb(intg_pd_ms: u32) -> LogControl {
+        let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
+        let lcb = LogControlBlock::new("lcb01")
+            .with_dataset("MMXU1$ds1")
+            .with_trg_ops(TriggerOptions::INTEGRITY)
+            .with_intg_pd_ms(intg_pd_ms);
+        LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb).with_storage(storage)
+    }
+
+    #[test]
+    fn integrity_is_due_once_per_period_from_enabling() {
+        let lc = integrity_lcb(1_000);
+        let t0 = Instant::now();
+        assert_eq!(lc.integrity_due(t0), None);
+        let due = t0 + Duration::from_millis(1_000);
+        assert_eq!(lc.integrity_due(due), Some("MMXU1$ds1".to_string()));
+        assert_eq!(
+            lc.integrity_due(due),
+            None,
+            "the next period starts at once"
+        );
+        assert_eq!(lc.integrity_due(due + Duration::from_millis(999)), None);
+        assert_eq!(
+            lc.integrity_due(due + Duration::from_millis(1_000)),
+            Some("MMXU1$ds1".to_string())
+        );
+    }
+
+    #[test]
+    fn integrity_is_never_due_without_the_trigger_or_a_period() {
+        let later = Instant::now() + Duration::from_secs(3_600);
+        assert_eq!(integrity_lcb(0).integrity_due(later), None);
+
+        let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
+        let lcb = LogControlBlock::new("lcb01")
+            .with_dataset("MMXU1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED | TriggerOptions::GI)
+            .with_intg_pd_ms(1_000);
+        let lc = LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb).with_storage(storage);
+        assert_eq!(lc.integrity_due(later), None);
+    }
+
+    #[test]
+    fn integrity_period_restarts_when_logging_is_enabled_again() {
+        let lc = integrity_lcb(1_000);
+        lc.set_log_ena(false).unwrap();
+        let later = Instant::now() + Duration::from_secs(3_600);
+        assert_eq!(
+            lc.integrity_due(later),
+            None,
+            "a disabled block logs nothing"
+        );
+        lc.set_log_ena(true).unwrap();
+        let t1 = Instant::now();
+        assert_eq!(lc.integrity_due(t1 + Duration::from_millis(500)), None);
+        assert!(lc
+            .integrity_due(t1 + Duration::from_millis(1_000))
+            .is_some());
     }
 
     #[test]
@@ -464,6 +570,82 @@ mod tests {
         let mut v = CollectingVisitor::new();
         lc.query_after(0, id1, &mut v).unwrap();
         assert_eq!(v.entries.len(), 2);
+    }
+
+    /// An entry is written through the whole-entry method of the backend, so
+    /// a backend that writes it at once never leaves part of it behind.
+    #[test]
+    fn an_entry_is_written_as_one_unit() {
+        #[derive(Debug, Default)]
+        struct WholeOnly {
+            written: Mutex<Vec<(u64, usize)>>,
+        }
+        impl LogStorage for WholeOnly {
+            fn add_entry(&self, _: u64) -> Result<EntryId, LogStorageError> {
+                Err(LogStorageError::Backend("piecewise write".into()))
+            }
+            fn add_entry_data(
+                &self,
+                _: EntryId,
+                _: &str,
+                _: MmsValue,
+                _: u8,
+            ) -> Result<(), LogStorageError> {
+                Err(LogStorageError::Backend("piecewise write".into()))
+            }
+            fn add_entry_with_data(
+                &self,
+                time_ms: u64,
+                data: &[JournalEntryData],
+            ) -> Result<EntryId, LogStorageError> {
+                self.written.lock().unwrap().push((time_ms, data.len()));
+                Ok(EntryId(1))
+            }
+            fn query_by_time(
+                &self,
+                _: u64,
+                _: u64,
+                _: &mut dyn LogEntryVisitor,
+            ) -> Result<(), LogStorageError> {
+                Ok(())
+            }
+            fn query_after(
+                &self,
+                _: u64,
+                _: EntryId,
+                _: &mut dyn LogEntryVisitor,
+            ) -> Result<(), LogStorageError> {
+                Ok(())
+            }
+            fn oldest_and_newest(
+                &self,
+            ) -> Result<
+                Option<(
+                    super::super::storage::EntryMeta,
+                    super::super::storage::EntryMeta,
+                )>,
+                LogStorageError,
+            > {
+                Ok(None)
+            }
+            fn count(&self) -> usize {
+                0
+            }
+        }
+        let storage = Arc::new(WholeOnly::default());
+        let lcb = LogControlBlock::new("lcb01").with_dataset("MMXU1$ds1");
+        let lc = LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb)
+            .with_storage(storage.clone() as Arc<dyn LogStorage>);
+        lc.write_entry(
+            5,
+            &[
+                ("a".to_string(), MmsValue::Boolean(true)),
+                ("b".to_string(), MmsValue::Integer(7)),
+            ],
+            0x10,
+        )
+        .expect("the whole-entry write succeeds");
+        assert_eq!(*storage.written.lock().unwrap(), [(5, 2)]);
     }
 
     /// An error part way through writing an entry is

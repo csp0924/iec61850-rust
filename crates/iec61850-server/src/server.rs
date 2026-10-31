@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// IEC 61850 server runtime.
 ///
@@ -345,9 +345,9 @@ impl IedServer {
     /// so a report control block with no buffer time sends one report, and a
     /// buffered one buffers one entry, holding every member the batch
     /// triggered. The periodic triggers, buffer time expiry, integrity and
-    /// general interrogation reports, wait until the guard is dropped, so none
-    /// of them sees part of a batch. A client Read is not held back and can see
-    /// part of a batch.
+    /// general interrogation reports, and integrity log entries, wait until the
+    /// guard is dropped, so none of them sees part of a batch. A client Read is
+    /// not held back and can see part of a batch.
     ///
     /// The server publishes no GOOSE message on its own, so the lock defers
     /// none; an application that publishes GOOSE drives its publisher itself.
@@ -788,6 +788,52 @@ impl IedServer {
                 );
             }
         }
+    }
+
+    /// Writes the integrity log entries due at `now`.
+    ///
+    /// An enabled log control block whose TrgOps hold integrity and whose
+    /// IntgPd is above zero writes one entry every IntgPd milliseconds, counted
+    /// from when it was enabled. The entry holds every member of its data set
+    /// with its current value and the integrity reason code. General
+    /// interrogation writes no log entry, as IEC 61850-7-2 does not support it
+    /// for logging.
+    ///
+    /// The tick loop of a started server calls this every millisecond, except
+    /// while the data model is locked. It is public so an application or a test
+    /// can drive it with clock readings of its own; `now_ms` is the time the
+    /// entries carry. Returns how many entries were written.
+    pub fn tick_log_integrity(&self, now: Instant, now_ms: u64) -> usize {
+        let Some(controls) = self.unique_log_controls() else {
+            return 0;
+        };
+        let mut written = 0;
+        for lc in controls {
+            let Some(data_set) = lc.integrity_due(now) else {
+                continue;
+            };
+            let Some(ds) = self.log_data_set(&lc, data_set) else {
+                continue;
+            };
+            let data: Vec<(String, MmsValue)> = ds
+                .entries
+                .iter()
+                .filter_map(|e| e.read_value().map(|v| (e.attr_ref.clone(), v)))
+                .collect();
+            if data.is_empty() {
+                continue;
+            }
+            match lc.write_entry(now_ms, &data, LOG_REASON_INTEGRITY) {
+                Ok(Some(_)) => written += 1,
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    mms_path = %lc.mms_path,
+                    error = %e,
+                    "the log storage backend failed, the integrity entry was not logged"
+                ),
+            }
+        }
+        written
     }
 
     /// Returns every registered log control block once, however many keys it
@@ -1283,6 +1329,9 @@ const LOG_REASON_QUALITY_CHANGE: u8 = 0x04;
 
 /// Log reason code of a data update: bit 3 of ReasonForInclusionInLog.
 const LOG_REASON_DATA_UPDATE: u8 = 0x08;
+
+/// Log reason code of an integrity entry: bit 4 of ReasonForInclusionInLog.
+const LOG_REASON_INTEGRITY: u8 = 0x10;
 
 /// Returns the log reason code of the reasons of `flag` that `trg_ops` enable,
 /// with the bits of ReasonForInclusionInLog (IEC 61850-8-1 table 39).
