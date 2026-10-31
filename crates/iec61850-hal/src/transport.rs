@@ -19,6 +19,7 @@ use core::fmt;
 /// produce it. Under `std`, `From<std::io::Error>` maps an I/O error onto
 /// these categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportError {
     /// A read or a write failed.
     Io,
@@ -26,8 +27,10 @@ pub enum TransportError {
     Closed,
     /// The operation timed out.
     Timeout,
-    /// Any other failure. Reserved so that adding a variant later is not a
-    /// breaking change.
+    /// Any other failure, one no specific variant describes.
+    ///
+    /// The enum is `#[non_exhaustive]`, so a later variant is not a breaking
+    /// change by itself; a match must keep a wildcard arm either way.
     Other,
 }
 

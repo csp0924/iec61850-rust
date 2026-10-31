@@ -97,6 +97,7 @@ pub mod ethertype {
 
 /// An error raised by an L2 socket operation.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EthernetError {
     /// The interface does not exist, or opening it is not permitted.
     #[error("interface `{0}` not found or not permitted")]
@@ -129,6 +130,7 @@ pub enum EthernetError {
 
 /// L2 socket configuration, passed when a backend is constructed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EthernetConfig {
     /// Platform-dependent interface name, such as `eth0`, `Ethernet 1` or `en0`.
     pub interface: String,
