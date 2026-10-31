@@ -520,7 +520,8 @@ use iec61850_mms::binary_time6_from_epoch_ms;
 /// - DatSet, TrgOps, IntgPd, BufTm, and RptID are refused with
 ///   TemporarilyUnavailable while RptEna is true
 /// - an accepted change to one of those fields purges the report buffer, through
-///   `BufferedReportControl::set_config_field`
+///   `BufferedReportControl::set_config_field`; of them only DatSet increments
+///   ConfRev, and an OptFlds change does neither
 ///
 /// The owner of a reservation is the peer address the server records for the
 /// association `conn_id`, so clients that share an address, behind one NAT or
@@ -1095,9 +1096,9 @@ fn set_brcb_opt_flds(
     if state.rpt_ena {
         return Some(Err(DataAccessError::TemporarilyUnavailable));
     }
-    // A BRCB keeps BUFFER_OVERFLOW and ENTRY_ID rather than masking them.
+    // A BRCB keeps BUFFER_OVERFLOW and ENTRY_ID rather than masking them. An
+    // OptFlds change neither purges the buffer nor counts in ConfRev.
     state.opt_flds = flds;
-    state.increase_conf_rev();
     Some(Ok(()))
 }
 
@@ -2079,6 +2080,67 @@ mod tests {
             v
         };
         assert!(after > initial, "changing DatSet must increase ConfRev");
+    }
+
+    fn brcb_conf_rev_and_len(engine: &Arc<Mutex<ReportingEngine>>, path: &str) -> (u32, usize) {
+        let brcb = engine.lock().unwrap().get_brcb(path).unwrap();
+        let conf_rev = brcb.state.lock().unwrap().conf_rev;
+        let len = brcb.lock_buffer().unwrap().len();
+        (conf_rev, len)
+    }
+
+    /// OptFlds changes neither ConfRev nor the buffer; BufTm, TrgOps, IntgPd and
+    /// RptID purge the buffer and leave ConfRev alone; only DatSet counts.
+    #[test]
+    fn brcb_conf_rev_and_purge_are_decided_per_field() {
+        let (engine, path) = make_engine_with_brcb("24", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "MMXU1$ds2", DS2_MEMBER)]);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        let fill = || {
+            brcb.enqueue_entry(1000, false, false, bytes::Bytes::from_static(b"x"))
+                .unwrap();
+        };
+        let write = |field: RcbField, value: RcbWriteValue| {
+            handle_set_brcb_field(&engine, &path, field, value, 1)
+        };
+        fill();
+        let opt_flds = OptFlds::SEQ_NUM | OptFlds::DATA_SET;
+        assert_eq!(
+            write(
+                RcbField::OptFlds,
+                RcbWriteValue::BitString(opt_flds.to_ber_bit_string().to_vec())
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(brcb_conf_rev_and_len(&engine, &path), (1, 1));
+
+        for (field, value) in [
+            (RcbField::BufTm, RcbWriteValue::Unsigned(250)),
+            (
+                RcbField::TrgOps,
+                RcbWriteValue::BitString(TriggerOptions::INTEGRITY.to_ber_bit_string().to_vec()),
+            ),
+            (RcbField::IntgPd, RcbWriteValue::Unsigned(5000)),
+            (
+                RcbField::RptId,
+                RcbWriteValue::VisibleString("renamed".to_string()),
+            ),
+        ] {
+            fill();
+            let name = field.as_str().to_string();
+            assert_eq!(write(field, value), Some(Ok(())), "{name}");
+            assert_eq!(brcb_conf_rev_and_len(&engine, &path), (1, 0), "{name}");
+        }
+
+        fill();
+        assert_eq!(
+            write(
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString("MMXU1$ds2".to_string())
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(brcb_conf_rev_and_len(&engine, &path), (2, 0));
     }
 
     /// Writing BufTm on a BRCB purges the buffer.

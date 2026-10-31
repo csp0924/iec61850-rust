@@ -102,8 +102,10 @@ pub const RESV_TMS_IMPLICIT_VALUE_S: u16 = 10;
 
 /// Which configuration field a BRCB write targets.
 ///
-/// Every configuration write funnels through `set_config_field`, so a field added
-/// later cannot accidentally skip the buffer purge the change requires.
+/// These are the fields whose change runs the PurgeBuf procedure, per
+/// IEC 61850-8-1 Table 72. Every such write funnels through `set_config_field`,
+/// so a field added later cannot accidentally skip the purge. OptFlds is not
+/// one of them: changing it purges nothing.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum BrcbConfigField {
@@ -699,9 +701,11 @@ impl BufferedReportControl {
     /// The single entry point for changing BRCB configuration.
     ///
     /// Changing DatSet, TrgOps, IntgPd, BufTm, or RptID to a different value purges
-    /// the report buffer and logs a warning naming the control block, the field,
-    /// and how many entries were discarded. Writing the value already in place
-    /// changes nothing and purges nothing.
+    /// the report buffer, per IEC 61850-8-1 Table 72, and logs a warning naming the
+    /// control block, the field, and how many entries were discarded. Only a
+    /// DatSet change increments ConfRev, which counts changes to the data set
+    /// configuration per IEC 61850-7-2. Writing the value already in place changes
+    /// nothing and purges nothing.
     ///
     /// Configuration may only be changed while `RptEna` is false.
     ///
@@ -767,8 +771,11 @@ impl BufferedReportControl {
             return Ok(ConfigChangeResult::NoChange);
         }
 
-        // A configuration change bumps ConfRev.
-        state.increase_conf_rev();
+        // ConfRev counts changes of the referenced data set, which a DatSet write
+        // is; the other fields only purge.
+        if matches!(field, BrcbConfigField::DatSet(_)) {
+            state.increase_conf_rev();
+        }
 
         // Release the state lock before taking the buffer lock; the two are never
         // held at the same time.
@@ -1220,6 +1227,37 @@ mod tests {
             );
             assert_eq!(rc.lock_buffer().unwrap().len(), 0);
         }
+    }
+
+    #[test]
+    fn set_config_field_counts_conf_rev_only_for_dat_set() {
+        // ConfRev counts DatSet changes; the other purging fields leave it alone.
+        for field_factory in [
+            (|| BrcbConfigField::TrgOps(TriggerOptions::INTEGRITY)) as fn() -> BrcbConfigField,
+            || BrcbConfigField::IntgPdMs(5000),
+            || BrcbConfigField::BufTmMs(250),
+            || BrcbConfigField::RptId("renamed".into()),
+        ] {
+            let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", make_brcb());
+            rc.set_config_field(field_factory()).unwrap();
+            assert_eq!(
+                rc.lock_state().unwrap().conf_rev,
+                1,
+                "{:?} must not count",
+                field_factory()
+            );
+        }
+        let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", make_brcb());
+        rc.set_config_field(BrcbConfigField::DatSet("OtherLN$ds2".into()))
+            .unwrap();
+        assert_eq!(rc.lock_state().unwrap().conf_rev, 2);
+        rc.set_config_field(BrcbConfigField::DatSet("OtherLN$ds2".into()))
+            .unwrap();
+        assert_eq!(
+            rc.lock_state().unwrap().conf_rev,
+            2,
+            "an unchanged DatSet does not count"
+        );
     }
 
     #[test]
