@@ -141,6 +141,7 @@ impl SntpClient {
 
 /// The result of one SNTP query, converted to Unix epoch seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct SntpResponse {
     /// Server transmit time (t3) as fractional Unix epoch seconds.
     pub server_time_unix_s: f64,

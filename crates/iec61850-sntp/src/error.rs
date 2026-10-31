@@ -4,6 +4,7 @@ use std::io;
 
 /// An error raised by the SNTP client or server.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SntpError {
     /// The datagram is shorter than the 48 bytes RFC 4330 defines, excluding
     /// the optional authenticator.

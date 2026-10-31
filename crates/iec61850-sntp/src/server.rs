@@ -17,6 +17,7 @@ use crate::time::NtpTimestamp;
 
 /// SNTP server configuration.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SntpServerConfig {
     /// Stratum, 1 for a primary reference. Defaults to 1.
     pub stratum: u8,
