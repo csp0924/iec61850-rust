@@ -17,6 +17,9 @@
 //! - `transport`: the `AsyncTransport` and `Timer` traits, definitions only.
 //! - `transport-tokio`: a blanket `AsyncTransport` impl for
 //!   `tokio::io::AsyncRead + AsyncWrite`, plus `TokioTimer`; implies `std`.
+//! - `transport-embassy`: `EmbassyTimer`, a `Timer` over `embassy-time`;
+//!   implies `embedded`. It provides no `AsyncTransport` implementation; a
+//!   `no_std` caller implements the trait for its own socket type.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

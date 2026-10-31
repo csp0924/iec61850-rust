@@ -58,8 +58,9 @@ Default: `std`, `ethernet`.
 - `transport` - the `AsyncTransport` and `Timer` traits, definitions only.
 - `transport-tokio` - a blanket `AsyncTransport` impl for
   `tokio::io::AsyncRead + AsyncWrite`, plus `TokioTimer`; implies `std`.
-- `transport-embassy` - the embassy and `embedded-io-async` bindings for the
-  `no_std` plus `alloc` path; implies `embedded`.
+- `transport-embassy` - `EmbassyTimer`, a `Timer` over `embassy-time`;
+  implies `embedded`. It provides no `AsyncTransport` implementation: a
+  `no_std` caller implements the trait for its own socket type.
 
 ## License
 

@@ -38,7 +38,8 @@ alloc = []
 
 # Embedded environment: alloc plus the hal transport traits, with the
 # downstream crates switched to no_std. Neither tokio nor std::io is enabled;
-# the concrete backend comes from the `transport-embassy` feature of the hal.
+# the caller supplies the AsyncTransport implementation and a Timer, such as
+# the EmbassyTimer of the hal `transport-embassy` feature.
 embedded = [
     "alloc",
     "iec61850-hal/transport",

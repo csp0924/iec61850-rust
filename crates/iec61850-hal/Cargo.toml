@@ -46,10 +46,10 @@ transport = []
 # default so that a default build does not pull in tokio. A downstream crate
 # enables it through `features = ["transport-tokio"]`.
 transport-tokio = ["transport", "std", "dep:tokio"]
-# Blanket impl over embassy and embedded-io-async, for the MMS stack on
-# no_std + alloc targets. Enabled by a downstream crate through
-# `features = ["transport-embassy"]`, or transitively by the `embedded` feature
-# of `iec61850-mms`.
+# `EmbassyTimer`, a Timer over embassy-time, for the MMS stack on no_std + alloc
+# targets. There is no AsyncTransport impl over embedded-io-async; the caller
+# implements the trait for its own socket type. Enabled by a downstream crate
+# through `features = ["transport-embassy"]`.
 transport-embassy = [
     "transport",
     "embedded",

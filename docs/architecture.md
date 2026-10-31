@@ -109,8 +109,10 @@ The boundary sits in three places:
   `T: AsyncTransport` from `iec61850-hal` rather than over
   `tokio::net::TcpStream`. Under the `transport-tokio` feature a blanket
   implementation covers every `tokio::io::AsyncRead + AsyncWrite + Unpin + Send`,
-  so an ordinary tokio type satisfies the trait unchanged; under
-  `transport-embassy` the same role is filled by `embedded-io-async`. The trait
+  so an ordinary tokio type satisfies the trait unchanged. There is no such
+  blanket implementation over `embedded-io-async`: a `no_std` caller
+  implements the trait for its own socket type, and `transport-embassy`
+  supplies only the timer. The trait
   uses `async fn` in a trait and is therefore not object safe, so callers are
   generic rather than boxed.
 - **The server crate owns the sockets, the MMS crate owns the PDUs.**
@@ -209,10 +211,10 @@ the client's report dispatcher and the enhanced control models — stay on `std`
 
 **Transport backends** live in `iec61850-hal`: `transport` supplies the trait
 definitions alone, `transport-tokio` the blanket implementation plus a
-tokio-backed timer, and `transport-embassy` the `embedded-io-async` and
-`embassy-time` equivalents. `ethernet` supplies the L2 traits with no platform
-dependency; `ethernet-linux-afpacket`, `ethernet-pcap` and
-`ethernet-windows-npcap` supply the backends.
+tokio-backed timer, and `transport-embassy` an `embassy-time` backed timer.
+`ethernet` supplies the L2 traits with no platform dependency;
+`ethernet-linux-afpacket`, `ethernet-pcap` and `ethernet-windows-npcap` supply
+the backends.
 
 **Subsystem selection** in the client and server lets a build carry only the
 services it needs. On the server, `reporting`, `control`, `logging`,

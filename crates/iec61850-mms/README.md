@@ -59,8 +59,9 @@ Default: `std`.
 - `alloc` - the allocator base that `std` and `embedded` share. It does not
   build on its own; a `no_std` build selects `embedded`.
 - `embedded` - `alloc` plus the hal transport traits, with the downstream
-  crates switched to `no_std`. The concrete backend comes from the
-  `transport-embassy` feature of the hal.
+  crates switched to `no_std`. The caller supplies the `AsyncTransport`
+  implementation and a `Timer`; the `transport-embassy` feature of the hal
+  provides `EmbassyTimer`.
 - `tls` - MMS over TLS on the secure MMS port 3782, through `iec61850-tls`.
   Implies `std`.
 
