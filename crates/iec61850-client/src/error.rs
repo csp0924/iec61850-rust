@@ -129,6 +129,17 @@ pub enum ClientError {
         after_ms: u64,
     },
 
+    /// An enhanced-security Operate was accepted, but no CommandTermination
+    /// for it arrived within the wait.
+    ///
+    /// The fate of the command is unknown: it may still be executing, and a
+    /// termination that arrives later is not reported as its outcome.
+    #[error("no command termination arrived within {after_ms} ms")]
+    CommandTerminationTimeout {
+        /// Wait that elapsed, in milliseconds.
+        after_ms: u64,
+    },
+
     /// The association was not established within the connect timeout.
     #[error("mms layer error: connect timed out after {after_ms} ms")]
     ConnectTimeout {

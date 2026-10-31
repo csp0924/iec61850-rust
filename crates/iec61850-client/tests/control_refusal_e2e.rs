@@ -287,6 +287,8 @@ fn script_write(invoke_id: u32, item: &str, value: &MmsData, seq: u32) -> Plan {
             ],
             ..Plan::default()
         },
+        // Accepted, with no command termination after it.
+        "SPCNOCT" => Plan::reply(write_response(invoke_id, WriteOutcome::Success)),
         // Accepted, with a CT+ for an enhanced model.
         "SPCACCEPT" => Plan {
             reply: Some(write_response(invoke_id, WriteOutcome::Success)),
@@ -670,6 +672,42 @@ async fn unanswered_cancel_is_an_error() {
     let r = spc.cancel(MmsValue::Boolean(true)).await;
     assert!(
         matches!(r, Err(ClientError::Timeout { after_ms: 300 })),
+        "got {r:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_enhanced_operate_without_a_termination_is_an_error() {
+    let conn = connect(start_server().await, 3_000).await;
+    let spc = handle(&conn, "SPCNOCT", ControlModel::DirectEnhanced);
+    let r = spc.operate(MmsValue::Boolean(true)).await;
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::CommandTerminationTimeout { after_ms: 5_000 })
+        ),
+        "got {r:?}"
+    );
+    // The association stays usable.
+    let spc = handle(&conn, "SPCACCEPT", ControlModel::DirectEnhanced);
+    assert_eq!(
+        spc.operate(MmsValue::Boolean(true)).await.expect("operate"),
+        ControlOutcome::Success
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_for_a_termination_that_never_comes_is_an_error() {
+    let conn = connect(start_server().await, 3_000).await;
+    let spc = handle(&conn, "SPCNOCT", ControlModel::DirectNormal);
+    let r = spc
+        .wait_command_termination(std::time::Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::CommandTerminationTimeout { after_ms: 200 })
+        ),
         "got {r:?}"
     );
 }

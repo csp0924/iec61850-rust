@@ -308,8 +308,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// # Errors
     ///
-    /// `NotConnected` if the association is closed; `Mms` if no command
-    /// termination arrives within the timeout; the typed error of the MMS
+    /// `NotConnected` if the association is closed;
+    /// `CommandTerminationTimeout` if an accepted enhanced Operate draws no
+    /// command termination within the wait; the typed error of the MMS
     /// layer, such as `Timeout` or `ConnectionLost`, when it fails other than
     /// by the server refusing the write, after which the fate of the command
     /// is unknown; and `InvalidArgument` for an enhanced model on a build
@@ -369,10 +370,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
                     None => Ok(ControlOutcome::Success),
                     Some(err) => Ok(ControlOutcome::failure(Some(err))),
                 },
-                None => Err(ClientError::Mms(format!(
-                    "timed out waiting for a command termination after {:?}",
-                    DEFAULT_CT_TIMEOUT
-                ))),
+                None => Err(ClientError::CommandTerminationTimeout {
+                    after_ms: duration_ms(DEFAULT_CT_TIMEOUT),
+                }),
             }
         }
         #[cfg(not(feature = "std"))]
@@ -531,8 +531,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// # Errors
     ///
-    /// `Mms` if none arrives within `timeout`. Requires `std` for its monotonic
-    /// deadline; an embedded caller uses the normal control models.
+    /// `CommandTerminationTimeout` if none arrives within `timeout`, and `Mms`
+    /// if a report that arrives does not decode. Requires `std` for its
+    /// monotonic deadline; an embedded caller uses the normal control models.
     #[cfg(feature = "std")]
     pub async fn wait_command_termination(
         &self,
@@ -540,10 +541,9 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ) -> Result<CommandTerminationParsed, ClientError> {
         match self.try_recv_command_termination(timeout).await? {
             Some(ct) => Ok(ct),
-            None => Err(ClientError::Mms(format!(
-                "timed out waiting for a command termination after {:?}",
-                timeout
-            ))),
+            None => Err(ClientError::CommandTerminationTimeout {
+                after_ms: duration_ms(timeout),
+            }),
         }
     }
 
@@ -663,6 +663,12 @@ impl CtMatch {
     fn matches(&self, ct: &CommandTerminationParsed, ctl_num: Option<u8>) -> bool {
         ct.object_ref_oper == self.object_ref_oper && ctl_num.is_none_or(|n| n == self.ctl_num)
     }
+}
+
+/// Converts a wait into whole milliseconds, saturating at `u64::MAX`.
+#[cfg(feature = "std")]
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Reports whether a CntrlObj reference names the control object
