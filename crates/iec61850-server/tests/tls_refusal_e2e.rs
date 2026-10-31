@@ -1,6 +1,15 @@
 //! A client the TLS server refuses learns why: the server sends its alert
 //! and closes the connection without resetting it, so the alert reaches the
 //! client over a real TCP connection.
+//!
+//! This is a check of the refusal over the wire, not the gate for how the
+//! connection is closed. A server that closed the socket at once would reset
+//! it only when the client's data arrived between the server reading the
+//! client's Finished and closing, which the scheduling of the host decides,
+//! so this test does not fail reliably against such a server. The gate is
+//! the pair of paused-clock tests in `iec61850-tls` (`acceptor.rs`):
+//! `a_refused_connection_is_drained_for_at_most_the_linger_time` and
+//! `a_refusal_beyond_the_drain_limit_is_closed_at_once`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
