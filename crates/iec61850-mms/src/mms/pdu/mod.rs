@@ -55,7 +55,7 @@ pub use define_named_variable_list::{
     encode_confirmed_define_named_variable_list_request,
     encode_confirmed_define_named_variable_list_response, DefineNamedVariableEntry,
     DefineNamedVariableListRequest, DefineNamedVariableListResponse, MAX_DEFINE_ENTRIES,
-    SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST,
+    SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST, SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE,
 };
 pub use delete_named_variable_list::{
     decode_confirmed_delete_named_variable_list_request,
