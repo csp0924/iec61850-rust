@@ -83,6 +83,44 @@ fn simulation_flag_crosses_the_wire_in_pdu_and_header() {
 
 #[test]
 #[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
+fn appid_only_subscription_drops_other_appids_on_the_wire() {
+    let (mut tx, rx) = veth_pair();
+    let (handle, states) = listen(rx, GooseSubscriberBuilder::new().app_id(0x1003));
+
+    let dst = [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x03];
+    let mut other = GoosePublisher::new(
+        CommParameters::new(0x1004, dst),
+        "LD/LLN0$GO$other",
+        None,
+        "LD/LLN0$ds",
+        1,
+    )
+    .unwrap();
+    let mut wanted = GoosePublisher::new(
+        CommParameters::new(0x1003, dst),
+        "LD/LLN0$GO$wanted",
+        None,
+        "LD/LLN0$ds",
+        1,
+    )
+    .unwrap();
+    // The unwanted APPID goes first, so it would be the first delivery if
+    // the filter let it through.
+    tx.send(&other.publish(&[MmsValue::Boolean(true)]).unwrap())
+        .expect("send other");
+    tx.send(&wanted.publish(&[MmsValue::Boolean(true)]).unwrap())
+        .expect("send wanted");
+
+    let state = states
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the matching publication was not received");
+    handle.stop_and_join();
+    assert_eq!(state.gocb_ref, "LD/LLN0$GO$wanted");
+    assert!(states.try_recv().is_err(), "nothing else was delivered");
+}
+
+#[test]
+#[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
 fn published_frame_arrives_with_vlan_tag_and_interface_source() {
     let (mut tx, rx) = veth_pair();
     let hw = tx.hw_addr().expect("veth has an ethernet address");

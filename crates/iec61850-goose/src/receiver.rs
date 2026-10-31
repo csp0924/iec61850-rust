@@ -655,6 +655,66 @@ mod tests {
     }
 
     #[test]
+    fn appid_only_subscriber_ignores_other_appids() {
+        let refs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let clone = refs.clone();
+        let sub = GooseSubscriberBuilder::new()
+            .app_id(0x0001)
+            .listener(move |e| {
+                if let crate::subscriber::GooseEvent::NewState { state, .. }
+                | crate::subscriber::GooseEvent::Retransmission { state, .. } = e
+                {
+                    clone.lock().unwrap().push(state.gocb_ref.clone());
+                }
+            })
+            .build();
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.start();
+
+        let a = encode_frame_with_pdu(&make_pdu("IED1/LLN0$GO$gcbA", 1, 0, 1), 0x0001, [0u8; 6]);
+        let b = encode_frame_with_pdu(&make_pdu("IED2/LLN0$GO$gcbB", 1, 0, 1), 0x0002, [0u8; 6]);
+        let c = encode_frame_with_pdu(&make_pdu("IED3/LLN0$GO$gcbC", 1, 0, 1), 0x0001, [0u8; 6]);
+        running.handle_message(&a);
+        running.handle_message(&b);
+        running.handle_message(&c);
+
+        assert_eq!(
+            *refs.lock().unwrap(),
+            vec![
+                "IED1/LLN0$GO$gcbA".to_string(),
+                "IED3/LLN0$GO$gcbC".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn dst_mac_only_subscriber_ignores_other_addresses() {
+        let count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let clone = count.clone();
+        let mac = [0x01, 0x0C, 0xCD, 0x01, 0x00, 0x05];
+        let sub = GooseSubscriberBuilder::new()
+            .dst_mac(mac)
+            .listener(move |_| {
+                *clone.lock().unwrap() += 1;
+            })
+            .build();
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut running = rx.start();
+
+        let hit = encode_frame_with_pdu(&make_pdu("IED1/LLN0$GO$gcbA", 1, 0, 1), 0x0001, mac);
+        let miss = encode_frame_with_pdu(
+            &make_pdu("IED2/LLN0$GO$gcbB", 1, 0, 1),
+            0x0001,
+            [0x01, 0x0C, 0xCD, 0x01, 0x00, 0x06],
+        );
+        running.handle_message(&hit);
+        running.handle_message(&miss);
+        assert_eq!(*count.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn st_num_rollback_sets_invalid_and_warns() {
         let valid_flags: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![]));
         let clone = valid_flags.clone();

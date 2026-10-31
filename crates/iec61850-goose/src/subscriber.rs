@@ -3,7 +3,10 @@
 //! A `GooseSubscriber` is a passive container. The receiver matches an incoming
 //! frame against its APPID, destination MAC, and gocbRef filters, then hands it
 //! the decoded PDU; the subscriber tracks stNum and sqNum and calls the
-//! listener with a `GooseEvent`.
+//! listener with a `GooseEvent`. Each filter applies exactly when it is set: a
+//! subscriber without a gocbRef filter is an observer of every gocbRef that
+//! its APPID and destination MAC filters let through, and one without any
+//! filter accepts every GOOSE frame.
 //!
 //! Sequence state is kept per gocbRef, so an observer that sees several
 //! publications checks each one against its own predecessor; the number of
@@ -158,7 +161,8 @@ impl GooseSubscriberBuilder {
         Self::default()
     }
 
-    /// Sets the gocbRef filter; leaving it unset selects observer mode.
+    /// Sets the gocbRef filter; leaving it unset accepts any gocbRef, which
+    /// makes the subscriber an observer.
     pub fn gocb_ref(mut self, gocb_ref: impl Into<String>) -> Self {
         self.gocb_ref = Some(gocb_ref.into());
         self
@@ -183,7 +187,11 @@ impl GooseSubscriberBuilder {
         self
     }
 
-    /// Selects observer mode, which accepts every GOOSE frame.
+    /// Selects observer mode, which accepts publications from every gocbRef.
+    ///
+    /// A gocbRef filter set on the same builder is dropped, whichever call
+    /// comes first. The APPID, destination MAC, and Simulation filters still
+    /// apply, so an observer with none of them accepts every GOOSE frame.
     pub fn observer(mut self) -> Self {
         self.is_observer = true;
         self
@@ -208,16 +216,19 @@ impl GooseSubscriberBuilder {
         self
     }
 
-    /// Builds the subscriber. A subscriber with no gocbRef filter is an
-    /// observer.
+    /// Builds the subscriber. A subscriber with no gocbRef filter, or one in
+    /// observer mode, is an observer.
     pub fn build(self) -> GooseSubscriber {
-        let is_observer = self.is_observer || self.gocb_ref.is_none();
+        let gocb_ref = if self.is_observer {
+            None
+        } else {
+            self.gocb_ref
+        };
         GooseSubscriber {
-            gocb_ref: self.gocb_ref.unwrap_or_default(),
+            gocb_ref,
             app_id: self.app_id,
             dst_mac: self.dst_mac,
             simulation: self.simulation,
-            is_observer,
             max_streams: self
                 .max_streams
                 .unwrap_or(DEFAULT_OBSERVER_MAX_STREAMS)
@@ -235,16 +246,14 @@ impl GooseSubscriberBuilder {
 ///
 /// Construct one through `GooseSubscriberBuilder` or `GooseSubscriber::new`.
 pub struct GooseSubscriber {
-    /// gocbRef filter; empty in observer mode.
-    pub(crate) gocb_ref: String,
+    /// gocbRef filter; `None` accepts any gocbRef.
+    pub(crate) gocb_ref: Option<String>,
     /// APPID filter; `None` accepts any APPID.
     pub(crate) app_id: Option<u16>,
     /// Destination MAC filter; `None` accepts any address.
     pub(crate) dst_mac: Option<[u8; 6]>,
     /// Simulation filter, applied after the PDU is decoded.
     pub(crate) simulation: SimulationFilter,
-    /// Observer mode, which bypasses every filter.
-    pub(crate) is_observer: bool,
     /// Upper bound on `streams`.
     pub(crate) max_streams: usize,
     /// Listener invoked for each event.
@@ -278,7 +287,6 @@ impl std::fmt::Debug for GooseSubscriber {
             .field("app_id", &self.app_id)
             .field("dst_mac", &self.dst_mac)
             .field("simulation", &self.simulation)
-            .field("is_observer", &self.is_observer)
             .field("has_listener", &self.listener.is_some())
             .finish()
     }
@@ -290,14 +298,16 @@ impl GooseSubscriber {
         GooseSubscriberBuilder::new().gocb_ref(gocb_ref).build()
     }
 
-    /// Creates an observer subscriber, which accepts every GOOSE frame.
+    /// Creates an observer subscriber with no filter, which accepts every
+    /// GOOSE frame.
     pub fn new_observer() -> Self {
         GooseSubscriberBuilder::new().observer().build()
     }
 
-    /// Returns the gocbRef filter.
+    /// Returns the gocbRef filter, or an empty string when any gocbRef is
+    /// accepted.
     pub fn gocb_ref(&self) -> &str {
-        &self.gocb_ref
+        self.gocb_ref.as_deref().unwrap_or("")
     }
 
     /// Returns the APPID filter.
@@ -310,9 +320,10 @@ impl GooseSubscriber {
         self.dst_mac
     }
 
-    /// Returns whether this is an observer subscription.
+    /// Returns whether this is an observer subscription, one that accepts
+    /// any gocbRef.
     pub fn is_observer(&self) -> bool {
-        self.is_observer
+        self.gocb_ref.is_none()
     }
 
     /// Returns the Simulation filter.
@@ -376,20 +387,17 @@ impl GooseSubscriber {
     }
 
     /// Returns whether the frame-level filters accept this APPID and
-    /// destination MAC. Observer mode always accepts.
+    /// destination MAC; an unset filter accepts any value.
     pub(crate) fn matches_frame(&self, app_id: u16, dst_mac: &[u8; 6]) -> bool {
-        if self.is_observer {
-            return true;
-        }
         let appid_ok = self.app_id.is_none_or(|id| id == app_id);
         let mac_ok = self.dst_mac.is_none_or(|m| &m == dst_mac);
         appid_ok && mac_ok
     }
 
-    /// Returns whether the gocbRef filter accepts this reference. Observer
-    /// mode always accepts.
+    /// Returns whether the gocbRef filter accepts this reference; an observer
+    /// accepts any.
     pub(crate) fn matches_gocb_ref(&self, gocb_ref: &str) -> bool {
-        self.is_observer || self.gocb_ref == gocb_ref
+        self.gocb_ref.as_deref().is_none_or(|g| g == gocb_ref)
     }
 
     /// Applies a decoded publication and invokes the listener.
@@ -661,6 +669,57 @@ mod tests {
 
         assert!(sub.matches_frame(0x0001, &mac_a));
         assert!(!sub.matches_frame(0x0001, &mac_b));
+    }
+
+    #[test]
+    fn appid_alone_filters_without_becoming_a_catch_all() {
+        let sub = GooseSubscriberBuilder::new().app_id(0x0001).build();
+        assert!(sub.is_observer(), "no gocbref filter means any gocbref");
+        assert_eq!(sub.app_id(), Some(0x0001));
+        assert!(sub.matches_frame(0x0001, &[0u8; 6]));
+        assert!(!sub.matches_frame(0x0002, &[0u8; 6]));
+        assert!(sub.matches_gocb_ref("IED1/LLN0$GO$a"));
+        assert!(sub.matches_gocb_ref("IED2/LLN0$GO$b"));
+    }
+
+    #[test]
+    fn dst_mac_alone_filters_without_becoming_a_catch_all() {
+        let mac_a = [0x01, 0x0C, 0xCD, 0x01, 0x00, 0x01];
+        let mac_b = [0x01, 0x0C, 0xCD, 0x01, 0x00, 0x02];
+        let sub = GooseSubscriberBuilder::new().dst_mac(mac_a).build();
+        assert_eq!(sub.dst_mac_filter(), Some(mac_a));
+        assert!(sub.matches_frame(0x1234, &mac_a));
+        assert!(!sub.matches_frame(0x1234, &mac_b));
+    }
+
+    #[test]
+    fn observer_drops_a_gocb_ref_filter_in_either_order() {
+        for sub in [
+            GooseSubscriberBuilder::new()
+                .gocb_ref("IED1/LLN0$GO$gcb")
+                .observer()
+                .build(),
+            GooseSubscriberBuilder::new()
+                .observer()
+                .gocb_ref("IED1/LLN0$GO$gcb")
+                .build(),
+        ] {
+            assert!(sub.is_observer());
+            assert_eq!(sub.gocb_ref(), "", "the getter reports no gocbref filter");
+            assert!(sub.matches_gocb_ref("IED1/LLN0$GO$gcb"));
+            assert!(sub.matches_gocb_ref("IED2/LLN0$GO$other"));
+        }
+    }
+
+    #[test]
+    fn observer_keeps_frame_filters() {
+        let sub = GooseSubscriberBuilder::new()
+            .observer()
+            .app_id(0x0001)
+            .build();
+        assert!(sub.is_observer());
+        assert!(sub.matches_frame(0x0001, &[0u8; 6]));
+        assert!(!sub.matches_frame(0x0002, &[0u8; 6]));
     }
 
     #[test]
