@@ -25,7 +25,7 @@ use iec61850_model::FC;
 use crate::connection::IedConnection;
 use crate::error::ClientError;
 use crate::object_io::parse_iec_object_path;
-use crate::prelude::{format, Arc, String, ToString, Vec};
+use crate::prelude::{format, Arc, BTreeSet, String, ToString, Vec};
 
 // Types.
 
@@ -95,17 +95,19 @@ pub const DEFAULT_MAX_NAME_LIST_NAMES: usize = 1_000_000;
 /// Calls GetNameList repeatedly until the server reports no more names.
 ///
 /// `domain` selects the scope: `Some(name)` is domain-specific, `None` is
-/// VMD-specific. The names come in alphabetical order, so a page that
-/// reports more names must end on a name ordered after the continuation it
-/// was asked for. The walk stops at the connection's name limit, so a server
-/// that keeps reporting more cannot hold the client in the loop.
+/// VMD-specific. The names are returned in the order the server sends them,
+/// each once; IEC 61850-8-1 sets no order for them, so a page may hold names
+/// that sort before the continuation it was asked for. A page that reports
+/// more names must end on a name other than that continuation and bring at
+/// least one name not yet received, so every request moves the walk on. The
+/// walk also stops at the connection's name limit.
 ///
 /// # Errors
 ///
 /// `NotConnected` if the association is not established, `Mms` if a page that
-/// reports more names does not end past the name the previous page ended on,
-/// `NameListLimit` if the walk exceeds the connection's name limit, and the
-/// error the MMS layer reports.
+/// reports more names ends on the continuation it was asked for or brings no
+/// name not yet received, `NameListLimit` if the walk exceeds the
+/// connection's name limit, and the error the MMS layer reports.
 async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     conn: &IedConnection<T, Tm>,
     object_class: ObjectClass,
@@ -116,6 +118,7 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
     }
     let limit = conn.max_name_list_names;
     let mut all: Vec<String> = Vec::new();
+    let mut received: BTreeSet<String> = BTreeSet::new();
     let mut continue_after: Option<String> = None;
     loop {
         let mut client = conn.mms_client.lock().await;
@@ -123,37 +126,41 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
             .get_name_list(object_class, domain, continue_after.as_deref())
             .await?;
         drop(client);
-        if all.len().saturating_add(page.len()) > limit {
-            tracing::warn!(
-                ?object_class,
-                domain,
-                limit,
-                "getnamelist walk exceeds the name limit, abandoning it"
-            );
-            return Err(ClientError::NameListLimit { limit });
-        }
-        if let Some(last) = page.last().cloned() {
-            all.extend(page);
-            if more {
-                if continue_after
-                    .as_deref()
-                    .is_some_and(|previous| last.as_str() <= previous)
-                {
+        let last = page.last().cloned();
+        let before = all.len();
+        for name in page {
+            if !received.contains(&name) {
+                if all.len() == limit {
                     tracing::warn!(
                         ?object_class,
                         domain,
-                        continue_after = last.as_str(),
-                        "getnamelist page does not advance past its continuation, abandoning the walk"
+                        limit,
+                        "getnamelist walk exceeds the name limit, abandoning it"
                     );
-                    return Err(ClientError::Mms(format!(
-                        "getnamelist does not advance past '{last}'"
-                    )));
+                    return Err(ClientError::NameListLimit { limit });
                 }
-                continue_after = Some(last);
-                continue;
+                received.insert(name.clone());
+                all.push(name);
             }
         }
-        break;
+        if !more {
+            break;
+        }
+        let Some(last) = last
+            .filter(|last| all.len() > before && continue_after.as_deref() != Some(last.as_str()))
+        else {
+            tracing::warn!(
+                ?object_class,
+                domain,
+                continue_after = continue_after.as_deref(),
+                "getnamelist page does not move the walk on, abandoning it"
+            );
+            return Err(ClientError::Mms(format!(
+                "getnamelist reports more names but brings none new after '{}'",
+                continue_after.as_deref().unwrap_or_default()
+            )));
+        };
+        continue_after = Some(last);
     }
     Ok(all)
 }
@@ -447,7 +454,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// logical node.
     ///
     /// Neither deduplicated nor filtered by functional constraint; the order is
-    /// that of the cached variable list, which the server reports alphabetically.
+    /// that of the cached variable list, which is the order the server reports.
     pub async fn get_logical_node_variables(
         &self,
         ln_ref: &str,

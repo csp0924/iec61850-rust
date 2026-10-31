@@ -9,6 +9,7 @@
 //!   spelling across both environments.
 //! - `HashMap`: `std::collections`, or `hashbrown` on embedded; only the
 //!   report dispatch of the `reporting` feature uses it.
+//! - `BTreeSet`: `std::collections`, or `alloc::collections` on embedded.
 //!
 //! Synchronization primitives are deliberately absent: `spin` must never be
 //! reached on a std target, where busy-waiting burns a core. The async lock
@@ -25,6 +26,12 @@ pub(crate) use std::sync::Arc;
 pub(crate) use hashbrown::HashMap;
 #[cfg(all(feature = "std", feature = "reporting"))]
 pub(crate) use std::collections::HashMap;
+
+// BTreeSet
+#[cfg(not(feature = "std"))]
+pub(crate) use alloc::collections::BTreeSet;
+#[cfg(feature = "std")]
+pub(crate) use std::collections::BTreeSet;
 
 // String / Vec / format! / ToString
 // These are already in the std prelude; re-exporting them keeps submodules on

@@ -2,11 +2,14 @@
 //! real TCP and the full ISO stack.
 //!
 //! The server answers GetNameList from a script keyed on the domain asked for:
-//! a well-formed model, a server that repeats the same page while reporting
-//! more names, and a server that keeps reporting new names.
+//! a well-formed model, servers that page names in an order other than byte
+//! order or send the continuation name again, a server that repeats the same
+//! page while reporting more names, and a server that keeps reporting new
+//! names.
 
 mod support;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -26,6 +29,49 @@ const ENDLESS_PAGE: usize = 2_000;
 const ENDLESS_PAGES: usize = 600;
 /// Pages the repeating walk sends before reporting no more names.
 const REPEATED_PAGES: u32 = 20;
+/// Names in each page of the walk sorted without regard to case.
+const NOCASE_PAGE: usize = 3;
+
+/// GetNameList requests for the `STUCKEND` domain.
+static STUCKEND_REQUESTS: AtomicU32 = AtomicU32::new(0);
+
+/// The variables of the `NOCASE` domain, in the order of a server that sorts
+/// names without regard to case, which is not byte order.
+fn nocase_names() -> Vec<String> {
+    let mut list = names(&[
+        "GGIO1",
+        "GGIO1$CO",
+        "GGIO1$CO$SPCSO1",
+        "GGIO1$CO$SPCSO1$Oper",
+        "GGIO1$CO$SPCSO1$Oper$ctlNum",
+        "GGIO1$CO$SPCSO1$Oper$ctlVal",
+        "GGIO1$CO$SPCSO1$Oper$origin",
+        "GGIO1$CO$SPCSO1$Oper$T",
+        "GGIO1$CO$SPCSO1$Oper$Test",
+        "GGIO1$ST",
+        "GGIO1$ST$Ind1",
+        "GGIO1$ST$Ind1$q",
+        "GGIO1$ST$Ind1$stVal",
+        "GGIO1$ST$Ind1$t",
+        "LLN0",
+        "LLN0$ST",
+        "LLN0$ST$Mod",
+        "LLN0$ST$Mod$stVal",
+    ]);
+    list.sort_by_key(|name| name.to_lowercase());
+    list
+}
+
+/// The page of `list` that continues after `after`, and whether more follow.
+fn page_after(list: &[String], after: Option<&str>, size: usize) -> (Vec<String>, bool) {
+    let from = after.map_or(0, |after| {
+        list.iter()
+            .position(|n| n == after)
+            .map_or(list.len(), |i| i + 1)
+    });
+    let page: Vec<String> = list.iter().skip(from).take(size).cloned().collect();
+    (page, from + size < list.len())
+}
 
 fn name_list(invoke_id: u32, identifiers: Vec<String>, more_follows: bool) -> Plan {
     let mut buf = BytesMut::new();
@@ -84,6 +130,45 @@ fn script_for(domain: &'static str) -> Arc<support::Script> {
                     }
                     Some(_) => Some(name_list(invoke_id, names(&["MMXU1"]), false)),
                 },
+                // Names sorted without regard to case, a few to a page.
+                "NOCASE" => {
+                    let (page, more) =
+                        page_after(&nocase_names(), req.continue_after.as_deref(), NOCASE_PAGE);
+                    Some(name_list(invoke_id, page, more))
+                }
+                // Every continuation starts with the name it continues after.
+                "INCLUSIVE" => match req.continue_after.as_deref() {
+                    None => Some(name_list(invoke_id, names(&["GGIO1", "GGIO1$ST"]), true)),
+                    Some("GGIO1$ST") => {
+                        Some(name_list(invoke_id, names(&["GGIO1$ST", "LLN0"]), true))
+                    }
+                    Some(_) => Some(name_list(invoke_id, names(&["LLN0", "LLN0$ST"]), false)),
+                },
+                // Every continuation brings only names already sent, ending on a
+                // name other than its continuation, until the script gives up.
+                "RECYCLE" => match req.continue_after.as_deref() {
+                    None => Some(name_list(
+                        invoke_id,
+                        names(&["GGIO1", "LLN0", "MMXU1"]),
+                        true,
+                    )),
+                    Some(after) => {
+                        let others: Vec<String> = ["GGIO1", "LLN0", "MMXU1"]
+                            .iter()
+                            .filter(|n| **n != after)
+                            .map(|n| n.to_string())
+                            .collect();
+                        Some(name_list(invoke_id, others, seq < REPEATED_PAGES))
+                    }
+                },
+                // A continuation that ends on the name it continues after.
+                "STUCKEND" => {
+                    STUCKEND_REQUESTS.fetch_add(1, Ordering::SeqCst);
+                    match req.continue_after.as_deref() {
+                        None => Some(name_list(invoke_id, names(&["GGIO1", "LLN0"]), true)),
+                        Some(_) => Some(name_list(invoke_id, names(&["MMXU1", "LLN0"]), true)),
+                    }
+                }
                 // A new page of names every time, past the client's limit.
                 "ENDLESS" => {
                     let page = seq as usize;
@@ -147,11 +232,66 @@ async fn name_list_walk_that_does_not_advance_is_an_error() {
     assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
 }
 
+/// A page whose names sort before the continuation is accepted: no order is
+/// required of the names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn name_list_walk_that_goes_back_is_an_error() {
+async fn name_list_walk_out_of_byte_order_completes() {
     let conn = connect("BACK").await;
+    let lns = conn
+        .get_logical_device_directory("BACK")
+        .await
+        .expect("ld directory");
+    assert_eq!(lns, names(&["LLN0", "GGIO1", "MMXU1"]));
+}
+
+/// A walk over small pages from a server that sorts names without regard to
+/// case returns every name once, in the order of the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_sorted_without_regard_to_case_completes() {
+    let conn = connect("NOCASE").await;
+    let all = nocase_names();
+    let lns = conn
+        .get_logical_device_directory("NOCASE")
+        .await
+        .expect("ld directory");
+    assert_eq!(lns, names(&["GGIO1", "LLN0"]));
+    let vars = conn
+        .get_logical_node_variables("NOCASE/GGIO1")
+        .await
+        .expect("ln variables");
+    let expected: Vec<String> = all
+        .iter()
+        .filter_map(|n| n.strip_prefix("GGIO1$").map(str::to_string))
+        .collect();
+    assert_eq!(vars, expected);
+    assert!(expected
+        .windows(2)
+        .any(|w| w[0].as_bytes() > w[1].as_bytes()));
+}
+
+/// A server that starts each continuation with the name it continues after
+/// yields every name once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_that_repeats_the_continuation_yields_each_name_once() {
+    let conn = connect("INCLUSIVE").await;
+    let model = conn
+        .get_device_model_from_server()
+        .await
+        .expect("device model");
+    assert_eq!(
+        model.logical_devices[0].variables,
+        names(&["GGIO1", "GGIO1$ST", "LLN0", "LLN0$ST"])
+    );
+}
+
+/// A page that reports more names but ends on the name it continues after
+/// ends the walk at once, even when it brings a new name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_that_ends_on_its_continuation_is_an_error() {
+    let conn = connect("STUCKEND").await;
     let r = conn.get_server_directory(false).await;
     assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert_eq!(STUCKEND_REQUESTS.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -256,4 +396,13 @@ async fn completed_disconnect_drops_the_device_model() {
     conn.disconnect().await.expect("disconnect");
     assert!(!conn.is_connected());
     assert!(conn.cached_device_model().await.is_none());
+}
+
+/// A server that reports more names but sends only names already received
+/// ends the walk, although each page ends on a different name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_list_walk_without_new_names_is_an_error() {
+    let conn = connect("RECYCLE").await;
+    let r = conn.get_server_directory(false).await;
+    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
 }
