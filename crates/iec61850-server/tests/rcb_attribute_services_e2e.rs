@@ -1,20 +1,26 @@
 //! Report control block attribute services over MMS.
 //!
 //! SetURCBValues and SetBRCBValues as two clients see them over real TCP and the
-//! full ISO stack: who holds a URCB reservation and when it is released, which
-//! BRCB writes count ConfRev and which purge the buffer, and which writes an
-//! enabled BRCB refuses.
+//! full ISO stack: who holds a URCB reservation, when it is taken and released,
+//! and which writes an unreserved URCB accepts; which BRCB writes count ConfRev
+//! and which purge the buffer, and which writes an enabled BRCB refuses.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
 use iec61850_client::mms_compat::mms_data_to_mms_value;
-use iec61850_client::report::parse::{parse_report, ParsedReport};
+use iec61850_client::report::parse::{parse_report, ParsedReport, ReasonForInclusion};
+use iec61850_mms::mms::client::connection::MmsConnection;
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
-use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName};
+use iec61850_mms::mms::pdu::common::{
+    DataAccessError, ObjectName, VariableAccessSpecification, WriteOutcome,
+};
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
+use iec61850_mms::mms::pdu::write::{encode_confirmed_write_request, WriteRequest, WriteResponse};
+use iec61850_mms::mms::pdu::MmsPdu;
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{
     cdc, DataAttribute, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
@@ -131,6 +137,16 @@ impl Fixture {
         mms
     }
 
+    /// Connects at the connection layer, for requests the MMS client does not
+    /// build, such as a Write of several variables.
+    async fn raw_connect(&self) -> MmsConnection {
+        let mut conn: MmsConnection = MmsConnection::new();
+        conn.connect("127.0.0.1", self.handle.bound_addr.port())
+            .await
+            .expect("connect");
+        conn
+    }
+
     fn set_st_val(&self, n: u32) {
         self.server
             .update_bit_string_from_int(&self.st_val, n)
@@ -174,6 +190,95 @@ async fn wait_for_buffered_entry(mms: &mut MmsClient) -> MmsData {
     }
 }
 
+/// Writes several URCB attributes in one Write request, in the order given, and
+/// returns the outcome of each.
+async fn write_urcb_fields(
+    conn: &mut MmsConnection,
+    fields: &[(&str, MmsData)],
+) -> Vec<WriteOutcome> {
+    let req = WriteRequest {
+        variable_access_spec: VariableAccessSpecification::ListOfVariable(
+            fields
+                .iter()
+                .map(|(field, _)| {
+                    ObjectName::DomainSpecific {
+                        domain_id: DOMAIN.into(),
+                        item_id: format!("{URCB_ITEM}${field}"),
+                    }
+                    .into()
+                })
+                .collect(),
+        ),
+        list_of_data: fields.iter().map(|(_, value)| value.clone()).collect(),
+    };
+    let mut full = BytesMut::new();
+    encode_confirmed_write_request(1, &req, &mut full);
+    let full = full.freeze();
+    let header = if full[1] <= 0x7f {
+        2
+    } else {
+        2 + usize::from(full[1] & 0x7f)
+    };
+    conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(full.slice(header..)))
+        .await
+        .expect("send the write request");
+    match conn.recv_mms_pdu_confirmed().await.expect("write response") {
+        MmsPdu::ConfirmedResponse(content) => {
+            // The content starts with the invokeID, `0x02 <len> <id>`.
+            let service = 2 + usize::from(content[1]);
+            WriteResponse::decode(&content[service..])
+                .expect("decode the write response")
+                .outcomes
+        }
+        other => panic!("expected a confirmed response, got {other:?}"),
+    }
+}
+
+/// Receives the next report on a connection-layer association; fails after
+/// four seconds.
+async fn next_raw_report(conn: &mut MmsConnection) -> ParsedReport {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let inner: Bytes = match conn.pop_pending_unconfirmed() {
+            Some(inner) => inner,
+            None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "no report arrived");
+                match conn
+                    .recv_mms_pdu_with_timeout(Some(remaining))
+                    .await
+                    .expect("receive")
+                {
+                    Some(MmsPdu::Unconfirmed(inner)) => inner,
+                    _ => continue,
+                }
+            }
+        };
+        if let Some(report) = as_report(&inner) {
+            return report;
+        }
+    }
+}
+
+/// Parses an InformationReport that carries a report, or returns `None` for
+/// any other InformationReport.
+fn as_report(inner: &Bytes) -> Option<ParsedReport> {
+    let report = decode_information_report(inner).expect("decode information report");
+    let is_rpt = matches!(
+        &report.variable_access_spec,
+        VariableAccessSpec::VariableListName(ObjectName::VmdSpecific(s)) if s == "RPT"
+    );
+    if !is_rpt {
+        return None;
+    }
+    let elements: Vec<MmsValue> = report
+        .list_of_access_result
+        .iter()
+        .map(mms_data_to_mms_value)
+        .collect();
+    Some(parse_report(&MmsValue::Array(elements)).expect("parse report"))
+}
+
 /// Receives the next report; fails after four seconds.
 async fn next_report(mms: &mut MmsClient) -> ParsedReport {
     let deadline = Instant::now() + Duration::from_secs(4);
@@ -187,20 +292,9 @@ async fn next_report(mms: &mut MmsClient) -> ParsedReport {
         else {
             continue;
         };
-        let report = decode_information_report(&inner).expect("decode information report");
-        let is_rpt = matches!(
-            &report.variable_access_spec,
-            VariableAccessSpec::VariableListName(ObjectName::VmdSpecific(s)) if s == "RPT"
-        );
-        if !is_rpt {
-            continue;
+        if let Some(report) = as_report(&inner) {
+            return report;
         }
-        let elements: Vec<MmsValue> = report
-            .list_of_access_result
-            .iter()
-            .map(mms_data_to_mms_value)
-            .collect();
-        return parse_report(&MmsValue::Array(elements)).expect("parse report");
     }
 }
 
@@ -285,29 +379,95 @@ async fn urcb_enable_reserves_implicitly() {
     );
 }
 
-/// On an unreserved URCB, a write of any attribute other than RptEna = TRUE is
-/// still refused and does not reserve it.
+fn trg_ops_data(trg_ops: TriggerOptions) -> MmsData {
+    let [padding, data @ ..] = trg_ops.to_ber_bit_string();
+    MmsData::BitString {
+        padding,
+        data: data.to_vec(),
+    }
+}
+
+/// On an unreserved URCB, a write of any attribute other than RptEna = TRUE
+/// takes effect and does not reserve it, so another client may still reserve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn urcb_other_writes_do_not_reserve() {
     let f = start().await;
     let mut mms = f.connect().await;
+    let mut other = f.connect().await;
+    let trg_ops = trg_ops_data(TriggerOptions::DATA_CHANGED | TriggerOptions::GI);
+    write_urcb(&mut mms, "TrgOps", trg_ops.clone())
+        .await
+        .expect("configure an unreserved URCB");
+    write_urcb(&mut mms, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable an unreserved URCB");
+    assert_eq!(read_urcb(&mut other, "TrgOps").await, trg_ops);
+    assert_eq!(read_urcb(&mut other, "Resv").await, MmsData::Boolean(false));
+    write_urcb(&mut other, "Resv", MmsData::Boolean(true))
+        .await
+        .expect("another client reserves the URCB");
+}
+
+/// One Write request that configures an unreserved URCB and ends with
+/// RptEna = TRUE succeeds as a whole: TrgOps and IntgPd take effect before the
+/// enable, which reserves the URCB for the writer, and the reports follow the
+/// new configuration. Another client is refused, one write or several alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn urcb_configured_and_enabled_in_one_write_request() {
+    let f = start().await;
+    let mut writer = f.raw_connect().await;
+    let mut third = f.raw_connect().await;
+    let mut other = f.connect().await;
+    let trg_ops = trg_ops_data(TriggerOptions::INTEGRITY);
+
+    let outcomes = write_urcb_fields(
+        &mut writer,
+        &[
+            ("TrgOps", trg_ops.clone()),
+            ("IntgPd", MmsData::Unsigned(100)),
+            ("RptEna", MmsData::Boolean(true)),
+        ],
+    )
+    .await;
+    assert_eq!(outcomes, vec![WriteOutcome::Success; 3]);
+    assert_eq!(read_urcb(&mut other, "TrgOps").await, trg_ops);
+    assert_eq!(
+        read_urcb(&mut other, "IntgPd").await,
+        MmsData::Unsigned(100)
+    );
+    assert_eq!(
+        read_urcb(&mut other, "RptEna").await,
+        MmsData::Boolean(true)
+    );
+    assert_eq!(read_urcb(&mut other, "Resv").await, MmsData::Boolean(true));
+
+    // Nothing changes the data, so only the new integrity period produces a report.
+    let report = next_raw_report(&mut writer).await;
+    assert_eq!(report.rpt_id, URCB_PATH);
+    assert_eq!(report.reasons, vec![ReasonForInclusion::INTEGRITY]);
+
     assert_refused_with(
-        write_urcb(
-            &mut mms,
-            "TrgOps",
-            MmsData::BitString {
-                padding: 2,
-                data: vec![0x40],
-            },
-        )
-        .await,
+        write_urcb(&mut other, "IntgPd", MmsData::Unsigned(200)).await,
         DataAccessError::ObjectAccessDenied,
     );
-    assert_refused_with(
-        write_urcb(&mut mms, "RptEna", MmsData::Boolean(false)).await,
-        DataAccessError::ObjectAccessDenied,
+    let outcomes = write_urcb_fields(
+        &mut third,
+        &[
+            ("TrgOps", trg_ops_data(TriggerOptions::DATA_CHANGED)),
+            ("IntgPd", MmsData::Unsigned(200)),
+            ("RptEna", MmsData::Boolean(true)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        outcomes,
+        vec![WriteOutcome::Failure(DataAccessError::ObjectAccessDenied); 3]
     );
-    assert_eq!(read_urcb(&mut mms, "Resv").await, MmsData::Boolean(false));
+    assert_eq!(read_urcb(&mut other, "TrgOps").await, trg_ops);
+    assert_eq!(
+        read_urcb(&mut other, "IntgPd").await,
+        MmsData::Unsigned(100)
+    );
 }
 
 /// A disabled BRCB keeps its ConfRev and its buffer when OptFlds is written; a

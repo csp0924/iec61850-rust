@@ -11,14 +11,17 @@
 //! |---|---|
 //! | Resv = true | not reserved by another client, and RptEna is false |
 //! | Resv = false | reserved by the writer, and RptEna is false |
-//! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
+//! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | unreserved or reserved by the writer, and RptEna is false; the write does not reserve |
 //! | RptEna = true | reserved by the writer, or unreserved, in which case the write reserves it for the writer |
-//! | RptEna = false | enabled, and the writer owns the reservation; the reservation is kept |
-//! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
+//! | RptEna = false | unreserved or reserved by the writer; the reservation is kept |
+//! | GI = true | unreserved or reserved by the writer; acted on only while enabled and trgOps includes GI |
 //! | ConfRev, SqNum, Owner | never writable; answered with ObjectAccessDenied |
 //!
 //! A refused enable-time write is answered with TemporarilyUnavailable, a write
-//! from a client that does not hold the reservation with ObjectAccessDenied.
+//! to a URCB another client has reserved with ObjectAccessDenied. A single
+//! Write request that configures an unreserved URCB and ends with RptEna = true
+//! therefore succeeds as a whole: the attributes take effect in request order
+//! and the enable that follows reserves the URCB for the writer.
 //!
 //! BRCB: the rules of IEC 61850-8-1 Table 72, documented on
 //! `handle_set_brcb_field`; ConfRev, SqNum, TimeOfEntry and Owner are never
@@ -152,7 +155,7 @@ pub enum RcbWriteValue {
 /// # Errors
 ///
 /// Returns the `DataAccessError` the client is to be answered with: a
-/// non-writable field or a writer that does not own the reservation gives
+/// non-writable field or a URCB reserved by another client gives
 /// `ObjectAccessDenied`, a wrong value type gives `TypeInconsistent`, a DatSet
 /// naming no known data set gives `ObjectValueInvalid`, an enabled control block
 /// gives `TemporarilyUnavailable`, and a poisoned mutex gives `HardwareFault`.
@@ -249,22 +252,22 @@ pub fn handle_set_rcb_field(
         return Ok(());
     }
 
-    // RptEna = true on an unreserved control block reserves it for the writer,
-    // per the Resv semantics of IEC 61850-7-2; the reservation is taken below,
-    // only once the enable succeeds.
-    let implicit_reservation = !state.resv
-        && state.client_conn_id.is_none()
-        && field == RcbField::RptEna
-        && matches!(value, RcbWriteValue::Bool(true));
+    // An unreserved control block takes writes from any client without being
+    // reserved by them. Only RptEna = true reserves it for the writer, per the
+    // Resv semantics of IEC 61850-7-2; the reservation is taken below, only once
+    // the enable succeeds.
+    let unreserved = !state.resv && state.client_conn_id.is_none();
+    let implicit_reservation =
+        unreserved && field == RcbField::RptEna && matches!(value, RcbWriteValue::Bool(true));
 
-    // Otherwise a client that does not hold the reservation may not write any
-    // other field, per the RCB write conditions of IEC 61850-7-2.
-    if !implicit_reservation && (!state.resv || state.client_conn_id != Some(conn_id)) {
+    // A control block reserved by another client accepts no write, per the
+    // Resv semantics of IEC 61850-7-2.
+    if !unreserved && (!state.resv || state.client_conn_id != Some(conn_id)) {
         tracing::warn!(
             mms_path,
             conn_id,
             field = field.as_str(),
-            "SetURCBValues: not reserved by this client, answering ObjectAccessDenied"
+            "SetURCBValues: reserved by another client, answering ObjectAccessDenied"
         );
         return Err(DataAccessError::ObjectAccessDenied);
     }
@@ -1821,12 +1824,13 @@ mod tests {
         assert_eq!(res, Err(DataAccessError::TemporarilyUnavailable));
     }
 
-    // ── An unreserved client may not write other fields ──────────────────────
+    // ── Writes to an unreserved or a reserved URCB ───────────────────────────
 
+    /// Any client may configure an unreserved URCB; the write takes effect and
+    /// does not reserve it.
     #[test]
-    fn ed21_non_reserved_write_denied() {
+    fn unreserved_urcb_accepts_a_configuration_write() {
         let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
-        // Write RptID without reserving first.
         let res = handle_set_rcb_field(
             &engine,
             &path,
@@ -1834,7 +1838,34 @@ mod tests {
             RcbWriteValue::VisibleString("newId".to_string()),
             1,
         );
-        assert_eq!(res, Err(DataAccessError::ObjectAccessDenied));
+        assert_eq!(res, Ok(()));
+        let rc_arc = engine.lock().unwrap().get_rcb(&path).unwrap();
+        let rc = rc_arc.lock().unwrap();
+        let state = rc.state.lock().unwrap();
+        assert_eq!(state.rpt_id, "newId");
+        assert!(!state.resv);
+        assert_eq!(state.client_conn_id, None);
+    }
+
+    /// A URCB reserved by one client refuses every write of another.
+    #[test]
+    fn reserved_urcb_refuses_another_client() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        for (field, value) in [
+            (
+                RcbField::RptId,
+                RcbWriteValue::VisibleString("newId".to_string()),
+            ),
+            (RcbField::IntgPd, RcbWriteValue::Unsigned(1000)),
+            (RcbField::RptEna, RcbWriteValue::Bool(false)),
+            (RcbField::Gi, RcbWriteValue::Bool(true)),
+        ] {
+            assert_eq!(
+                handle_set_rcb_field(&engine, &path, field, value, 2),
+                Err(DataAccessError::ObjectAccessDenied)
+            );
+        }
     }
 
     // ── Enable and disable ───────────────────────────────────────────────────
@@ -1946,8 +1977,8 @@ mod tests {
     }
 
     /// Only RptEna = TRUE reserves implicitly: RptEna = FALSE and every other
-    /// attribute are still refused on an unreserved URCB, and an enable that
-    /// fails leaves the URCB unreserved.
+    /// attribute are accepted on an unreserved URCB without reserving it, and
+    /// an enable that fails leaves the URCB unreserved.
     #[test]
     fn urcb_without_resv_only_an_enable_reserves() {
         let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
@@ -1958,7 +1989,7 @@ mod tests {
         ] {
             assert_eq!(
                 handle_set_rcb_field(&engine, &path, field, value, 1),
-                Err(DataAccessError::ObjectAccessDenied)
+                Ok(())
             );
         }
         assert_eq!(urcb_resv(&engine, &path), (false, None));

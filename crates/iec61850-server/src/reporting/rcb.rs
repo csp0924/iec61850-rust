@@ -13,7 +13,8 @@
 //! IDLE ◄──────────────(conn drop)────────────────── ENABLED
 //! ```
 //!
-//! Enabling an unreserved URCB reserves it for the client that enables it. A
+//! Enabling an unreserved URCB reserves it for the client that enables it;
+//! writing any other attribute of an unreserved URCB leaves it unreserved. A
 //! URCB reservation has no timeout: it is released only when the holder writes
 //! Resv = false or its connection goes away. Disabling reporting keeps it.
 
