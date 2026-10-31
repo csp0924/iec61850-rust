@@ -286,6 +286,34 @@ impl LogControl {
         storage.add_entry_with_data(time_ms, &data).map(Some)
     }
 
+    /// Writes one entry holding `data`, each data set member with its own
+    /// reason code, when the control block is enabled and has a storage bound;
+    /// otherwise writes nothing and returns `Ok(None)`.
+    #[cfg(any(feature = "full-server", test))]
+    pub(crate) fn write_members(
+        &self,
+        time_ms: u64,
+        data: &[(String, iec61850_model::MmsValue, u8)],
+    ) -> Result<Option<EntryId>, LogStorageError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let Some(storage) = self.storage.clone() else {
+            tracing::warn!(
+                mms_path = %self.mms_path,
+                "log control has no storage bound, trigger skipped"
+            );
+            return Ok(None);
+        };
+        let data: Vec<super::storage::JournalEntryData> = data
+            .iter()
+            .map(|(data_ref, value, reason_code)| {
+                super::storage::JournalEntryData::new(data_ref.clone(), value.clone(), *reason_code)
+            })
+            .collect();
+        storage.add_entry_with_data(time_ms, &data).map(Some)
+    }
+
     /// Reports whether an integrity entry is due at `now`; when it is, returns
     /// the data set to log and starts the next integrity period from `now`.
     ///

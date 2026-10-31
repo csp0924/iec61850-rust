@@ -15,16 +15,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use iec61850_goose::{CommParameters, GoosePublisher};
-use iec61850_model::{
-    DataAttribute, DataAttributeType, DataObject, DataSetEntry, DoChild, IedModel, LogicalDevice,
-    LogicalNode, FC,
-};
+use iec61850_model::{DataSetEntry, IedModel, LogicalDevice, LogicalNode};
 
 use crate::error::{Result, ServerError};
 use crate::goose_mapping::GoCBHandle;
 use crate::logging::{InMemoryLogStorage, LogControl, LogControlBlock, LogStorage};
 use crate::reporting::multi_instance::{instance_paths, register_rcb_instances, trigger_options};
-use crate::reporting::{Dataset, DatasetEntry};
+use crate::reporting::{Dataset, DatasetEntry, DatasetError};
 use crate::server::IedServer;
 
 /// Creates the storage of a log, given its reference `<LD>/<LN>$<logName>`.
@@ -150,7 +147,8 @@ impl IedServer {
     /// GOOSE or log control block of the model is already registered under
     /// the same reference, and `InvalidModel` when two of them, report control
     /// block instances included, have the same reference, when a data set member does not
-    /// resolve, names an array element, or resolves to no attribute, when a
+    /// resolve, names an array element, resolves to no attribute or to more
+    /// than [`DatasetEntry::MAX_LEAVES`] attributes, when a
     /// control block names a data set of another logical device or one the
     /// server does not hold, or when a GOOSE control block names no data set.
     /// Nothing is registered when an error is returned. A control object
@@ -393,13 +391,11 @@ impl Plan {
                     let name = format!("{ln_name}${}", ds.name);
                     let mut out = Dataset::new(name.clone());
                     for entry in &ds.entries {
-                        for member in member_entries(model, ld, entry).map_err(|why| {
+                        out.push(member_entry(model, ld, entry).map_err(|why| {
                             ServerError::InvalidModel(format!(
                                 "data set {domain}/{name}: member {entry} {why}"
                             ))
-                        })? {
-                            out.push(member);
-                        }
+                        })?);
                     }
                     plan.data_sets.push((domain.clone(), out));
                 }
@@ -535,19 +531,13 @@ fn log_reference(domain: &str, log_ref: &str) -> String {
     }
 }
 
-/// The node a data set member path has reached.
-enum Node<'a> {
-    Do(&'a DataObject),
-    Da(&'a DataAttribute),
-}
-
-/// Binds a data set member of the model to the basic-type attributes it
-/// covers, in model order; the error says why it does not resolve.
-fn member_entries(
+/// Binds a data set member of the model to the node it names, an FCD or an
+/// FCDA of any type; the error says why it does not resolve.
+fn member_entry(
     model: &IedModel,
     owner: &LogicalDevice,
     entry: &DataSetEntry,
-) -> core::result::Result<Vec<DatasetEntry>, &'static str> {
+) -> core::result::Result<DatasetEntry, &'static str> {
     if entry.array_index.is_some() {
         return Err("names an array element, which is not supported");
     }
@@ -559,62 +549,15 @@ fn member_entries(
             .or_else(|| model.ld_by_domain(&entry.ld_inst))
             .ok_or("names no logical device of the model")?
     };
-    let ln = ld
-        .ln_by_name(&entry.ln_name)
-        .ok_or("names no logical node of the model")?;
-    let mut path: Vec<&str> = entry.do_path.iter().map(String::as_str).collect();
-    if let Some(component) = &entry.component {
-        path.extend(component.split('.'));
+    let mut path = format!("{}${}", entry.ln_name, entry.fc.as_str());
+    let component = entry.component.iter().flat_map(|c| c.split('.'));
+    for seg in entry.do_path.iter().map(String::as_str).chain(component) {
+        path.push('$');
+        path.push_str(seg);
     }
-    let (first, rest) = path.split_first().ok_or("has an empty path")?;
-    let mut node = Node::Do(ln.do_by_name(first).ok_or("does not resolve")?);
-    for seg in rest {
-        node = match node {
-            Node::Do(d) => match d.child_by_name(seg, Some(entry.fc)) {
-                Some(DoChild::SubDo(s)) => Node::Do(s),
-                Some(DoChild::Da(a)) => Node::Da(a),
-                None => return Err("does not resolve"),
-            },
-            Node::Da(a) => Node::Da(a.child_by_name(seg).ok_or("does not resolve")?),
-        };
-    }
-    let prefix = format!(
-        "{}/{}${}${}",
-        ld.domain_name(&model.ied_name),
-        ln.full_name(),
-        entry.fc.as_str(),
-        path.join("$")
-    );
-    // TODO: bind a member that names a data object or a constructed attribute
-    // as one functionally constrained entry once a data set entry can hold one.
-    let mut out = Vec::new();
-    match node {
-        Node::Do(d) => do_leaves(d, entry.fc, &prefix, &mut out),
-        Node::Da(a) if a.fc == entry.fc => da_leaves(a, &prefix, &mut out),
-        Node::Da(_) => return Err("does not resolve under its functional constraint"),
-    }
-    if out.is_empty() {
-        return Err("covers no attribute under its functional constraint");
-    }
-    Ok(out)
-}
-
-fn do_leaves(d: &DataObject, fc: FC, prefix: &str, out: &mut Vec<DatasetEntry>) {
-    for child in &d.children {
-        match child {
-            DoChild::SubDo(s) => do_leaves(s, fc, &format!("{prefix}${}", s.name), out),
-            DoChild::Da(a) if a.fc == fc => da_leaves(a, &format!("{prefix}${}", a.name), out),
-            DoChild::Da(_) => {}
-        }
-    }
-}
-
-fn da_leaves(a: &DataAttribute, reference: &str, out: &mut Vec<DatasetEntry>) {
-    if a.ty == DataAttributeType::Constructed || !a.children.is_empty() {
-        for c in &a.children {
-            da_leaves(c, &format!("{reference}${}", c.name), out);
-        }
-    } else {
-        out.push(DatasetEntry::new(reference, Arc::clone(&a.value)));
-    }
+    DatasetEntry::from_model(model, &ld.domain_name(&model.ied_name), &path).map_err(|e| match e {
+        DatasetError::MemberNotFound { .. } => "does not resolve under its functional constraint",
+        DatasetError::TooLarge { .. } => "holds more attributes than a member may",
+        _ => "is not a valid member path",
+    })
 }

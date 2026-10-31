@@ -1,32 +1,31 @@
 //! Dynamic data set operations: CreateDataSet and DeleteDataSet of
 //! IEC 61850-7-2.
 //!
-//! Creates and deletes named variable lists at runtime. A member is resolved
-//! through the `IedModel` logical node, data object, and data attribute tree, and
-//! yields the `Arc<RwLock<MmsValue>>` shared with `DataAttribute::value`, the same
-//! handle a statically registered data set uses.
+//! Creates and deletes named variable lists at runtime. Each member is resolved
+//! through the `IedModel` logical node, data object, and data attribute tree by
+//! [`DatasetEntry::from_model`], and shares the value locks of the model's
+//! attributes, as a statically registered data set does.
 //!
-//! A member path is `<LN>$<FC>$<DO>[$<SDO>...]$<DA>[$<SDA>...]`, for example
-//! `GGIO1$ST$Ind1$stVal` or `MMXU1$MX$A$phsA$cVal$mag$f`: logical node class
-//! and instance, functional constraint, data object name, any number of
-//! sub-data-objects, data attribute name, and any sub-attributes nested inside
-//! it. The data attribute is matched by name and functional constraint, as
-//! IEC 61850-7-2 §13.2.2.3 makes a member a functional-constrained data
-//! attribute.
+//! A member path is `<LN>$<FC>$<DO>[$<SDO>...][$<DA>[$<SDA>...]]`: functional-
+//! constrained data (FCD) naming a data object or sub-data-object, or a
+//! functional-constrained data attribute (FCDA) naming a data attribute or
+//! sub-attribute of any type, for example `GGIO1$ST$Ind1`,
+//! `MMXU1$MX$TotW$mag` or `MMXU1$MX$A$phsA$cVal$mag$f`. IEC 61850-7-2
+//! §13.2.2.3 lets a member be either, and an IED that supports CreateDataSet
+//! must handle any valid one.
 //!
-//! A member is one attribute of a basic type. A member that names a data
-//! object, a sub-data-object, or a constructed attribute is refused: an entry
-//! holds a single value, and the value of such a member lives in the
-//! attributes beneath it.
+//! A run-time data set holds at most [`DynamicDatasetOps::MAX_MEMBERS`]
+//! members and [`DynamicDatasetOps::MAX_LEAVES`] leaves across them, and each
+//! member at most [`DatasetEntry::MAX_LEAVES`] leaves, so a request naming
+//! large data objects cannot make the server hold an unbounded number of
+//! value references.
 //!
 //! Array indices, the `(N)` syntax, are not supported; the `dataset_admin` module
 //! of the client crate rejects them before they reach this module.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use iec61850_model::{IedModel, MmsValue, FC};
-
-use crate::service::read::Node;
+use iec61850_model::IedModel;
 
 use super::dataset::{Dataset, DatasetEntry};
 use super::DatasetRegistry;
@@ -52,9 +51,9 @@ pub enum DatasetError {
         /// The member path that did not resolve.
         path: String,
     },
-    /// The member path is malformed, with too few segments or an unparseable
-    /// functional constraint token, or it names a member form this server does
-    /// not serve: a data object, a sub-data-object, or a constructed attribute.
+    /// The member path is malformed, with too few segments, an empty segment
+    /// or an unparseable functional constraint token, or it names an array of
+    /// data objects, which this server does not serve as a member.
     MemberInvalidPath {
         /// The malformed member path.
         path: String,
@@ -66,6 +65,15 @@ pub enum DatasetError {
     },
     /// The `DatasetRegistry` lock is poisoned.
     RegistryPoisoned,
+    /// A size limit is exceeded: a member holds more than
+    /// [`DatasetEntry::MAX_LEAVES`] leaves, and `path` names the member, or a
+    /// run-time data set holds more than [`DynamicDatasetOps::MAX_MEMBERS`]
+    /// members or [`DynamicDatasetOps::MAX_LEAVES`] leaves, and `path` names
+    /// the data set.
+    TooLarge {
+        /// The member or data set over the limit.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -82,6 +90,7 @@ impl std::fmt::Display for DatasetError {
                 write!(f, "dataset is static and not deletable: {name}")
             }
             Self::RegistryPoisoned => write!(f, "dataset registry RwLock poisoned"),
+            Self::TooLarge { path } => write!(f, "dataset size limit exceeded: {path}"),
         }
     }
 }
@@ -101,6 +110,13 @@ pub struct DatasetMeta {
 }
 
 impl DynamicDatasetOps {
+    /// Largest number of members of a data set created at run time.
+    pub const MAX_MEMBERS: usize = 1024;
+
+    /// Largest number of leaves, summed over its members, of a data set created
+    /// at run time.
+    pub const MAX_LEAVES: usize = 4096;
+
     /// Creates a dynamic data set, resolving every member through the model.
     ///
     /// Every member is resolved before anything is registered, so a failure part
@@ -110,6 +126,8 @@ impl DynamicDatasetOps {
     /// - [`DatasetError::NameAlreadyExists`] when the domain and name are taken.
     /// - [`DatasetError::MemberNotFound`] when a member is not in the model.
     /// - [`DatasetError::MemberInvalidPath`] when a member path is malformed.
+    /// - [`DatasetError::TooLarge`] when a member or the data set exceeds a size
+    ///   limit.
     /// - [`DatasetError::RegistryPoisoned`] when the registry lock is poisoned.
     pub fn add_dynamic(
         registry: &DatasetRegistry,
@@ -131,12 +149,23 @@ impl DynamicDatasetOps {
             }
         }
 
+        let too_large = || DatasetError::TooLarge {
+            path: format!("{domain}/{list_name}"),
+        };
+        if members.len() > Self::MAX_MEMBERS {
+            return Err(too_large());
+        }
+
         // Resolve every member; the registry is written only if all of them resolve.
         let mut entries: Vec<DatasetEntry> = Vec::with_capacity(members.len());
+        let mut leaves = 0usize;
         for (mem_domain, mem_path) in &members {
-            let value = resolve_attr_value(ied_model, mem_domain, mem_path)?;
-            let attr_ref = format!("{mem_domain}/{mem_path}");
-            entries.push(DatasetEntry::new(attr_ref, value));
+            let entry = DatasetEntry::from_model(ied_model, mem_domain, mem_path)?;
+            leaves += entry.leaf_count();
+            if leaves > Self::MAX_LEAVES {
+                return Err(too_large());
+            }
+            entries.push(entry);
         }
 
         let dataset = Arc::new(Dataset {
@@ -192,60 +221,23 @@ impl DynamicDatasetOps {
     }
 }
 
-/// Resolves the MMS path `<LN>$<FC>$<DO>[$<SDO>...]$<DA>[$<SDA>...]` to the
-/// value handle shared with the model.
-fn resolve_attr_value(
-    ied_model: &IedModel,
-    domain: &str,
-    mms_path: &str,
-) -> Result<Arc<RwLock<MmsValue>>, DatasetError> {
-    let parts: Vec<&str> = mms_path.split('$').collect();
-    if parts.len() < 4 {
-        return Err(DatasetError::MemberInvalidPath {
-            path: format!("{domain}/{mms_path}"),
-        });
-    }
-    let invalid = || DatasetError::MemberInvalidPath {
-        path: format!("{domain}/{mms_path}"),
-    };
-    let not_found = || DatasetError::MemberNotFound {
-        path: format!("{domain}/{mms_path}"),
-    };
-    if parts.iter().any(|p| p.is_empty()) {
-        return Err(invalid());
-    }
-    let fc = FC::parse(parts[1]).map_err(|_| invalid())?;
-
-    let ln = ied_model
-        .ld_by_domain(domain)
-        .and_then(|ld| ld.ln_by_name(parts[0]))
-        .ok_or_else(not_found)?;
-    let dobj = ln.do_by_name(parts[2]).ok_or_else(not_found)?;
-
-    // Sub-data-objects may nest to any depth before the data attribute, which
-    // must carry the functional constraint of the path; sub-attributes are
-    // descended by name.
-    let mut node = Node::Object(dobj);
-    for seg in &parts[3..] {
-        node = node.child(fc, seg).ok_or_else(not_found)?;
-    }
-
-    // A data object, a sub-data-object or a constructed attribute holds no
-    // value of its own.
-    match node {
-        Node::Attribute(da) if node.is_leaf() => Ok(Arc::clone(&da.value)),
-        _ => Err(invalid()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use iec61850_model::{
         DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder,
-        LogicalDeviceBuilder, LogicalNodeBuilder, TrgOps,
+        LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
     };
     use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    fn resolve_attr_value(
+        model: &IedModel,
+        domain: &str,
+        path: &str,
+    ) -> Result<MmsValue, DatasetError> {
+        DatasetEntry::from_model(model, domain, path).map(|e| e.read_value().unwrap())
+    }
 
     fn build_model() -> Arc<IedModel> {
         let stval = DataAttribute::new(
@@ -280,7 +272,7 @@ mod tests {
     fn resolve_simple_path_ok() {
         let model = build_model();
         let v = resolve_attr_value(&model, "IED1LD0", "GGIO1$ST$Ind1$stVal").unwrap();
-        assert_eq!(*v.read().unwrap(), MmsValue::Boolean(false));
+        assert_eq!(v, MmsValue::Boolean(false));
     }
 
     #[test]
@@ -298,8 +290,8 @@ mod tests {
     }
 
     /// A member reaches a data attribute across any depth of
-    /// sub-data-objects; one that stops on a sub-data-object is not a
-    /// single value.
+    /// sub-data-objects; one that stops on a sub-data-object reads as its
+    /// structure.
     #[test]
     fn resolve_descends_sub_data_objects() {
         let set_mag = DataAttribute::new(
@@ -324,11 +316,11 @@ mod tests {
             .build()
             .unwrap();
         let v = resolve_attr_value(&model, "IED1LD0", "GGIO1$SP$PhSet$phsA$cmv$setMag").unwrap();
-        assert_eq!(*v.read().unwrap(), MmsValue::Float32(2.5));
-        assert!(matches!(
-            resolve_attr_value(&model, "IED1LD0", "GGIO1$SP$PhSet$phsA"),
-            Err(DatasetError::MemberInvalidPath { .. })
-        ));
+        assert_eq!(v, MmsValue::Float32(2.5));
+        assert_eq!(
+            resolve_attr_value(&model, "IED1LD0", "GGIO1$SP$PhSet$phsA").unwrap(),
+            MmsValue::Structure(vec![MmsValue::Structure(vec![MmsValue::Float32(2.5)])])
+        );
         assert!(matches!(
             resolve_attr_value(&model, "IED1LD0", "GGIO1$ST$PhSet$phsA$cmv$setMag"),
             Err(DatasetError::MemberNotFound { .. })
@@ -338,7 +330,7 @@ mod tests {
     #[test]
     fn resolve_short_path_returns_invalid() {
         let model = build_model();
-        let err = resolve_attr_value(&model, "IED1LD0", "GGIO1$ST$Ind1").unwrap_err();
+        let err = resolve_attr_value(&model, "IED1LD0", "GGIO1$ST").unwrap_err();
         assert!(matches!(err, DatasetError::MemberInvalidPath { .. }));
     }
 
@@ -409,6 +401,60 @@ mod tests {
             &reg,
             "IED1LD0",
             "GGIO1$ds_dyn"
+        ));
+    }
+
+    /// A run-time data set beyond the member or leaf limit is refused whole;
+    /// one at the limits is created.
+    #[test]
+    fn add_dynamic_holds_the_size_limits() {
+        let model = build_model();
+        let reg = empty_registry();
+        let leaf = || ("IED1LD0".to_string(), "GGIO1$ST$Ind1$stVal".to_string());
+        let at_limit = vec![leaf(); DynamicDatasetOps::MAX_MEMBERS];
+        DynamicDatasetOps::add_dynamic(&reg, &model, "IED1LD0", "GGIO1$full", at_limit)
+            .expect("a data set at the member limit");
+        let over = vec![leaf(); DynamicDatasetOps::MAX_MEMBERS + 1];
+        assert!(matches!(
+            DynamicDatasetOps::add_dynamic(&reg, &model, "IED1LD0", "GGIO1$over", over),
+            Err(DatasetError::TooLarge { .. })
+        ));
+        assert!(!DynamicDatasetOps::contains(&reg, "IED1LD0", "GGIO1$over"));
+
+        // Members of 1000 leaves each: four fit the leaf limit, five do not.
+        let attrs: Vec<DoChild> = (0..1000)
+            .map(|i| {
+                DoChild::Da(DataAttribute::new(
+                    format!("a{i}"),
+                    FC::Sp,
+                    DataAttributeType::Int32,
+                    TrgOps::default(),
+                    MmsValue::Integer(0),
+                ))
+            })
+            .collect();
+        let ggio1 = iec61850_model::LogicalNode::new(
+            String::new(),
+            "GGIO",
+            "1",
+            vec![DataObject::new("Big", attrs)],
+        );
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio1)
+            .build()
+            .unwrap();
+        let big = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let member = || ("IED1LD0".to_string(), "GGIO1$SP$Big".to_string());
+        DynamicDatasetOps::add_dynamic(&reg, &big, "IED1LD0", "GGIO1$four", vec![member(); 4])
+            .expect("4000 leaves");
+        assert!(matches!(
+            DynamicDatasetOps::add_dynamic(&reg, &big, "IED1LD0", "GGIO1$five", vec![member(); 5]),
+            Err(DatasetError::TooLarge { .. })
         ));
     }
 }

@@ -157,6 +157,12 @@ pub enum WriteOutcome {
 /// whole read, which then carries no part of the value. Handlers below one
 /// that answered with a value are not consulted.
 ///
+/// A data set member naming a data object or a constructed attribute is read
+/// as that node: an error of any handler at, above or below it fails that
+/// member alone in GetDataSetValues. Read handlers decide the reads of a
+/// client only; reports and log entries carry the values of the model and
+/// consult no read handler.
+///
 /// [`ReadContext::requested`] tells a read of the node itself from a read
 /// that covers it; a handler meant for its own path only answers
 /// [`ReadOutcome::CacheMiss`] when the two differ.

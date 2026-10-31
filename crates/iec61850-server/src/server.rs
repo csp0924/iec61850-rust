@@ -720,9 +720,7 @@ impl IedServer {
     /// Every attribute is looked up in the report indexes before the reporting
     /// engine is locked, and the engine then takes all of them at once.
     fn raise_triggers(&self, triggers: &[PendingTrigger]) {
-        for t in triggers {
-            self.log_update(t.key(), t.flag, &t.value);
-        }
+        self.log_updates(triggers);
         let updates: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> = {
             let index = self.inner.attr_ref_index.read().ok();
             triggers
@@ -757,20 +755,23 @@ impl IedServer {
         }
     }
 
-    /// Writes one log entry for an updated attribute through every enabled log
-    /// control block whose data set holds it.
+    /// Writes the log entry of a batch of attribute updates through every
+    /// enabled log control block whose data set holds one of the attributes.
     ///
-    /// `ptr_key` identifies the attribute by the address of its shared value,
-    /// which is how a data set member refers to it. A control block writes an
-    /// entry when its TrgOps enable at least one reason of `flag`, data-change,
-    /// quality-change or data-update, and its DatSet names a registered data
-    /// set of the domain, as `<LN>$<name>` or `<LD>/<LN>$<name>`, with the
-    /// attribute as a member. The entry carries the member reference, the new
-    /// value and the reason code of the enabled reasons, so an update writes
-    /// one entry whatever the number of its reasons. A control block registered
-    /// under several keys writes once.
-    fn log_update(&self, ptr_key: usize, flag: InclusionFlag, value: &MmsValue) {
-        if !flag.has_trigger() {
+    /// An attribute is identified by its shared value, which is how a data set
+    /// member refers to it. A control block takes an update when its TrgOps
+    /// enable at least one reason of it, data-change, quality-change or
+    /// data-update, and its DatSet names a registered data set of the domain,
+    /// as `<LN>$<name>` or `<LD>/<LN>$<name>`, with a member the attribute is
+    /// or lies beneath. It then writes one entry for the whole batch, holding
+    /// each member the batch reaches once, in data set order, with the member
+    /// reference, the member value and the reason code of the enabled reasons
+    /// of the updates beneath it. The value of a member naming a data object
+    /// or a constructed attribute is its current structure with the parts of
+    /// the updated attributes set to the values written. A control block
+    /// registered under several keys writes once.
+    fn log_updates(&self, triggers: &[PendingTrigger]) {
+        if !triggers.iter().any(|t| t.flag.has_trigger()) {
             return;
         }
         let Some(controls) = self.unique_log_controls() else {
@@ -778,12 +779,11 @@ impl IedServer {
         };
         let mut now_ms: Option<u64> = None;
         for lc in controls {
-            let (data_set, reason_code) = match lc.state.lock() {
+            let (data_set, trg_ops) = match lc.state.lock() {
                 Ok(state) if matches!(state.log_ena, crate::logging::LogState::Enabled) => {
-                    let reason_code = log_reason(flag, state.trg_ops);
                     match state.data_set.clone() {
-                        Some(data_set) if reason_code != 0 => (data_set, reason_code),
-                        _ => continue,
+                        Some(data_set) => (data_set, state.trg_ops),
+                        None => continue,
                     }
                 }
                 Ok(_) => continue,
@@ -798,21 +798,45 @@ impl IedServer {
             let Some(ds) = self.log_data_set(&lc, data_set) else {
                 continue;
             };
-            let Some(data_ref) = ds
-                .entries
-                .iter()
-                .find(|e| Arc::as_ptr(&e.value) as usize == ptr_key)
-                .map(|e| e.attr_ref.clone())
-            else {
+            // Member position to its value and reason code, over the batch.
+            let mut members: Vec<(usize, MmsValue, u8)> = Vec::new();
+            for t in triggers {
+                let reason_code = log_reason(t.flag, trg_ops);
+                if reason_code == 0 {
+                    continue;
+                }
+                for (idx, entry) in ds.entries.iter().enumerate() {
+                    let slot = members.iter().position(|(i, ..)| *i == idx);
+                    let held = slot.map(|s| members[s].1.clone());
+                    let Some((_, value)) = entry.value_with_cell(held, &t.cell, &t.value) else {
+                        continue;
+                    };
+                    match slot {
+                        Some(s) => {
+                            members[s].1 = value;
+                            members[s].2 |= reason_code;
+                        }
+                        None => members.push((idx, value, reason_code)),
+                    }
+                }
+            }
+            if members.is_empty() {
                 continue;
-            };
+            }
+            members.sort_by_key(|(idx, ..)| *idx);
+            let data: Vec<(String, MmsValue, u8)> = members
+                .into_iter()
+                .map(|(idx, value, reason_code)| {
+                    (ds.entries[idx].attr_ref.clone(), value, reason_code)
+                })
+                .collect();
             let time_ms = *now_ms.get_or_insert_with(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64
             });
-            if let Err(e) = lc.write_entry(time_ms, &[(data_ref, value.clone())], reason_code) {
+            if let Err(e) = lc.write_members(time_ms, &data) {
                 tracing::warn!(
                     mms_path = %lc.mms_path,
                     error = %e,
@@ -970,11 +994,11 @@ impl IedServer {
 
     /// Registers an unbuffered report control block and its data set.
     ///
-    /// Besides handing both to the engine, this indexes every member of the
-    /// data set by the address of its value, so that a later update can find
-    /// the attribute reference the engine knows it by, and registers the data
-    /// set so that a read by name resolves it. A data set with an empty name
-    /// stands for none and is not registered.
+    /// Besides handing both to the engine, this indexes every leaf of the data
+    /// set members by the address of its value, so that a later update can
+    /// find the attribute reference the engine knows it by, and registers the
+    /// data set so that a read by name resolves it. A data set with an empty
+    /// name stands for none and is not registered.
     ///
     /// # Errors
     ///
@@ -994,11 +1018,7 @@ impl IedServer {
 
         // Collected before the engine takes the data set, while these are still
         // the same shared values.
-        let index_entries: Vec<(usize, DataAttributeRef)> = ds
-            .entries
-            .iter()
-            .map(|e| (Arc::as_ptr(&e.value) as usize, e.attr_ref.clone()))
-            .collect();
+        let index_entries = leaf_index_entries(&ds);
 
         // The domain comes from the object reference of the control block,
         // `<domain>/<LN>$RP$<rcb>`, and the data set keeps its own name. The
@@ -1069,11 +1089,7 @@ impl IedServer {
             }
         }
 
-        let index_entries: Vec<(usize, DataAttributeRef)> = ds
-            .entries
-            .iter()
-            .map(|e| (Arc::as_ptr(&e.value) as usize, e.attr_ref.clone()))
-            .collect();
+        let index_entries = leaf_index_entries(&ds);
 
         let dataset_key: Option<(String, String)> = brc
             .mms_path
@@ -1467,6 +1483,16 @@ fn same_value(a: &MmsValue, b: &MmsValue) -> bool {
         (MmsValue::Float64(x), MmsValue::Float64(y)) => x.to_bits() == y.to_bits(),
         _ => a == b,
     }
+}
+
+/// The address of the value of every leaf of the members of `ds`, with the
+/// attribute reference the reporting engine knows the leaf by.
+fn leaf_index_entries(ds: &Dataset) -> Vec<(usize, DataAttributeRef)> {
+    ds.entries
+        .iter()
+        .flat_map(|e| e.leaves())
+        .map(|leaf| (Arc::as_ptr(&leaf.value) as usize, leaf.attr_ref.clone()))
+        .collect()
 }
 
 /// An attribute update whose report and log triggers are still to be raised.

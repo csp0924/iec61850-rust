@@ -1,8 +1,10 @@
 //! Server handler for the MMS DefineNamedVariableList service, the mapping of
 //! the IEC 61850-7-2 CreateDataSet request.
 //!
-//! Every entry of the request is resolved against the model to the shared
-//! `MmsValue` it names; the resulting data set is stored in the dataset
+//! Every entry of the request is resolved against the model to the node it
+//! names, functional-constrained data or a functional-constrained data
+//! attribute of any type, sharing the values of the leaves beneath it; the
+//! resulting data set is stored in the dataset
 //! registry that the dispatcher and the Read VariableListName path share, and
 //! its key is added to the dynamic-key set so that DeleteNamedVariableList can
 //! tell a runtime-created data set from a configured one. Only domain-specific
@@ -17,7 +19,8 @@
 //! Such a data set is persistent: it outlives the association that created it.
 //! [`DynamicDatasetQuota`] bounds how many exist across the server and how many
 //! of them one association has created; a request beyond either limit is
-//! answered with `Resource(CapabilityUnavailable)`.
+//! answered with `Resource(CapabilityUnavailable)`, as is a request whose
+//! members exceed the size limits of [`DynamicDatasetOps`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -284,6 +287,17 @@ pub(crate) fn handle_define_named_variable_list(
                 "unexpected static-not-deletable while adding a data set"
             );
             crate::service::make_confirmed_error_pub(invoke_id, ErrorClass::Access(access::OTHER))
+        }
+        Err(DatasetError::TooLarge { path }) => {
+            tracing::warn!(
+                invoke_id,
+                path,
+                "define-named-variable-list exceeds a data set size limit, answering capability-unavailable"
+            );
+            crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Resource(resource::CAPABILITY_UNAVAILABLE),
+            )
         }
         Err(DatasetError::RegistryPoisoned) => {
             tracing::warn!(

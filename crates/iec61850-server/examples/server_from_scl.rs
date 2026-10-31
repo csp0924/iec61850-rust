@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iec61850_model::cb::{OptFlds, ReportControlBlock};
-use iec61850_model::tree::{DataAttribute, DataSet, DataSetEntry, IedModel, LogicalNode};
+use iec61850_model::tree::{DataAttribute, DataSet, IedModel, LogicalNode};
 use iec61850_model::{ControlModel, MmsValue, NodeRef, ObjectRef, TrgOps, FC};
 use iec61850_server::control::handler::OperateFuture;
 use iec61850_server::control::{
@@ -148,7 +148,7 @@ fn register_control_blocks(
 
     let mut datasets: HashMap<&str, Dataset> = HashMap::new();
     for ds in &ln0.datasets {
-        let built = build_dataset(&model, domain, ln0, ds)?;
+        let built = build_dataset(&model, ln0, ds)?;
         println!(
             "data set {}/{} with {} members",
             domain,
@@ -192,33 +192,17 @@ fn register_control_blocks(
 }
 
 /// Resolve a model data set into the server data set of live attribute slots.
+/// A member without a daName is a data object (FCD) and is served whole.
 fn build_dataset(
     model: &IedModel,
-    domain: &str,
     owner: &LogicalNode,
     ds: &DataSet,
 ) -> Result<Dataset, Box<dyn std::error::Error>> {
     let mut out = Dataset::new(format!("{}${}", owner.full_name(), ds.name));
     for entry in &ds.entries {
-        let da = resolve_da_fc(model, &iec_path(domain, entry), entry.fc)
-            .ok_or_else(|| format!("data set {} references missing {}", ds.name, entry.ln_name))?;
-        out.push(DatasetEntry::new(data_reference(domain, entry), da.value));
+        out.push(DatasetEntry::from_data_set_entry(model, entry)?);
     }
     Ok(out)
-}
-
-/// Object reference of a data set member in `ldName/lnName.doName.daName` form.
-fn iec_path(domain: &str, entry: &DataSetEntry) -> String {
-    format!("{domain}/{}.{}", entry.ln_name, entry.do_path.join("."))
-}
-
-/// Wire data reference of a data set member, `<domain>/<LN>$<FC>$<DO>$<DA>`
-/// per IEC 61850-8-1. Reports carry it in the optional DataRef field.
-fn data_reference(domain: &str, entry: &DataSetEntry) -> String {
-    // An FCDA carries its daName as one dotted attribute path, so the dots are
-    // normalized here: every level of the reference is separated by `$`.
-    let path = entry.do_path.join(".").replace('.', "$");
-    format!("{domain}/{}${}${path}", entry.ln_name, entry.fc.as_str())
 }
 
 fn trigger_options(trg: TrgOps) -> TriggerOptions {
@@ -370,23 +354,6 @@ async fn run_value_updater(server: IedServer, handles: UpdaterHandles) {
                 eprintln!("update {} failed: {e}", da.name);
             }
         }
-    }
-}
-
-/// Resolve a data set member, under its functional constraint, to an owned
-/// handle on the shared value slot.
-fn resolve_da_fc(model: &IedModel, iec_path: &str, fc: FC) -> Option<DataAttribute> {
-    let mut r = ObjectRef::parse_iec(iec_path).ok()?;
-    r.fc = Some(fc);
-    match model.node_by_object_ref(&r)? {
-        NodeRef::Da(da) => Some(DataAttribute::with_shared_value(
-            da.name.clone(),
-            da.fc,
-            da.ty,
-            da.trg_ops,
-            da.value.clone(),
-        )),
-        _ => None,
     }
 }
 

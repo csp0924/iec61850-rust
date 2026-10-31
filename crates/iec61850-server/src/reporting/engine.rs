@@ -16,7 +16,7 @@ use super::pdu::{
     brcb_encode_snapshot, encode_brcb_report_pdus, encode_report_pdus, pending_from_brcb_entry,
     BrcbReportEncodeParams, ReportEncodeParams,
 };
-use super::rcb::{PendingReport, ReportControl};
+use super::rcb::{PendingReport, RcbState, ReportControl};
 use super::sink::{ChannelReportSink, SendOutcome, REPORT_CHANNEL_CAP};
 use crate::connection::ConnectionId;
 use crate::error::{Result, ServerError};
@@ -134,8 +134,8 @@ pub struct ReportingEngine {
     value_index: ValueIndex,
 }
 
-/// Attribute reference of every data set member a DatSet write bound a control
-/// block to, keyed by the address of the member's value lock.
+/// Attribute reference of every leaf of the data set members a DatSet write
+/// bound a control block to, keyed by the address of the leaf's value lock.
 ///
 /// Members of the data sets registered with a control block are indexed by the
 /// server; this index holds the ones a client binds later. The server holds a
@@ -157,16 +157,17 @@ struct ValueIndexInner {
 type MemberMap = HashMap<usize, (Weak<RwLock<MmsValue>>, DataAttributeRef)>;
 
 impl ValueIndex {
-    /// Records the attribute reference of every member of `dataset`.
+    /// Records the attribute reference of every leaf of the members of
+    /// `dataset`.
     fn insert_members(&self, dataset: &Dataset) {
         let Ok(mut index) = self.0.members.write() else {
             tracing::warn!("the member value index lock is poisoned; the members were not indexed");
             return;
         };
-        for entry in &dataset.entries {
+        for leaf in dataset.entries.iter().flat_map(|e| e.leaves()) {
             index.insert(
-                Arc::as_ptr(&entry.value) as usize,
-                (Arc::downgrade(&entry.value), entry.attr_ref.clone()),
+                Arc::as_ptr(&leaf.value) as usize,
+                (Arc::downgrade(&leaf.value), leaf.attr_ref.clone()),
             );
         }
         if !dataset.entries.is_empty() {
@@ -441,14 +442,8 @@ impl ReportingEngine {
             state.dataset = Some(dataset.clone());
         }
 
-        // Inverted index: one weak handle per data set entry attribute.
-        for entry in &dataset.entries {
-            let weak = Arc::downgrade(&rc);
-            self.watch_map
-                .entry(entry.attr_ref.clone())
-                .or_default()
-                .push(weak);
-        }
+        // Inverted index: one weak handle per leaf of the data set members.
+        watch_leaves(&mut self.watch_map, &rc, &dataset);
 
         self.rcbs.insert(mms_path, rc);
         Ok(())
@@ -535,14 +530,8 @@ impl ReportingEngine {
             }
         }
         let brcb_arc = Arc::new(brcb);
-        // BRCB inverted index: one weak handle per data set entry attribute.
-        for entry in &dataset.entries {
-            let weak = Arc::downgrade(&brcb_arc);
-            self.brcb_watch_map
-                .entry(entry.attr_ref.clone())
-                .or_default()
-                .push(weak);
-        }
+        // BRCB inverted index: one weak handle per leaf of the data set members.
+        watch_leaves(&mut self.brcb_watch_map, &brcb_arc, &dataset);
         self.brcb_datasets.insert(mms_path.clone(), dataset);
         self.brcbs.insert(mms_path, brcb_arc);
         Ok(())
@@ -605,21 +594,11 @@ impl ReportingEngine {
         old: Option<&Dataset>,
         new: Option<&Dataset>,
     ) {
-        for entry in old.map(|d| d.entries.as_slice()).unwrap_or_default() {
-            if let Some(list) = self.watch_map.get_mut(&entry.attr_ref) {
-                list.retain(|w| !std::ptr::eq(w.as_ptr(), Arc::as_ptr(rc)));
-                if list.is_empty() {
-                    self.watch_map.remove(&entry.attr_ref);
-                }
-            }
+        if let Some(old) = old {
+            unwatch_leaves(&mut self.watch_map, rc, old);
         }
         if let Some(ds) = new {
-            for entry in &ds.entries {
-                self.watch_map
-                    .entry(entry.attr_ref.clone())
-                    .or_default()
-                    .push(Arc::downgrade(rc));
-            }
+            watch_leaves(&mut self.watch_map, rc, ds);
             self.index_values(ds);
         }
     }
@@ -633,25 +612,13 @@ impl ReportingEngine {
             return;
         };
         if let Some(old) = self.brcb_datasets.remove(mms_path) {
-            for entry in &old.entries {
-                if let Some(list) = self.brcb_watch_map.get_mut(&entry.attr_ref) {
-                    list.retain(|w| !std::ptr::eq(w.as_ptr(), Arc::as_ptr(&brcb)));
-                    if list.is_empty() {
-                        self.brcb_watch_map.remove(&entry.attr_ref);
-                    }
-                }
-            }
+            unwatch_leaves(&mut self.brcb_watch_map, &brcb, &old);
         }
         if let Ok(mut pending) = self.brcb_buftm_pending.lock() {
             pending.remove(mms_path);
         }
         if let Some(ds) = dataset {
-            for entry in &ds.entries {
-                self.brcb_watch_map
-                    .entry(entry.attr_ref.clone())
-                    .or_default()
-                    .push(Arc::downgrade(&brcb));
-            }
+            watch_leaves(&mut self.brcb_watch_map, &brcb, &ds);
             self.index_values(&ds);
             self.brcb_datasets.insert(mms_path.to_string(), ds);
         }
@@ -715,10 +682,16 @@ impl ReportingEngine {
     /// sends that report immediately, and the new trigger opens the next buffer
     /// time, so no value is overwritten before it is reported.
     ///
-    /// `attr_ref` has the form `"<domain>/<LN>$<FC>$<DO>$<DA>"`. `new_value` is
-    /// cloned into the pending snapshot. `flag` selects the trigger class (data
-    /// change, quality change, or data update). `now_ms` is the current time in
-    /// milliseconds and seeds the buffer-time deadline.
+    /// `attr_ref` names a basic-type attribute,
+    /// `"<domain>/<LN>$<FC>$<DO>[$...]$<DA>[$...]"`. Every data set member it
+    /// belongs to is triggered: the member it names, or a member naming a data
+    /// object or constructed attribute above it, whose value in the snapshot is
+    /// the member's current value with this attribute's part set to
+    /// `new_value` and whose reasons accumulate those of each attribute
+    /// beneath it (IEC 61850-7-2 §17.2.3.2.3 reports by data set member).
+    /// `new_value` is cloned into the pending snapshot. `flag` selects the
+    /// trigger class (data change, quality change, or data update). `now_ms` is
+    /// the current time in milliseconds and seeds the buffer-time deadline.
     pub fn on_value_updated(
         &self,
         attr_ref: &DataAttributeRef,
@@ -758,27 +731,23 @@ impl ReportingEngine {
                 continue;
             }
 
-            // Resolve the index first so the shared borrow of the data set ends
-            // before state is mutated below.
-            let idx = {
-                let Some(ref ds) = state.dataset else {
-                    continue;
-                };
-                match ds.entries.iter().position(|e| &e.attr_ref == attr_ref) {
-                    Some(i) => i,
-                    None => continue,
-                }
+            // Resolve the members first so the shared borrow of the data set
+            // ends before state is mutated below.
+            let idxs = match state.dataset {
+                Some(ref ds) => ds.members_of(attr_ref),
+                None => continue,
             };
+            if idxs.is_empty() {
+                continue;
+            }
 
             // Buffer-time bypass, per the BufTm rules of IEC 61850-7-2: a second
             // trigger of a member already in the pending report sends that report
             // at once, and the new trigger starts the next buffer time.
-            let already_triggered = state
-                .pending
-                .as_ref()
-                .and_then(|p| p.inclusion_flags.get(idx))
-                .map(|f| f.has_trigger())
-                .unwrap_or(false);
+            let already_triggered = state.pending.as_ref().is_some_and(|p| {
+                idxs.iter()
+                    .any(|&i| p.inclusion_flags.get(i).is_some_and(|f| f.has_trigger()))
+            });
 
             if let (true, Some(conn_id)) = (already_triggered, state.client_conn_id) {
                 if let Some(pending) = state.pending.take() {
@@ -790,7 +759,6 @@ impl ReportingEngine {
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
                         attr_ref = %attr_ref,
-                        idx,
                         "buffer-time bypass: member retriggered inside the buffer window, sending the pending report now"
                     );
                     // flush_pending takes the state lock itself.
@@ -811,16 +779,23 @@ impl ReportingEngine {
                 }
             }
 
-            let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
-            let pending = state
-                .pending
-                .get_or_insert_with(|| PendingReport::new_empty(ds_len, now_ms));
-
-            if let Some(f) = pending.inclusion_flags.get_mut(idx) {
-                *f = flag;
-            }
-            if let Some(slot) = pending.snapshot.get_mut(idx) {
-                *slot = Some(new_value.clone());
+            let RcbState {
+                dataset, pending, ..
+            } = &mut *state;
+            let Some(ds) = dataset.as_ref() else {
+                continue;
+            };
+            let pending = pending.get_or_insert_with(|| PendingReport::new_empty(ds.len(), now_ms));
+            for &idx in &idxs {
+                fill_member(
+                    ds,
+                    idx,
+                    attr_ref,
+                    &new_value,
+                    flag,
+                    &mut pending.inclusion_flags,
+                    &mut pending.snapshot,
+                );
             }
 
             if !state.triggered {
@@ -2072,7 +2047,7 @@ impl ReportingEngine {
         if !state.rpt_ena {
             return None;
         }
-        let mut slots: Vec<(usize, InclusionFlag, &MmsValue)> = Vec::new();
+        let mut slots: Vec<(usize, InclusionFlag, &DataAttributeRef, &MmsValue)> = Vec::new();
         for &u in members {
             let (attr_ref, value, flag) = &updates[u];
             let flag = enabled_triggers(*flag, state.trg_ops);
@@ -2083,12 +2058,10 @@ impl ReportingEngine {
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let idx = state
-                .dataset
-                .as_ref()
-                .and_then(|ds| ds.entries.iter().position(|e| &e.attr_ref == attr_ref));
-            if let Some(idx) = idx {
-                slots.push((idx, flag, value));
+            if let Some(ds) = state.dataset.as_ref() {
+                for idx in ds.members_of(attr_ref) {
+                    slots.push((idx, flag, attr_ref, value));
+                }
             }
         }
         if slots.is_empty() {
@@ -2101,7 +2074,7 @@ impl ReportingEngine {
         let retriggered = state.pending.as_ref().is_some_and(|p| {
             slots
                 .iter()
-                .any(|(idx, _, _)| p.inclusion_flags.get(*idx).is_some_and(|f| f.has_trigger()))
+                .any(|(idx, ..)| p.inclusion_flags.get(*idx).is_some_and(|f| f.has_trigger()))
         });
         if let (true, Some(conn_id)) = (retriggered, state.client_conn_id) {
             if let Some(pending) = state.pending.take() {
@@ -2127,17 +2100,23 @@ impl ReportingEngine {
             }
         }
 
-        let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
-        let pending = state
-            .pending
-            .get_or_insert_with(|| PendingReport::new_empty(ds_len, now_ms));
-        for (idx, flag, value) in slots {
-            if let Some(f) = pending.inclusion_flags.get_mut(idx) {
-                *f = flag;
-            }
-            if let Some(slot) = pending.snapshot.get_mut(idx) {
-                *slot = Some(value.clone());
-            }
+        let RcbState {
+            dataset, pending, ..
+        } = &mut *state;
+        let Some(ds) = dataset.as_ref() else {
+            return dropped;
+        };
+        let pending = pending.get_or_insert_with(|| PendingReport::new_empty(ds.len(), now_ms));
+        for (idx, flag, attr_ref, value) in slots {
+            fill_member(
+                ds,
+                idx,
+                attr_ref,
+                value,
+                flag,
+                &mut pending.inclusion_flags,
+                &mut pending.snapshot,
+            );
         }
         if !state.triggered {
             state.triggered = true;
@@ -2174,29 +2153,34 @@ impl ReportingEngine {
         let Some(ds) = self.brcb_datasets.get(mms_path) else {
             return;
         };
-        let slots: Vec<(usize, InclusionFlag, &MmsValue)> = members
+        let slots: Vec<(usize, InclusionFlag, &DataAttributeRef, &MmsValue)> = members
             .iter()
-            .filter_map(|&u| {
+            .flat_map(|&u| {
                 let (attr_ref, value, flag) = &updates[u];
                 let flag = enabled_triggers(*flag, trg_ops);
-                if !flag.has_trigger() {
-                    return None;
-                }
-                let idx = ds.entries.iter().position(|e| &e.attr_ref == attr_ref)?;
-                Some((idx, flag, value))
+                let idxs = if flag.has_trigger() {
+                    ds.members_of(attr_ref)
+                } else {
+                    Vec::new()
+                };
+                idxs.into_iter()
+                    .map(move |idx| (idx, flag, attr_ref, value))
             })
             .collect();
         if slots.is_empty() {
             return;
         }
         let fill = |snap: &mut EnqueuedSnapshot| {
-            for (idx, flag, value) in &slots {
-                if let Some(slot) = snap.inclusion_flags.get_mut(*idx) {
-                    *slot = *flag;
-                }
-                if let Some(slot) = snap.values.get_mut(*idx) {
-                    *slot = Some((*value).clone());
-                }
+            for (idx, flag, attr_ref, value) in &slots {
+                fill_member(
+                    ds,
+                    *idx,
+                    attr_ref,
+                    value,
+                    *flag,
+                    &mut snap.inclusion_flags,
+                    &mut snap.values,
+                );
             }
         };
 
@@ -2221,7 +2205,7 @@ impl ReportingEngine {
             // A batch member already in the open window closes it first, so the
             // window keeps the values from before the batch.
             let retriggered = pending.get(mms_path).is_some_and(|p| {
-                slots.iter().any(|(idx, _, _)| {
+                slots.iter().any(|(idx, ..)| {
                     p.snapshot
                         .inclusion_flags
                         .get(*idx)
@@ -2300,25 +2284,24 @@ impl ReportingEngine {
             return;
         }
 
-        let idx = match self
-            .brcb_datasets
-            .get(&mms_path)
-            .and_then(|ds| ds.entries.iter().position(|e| &e.attr_ref == attr_ref))
-        {
-            Some(i) => i,
-            None => return,
+        let Some(ds) = self.brcb_datasets.get(&mms_path) else {
+            return;
+        };
+        let idxs = ds.members_of(attr_ref);
+        if idxs.is_empty() {
+            return;
+        }
+        let fill = |flags: &mut [InclusionFlag], values: &mut [Option<MmsValue>]| {
+            for &idx in &idxs {
+                fill_member(ds, idx, attr_ref, new_value, flag, flags, values);
+            }
         };
 
         if buf_tm_ms == 0 {
             // Single-trigger snapshot: the other data set slots stay `None`, so
-            // the encoded inclusion bitmap marks only this index.
+            // the encoded inclusion bitmap marks only the members triggered.
             let mut snap = EnqueuedSnapshot::new(ds_len);
-            if let Some(slot) = snap.inclusion_flags.get_mut(idx) {
-                *slot = flag;
-            }
-            if let Some(slot) = snap.values.get_mut(idx) {
-                *slot = Some(new_value.clone());
-            }
+            fill(&mut snap.inclusion_flags, &mut snap.values);
             if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(now_ms, false, false, snap) {
                 tracing::warn!(
                     mms_path = %mms_path,
@@ -2340,10 +2323,12 @@ impl ReportingEngine {
             // accumulated entry is buffered at once and the new trigger opens
             // the next window, per the BufTm rules of IEC 61850-7-2.
             let retriggered = pending.get(&mms_path).is_some_and(|p| {
-                p.snapshot
-                    .inclusion_flags
-                    .get(idx)
-                    .is_some_and(|f| f.has_trigger())
+                idxs.iter().any(|&idx| {
+                    p.snapshot
+                        .inclusion_flags
+                        .get(idx)
+                        .is_some_and(|f| f.has_trigger())
+                })
             });
             let completed = if retriggered {
                 pending.remove(&mms_path)
@@ -2357,12 +2342,8 @@ impl ReportingEngine {
                     due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
                     snapshot: EnqueuedSnapshot::new(ds_len),
                 });
-            if let Some(slot) = entry.snapshot.inclusion_flags.get_mut(idx) {
-                *slot = flag;
-            }
-            if let Some(slot) = entry.snapshot.values.get_mut(idx) {
-                *slot = Some(new_value.clone());
-            }
+            let snapshot = &mut entry.snapshot;
+            fill(&mut snapshot.inclusion_flags, &mut snapshot.values);
             completed
         };
         if let Some(p) = completed {
@@ -2405,6 +2386,73 @@ fn merge_updates(
         }
     }
     merged
+}
+
+/// Adds `watcher` to the watch list of every leaf of the members of `dataset`,
+/// once per leaf.
+fn watch_leaves<T>(
+    watch_map: &mut HashMap<DataAttributeRef, Vec<Weak<T>>>,
+    watcher: &Arc<T>,
+    dataset: &Dataset,
+) {
+    for leaf in dataset.entries.iter().flat_map(|e| e.leaves()) {
+        let list = watch_map.entry(leaf.attr_ref.clone()).or_default();
+        if !list
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(watcher)))
+        {
+            list.push(Arc::downgrade(watcher));
+        }
+    }
+}
+
+/// Removes `watcher` from the watch list of every leaf of the members of
+/// `dataset`.
+fn unwatch_leaves<T>(
+    watch_map: &mut HashMap<DataAttributeRef, Vec<Weak<T>>>,
+    watcher: &Arc<T>,
+    dataset: &Dataset,
+) {
+    for leaf in dataset.entries.iter().flat_map(|e| e.leaves()) {
+        if let Some(list) = watch_map.get_mut(&leaf.attr_ref) {
+            list.retain(|w| !std::ptr::eq(w.as_ptr(), Arc::as_ptr(watcher)));
+            if list.is_empty() {
+                watch_map.remove(&leaf.attr_ref);
+            }
+        }
+    }
+}
+
+/// Records a trigger of the attribute `leaf_ref` in the slot of member `idx`
+/// of `ds`.
+///
+/// A member naming the attribute takes `flag` and `value`. A member naming a
+/// data object or a constructed attribute above it adds `flag` to the reasons
+/// it holds and takes its value with the attribute's part set to `value`,
+/// starting from the value it holds, or from its current value when it holds
+/// none, so the triggers of several attributes beneath one member accumulate
+/// in one value.
+fn fill_member(
+    ds: &Dataset,
+    idx: usize,
+    leaf_ref: &str,
+    value: &MmsValue,
+    flag: InclusionFlag,
+    flags: &mut [InclusionFlag],
+    values: &mut [Option<MmsValue>],
+) {
+    let (Some(entry), Some(f), Some(slot)) =
+        (ds.entry(idx), flags.get_mut(idx), values.get_mut(idx))
+    else {
+        return;
+    };
+    if entry.is_leaf() {
+        *f = flag;
+        *slot = Some(value.clone());
+    } else {
+        *f = f.union(flag);
+        *slot = entry.value_with(slot.take(), leaf_ref, value);
+    }
 }
 
 /// Groups the positions in `updates` by the control block watching them, in
@@ -5117,5 +5165,122 @@ mod tests {
         let n = assert_one_report_in_order(&pdus, 3);
         assert!(n > REPORT_CHANNEL_CAP, "{n} segments");
         assert_eq!(brcb_arc.state.lock().unwrap().sq_num, 1);
+    }
+}
+
+#[cfg(test)]
+mod data_set_member_tests {
+    use super::*;
+    use crate::reporting::brcb::{Brcb, BufferedReportControl};
+    use crate::reporting::dataset::{DatasetEntry, DatasetLeaf};
+    use crate::reporting::rcb::Rcb;
+
+    const ST_VAL: &str = "IED1LD0/GGIO1$ST$Ind1$stVal";
+    const Q: &str = "IED1LD0/GGIO1$ST$Ind1$q";
+
+    /// A data set whose only member is `GGIO1$ST$Ind1`, holding `stVal` and
+    /// `q`, and the value locks of those two leaves.
+    fn fcd_data_set() -> (Dataset, [Arc<RwLock<MmsValue>>; 2]) {
+        let model = {
+            use iec61850_model::{cdc, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
+            let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+                .add_do(cdc::sps("Ind1", cdc::CdcOptions::NONE))
+                .build()
+                .unwrap();
+            let ld = LogicalDeviceBuilder::new("LD0")
+                .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+                .add_ln(ggio)
+                .build()
+                .unwrap();
+            IedModelBuilder::new("IED1")
+                .add_ld(ld)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let entry = DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$ST$Ind1").unwrap();
+        let leaves: Vec<&DatasetLeaf> = entry.leaves();
+        let cells = [Arc::clone(&leaves[0].value), Arc::clone(&leaves[1].value)];
+        let mut ds = Dataset::new("LLN0$ds");
+        ds.push(entry);
+        (ds, cells)
+    }
+
+    fn quality(byte0: u8) -> MmsValue {
+        MmsValue::BitString {
+            padding: 3,
+            data: vec![byte0, 0],
+        }
+    }
+
+    /// Two attributes of one FCD member in one batch give a BRCB with no
+    /// buffer time one entry, in which the member holds both new values and
+    /// the union of the two reasons.
+    #[test]
+    fn a_batch_under_one_member_buffers_it_once_with_both_reasons() {
+        let mut eng = ReportingEngine::new_null();
+        let (ds, cells) = fcd_data_set();
+        let brcb = Brcb::new("brcb01", "LLN0$ds")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED | TriggerOptions::QUALITY_CHANGED);
+        let path = "IED1LD0/LLN0$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), ds)
+            .unwrap();
+        *cells[0].write().unwrap() = MmsValue::Boolean(true);
+        *cells[1].write().unwrap() = quality(0x40);
+        eng.on_values_updated(
+            &[
+                (
+                    ST_VAL.to_string(),
+                    MmsValue::Boolean(true),
+                    InclusionFlag::VALUE_CHANGED,
+                ),
+                (Q.to_string(), quality(0x40), InclusionFlag::QUALITY_CHANGED),
+            ],
+            1_000,
+        );
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        let entries = brcb_arc.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 1, "one entry");
+        let snap = entries[0].snapshot.as_ref().expect("snapshot");
+        assert_eq!(
+            snap.inclusion_flags,
+            [InclusionFlag::VALUE_CHANGED.union(InclusionFlag::QUALITY_CHANGED)]
+        );
+        let MmsValue::Structure(members) = snap.values[0].clone().expect("value") else {
+            panic!("the member is a structure");
+        };
+        assert_eq!(members[0], MmsValue::Boolean(true));
+        assert_eq!(members[1], quality(0x40));
+    }
+
+    /// A single update of an attribute beneath an FCD member puts the member
+    /// in the pending URCB report as its whole structure, with that
+    /// attribute's part set to the value the update carries.
+    #[test]
+    fn an_update_beneath_a_member_puts_the_whole_member_in_the_report() {
+        let mut eng = ReportingEngine::new_null();
+        let (ds, _cells) = fcd_data_set();
+        let rcb = Rcb::new("urcb01", "LLN0$ds").with_trg_ops(TriggerOptions::QUALITY_CHANGED);
+        let path = "IED1LD0/LLN0$RP$urcb01";
+        eng.register_rcb(ReportControl::new(path, rcb), ds).unwrap();
+        let rc_arc = eng.get_rcb(path).unwrap();
+        rc_arc.lock().unwrap().state.lock().unwrap().rpt_ena = true;
+
+        eng.on_value_updated(
+            &Q.to_string(),
+            quality(0x20),
+            InclusionFlag::QUALITY_CHANGED,
+            1_000,
+        );
+        let rc = rc_arc.lock().unwrap();
+        let state = rc.state.lock().unwrap();
+        let pending = state.pending.as_ref().expect("a pending report");
+        assert_eq!(pending.inclusion_flags, [InclusionFlag::QUALITY_CHANGED]);
+        let MmsValue::Structure(members) = pending.snapshot[0].clone().expect("value") else {
+            panic!("the member is a structure");
+        };
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], MmsValue::Boolean(false));
+        assert_eq!(members[1], quality(0x20));
     }
 }

@@ -3,7 +3,9 @@
 //!
 //! The request names one data set; the response carries its members in
 //! registration order, each as the MMS variable `<domain>` and
-//! `<LN>$<FC>$<DO>[$<SDA>...]` the entry holds, together with `mmsDeletable`.
+//! `<LN>$<FC>$<DO>[$<SDO>...][$<DA>[$<SDA>...]]` the entry holds, together with
+//! `mmsDeletable`. A member naming a data object is listed by that name, as
+//! the FCD it is, not as the attributes beneath it.
 //!
 //! ## mmsDeletable
 //!
@@ -21,7 +23,7 @@
 //!
 //! ## Member references
 //!
-//! A `DatasetEntry` holds `"<domain>/<LN>$<FC>$<DO>[$<SDA>...]"`. An entry
+//! A `DatasetEntry` holds `"<domain>/<LN>$<FC>$<DO>[$...]"`. An entry
 //! without that separator violates the registry contract and is answered with
 //! an access error rather than emitted as a reference the client cannot
 //! resolve.

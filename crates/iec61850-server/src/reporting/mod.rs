@@ -6,6 +6,10 @@
 //! fields to clients. `ReportingEngine` is the entry point; it is held by
 //! `IedServer` behind an `Arc<Mutex<..>>` so that reporting state stays
 //! consistent across connection tasks.
+//!
+//! A data set member is an FCDA or an FCD and is reported as one unit; see
+//! [`dataset`]. A report carries the values of the model: read handlers, which
+//! decide the reads of a client, are not consulted.
 
 pub mod brcb;
 pub mod buffer;
@@ -23,7 +27,7 @@ pub mod sqlite_buffer;
 
 // Public re-exports: the minimal surface used from other crates.
 
-pub use dataset::{DataAttributeRef, Dataset, DatasetEntry};
+pub use dataset::{DataAttributeRef, Dataset, DatasetEntry, DatasetLeaf};
 pub use dynamic_ops::{DatasetError, DatasetMeta, DynamicDatasetOps};
 
 /// Shared data set registry, keyed by `(mms domain, mms list_name)`, for example

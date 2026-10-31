@@ -588,20 +588,27 @@ async fn last_activation_time_carries_the_configured_time_quality() {
 
 // ── Data set members ────────────────────────────────────────────────────
 
-/// A constructed attribute holds no value of its own, so a data set member
-/// naming one is refused, while a member naming one of its leaves is
-/// accepted and reads the leaf value.
+/// A data set member naming a constructed attribute reads as the structure of
+/// its leaves, and a member naming one of its leaves as the leaf value
+/// (IEC 61850-7-2 §13.2.2.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_data_set_refuses_a_constructed_member() {
+async fn create_data_set_takes_a_constructed_member() {
     let server = server_with(model(false), IedServerConfig::default());
     let handle = server.start().await.unwrap();
     let conn = ied(&handle).await;
 
-    let constructed = t!(conn.create_data_set(
+    t!(conn.create_data_set(
         "IED1LD0/LLN0.dynCons",
         &[DataSetMember::new("IED1LD0/GGIO1.AnIn1.mag", FC::Mx)]
-    ));
-    assert!(constructed.is_err(), "{constructed:?}");
+    ))
+    .expect("a constructed member is accepted");
+    let values = t!(conn.get_data_set_values("IED1LD0/LLN0.dynCons")).unwrap();
+    assert_eq!(
+        values,
+        [AccessResult::Success(MmsData::Structure(vec![
+            MmsData::Float32(7.0)
+        ]))]
+    );
     t!(conn.create_data_set(
         "IED1LD0/LLN0.dynLeaf",
         &[DataSetMember::new("IED1LD0/GGIO1.AnIn1.mag.f", FC::Mx)]

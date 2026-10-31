@@ -839,8 +839,8 @@ async fn the_log_takes_the_triggers_the_reports_take() {
     handle.stop().await;
 }
 
-/// Updates under the data model lock are logged when it is released, one
-/// entry per attribute with its last value.
+/// Updates under the data model lock are logged when it is released, as one
+/// entry holding each attribute once with its last value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn updates_under_the_data_model_lock_are_logged_on_release() {
     let m = model();
@@ -856,12 +856,12 @@ async fn updates_under_the_data_model_lock_are_logged_on_release() {
         srv.update_boolean(da(&m, 1), true).unwrap();
         assert_eq!(storage.count(), 0, "nothing is logged under the lock");
     }
-    assert_eq!(storage.count(), 2);
+    assert_eq!(storage.count(), 1);
 
     let mut c = connect(&handle).await;
     let resp = read_journal(&mut c).await;
-    assert_eq!(journal(&resp), [vec![(IND1, 0x02)], vec![(IND2, 0x02)]]);
-    assert_eq!(resp.entries[1].variables[0].value, MmsData::Boolean(true));
+    assert_eq!(journal(&resp), [vec![(IND1, 0x02), (IND2, 0x02)]]);
+    assert_eq!(resp.entries[0].variables[1].value, MmsData::Boolean(true));
     c.disconnect().await.ok();
     handle.stop().await;
 }
