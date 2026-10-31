@@ -241,8 +241,14 @@ impl IedConnection<TcpStream, TokioTimer> {
     /// returns [`ClientError::TlsHandshake`], whose
     /// [`TlsFailureKind`](crate::TlsFailureKind) tells why; running out of the
     /// deadline during the handshake is the `Timeout` kind, and during the TCP
-    /// connection or the COTP handshake [`ClientError::ConnectTimeout`]. A
-    /// failure after these steps returns the error of that step.
+    /// connection or the COTP handshake [`ClientError::ConnectTimeout`].
+    ///
+    /// Until the association is established, a TLS error also returns
+    /// [`ClientError::TlsHandshake`], classified like a failed handshake. This
+    /// covers a TLS 1.3 server that refuses the client certificate: the client
+    /// completes its side of the handshake first and reads the fatal alert
+    /// during the COTP exchange, which returns the `AlertReceived` kind. Any
+    /// other failure after the handshake returns the error of its step.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &self,

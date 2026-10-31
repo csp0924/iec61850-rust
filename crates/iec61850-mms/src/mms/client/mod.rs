@@ -226,7 +226,10 @@ impl MmsClient<TcpStream, TokioTimer> {
     /// handshake returns `ClientError::TlsHandshake` with its
     /// [`TlsFailureKind`], and so does running out of the deadline during the
     /// handshake, with the `Timeout` kind; running out of it during the TCP
-    /// connection or the COTP handshake returns `ConnectTimeout`.
+    /// connection or the COTP handshake returns `ConnectTimeout`. A TLS error
+    /// after the handshake and before the association is established, such as
+    /// the fatal alert of a TLS 1.3 server refusing the client certificate,
+    /// returns `ClientError::TlsHandshake` as well.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,

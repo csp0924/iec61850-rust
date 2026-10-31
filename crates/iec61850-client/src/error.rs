@@ -168,15 +168,17 @@ pub enum ClientError {
     ReleasedByPeer,
 
     /// The transport failed: a TCP connection was refused, a host name did not
-    /// resolve, a read or write failed, or a TLS peer sent a fatal alert after
-    /// the handshake. The connection is closed.
+    /// resolve, a read or write failed, or a TLS peer sent a fatal alert on an
+    /// established association. The connection is closed.
     ///
     /// [`TransportError::kind`] gives the category of the failure and
     /// [`TransportError::detail`] the text the transport reported, if any.
     #[error("mms layer error: transport error: {0}")]
     Transport(TransportError),
 
-    /// The TLS handshake failed. The connection is closed.
+    /// The TLS handshake failed, or the TLS session failed later while the
+    /// connection was being established, before the association was set up.
+    /// The connection is closed.
     ///
     /// `kind` classifies the failure, so a caller can tell a rejected
     /// certificate from a refusal by the peer, a version or cipher mismatch, a

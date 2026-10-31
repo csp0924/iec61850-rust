@@ -70,7 +70,8 @@ pub enum TlsFailureKind {
     /// The peer certificate was rejected, by chain validation or any other
     /// verification step, or the peer presented none where one is required.
     Verification,
-    /// The peer ended the handshake with a fatal alert.
+    /// The peer sent a fatal alert, during the handshake or later while the
+    /// connection was being established.
     AlertReceived,
     /// The two sides allow no TLS version in common.
     VersionUnsupported,
@@ -166,12 +167,15 @@ pub enum ClientError {
     /// The transport failed with an I/O error; the connection is closed.
     ///
     /// Carries the category of the failure and, when the transport reported
-    /// one, the text of the underlying error, such as a fatal TLS alert or the
-    /// operating system message of a refused TCP connection.
+    /// one, the text of the underlying error, such as a fatal TLS alert
+    /// received on an established association or the operating system message
+    /// of a refused TCP connection.
     #[error("transport error: {0}")]
     Transport(TransportError),
 
-    /// The TLS handshake failed; the connection is closed.
+    /// The TLS handshake failed, or the TLS session failed later while the
+    /// connection was being established, before the MMS Initiate response was
+    /// accepted; the connection is closed.
     ///
     /// `kind` classifies the failure and `message` is the text of the TLS
     /// error.

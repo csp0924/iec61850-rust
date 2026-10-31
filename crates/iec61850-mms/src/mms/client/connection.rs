@@ -39,14 +39,19 @@
 //!   connection and surface as `ConnectionLost`.
 //! - An I/O error of the transport closes the connection and surfaces as
 //!   `Transport`, carrying the category and text the transport reported; a TLS
-//!   alert received after the handshake arrives this way.
+//!   alert received once the association is established arrives this way.
 //! - Establishing the connection, the TCP connection, the TLS handshake and
 //!   the COTP CR and CC, is bounded by one `connect_timeout_ms` deadline for
 //!   all of these steps together. Running out of it during the TLS handshake
 //!   is a `TlsHandshake` of the `Timeout` kind, and during any other of these
 //!   steps `ConnectTimeout`.
 //! - A failed TLS handshake surfaces as `TlsHandshake`, carrying the kind of
-//!   failure.
+//!   failure. So does a TLS error, such as a fatal alert or a record that does
+//!   not decrypt, while the connection is being established: from the TCP
+//!   connection until the MMS Initiate response has been accepted. Under
+//!   TLS 1.3 a server that refuses the client certificate does so after the
+//!   client has completed its side of the handshake, and the client reads its
+//!   alert only during the COTP exchange that follows.
 
 use super::error::ClientError;
 use crate::compat::prelude::*;
@@ -90,6 +95,111 @@ fn tls_failure_message(e: &TlsError) -> String {
     match e {
         TlsError::Handshake(inner) => inner.to_string(),
         other => other.to_string(),
+    }
+}
+
+/// The failure of a TLS association that `error` interrupted after the
+/// handshake, while the association was being established.
+///
+/// A transport failure behind which the session recorded `tls_error` is that
+/// TLS error, classified like a failed handshake; any other failure is
+/// returned unchanged.
+#[cfg(feature = "tls")]
+fn tls_setup_failure(error: ClientError, tls_error: Option<&rustls::Error>) -> ClientError {
+    match (error, tls_error) {
+        (ClientError::Transport(_), Some(err)) => {
+            let e = TlsError::from(err.clone());
+            ClientError::TlsHandshake {
+                kind: tls_failure_kind(&e),
+                message: tls_failure_message(&e),
+            }
+        }
+        (error, _) => error,
+    }
+}
+
+/// The client TLS session of an association, recording the first TLS error a
+/// read or a write of it failed with.
+///
+/// The transport layer reduces a failed read to a category and a text, which
+/// is what an established association reports; the record keeps the TLS
+/// error itself for the classification of a failure while the association is
+/// being established.
+#[cfg(feature = "tls")]
+struct ClientTlsStream {
+    inner: TlsStream<TcpStream>,
+    tls_error: Arc<std::sync::OnceLock<rustls::Error>>,
+}
+
+#[cfg(feature = "tls")]
+impl ClientTlsStream {
+    /// Records the TLS error behind `result`, if it is a failure carrying one.
+    fn record<R>(
+        &self,
+        result: core::task::Poll<std::io::Result<R>>,
+    ) -> core::task::Poll<std::io::Result<R>> {
+        if let core::task::Poll::Ready(Err(e)) = &result {
+            if let Some(err) = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            {
+                let _ = self.tls_error.set(err.clone());
+            }
+        }
+        result
+    }
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncRead for ClientTlsStream {
+    fn poll_read(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        let result = core::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.record(result)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl tokio::io::AsyncWrite for ClientTlsStream {
+    fn poll_write(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &[u8],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        let result = core::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.record(result)
+    }
+
+    fn poll_write_vectored(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        let result = core::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.record(result)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        let result = core::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.record(result)
+    }
+
+    fn poll_shutdown(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        let result = core::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.record(result)
     }
 }
 
@@ -179,7 +289,7 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     cotp: Option<CotpConnection<T>>,
     /// COTP connection over TLS; `None` while disconnected.
     #[cfg(feature = "tls")]
-    cotp_tls: Option<CotpConnection<TlsStream<TcpStream>>>,
+    cotp_tls: Option<CotpConnection<ClientTlsStream>>,
     /// Session layer state, including selector negotiation.
     session: IsoSession,
     /// Presentation layer state, including context identifier negotiation.
@@ -465,6 +575,14 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// `ClientError::TlsHandshake`, and so does running out of the deadline
     /// during the handshake, with the `Timeout` kind; running out of it during
     /// the TCP connection or the COTP handshake returns `ConnectTimeout`.
+    ///
+    /// A TLS error after the handshake and before the MMS Initiate response has
+    /// been accepted, such as the fatal alert of a TLS 1.3 server refusing the
+    /// client certificate, also returns `ClientError::TlsHandshake`, classified
+    /// like a failed handshake: `AlertReceived` for a fatal alert and the kind
+    /// of the TLS error otherwise. A transport failure with no TLS error behind
+    /// it returns the error of the step it interrupted, as on the plaintext
+    /// path.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,
@@ -472,19 +590,26 @@ impl MmsConnection<TcpStream, TokioTimer> {
         connector: &TlsConnector,
         server_name: ServerName<'static>,
     ) -> Result<(), ClientError> {
-        let result = self.associate_tls(addr, connector, server_name).await;
+        let tls_error = Arc::new(std::sync::OnceLock::new());
+        let result = self
+            .associate_tls(addr, connector, server_name, &tls_error)
+            .await
+            .map_err(|e| tls_setup_failure(e, tls_error.get()));
         if result.is_err() {
             self.close_raw();
         }
         result
     }
 
+    /// Runs the association sequence over TLS, recording in `tls_error` the
+    /// first TLS error the session fails with after the handshake.
     #[cfg(feature = "tls")]
     async fn associate_tls(
         &mut self,
         addr: std::net::SocketAddr,
         connector: &TlsConnector,
         server_name: ServerName<'static>,
+        tls_error: &Arc<std::sync::OnceLock<rustls::Error>>,
     ) -> Result<(), ClientError> {
         self.reset_association_state();
         self.set_state(ConnectionState::Connecting);
@@ -509,6 +634,10 @@ impl MmsConnection<TcpStream, TokioTimer> {
                 })?;
             debug!("tls handshake complete");
             step.store(STEP_COTP, Ordering::Relaxed);
+            let tls_stream = ClientTlsStream {
+                inner: tls_stream,
+                tls_error: Arc::clone(tls_error),
+            };
             CotpConnection::connect(tls_stream, opts)
                 .await
                 .map_err(|e| association_failed("cotp tls", e))
@@ -1707,6 +1836,41 @@ mod tls_failure_tests {
         for (error, kind) in cases {
             assert_eq!(tls_failure_kind(&error), kind, "{error}");
         }
+    }
+
+    /// A transport failure behind which the session recorded a TLS error is
+    /// that TLS error, classified like a failed handshake; a transport failure
+    /// with no TLS error, and any other failure, are kept.
+    #[test]
+    fn a_setup_failure_is_a_tls_failure_only_with_a_tls_error_behind_it() {
+        let transport = || {
+            ClientError::Transport(
+                TransportError::io(IoErrorKind::InvalidData).with_detail("invalid data"),
+            )
+        };
+        let alert = R::AlertReceived(AlertDescription::CertificateRequired);
+        assert!(matches!(
+            tls_setup_failure(transport(), Some(&alert)),
+            ClientError::TlsHandshake { kind: TlsFailureKind::AlertReceived, message, .. }
+                if message == "received fatal alert: CertificateRequired"
+        ));
+        assert!(matches!(
+            tls_setup_failure(transport(), Some(&R::DecryptError)),
+            ClientError::TlsHandshake { kind: TlsFailureKind::Other, message, .. }
+                if message == R::DecryptError.to_string()
+        ));
+        assert!(matches!(
+            tls_setup_failure(transport(), None),
+            ClientError::Transport(cause) if cause.kind() == IoErrorKind::InvalidData
+        ));
+        assert!(matches!(
+            tls_setup_failure(ClientError::ConnectionLost, Some(&alert)),
+            ClientError::ConnectionLost
+        ));
+        assert!(matches!(
+            tls_setup_failure(ClientError::ConnectTimeout { timeout_ms: 10 }, Some(&alert)),
+            ClientError::ConnectTimeout { timeout_ms: 10 }
+        ));
     }
 
     /// The text of a handshake error carries the TLS error once.
