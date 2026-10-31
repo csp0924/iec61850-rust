@@ -22,5 +22,7 @@ mod time;
 pub use client::{SntpClient, SntpResponse};
 pub use error::SntpError;
 pub use packet::{LeapIndicator, Mode, SntpPacket, SNTP_PACKET_LEN};
-pub use server::{SntpServer, SntpServerConfig};
+pub use server::{
+    SntpClock, SntpClockStatus, SntpServer, SntpServerConfig, UNSYNCHRONIZED_STRATUM,
+};
 pub use time::{NtpTimestamp, NTP_UNIX_OFFSET_S};

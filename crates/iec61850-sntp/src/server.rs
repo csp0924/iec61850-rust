@@ -2,12 +2,14 @@
 //!
 //! `bind` opens the UDP socket and `run` enters the receive loop. Every valid
 //! client or symmetric-active request is answered with a reply stamped from
-//! the current system clock. A per-datagram failure, including a receive
-//! error that concerns one datagram only, is reported with `tracing::warn!`
-//! and never breaks the loop.
+//! the current system clock, and the reply reports the synchronization state
+//! an [`SntpClock`] holds. A per-datagram failure, including a receive error
+//! that concerns one datagram only, is reported with `tracing::warn!` and
+//! never breaks the loop.
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use tokio::net::UdpSocket;
 
@@ -15,11 +17,78 @@ use crate::error::SntpError;
 use crate::packet::{LeapIndicator, Mode, SntpPacket, MAX_DATAGRAM_LEN};
 use crate::time::NtpTimestamp;
 
+/// Stratum a reply carries while the clock is not synchronized: 16, the
+/// unsynchronized stratum of NTPv4 (RFC 5905), which RFC 4330 leaves
+/// reserved.
+pub const UNSYNCHRONIZED_STRATUM: u8 = 16;
+
+/// Synchronization state of the clock an SNTP server serves.
+///
+/// `last_set` is the time the clock was last set from its reference, which a
+/// reply carries as its Reference Timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SntpClockStatus {
+    /// The clock is synchronized. A reply carries leap indicator 0 and the
+    /// configured stratum. `None` stands for a clock under continuous
+    /// discipline, for which a reply reports its receive time as the
+    /// Reference Timestamp.
+    Synchronized {
+        /// When the clock was last set, or `None` under continuous discipline.
+        last_set: Option<NtpTimestamp>,
+    },
+    /// The clock is not synchronized. A reply carries leap indicator 3 and
+    /// [`UNSYNCHRONIZED_STRATUM`]. `None` stands for a clock that was never
+    /// set, for which a reply carries a zero Reference Timestamp.
+    Unsynchronized {
+        /// When the clock was last set, or `None` when it never was.
+        last_set: Option<NtpTimestamp>,
+    },
+}
+
+impl Default for SntpClockStatus {
+    /// A synchronized clock under continuous discipline.
+    fn default() -> Self {
+        Self::Synchronized { last_set: None }
+    }
+}
+
+/// Shared, updatable synchronization state of the clock an SNTP server
+/// serves.
+///
+/// Clones share one state: the application keeps a clone and calls
+/// [`Self::set`] whenever the clock gains or loses synchronization, and every
+/// later reply of a server configured with another clone reports it.
+#[derive(Debug, Clone, Default)]
+pub struct SntpClock {
+    status: Arc<RwLock<SntpClockStatus>>,
+}
+
+impl SntpClock {
+    /// Creates a clock in the state `status`.
+    pub fn new(status: SntpClockStatus) -> Self {
+        Self {
+            status: Arc::new(RwLock::new(status)),
+        }
+    }
+
+    /// Replaces the state.
+    pub fn set(&self, status: SntpClockStatus) {
+        *self.status.write().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+
+    /// Returns the current state.
+    pub fn status(&self) -> SntpClockStatus {
+        *self.status.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// SNTP server configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SntpServerConfig {
-    /// Stratum, 1 for a primary reference. Defaults to 1.
+    /// Stratum while the clock is synchronized, 1 for a primary reference.
+    /// Defaults to 1.
     pub stratum: u8,
     /// Precision as log2 seconds. Defaults to -20, roughly microseconds.
     pub precision: i8,
@@ -30,6 +99,11 @@ pub struct SntpServerConfig {
     /// Reference identifier, four ASCII characters at stratum 1. Defaults to
     /// `LOCL`.
     pub reference_id: [u8; 4],
+    /// Synchronization state the replies report. Defaults to a synchronized
+    /// clock under continuous discipline, so a reply carries leap indicator
+    /// 0, the configured stratum, and its receive time as the Reference
+    /// Timestamp.
+    pub clock: SntpClock,
 }
 
 impl Default for SntpServerConfig {
@@ -40,6 +114,7 @@ impl Default for SntpServerConfig {
             root_delay: 0,
             root_dispersion: 0,
             reference_id: *b"LOCL",
+            clock: SntpClock::default(),
         }
     }
 }
@@ -178,7 +253,9 @@ fn on_receive_error(err: io::Error) -> io::Result<()> {
 ///
 /// A client request (mode 3) is answered in server mode (4) and a
 /// symmetric-active request (mode 1) in symmetric-passive mode (2); version
-/// and poll are copied from the request, as RFC 4330 section 5 requires.
+/// and poll are copied from the request, as RFC 4330 section 5 requires. The
+/// leap indicator, stratum and Reference Timestamp follow the state of
+/// `config.clock`, as [`SntpClockStatus`] describes.
 ///
 /// Kept free-standing so it can be tested without a socket or an async
 /// runtime.
@@ -203,19 +280,31 @@ pub fn build_reply(
         other => return Err(SntpError::UnexpectedMode(other as u8)),
     };
 
+    let (leap, stratum, reference_ts) = match config.clock.status() {
+        SntpClockStatus::Synchronized { last_set } => (
+            LeapIndicator::NoWarning,
+            config.stratum,
+            last_set.unwrap_or(recv_ts),
+        ),
+        SntpClockStatus::Unsynchronized { last_set } => (
+            LeapIndicator::AlarmUnsynchronized,
+            UNSYNCHRONIZED_STRATUM,
+            last_set.unwrap_or(NtpTimestamp::ZERO),
+        ),
+    };
     let xmit_ts = NtpTimestamp::now()?;
 
     Ok(SntpPacket {
-        leap: LeapIndicator::NoWarning,
+        leap,
         version: req.version,
         mode,
-        stratum: config.stratum,
+        stratum,
         poll: req.poll,
         precision: config.precision,
         root_delay: config.root_delay,
         root_dispersion: config.root_dispersion,
         reference_id: config.reference_id,
-        reference_ts: recv_ts,
+        reference_ts,
         // RFC 4330 §5: the client transmit timestamp is echoed as originate.
         originate_ts: req.transmit_ts,
         receive_ts: recv_ts,
@@ -334,6 +423,66 @@ mod tests {
         let reply =
             build_reply(&cfg(), &req.encode(), NtpTimestamp::ZERO).expect("symmetric accepted");
         assert_eq!(reply.mode, Mode::SymmetricPassive);
+    }
+
+    const SET: NtpTimestamp = NtpTimestamp {
+        seconds: 0x1111_2222,
+        fraction: 0x3333_4444,
+    };
+    const RECV: NtpTimestamp = NtpTimestamp {
+        seconds: 0x9999_AAAA,
+        fraction: 7,
+    };
+
+    fn reply_with(status: SntpClockStatus) -> SntpPacket {
+        let mut config = cfg();
+        config.stratum = 2;
+        config.clock = SntpClock::new(status);
+        build_reply(&config, &SntpPacket::client_request().encode(), RECV).expect("valid reply")
+    }
+
+    #[test]
+    fn default_clock_reports_a_synchronized_clock_set_at_the_receive_time() {
+        let reply = build_reply(&cfg(), &SntpPacket::client_request().encode(), RECV).unwrap();
+        assert_eq!(reply.leap, LeapIndicator::NoWarning);
+        assert_eq!(reply.stratum, 1);
+        assert_eq!(reply.reference_ts, RECV);
+    }
+
+    #[test]
+    fn synchronized_clock_reports_when_it_was_last_set() {
+        let reply = reply_with(SntpClockStatus::Synchronized {
+            last_set: Some(SET),
+        });
+        assert_eq!(reply.leap, LeapIndicator::NoWarning);
+        assert_eq!(reply.stratum, 2);
+        assert_eq!(reply.reference_ts, SET);
+    }
+
+    #[test]
+    fn unsynchronized_clock_reports_the_alarm_and_stratum_16() {
+        let reply = reply_with(SntpClockStatus::Unsynchronized {
+            last_set: Some(SET),
+        });
+        assert_eq!(reply.leap, LeapIndicator::AlarmUnsynchronized);
+        assert_eq!(reply.stratum, UNSYNCHRONIZED_STRATUM);
+        assert_eq!(reply.reference_ts, SET);
+    }
+
+    #[test]
+    fn never_set_clock_reports_a_zero_reference_timestamp() {
+        let reply = reply_with(SntpClockStatus::Unsynchronized { last_set: None });
+        assert_eq!(reply.reference_ts, NtpTimestamp::ZERO);
+    }
+
+    #[test]
+    fn clones_of_a_clock_share_its_state() {
+        let clock = SntpClock::default();
+        let mut config = cfg();
+        config.clock = clock.clone();
+        clock.set(SntpClockStatus::Unsynchronized { last_set: None });
+        let reply = build_reply(&config, &SntpPacket::client_request().encode(), RECV).unwrap();
+        assert_eq!(reply.leap, LeapIndicator::AlarmUnsynchronized);
     }
 
     #[test]
