@@ -199,7 +199,7 @@ fn build_dataset(
 ) -> Result<Dataset, Box<dyn std::error::Error>> {
     let mut out = Dataset::new(format!("{}${}", owner.full_name(), ds.name));
     for entry in &ds.entries {
-        let da = resolve_da(model, &iec_path(domain, entry))
+        let da = resolve_da_fc(model, &iec_path(domain, entry), entry.fc)
             .ok_or_else(|| format!("data set {} references missing {}", ds.name, entry.ln_name))?;
         out.push(DatasetEntry::new(data_reference(domain, entry), da.value));
     }
@@ -374,6 +374,23 @@ async fn run_value_updater(server: IedServer, handles: UpdaterHandles) {
                 eprintln!("update {} failed: {e}", da.name);
             }
         }
+    }
+}
+
+/// Resolve a data set member, under its functional constraint, to an owned
+/// handle on the shared value slot.
+fn resolve_da_fc(model: &IedModel, iec_path: &str, fc: FC) -> Option<DataAttribute> {
+    let r = ObjectRef::parse_iec(iec_path).ok()?;
+    match model.node_by_object_ref_fc(&r, fc)? {
+        NodeRef::Da(da) => Some(DataAttribute {
+            name: da.name.clone(),
+            fc: da.fc,
+            ty: da.ty,
+            trg_ops: da.trg_ops,
+            value: da.value.clone(),
+            children: Vec::new(),
+        }),
+        _ => None,
     }
 }
 

@@ -4,11 +4,12 @@
 //! the active setting group, which a client reads and never writes. The model
 //! holds one value per setting: committing an edit of the active group makes
 //! the edited value the FC=SG value, and committing another group leaves it.
-//! A setting declared with `fc="SG"` only is not editable under FC=SE.
+//! A setting declared with `fc="SG"` only is not editable under FC=SE. A data
+//! set created at run time takes a member under FC=SG.
 
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
-use iec61850_mms::mms::pdu::DataAccessError;
+use iec61850_mms::mms::pdu::{AccessResult, DataAccessError, DefineNamedVariableEntry};
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{IedModel, FC};
 use iec61850_server::{IedServer, IedServerConfig, ServerHandle, WriteAccessPolicies};
@@ -39,6 +40,8 @@ const SETTINGS_SCL: &str = r#"<SCL>
       <DO name="OpDlTmms" type="ING_SE_T"/>
       <DO name="StrVal" type="ASG_SE_T"/>
       <DO name="TmMult" type="ING_SG_T"/>
+      <DO name="TmSet" type="TMSET_T"/>
+      <DO name="MinOpTmms" type="ING_BOTH_T"/>
     </LNodeType>
     <DOType id="ENC_T" cdc="ENC"><DA name="stVal" fc="ST" bType="BOOLEAN"/></DOType>
     <DOType id="ING_SE_T" cdc="ING">
@@ -46,6 +49,13 @@ const SETTINGS_SCL: &str = r#"<SCL>
     </DOType>
     <DOType id="ASG_SE_T" cdc="ASG">
       <DA name="setMag" fc="SE" bType="Struct" type="AnVal_T"/>
+    </DOType>
+    <DOType id="ING_BOTH_T" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"><Val>3</Val></DA>
+      <DA name="setVal" fc="SE" bType="INT32"><Val>4</Val></DA>
+    </DOType>
+    <DOType id="TMSET_T" cdc="ING">
+      <SDO name="tm" type="ING_SE_T"/>
     </DOType>
     <DOType id="ING_SG_T" cdc="ING">
       <DA name="setVal" fc="SG" bType="INT32"><Val>7</Val></DA>
@@ -168,6 +178,7 @@ async fn sg_view_is_listed_and_read_with_the_logical_node() {
         "PTOC1$SG$OpDlTmms$setVal",
         "PTOC1$SG$StrVal$setMag$f",
         "PTOC1$SG$TmMult$setVal",
+        "PTOC1$SG$TmSet$tm$setVal",
         "PTOC1$SE$OpDlTmms$setVal",
     ] {
         assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
@@ -178,7 +189,7 @@ async fn sg_view_is_listed_and_read_with_the_logical_node() {
     );
 
     match read(&mut c, "PTOC1$SG").await {
-        MmsData::Structure(dos) => assert_eq!(dos.len(), 3, "{dos:?}"),
+        MmsData::Structure(dos) => assert_eq!(dos.len(), 5, "{dos:?}"),
         other => panic!("PTOC1$SG reads as a structure, got {other:?}"),
     }
 }
@@ -209,6 +220,25 @@ async fn commit_of_the_active_group_updates_the_sg_view() {
         MmsData::Integer(300)
     );
 
+    // A setting below a sub-object is committed the same way.
+    write(&mut c, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(1))
+        .await
+        .expect("edit the active group");
+    write(&mut c, "PTOC1$SE$TmSet$tm$setVal", MmsData::Integer(42))
+        .await
+        .expect("edit the setting below a sub-object");
+    assert_eq!(
+        read(&mut c, "PTOC1$SG$TmSet$tm$setVal").await,
+        MmsData::Integer(100)
+    );
+    write(&mut c, "LLN0$SP$SGCB$CnfEdit", MmsData::Boolean(true))
+        .await
+        .expect("commit");
+    assert_eq!(
+        read(&mut c, "PTOC1$SG$TmSet$tm$setVal").await,
+        MmsData::Integer(42)
+    );
+
     write(&mut c, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(2))
         .await
         .expect("edit another group");
@@ -221,5 +251,40 @@ async fn commit_of_the_active_group_updates_the_sg_view() {
     assert_eq!(
         read(&mut c, "PTOC1$SG$OpDlTmms$setVal").await,
         MmsData::Integer(300)
+    );
+}
+
+/// CreateDataSet takes the FC=SE and the FC=SG data attribute of a setting as
+/// members, whichever the DOType declares first, and GetDataSetValues reads
+/// each one's value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_set_created_at_run_time_takes_an_sg_member() {
+    let handle = start().await;
+    let mut c = connect(&handle).await;
+
+    c.define_named_variable_list(
+        DOMAIN,
+        "PTOC1$dsSg",
+        vec![
+            DefineNamedVariableEntry::domain(DOMAIN, "PTOC1$SG$OpDlTmms$setVal"),
+            DefineNamedVariableEntry::domain(DOMAIN, "PTOC1$SE$OpDlTmms$setVal"),
+            DefineNamedVariableEntry::domain(DOMAIN, "PTOC1$SE$MinOpTmms$setVal"),
+            DefineNamedVariableEntry::domain(DOMAIN, "PTOC1$SG$MinOpTmms$setVal"),
+        ],
+    )
+    .await
+    .expect("CreateDataSet with FC=SG members");
+    let values = c
+        .read_named_variable_list_values(DOMAIN, "PTOC1$dsSg")
+        .await
+        .expect("GetDataSetValues");
+    assert_eq!(
+        values,
+        vec![
+            AccessResult::Success(MmsData::Integer(250)),
+            AccessResult::Success(MmsData::Integer(250)),
+            AccessResult::Success(MmsData::Integer(4)),
+            AccessResult::Success(MmsData::Integer(3)),
+        ]
     );
 }
