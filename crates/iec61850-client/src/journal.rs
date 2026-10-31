@@ -240,6 +240,14 @@ fn drop_resent(
     page.drain(..resent);
 }
 
+/// Removes from `page` the entries later than `end_ms`, and returns whether
+/// there were any.
+fn drop_past_end(end_ms: u64, page: &mut Vec<ClientJournalEntry>) -> bool {
+    let before = page.len();
+    page.retain(|e| e.time_ms <= end_ms);
+    page.len() < before
+}
+
 /// Splits a log reference `<domain>/<item>` into its two parts.
 ///
 /// The reference is the LogRef of the journal, such as
@@ -312,10 +320,9 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     /// `log_ref` is the LogRef of the journal, an MMS path of the form
     /// `<domain>/<item>`, for example `IED1LD0/LLN0$GeneralLog`. When more
     /// follow, [`JournalQuery::continuation`] gives the next request; it
-    /// keeps the stop of `query`, so the result never runs past it. The
-    /// entries are returned as the server sent them: a server that sends the
-    /// entry it resumes after again is corrected only by
-    /// [`Self::query_journal_all`].
+    /// keeps the stop of `query`. The entries are returned as the server sent
+    /// them: a server that sends the entry it resumes after again, or that
+    /// ignores the end time, is corrected only by [`Self::query_journal_all`].
     ///
     /// # Errors
     ///
@@ -347,22 +354,25 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     /// the end time of a time-range query bounds every page, and an entry
     /// count bounds the total.
     ///
-    /// The result holds each selected entry once, also from a server that
-    /// does not resume exactly after the entry a continuation names: entries
-    /// that are not after that entry are dropped. When the page holds the
-    /// cursor entry, it and the entries ahead of it go: a server that treats
-    /// entryToStartAfter as inclusive sends the cursor entry again, and a
-    /// server that resumes at the cursor's time also sends the entries of that
-    /// time ahead of it. Otherwise the leading entries of the cursor's time
-    /// that were already received go. EntryIDs are compared only for
-    /// equality. This applies to the first page as well when `query` sets
-    /// entryToStartAfter.
+    /// The result holds each selected entry once, and none past the end time,
+    /// also from a server that does not follow the selection exactly:
+    ///
+    /// - Entries that are not after the entry a page resumes after are
+    ///   dropped. When the page holds the cursor entry, it and the entries
+    ///   ahead of it go: a server that treats entryToStartAfter as inclusive
+    ///   sends the cursor entry again, and a server that resumes at the
+    ///   cursor's time also sends the entries of that time ahead of it.
+    ///   Otherwise the leading entries of the cursor's time that were already
+    ///   received go. EntryIDs are compared only for equality. This applies to
+    ///   the first page as well when `query` sets entryToStartAfter.
+    /// - With an end time, entries later than it are dropped, and the first
+    ///   page that holds one ends the read, whatever `moreFollows` says.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::query_journal`];
     /// [`ClientError::JournalNotAdvancing`] when the server reports that more
-    /// entries follow but a page holds none beyond the entries dropped,
+    /// entries follow but a page holds none beyond the entries dropped above,
     /// or when a continuation begins before the time of the entry it resumes
     /// after, as from a server that ignores entryToStartAfter. Either would
     /// otherwise repeat the same request forever.
@@ -371,6 +381,10 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
         log_ref: &str,
         query: &JournalQuery,
     ) -> Result<Vec<ClientJournalEntry>, ClientError> {
+        let end_ms = match query.stop {
+            Some(JournalStop::Time(ms)) => Some(ms),
+            _ => None,
+        };
         let mut all = Vec::new();
         let mut next = query.clone();
         let mut resumed = false;
@@ -382,7 +396,8 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
                     return Err(ClientError::JournalNotAdvancing);
                 }
             }
-            if !more {
+            let past_end = end_ms.is_some_and(|end| drop_past_end(end, &mut page));
+            if !more || past_end {
                 all.extend(page);
                 return Ok(all);
             }
@@ -520,6 +535,15 @@ mod tests {
         let mut page = vec![entry(5, 170)];
         drop_resent(&cursor(2, 170), &received, &mut page);
         assert_eq!(ids(&page), [5]);
+    }
+
+    #[test]
+    fn entries_past_the_end_time_are_dropped() {
+        let mut page = vec![entry(1, 100), entry(2, 200), entry(3, 201)];
+        assert!(drop_past_end(200, &mut page));
+        assert_eq!(ids(&page), [1, 2]);
+        assert!(!drop_past_end(200, &mut page));
+        assert_eq!(ids(&page), [1, 2]);
     }
 
     #[test]

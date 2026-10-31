@@ -47,6 +47,9 @@ enum Paging {
     /// that entry out, sending again the other entries of that time ahead of
     /// it.
     CursorTimeWithoutCursor,
+    /// Resumes after the entry of entryToStartAfter, but ignores endingTime
+    /// unless startingTime is present.
+    EndTimeIgnored,
     /// Answers the first request with the first three entries and every
     /// continuation with the entry it resumes after, always with moreFollows.
     Stuck,
@@ -99,6 +102,11 @@ fn select(paging: Paging, req: &ReadJournalRequest, requests: u32) -> (Vec<usize
         _ => 0,
     };
     let end = match req.range_stop {
+        Some(JournalRangeStop::EndingTime(_))
+            if paging == Paging::EndTimeIgnored && req.range_start.is_none() =>
+        {
+            u64::MAX
+        }
         Some(JournalRangeStop::EndingTime(ms)) => ms,
         _ => u64::MAX,
     };
@@ -266,6 +274,18 @@ async fn a_server_that_resends_received_entries_of_the_cursor_time_yields_each_o
     let read = read_all(Paging::CursorTimeWithoutCursor, &whole_journal()).await;
     assert_eq!(read.result.unwrap(), (0..TOTAL).collect::<Vec<_>>());
     let read = read_all(Paging::CursorTimeWithoutCursor, &by_time()).await;
+    assert_eq!(read.result.unwrap(), by_time_expected());
+}
+
+/// A server that ignores the end time of QueryLogAfter: the entries past it
+/// are dropped and no request follows the page that reached past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_ignores_the_end_time_is_cut_at_it() {
+    let read = read_all(Paging::EndTimeIgnored, &after_with_end_time()).await;
+    assert_eq!(read.result.unwrap(), after_with_end_time_expected());
+    assert_eq!(read.past_end_requests, 0);
+    assert!(read.requests > 1);
+    let read = read_all(Paging::EndTimeIgnored, &by_time()).await;
     assert_eq!(read.result.unwrap(), by_time_expected());
 }
 
