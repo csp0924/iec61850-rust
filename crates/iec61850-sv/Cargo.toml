@@ -30,3 +30,10 @@ libc = "0.2"
 libc = "0.2"
 # The sv_publisher_live example drives the AF_PACKET backend of the hal.
 iec61850-hal = { workspace = true, features = ["ethernet-linux-afpacket"] }
+
+# sv_publisher_live opens its socket with iec61850_hal::ethernet::open_socket.
+# Outside Linux the pcap backend must be requested explicitly:
+#   cargo run -p iec61850-sv --example sv_publisher_live \
+#       --features iec61850-hal/ethernet-pcap -- <interface>
+# The NPCAP or libpcap SDK is supplied by the user; without a backend the
+# example prints a hint and exits.

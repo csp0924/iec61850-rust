@@ -11,9 +11,10 @@ VLAN and SV header layers, `nine_two_le` the 9-2LE channel layout,
 `publisher` the frame template and hot-path setters, `publish_thread` a
 Linux publish loop over `clock_nanosleep` with SCHED_FIFO, `subscriber`
 per-svID filtering and sample continuity, and `receiver` the typestate that
-owns the L2 source. Publishing and subscribing need an `AF_PACKET` socket
-with `CAP_NET_RAW`, so the runtime path is Linux only; a libpcap or NPCAP
-backend is available for development.
+owns the L2 source. On Linux, publishing and subscribing use an `AF_PACKET`
+socket and need `CAP_NET_RAW`, and `publish_thread` is Linux only; elsewhere
+the libpcap or NPCAP backend of `iec61850-hal` (`ethernet-pcap`,
+`ethernet-windows-npcap`) serves development and testing.
 
 Not implemented here: SVCB management over MMS, R-SV over UDP, and the
 protection profile of 256 samples per cycle.

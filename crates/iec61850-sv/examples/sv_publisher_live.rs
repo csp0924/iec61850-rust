@@ -22,39 +22,31 @@
 //!
 //! ```text
 //! [publisher-live] iface=eth0 appid=0x4000 svID=rustSV01 sps=4000
-//! [publisher-live] backend=AfPacketSocket
 //! [publisher-live] 4000 samples sent, 1 s
 //! ```
 //!
 //! # Platforms
 //!
-//! Linux uses `AfPacketSocket` and needs `CAP_NET_RAW`. On Windows and macOS
-//! the pcap backend has to be selected explicitly, because linking it needs an
-//! SDK that a default build must not require:
+//! The socket comes from `iec61850_hal::ethernet::open_socket`. Linux uses the
+//! AF_PACKET backend and needs `CAP_NET_RAW`. Elsewhere the pcap backend has
+//! to be selected explicitly, because linking it needs the libpcap or NPCAP
+//! SDK, which a default build must not require:
 //!
 //! ```sh
-//! cargo build -p iec61850-sv --example sv_publisher_live \
-//!     --features iec61850-hal/ethernet-pcap
+//! cargo run -p iec61850-sv --example sv_publisher_live \
+//!     --features iec61850-hal/ethernet-pcap -- <interface>
 //! ```
+//!
+//! Without a backend the example prints this hint and exits with status 2.
 
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!("sv_publisher_live uses the Linux AF_PACKET backend of the HAL");
-    eprintln!("build with --features iec61850-hal/ethernet-pcap for a pcap backend");
-    std::process::exit(2);
-}
-
-#[cfg(target_os = "linux")]
 fn main() {
     impl_::run();
 }
 
-#[cfg(target_os = "linux")]
 mod impl_ {
     use std::time::{Duration, Instant};
 
-    use iec61850_hal::ethernet::linux::AfPacketSocket;
-    use iec61850_hal::ethernet::{EthernetAddr, EthernetConfig, EthernetSink};
+    use iec61850_hal::ethernet::{open_socket, EthernetAddr, EthernetConfig, EthernetError};
     use iec61850_model::Quality;
     use iec61850_sv::nine_two_le::{ChannelSample, NineTwoLE, SAMPLE_SIZE};
     use iec61850_sv::publisher::SvPublisherBuilder;
@@ -85,12 +77,22 @@ mod impl_ {
             .expect("set_smp_cnt_limit");
         let mut publisher = builder.setup_complete().expect("setup_complete");
         let cfg = EthernetConfig::new(iface).with_multicast(EthernetAddr(SV_DEFAULT_DST_MAC));
-        let mut sink =
-            AfPacketSocket::open(&cfg).expect("open AF_PACKET socket, which needs CAP_NET_RAW");
+        let mut sink = match open_socket(&cfg) {
+            Ok(sink) => sink,
+            Err(EthernetError::BackendNotSupported(_)) => {
+                eprintln!("sv_publisher_live needs an L2 backend of iec61850-hal:");
+                eprintln!("Linux builds AF_PACKET in; elsewhere build with");
+                eprintln!("--features iec61850-hal/ethernet-pcap");
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("[publisher-live] cannot open {iface}: {e}");
+                std::process::exit(3);
+            }
+        };
 
         eprintln!(
             "[publisher-live] iface={iface} appid=0x{APP_ID:04x} svID={SV_ID} sps={SAMPLES_PER_SECOND}\n\
-             [publisher-live] backend=AfPacketSocket\n\
              [publisher-live] 9-2 LE, 8 channels: IA IB IC IN VA VB VC VN\n\
              [publisher-live] Ctrl+C to stop"
         );
