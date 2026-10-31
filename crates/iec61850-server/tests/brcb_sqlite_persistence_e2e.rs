@@ -170,7 +170,7 @@ fn brcb_sqlite_buffer_survives_engine_drop_and_resyncs_after_entry() {
     // The flush is timed rather than guarded by a watchdog thread; a single
     // flush must not take anywhere near this long.
     let flush_start = std::time::Instant::now();
-    let sent_count = eng_b.flush_brcb_pending(&brcb_arc, 7, 2_000_000);
+    let sent_count = eng_b.flush_brcb_pending(&brcb_arc, 7);
     let flush_elapsed = flush_start.elapsed();
     assert!(
         flush_elapsed < Duration::from_secs(5),

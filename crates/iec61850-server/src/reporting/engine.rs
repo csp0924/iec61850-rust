@@ -892,7 +892,7 @@ impl ReportingEngine {
 
             if rpt_ena {
                 if let Some(cid) = conn_id {
-                    self.flush_brcb_pending(brcb_arc, cid, now_ms);
+                    self.flush_brcb_pending(brcb_arc, cid);
                 }
             }
         }
@@ -1377,14 +1377,13 @@ impl ReportingEngine {
     ///
     /// Every report carries, as TimeOfEntry, the time its entry entered the
     /// buffer, which is also what GetBRCBValues reads back as `TimeofEntry`; the
-    /// send time `_now_ms` does not appear on the wire.
+    /// send time does not appear on the wire.
     ///
     /// Returns the number of entries sent.
     pub fn flush_brcb_pending(
         &self,
         brcb: &Arc<BufferedReportControl>,
         conn_id: ConnectionId,
-        _now_ms: u64,
     ) -> usize {
         // Read the anchor and release the state lock before calling
         // brcb_encode_snapshot, which takes the same lock; std mutexes are not
@@ -1599,7 +1598,7 @@ impl ReportingEngine {
     /// Flushes every BRCB that is enabled and has a client connection.
     ///
     /// Returns the total number of entries sent.
-    pub fn flush_all_brcb_pending(&self, now_ms: u64) -> usize {
+    pub fn flush_all_brcb_pending(&self) -> usize {
         let mut total = 0;
         for brcb_arc in self.brcbs.values() {
             // The state guard must be dropped before flush_brcb_pending, which takes
@@ -1616,7 +1615,7 @@ impl ReportingEngine {
                     None => continue,
                 }
             };
-            total += self.flush_brcb_pending(brcb_arc, conn_id, now_ms);
+            total += self.flush_brcb_pending(brcb_arc, conn_id);
         }
         total
     }
@@ -2759,14 +2758,14 @@ mod tests {
         let logs = LogCount::default();
         tracing::subscriber::with_default(logs.clone(), || {
             for _ in 0..40 {
-                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5, 2_000), 0);
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
             }
         });
         assert_eq!(logs.warns(), 1, "one warning while the channel stays full");
         assert!(brcb_arc.state.lock().unwrap().rpt_ena);
 
         while rx.try_recv().is_ok() {}
-        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5, 3_000), 1);
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 1);
         assert!(rx.try_recv().is_ok(), "the buffered entry is delivered");
     }
 
@@ -3020,7 +3019,7 @@ mod tests {
             s.transmit_anchor = TransmitAnchor::FromHead;
         }
 
-        let n = eng.flush_brcb_pending(&brcb_arc, 42, 1_000_000);
+        let n = eng.flush_brcb_pending(&brcb_arc, 42);
         assert_eq!(n, 3, "a from-head anchor must send all three entries");
 
         let pdus = sink.pdus.lock().unwrap();
@@ -3059,7 +3058,7 @@ mod tests {
             s.transmit_anchor = TransmitAnchor::AfterEntryId(id1);
         }
 
-        let n = eng.flush_brcb_pending(&brcb_arc, 7, 1_000_000);
+        let n = eng.flush_brcb_pending(&brcb_arc, 7);
         assert_eq!(
             n, 2,
             "an after-entry-id anchor must send the two later entries"
@@ -3092,7 +3091,7 @@ mod tests {
         }
 
         let pre_sq = brcb_arc.state.lock().unwrap().sq_num;
-        eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000);
+        eng.flush_brcb_pending(&brcb_arc, 1);
 
         let s = brcb_arc.state.lock().unwrap();
         assert_eq!(s.transmit_anchor, TransmitAnchor::AfterEntryId(id_last));
@@ -3118,7 +3117,7 @@ mod tests {
             let mut s = brcb_arc.state.lock().unwrap();
             s.transmit_anchor = TransmitAnchor::FromHead;
         }
-        let n = eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000);
+        let n = eng.flush_brcb_pending(&brcb_arc, 1);
         assert_eq!(n, 0);
         assert!(sink.pdus.lock().unwrap().is_empty());
         let s = brcb_arc.state.lock().unwrap();
@@ -3140,7 +3139,7 @@ mod tests {
         brcb_arc
             .enqueue_entry(1000, false, false, bytes::Bytes::from_static(b"e"))
             .unwrap();
-        let n = eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000);
+        let n = eng.flush_brcb_pending(&brcb_arc, 1);
         assert_eq!(n, 0, "a none anchor must not send any pdu");
         assert!(sink.pdus.lock().unwrap().is_empty());
     }
@@ -3176,8 +3175,8 @@ mod tests {
         let (eng, sink, brcb_arc) = brcb_resynced_on_the_newest_entry();
         let logs = LogCount::default();
         tracing::subscriber::with_default(logs.clone(), || {
-            for t in 0..200 {
-                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000 + t), 0);
+            for _ in 0..200 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1), 0);
             }
         });
         assert_eq!(logs.errors(), 0, "waiting for the next entry is no error");
@@ -3188,7 +3187,7 @@ mod tests {
         brcb_arc
             .enqueue_entry(2000, false, false, bytes::Bytes::from_static(b"f"))
             .unwrap();
-        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_000), 1);
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1), 1);
         assert_eq!(sink.pdus.lock().unwrap().len(), 1);
     }
 
@@ -3205,9 +3204,9 @@ mod tests {
         brcb_arc.state.lock().unwrap().transmit_anchor = TransmitAnchor::WaitingForNext;
         let logs = LogCount::default();
         tracing::subscriber::with_default(logs.clone(), || {
-            assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_000), 1);
-            for t in 0..50 {
-                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1, 2_000_001 + t), 0);
+            assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1), 1);
+            for _ in 0..50 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 1), 0);
             }
         });
         assert_eq!(logs.errors(), 1, "logged once, when the anchor is resolved");
@@ -3234,7 +3233,7 @@ mod tests {
             let mut s = brcb_arc.state.lock().unwrap();
             s.transmit_anchor = TransmitAnchor::FromHead;
         }
-        eng.flush_brcb_pending(&brcb_arc, 1, 1_000_000);
+        eng.flush_brcb_pending(&brcb_arc, 1);
         assert!(
             !brcb_arc.lock_buffer().unwrap().is_overflow(),
             "overflow must be cleared once the entry is sent"
@@ -3304,7 +3303,7 @@ mod tests {
             let mut s = brcb_arc.state.lock().unwrap();
             s.transmit_anchor = TransmitAnchor::FromHead;
         }
-        let sent = eng.flush_brcb_pending(&brcb_arc, 7, 1_000_001);
+        let sent = eng.flush_brcb_pending(&brcb_arc, 7);
         assert_eq!(sent, 1, "exactly one entry must be sent");
 
         // A BER boolean is encoded as tag 0x83, length 1, content 0xff for true.
@@ -3635,7 +3634,7 @@ mod tests {
             InclusionFlag::VALUE_CHANGED,
             buffered_at,
         );
-        assert_eq!(eng.flush_brcb_pending(&brcb, 5, sent_at), 1);
+        assert_eq!(eng.flush_brcb_pending(&brcb, 5), 1);
         let pdus = sink.pdus.lock().unwrap();
         let toe = iec61850_mms::binary_time6_from_epoch_ms(buffered_at);
         assert!(

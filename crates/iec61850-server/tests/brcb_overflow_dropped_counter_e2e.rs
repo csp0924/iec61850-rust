@@ -159,7 +159,7 @@ async fn brcb_overflow_dropped_counter_e2e() {
             state.transmit_anchor = TransmitAnchor::FromHead;
         }
 
-        let sent = eng.flush_brcb_pending(&brcb_arc, 7, 1_000_100);
+        let sent = eng.flush_brcb_pending(&brcb_arc, 7);
         assert_eq!(sent, 4, "a flush from the head must send all four entries");
 
         // The sink received one PDU per entry.

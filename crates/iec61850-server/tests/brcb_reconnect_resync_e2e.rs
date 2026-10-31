@@ -153,8 +153,7 @@ fn run_round_default(
     }
 
     // (3) flush
-    let now_ms = base_now_ms + count as u64;
-    let sent = eng.flush_brcb_pending(&brcb_arc, conn_id, now_ms);
+    let sent = eng.flush_brcb_pending(&brcb_arc, conn_id);
     assert_eq!(
         sent,
         count,
@@ -242,7 +241,7 @@ async fn brcb_reconnect_resync_5clients_5rounds_no_loss_strict_increasing_entry_
                     }
 
                     // Nothing is sent while the anchor is waiting.
-                    let n_zero = eng.flush_brcb_pending(&brcb_arc, conn_id, base_now_ms);
+                    let n_zero = eng.flush_brcb_pending(&brcb_arc, conn_id);
                     assert_eq!(n_zero, 0, "a waiting anchor must send nothing");
                     let drained_zero = sink.drain();
                     assert!(
@@ -273,7 +272,7 @@ async fn brcb_reconnect_resync_5clients_5rounds_no_loss_strict_increasing_entry_
                     }
 
                     // The flush now sends that new entry.
-                    let n_one = eng.flush_brcb_pending(&brcb_arc, conn_id, base_now_ms + 2);
+                    let n_one = eng.flush_brcb_pending(&brcb_arc, conn_id);
                     assert_eq!(
                         n_one, 1,
                         "the flush must send the entry that released the anchor"

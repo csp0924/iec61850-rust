@@ -654,7 +654,7 @@ fn brcb_send_path_after_entry_id_zero_e2e_w3b() {
     );
 
     // The flush sends one PDU per entry.
-    let n = eng.flush_brcb_pending(&brcb_arc, 99, 5_000_000);
+    let n = eng.flush_brcb_pending(&brcb_arc, 99);
     assert_eq!(n, 4, "a flush from the head must send all four entries");
 
     let pdus = sink.pdus.lock().unwrap();
