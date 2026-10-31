@@ -917,7 +917,7 @@ async fn next_report(client: &mut MmsClient) -> (Vec<bool>, Vec<MmsValue>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_object_write_is_reported_as_one_batch() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let (_server, handle, mut client) = start_reporting().await;
+        let (server, handle, mut client) = start_reporting().await;
 
         client
             .write(
@@ -927,6 +927,7 @@ async fn data_object_write_is_reported_as_one_batch() {
             )
             .await
             .expect("FCD write");
+        assert_eq!(buffered_entries(&server), 1, "one entry once answered");
         assert_eq!(
             next_report(&mut client).await,
             (
@@ -960,7 +961,9 @@ fn buffered_entries(server: &IedServer) -> usize {
 }
 
 /// While the data model is locked, the triggers of an FCD write wait for the
-/// release and then go out as one report.
+/// release and then go out as one report. The triggers are raised before the
+/// write is answered and the release raises them before it returns, so the
+/// buffer holds no entry until the release and one entry right after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_object_write_under_the_model_lock_is_reported_on_release() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -975,7 +978,9 @@ async fn data_object_write_under_the_model_lock_is_reported_on_release() {
             )
             .await
             .expect("FCD write");
+        assert_eq!(buffered_entries(&server), 0, "nothing while locked");
         drop(guard);
+        assert_eq!(buffered_entries(&server), 1, "one entry on release");
         assert_eq!(
             next_report(&mut client).await,
             (
