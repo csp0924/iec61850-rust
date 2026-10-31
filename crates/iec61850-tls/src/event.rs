@@ -12,6 +12,7 @@
 
 /// Severity of a TLS event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsEventLevel {
     /// Informational: a normal-flow notification.
     Info,
@@ -26,6 +27,7 @@ pub enum TlsEventLevel {
 /// TLS event codes, as defined in IEC 62351-3 §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum TlsEventCode {
     // Informational events
     /// The TLS session was established. Raised by the acceptor and the

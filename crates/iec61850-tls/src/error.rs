@@ -7,6 +7,7 @@ use thiserror::Error;
 /// Library code does not panic; every failure path returns
 /// `Result<_, TlsError>`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TlsError {
     /// The TLS handshake failed inside rustls.
     #[error("TLS handshake failed: {0}")]

@@ -44,6 +44,7 @@ use crate::verifier::{
 /// Only 1.2 and 1.3 exist as variants, so TLS 1.0 and 1.1 are excluded at
 /// compile time. IEC 62351-3 Annex A sets TLS 1.2 as the floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TlsVersion {
     /// TLS 1.2.
     Tls12,
