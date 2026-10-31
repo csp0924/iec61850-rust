@@ -8,10 +8,11 @@
 //! channel therefore approximates socket backpressure without touching the socket.
 //!
 //! The sink knows nothing about metrics: the engine decides what a `WouldBlock`
-//! means. A full channel drops the rest of a URCB report and keeps a BRCB entry
-//! buffered for a later attempt; the engine counts and logs the drops but leaves
-//! RptEna and Resv alone, because only the loss of the association disables a
-//! control block. An association that stops reading altogether is closed by the
+//! means. A URCB report the channel has no room for is dropped whole, and a
+//! BRCB entry waits in its buffer for a later attempt; a report longer than the
+//! channel is sent in parts as the channel drains. The engine counts and logs
+//! the drops but leaves RptEna and Resv alone, because only the loss of the
+//! association disables a control block. An association that stops reading altogether is closed by the
 //! idle and send timeouts of the connection lifecycle, and its control blocks
 //! are released then.
 //!
@@ -116,8 +117,9 @@ impl ChannelReportSink {
     /// Returns how many more PDUs the channel of one connection accepts right
     /// now, or `None` when no channel is registered for it.
     ///
-    /// Only the connection task takes PDUs out, so the value can only grow
-    /// until the caller pushes again.
+    /// The reporting engine is the only producer and pushes under its own lock,
+    /// and only the connection task takes PDUs out, so for the engine the value
+    /// can only grow until it pushes again.
     pub fn available_capacity(&self, conn_id: ConnectionId) -> Option<usize> {
         let g = self.inner.read().ok()?;
         g.get(&conn_id).map(|tx| tx.capacity())

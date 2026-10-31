@@ -24,7 +24,7 @@ use crate::flags::{InclusionFlag, TriggerOptions};
 use bytes::Bytes;
 use iec61850_mms::mms::server::connection::SERVER_MAX_PDU_SIZE;
 use iec61850_model::MmsValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -115,6 +115,9 @@ pub struct ReportingEngine {
     /// MMS paths of the BRCBs whose last send found the channel full; a BRCB
     /// logs when it enters and when it leaves this set, not on every retry.
     brcb_blocked: Mutex<HashSet<String>>,
+    /// Segments of a report longer than the channel that are still to be
+    /// sent, keyed by the MMS path of the URCB or BRCB.
+    partial_reports: Mutex<HashMap<String, PartialReport>>,
     /// Engine-level metrics. `dropped_buffer_full` is incremented by the buffer
     /// backends themselves when an entry has to be discarded.
     metrics: Arc<ReportingEngineMetrics>,
@@ -193,6 +196,72 @@ struct Peer {
     ip: IpAddr,
     /// max_mms_pdu_size negotiated by Initiate, in bytes.
     max_pdu_size_bytes: usize,
+}
+
+/// The segments of one report that did not fit in the channel yet.
+///
+/// A report with more segments than the channel holds is sent in parts: the
+/// first segments go out at once and the rest wait here, in order, until the
+/// channel takes them. Nothing is sent twice and nothing is dropped, and a
+/// control block sends nothing else until its report is complete.
+#[derive(Debug)]
+struct PartialReport {
+    /// Connection the report goes to.
+    conn_id: ConnectionId,
+    /// EntryID and TimeOfEntry of the buffered entry, for a BRCB.
+    entry: Option<(super::buffer::EntryId, u64)>,
+    /// Segments still to be sent.
+    rest: VecDeque<Bytes>,
+}
+
+/// How far a report got into the channel of its connection.
+enum Delivery {
+    /// Every segment was accepted; `sent` counts them.
+    Complete { sent: usize },
+    /// The channel filled after `sent` segments; `rest` were not accepted.
+    Blocked { sent: usize, rest: VecDeque<Bytes> },
+    /// The receiver is gone or was never registered.
+    Gone,
+}
+
+/// Pushes `segments` into the channel of `conn_id` in order, stopping at the
+/// first one the channel does not accept.
+fn push_segments(
+    sink: &ChannelReportSink,
+    conn_id: ConnectionId,
+    mut segments: VecDeque<Bytes>,
+) -> Delivery {
+    let mut sent = 0;
+    while let Some(pdu) = segments.pop_front() {
+        match sink.try_send_pdu(conn_id, pdu.clone()) {
+            SendOutcome::Sent => sent += 1,
+            SendOutcome::WouldBlock => {
+                segments.push_front(pdu);
+                return Delivery::Blocked {
+                    sent,
+                    rest: segments,
+                };
+            }
+            SendOutcome::ReceiverDropped | SendOutcome::NotFound => return Delivery::Gone,
+        }
+    }
+    Delivery::Complete { sent }
+}
+
+/// What resuming a partly sent report did.
+enum Resumed {
+    /// No report of the control block was waiting.
+    Idle,
+    /// The waiting report is now complete; for a BRCB, `entry` is the entry
+    /// it carried.
+    Done {
+        sent: usize,
+        entry: Option<(super::buffer::EntryId, u64)>,
+    },
+    /// Segments still wait for room; `sent` went out this time.
+    Blocked { sent: usize },
+    /// The receiver is gone.
+    Gone,
 }
 
 /// Buffer-time accumulation state for one BRCB.
@@ -292,6 +361,7 @@ impl ReportingEngine {
             sink,
             channel_sink: None,
             brcb_blocked: Mutex::new(HashSet::new()),
+            partial_reports: Mutex::new(HashMap::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: registry,
@@ -301,9 +371,10 @@ impl ReportingEngine {
 
     /// Creates an engine backed by a backpressure-aware `ChannelReportSink`.
     ///
-    /// Reports are then sent through `try_send_pdu`. A full channel drops the
-    /// rest of a URCB report and keeps a BRCB entry buffered for the next tick;
-    /// neither changes RptEna or Resv. Only a channel whose receiver is gone
+    /// Reports are then sent through `try_send_pdu`. A URCB report the channel
+    /// has no room for is dropped whole, a BRCB entry waits in its buffer, and a
+    /// report longer than the channel is sent in parts as it drains; none of
+    /// this changes RptEna or Resv. Only a channel whose receiver is gone
     /// releases the control blocks of the connection.
     ///
     /// `registry` is the data set registry DatSet writes resolve against, as
@@ -324,6 +395,7 @@ impl ReportingEngine {
             sink: trait_sink,
             channel_sink: Some(sink),
             brcb_blocked: Mutex::new(HashSet::new()),
+            partial_reports: Mutex::new(HashMap::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: registry,
@@ -849,6 +921,11 @@ impl ReportingEngine {
                     state.trg_ops,
                 )
             };
+            // A disabled BRCB starts its next transmission afresh, after a
+            // resynchronization or a purge.
+            if !rpt_ena {
+                self.forget_partial(mms_path);
+            }
 
             // General interrogation: enqueue the whole data set as one entry and
             // clear the request flag.
@@ -922,7 +999,11 @@ impl ReportingEngine {
     }
 
     /// Restarts a BRCB integrity period timer; called when the BRCB is enabled.
+    ///
+    /// An entry left partly sent before the BRCB was disabled is forgotten, so
+    /// transmission starts with its first segment again.
     pub fn refresh_brcb_integrity_period(&self, mms_path: &str) {
+        self.forget_partial(mms_path);
         let intg_pd_ms = match self.brcbs.get(mms_path) {
             Some(b) => match b.state.lock() {
                 Ok(s) => s.intg_pd_ms,
@@ -965,6 +1046,33 @@ impl ReportingEngine {
             let Ok(rc_guard) = rc_arc.lock() else {
                 continue;
             };
+
+            // A report longer than the channel goes on where it stopped, and the
+            // control block sends nothing new until it is complete.
+            let (enabled, owner) = match rc_guard.state.lock() {
+                Ok(s) => (s.rpt_ena, s.client_conn_id),
+                Err(_) => continue,
+            };
+            match self.resume_partial(&rc_guard.mms_path, owner, enabled) {
+                Resumed::Idle => {}
+                Resumed::Done { sent, .. } => {
+                    if let Some(c) = owner {
+                        self.count_urcb_sent(&rc_guard, c, sent);
+                    }
+                }
+                Resumed::Blocked { sent } => {
+                    if let Some(c) = owner {
+                        self.count_urcb_sent(&rc_guard, c, sent);
+                    }
+                    continue;
+                }
+                Resumed::Gone => {
+                    if let Some(c) = owner {
+                        to_drop.push(c);
+                    }
+                    continue;
+                }
+            }
 
             // Decide what to send while the state lock is held, then flush after it
             // is released.
@@ -1144,6 +1252,9 @@ impl ReportingEngine {
     /// with a positive ResvTms stays reserved for its owner for ResvTms seconds
     /// from now; an unreserved one forgets its owner.
     pub fn on_connection_dropped(&self, conn_id: ConnectionId) {
+        if let Ok(mut m) = self.partial_reports.lock() {
+            m.retain(|_, p| p.conn_id != conn_id);
+        }
         for rc_arc in self.rcbs.values() {
             let Ok(rc_guard) = rc_arc.lock() else {
                 continue;
@@ -1213,8 +1324,9 @@ impl ReportingEngine {
     ///   dropped whole and counted in `dropped_socket_full`; RptEna and Resv are
     ///   left as they are, since only the loss of the association disables a
     ///   URCB (IEC 61850-7-2 §17.2.4.4, §17.2.4.5). A report with more segments
-    ///   than the channel holds is started once the channel is empty, and a
-    ///   `WouldBlock` part way drops its remaining segments
+    ///   than the channel holds is started once the channel is empty, and the
+    ///   segments the channel does not take yet are sent by later ticks, in
+    ///   order and once each; the URCB sends nothing new until then
     /// - `ReceiverDropped` or `NotFound`: the connection is treated as gone and
     ///   `Some(conn_id)` is returned
     ///
@@ -1297,39 +1409,26 @@ impl ReportingEngine {
                 self.count_urcb_drop(rc, conn_id, segments);
                 return None;
             }
-            for (n, pdu) in pdus.into_iter().enumerate() {
-                let outcome = ch_sink.try_send_pdu(conn_id, pdu);
-                match outcome {
-                    SendOutcome::Sent => {
-                        rc.metrics.sent.fetch_add(1, Ordering::Relaxed);
-                        let dropped = rc
-                            .metrics
-                            .consecutive_socket_full
-                            .swap(0, Ordering::Relaxed);
-                        if dropped > 0 {
-                            tracing::warn!(
-                                conn_id,
-                                mms_path = %rc.mms_path,
-                                dropped,
-                                "report delivery resumed after the report channel was full"
-                            );
-                        }
-                    }
-                    SendOutcome::WouldBlock => {
-                        // Only a report with more segments than the channel holds
-                        // gets here: this segment and the ones after it are dropped.
-                        self.count_urcb_drop(rc, conn_id, segments - n);
-                        return None;
-                    }
-                    SendOutcome::ReceiverDropped | SendOutcome::NotFound => {
-                        tracing::warn!(
-                            conn_id,
-                            mms_path = %rc.mms_path,
-                            ?outcome,
-                            "send failed, client is presumed disconnected"
-                        );
-                        return Some(conn_id);
-                    }
+            // A report still waiting to finish holds this one back.
+            if self.has_partial(&rc.mms_path) {
+                self.count_urcb_drop(rc, conn_id, segments);
+                return None;
+            }
+            match push_segments(ch_sink, conn_id, pdus.into()) {
+                Delivery::Complete { sent } => self.count_urcb_sent(rc, conn_id, sent),
+                Delivery::Blocked { sent, rest } => {
+                    // Only a report longer than the channel gets here; the rest
+                    // of it goes out as the channel drains.
+                    self.count_urcb_sent(rc, conn_id, sent);
+                    self.keep_partial(&rc.mms_path, conn_id, None, rest);
+                }
+                Delivery::Gone => {
+                    tracing::warn!(
+                        conn_id,
+                        mms_path = %rc.mms_path,
+                        "send failed, client is presumed disconnected"
+                    );
+                    return Some(conn_id);
                 }
             }
         } else {
@@ -1346,6 +1445,107 @@ impl ReportingEngine {
             }
         }
         None
+    }
+
+    /// Counts `sent` report PDUs of a URCB, and logs when they end a run of
+    /// drops.
+    fn count_urcb_sent(&self, rc: &ReportControl, conn_id: ConnectionId, sent: usize) {
+        if sent == 0 {
+            return;
+        }
+        rc.metrics.sent.fetch_add(sent as u64, Ordering::Relaxed);
+        let dropped = rc
+            .metrics
+            .consecutive_socket_full
+            .swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(
+                conn_id,
+                mms_path = %rc.mms_path,
+                dropped,
+                "report delivery resumed after the report channel was full"
+            );
+        }
+    }
+
+    /// Reports whether a report of the control block at `mms_path` is still
+    /// waiting to finish.
+    fn has_partial(&self, mms_path: &str) -> bool {
+        self.partial_reports
+            .lock()
+            .map(|m| m.contains_key(mms_path))
+            .unwrap_or(false)
+    }
+
+    /// Keeps the segments `rest` of a report to `conn_id` until the channel
+    /// takes them.
+    fn keep_partial(
+        &self,
+        mms_path: &str,
+        conn_id: ConnectionId,
+        entry: Option<(super::buffer::EntryId, u64)>,
+        rest: VecDeque<Bytes>,
+    ) {
+        if let Ok(mut m) = self.partial_reports.lock() {
+            m.insert(
+                mms_path.to_string(),
+                PartialReport {
+                    conn_id,
+                    entry,
+                    rest,
+                },
+            );
+        }
+    }
+
+    /// Forgets the partly sent report of the control block at `mms_path`.
+    fn forget_partial(&self, mms_path: &str) {
+        if let Ok(mut m) = self.partial_reports.lock() {
+            m.remove(mms_path);
+        }
+    }
+
+    /// Sends what the channel takes of the partly sent report of the control
+    /// block at `mms_path`.
+    ///
+    /// A report kept for another connection than `conn_id`, or for a control
+    /// block that is no longer enabled, is forgotten.
+    fn resume_partial(
+        &self,
+        mms_path: &str,
+        conn_id: Option<ConnectionId>,
+        enabled: bool,
+    ) -> Resumed {
+        let Some(ch_sink) = self.channel_sink.as_ref() else {
+            return Resumed::Idle;
+        };
+        let Ok(mut m) = self.partial_reports.lock() else {
+            return Resumed::Idle;
+        };
+        let Some(partial) = m.remove(mms_path) else {
+            return Resumed::Idle;
+        };
+        if !enabled || conn_id != Some(partial.conn_id) {
+            return Resumed::Idle;
+        }
+        match push_segments(ch_sink, partial.conn_id, partial.rest) {
+            Delivery::Complete { sent } => Resumed::Done {
+                sent,
+                entry: partial.entry,
+            },
+            Delivery::Blocked { sent, rest } => {
+                m.insert(
+                    mms_path.to_string(),
+                    PartialReport {
+                        conn_id: partial.conn_id,
+                        entry: partial.entry,
+                        rest,
+                    },
+                );
+                Resumed::Blocked { sent }
+            }
+            Delivery::Gone => Resumed::Gone,
+        }
     }
 
     /// Counts `dropped` report PDUs of a URCB lost to a full channel, and logs
@@ -1417,8 +1617,11 @@ impl ReportingEngine {
     /// carries the EntryID of that entry. `sq_num`, the transmit anchor, and the
     /// overflow flag advance only once the last segment of an entry has been
     /// accepted. An entry whose segments do not all fit in the channel is not
-    /// started and waits at the anchor for the next attempt, so no segment is
-    /// sent twice; a closed or unknown receiver drops the connection. An entry
+    /// started and waits at the anchor for the next attempt. An entry with more
+    /// segments than the channel holds starts on an empty channel, and its
+    /// remaining segments go out on later passes, in order and once each, before
+    /// anything after it; disabling the BRCB or losing the connection forgets
+    /// them. A closed or unknown receiver drops the connection. An entry
     /// that cannot be encoded within the negotiated PDU size is dropped: it is
     /// logged and counted once, and the anchor moves past it.
     ///
@@ -1435,29 +1638,47 @@ impl ReportingEngine {
         // Read the anchor and release the state lock before calling
         // brcb_encode_snapshot, which takes the same lock; std mutexes are not
         // reentrant.
+        // An entry longer than the channel goes on where it stopped; nothing
+        // after it is sent until it is complete.
+        let mut sent_count: usize = 0;
+        match self.resume_partial(&brcb.mms_path, Some(conn_id), true) {
+            Resumed::Idle => {}
+            Resumed::Done { entry, .. } => {
+                if let Some((entry_id, time_of_entry_ms)) = entry {
+                    self.brcb_entry_sent(brcb, conn_id, entry_id, time_of_entry_ms);
+                    sent_count = 1;
+                }
+            }
+            Resumed::Blocked { .. } => return 0,
+            Resumed::Gone => {
+                self.on_connection_dropped(conn_id);
+                return 0;
+            }
+        }
+
         let (anchor, resynced_on) = {
             let Ok(state) = brcb.state.lock() else {
                 tracing::warn!(mms_path = %brcb.mms_path, "brcb state mutex poisoned");
-                return 0;
+                return sent_count;
             };
             (state.transmit_anchor.clone(), state.last_committed_entry_id)
         };
         let snap = match brcb_encode_snapshot(brcb) {
             Ok(s) => s,
-            Err(_) => return 0,
+            Err(_) => return sent_count,
         };
 
         let (entries, mut imply_overflow) = match anchor {
             TransmitAnchor::None => {
                 // Not resynchronized yet: the client has not written EntryID.
-                return 0;
+                return sent_count;
             }
             TransmitAnchor::FromHead => {
                 // An all-zero EntryID means send from the head, and the first entry
                 // implies BufOvfl = true.
                 let buf = match brcb.lock_buffer() {
                     Ok(b) => b,
-                    Err(_) => return 0,
+                    Err(_) => return sent_count,
                 };
                 let entries = buf.iter_entries();
                 drop(buf);
@@ -1466,7 +1687,7 @@ impl ReportingEngine {
             TransmitAnchor::AfterEntryId(after) => {
                 let buf = match brcb.lock_buffer() {
                     Ok(b) => b,
-                    Err(_) => return 0,
+                    Err(_) => return sent_count,
                 };
                 let entries = buf.iter_from(&after);
                 let ovfl = buf.is_overflow();
@@ -1478,13 +1699,13 @@ impl ReportingEngine {
                 // been buffered since: an ordinary wait for the next entry.
                 let buf = match brcb.lock_buffer() {
                     Ok(b) => b,
-                    Err(_) => return 0,
+                    Err(_) => return sent_count,
                 };
                 let entries = buf.iter_from(&resynced_on);
                 let ovfl = buf.is_overflow();
                 drop(buf);
                 if entries.is_empty() {
-                    return 0;
+                    return sent_count;
                 }
                 // A newer entry is buffered, yet on_enqueue never resolved the
                 // anchor. Resolving it here logs this once and resumes after the
@@ -1504,7 +1725,7 @@ impl ReportingEngine {
         };
 
         if entries.is_empty() {
-            return 0;
+            return sent_count;
         }
 
         // Prefer the data set bound by register_brcb_with_dataset; fall back to an
@@ -1515,7 +1736,6 @@ impl ReportingEngine {
         };
         let dataset = &dataset_clone;
         let max_pdu = self.max_pdu_size_bytes(conn_id);
-        let mut sent_count: usize = 0;
 
         for entry in entries.iter() {
             // Read sqNum without advancing it: it moves only after the last segment.
@@ -1553,47 +1773,34 @@ impl ReportingEngine {
                 }
             };
 
-            let mut all_segments_sent = true;
             if let Some(ref ch_sink) = self.channel_sink {
                 // An entry the channel has no room for waits whole for the next
-                // pass, so no segment of it is sent twice.
+                // pass; one longer than the channel starts on an empty channel
+                // and its remaining segments wait for room.
                 if !channel_has_room(ch_sink, conn_id, pdus.len()) {
-                    if self.set_brcb_blocked(&brcb.mms_path, true) {
+                    self.note_brcb_blocked(brcb, conn_id, entry.entry_id);
+                    return sent_count;
+                }
+                match push_segments(ch_sink, conn_id, pdus.into()) {
+                    Delivery::Complete { .. } => {}
+                    Delivery::Blocked { rest, .. } => {
+                        self.keep_partial(
+                            &brcb.mms_path,
+                            conn_id,
+                            Some((entry.entry_id, entry.time_of_entry_ms)),
+                            rest,
+                        );
+                        self.note_brcb_blocked(brcb, conn_id, entry.entry_id);
+                        return sent_count;
+                    }
+                    Delivery::Gone => {
                         tracing::warn!(
                             conn_id,
                             mms_path = %brcb.mms_path,
-                            entry_id = entry.entry_id.as_u64(),
-                            "report channel full, brcb entries stay buffered until it drains"
+                            "brcb send failed, connection treated as closed"
                         );
-                    }
-                    return sent_count;
-                }
-                for pdu in pdus {
-                    let outcome = ch_sink.try_send_pdu(conn_id, pdu);
-                    match outcome {
-                        SendOutcome::Sent => {}
-                        SendOutcome::WouldBlock => {
-                            if self.set_brcb_blocked(&brcb.mms_path, true) {
-                                tracing::warn!(
-                                    conn_id,
-                                    mms_path = %brcb.mms_path,
-                                    entry_id = entry.entry_id.as_u64(),
-                                    "report channel full, brcb entries stay buffered until it drains"
-                                );
-                            }
-                            all_segments_sent = false;
-                            break;
-                        }
-                        SendOutcome::ReceiverDropped | SendOutcome::NotFound => {
-                            tracing::warn!(
-                                conn_id,
-                                mms_path = %brcb.mms_path,
-                                ?outcome,
-                                "brcb send failed, connection treated as closed"
-                            );
-                            self.on_connection_dropped(conn_id);
-                            return sent_count;
-                        }
+                        self.on_connection_dropped(conn_id);
+                        return sent_count;
                     }
                 }
             } else {
@@ -1610,35 +1817,57 @@ impl ReportingEngine {
                 }
             }
 
-            if !all_segments_sent {
-                // A segment failed part way through: leave the anchor in place and
-                // retry on the next pass.
-                return sent_count;
-            }
-
-            // Every segment was accepted: advance the anchor and sqNum, clear overflow.
-            if self.set_brcb_blocked(&brcb.mms_path, false) {
-                tracing::debug!(
-                    conn_id,
-                    mms_path = %brcb.mms_path,
-                    "report channel drained, brcb transmission resumed"
-                );
-            }
-            if let Ok(mut state) = brcb.state.lock() {
-                state.sq_num = state.sq_num.wrapping_add(1);
-                state.transmit_anchor = TransmitAnchor::AfterEntryId(entry.entry_id);
-                state.last_sent_entry_id = entry.entry_id;
-                state.last_sent_time_of_entry_ms = entry.time_of_entry_ms;
-            }
-            if let Ok(mut buf) = brcb.lock_buffer() {
-                buf.clear_overflow();
-            }
+            self.brcb_entry_sent(brcb, conn_id, entry.entry_id, entry.time_of_entry_ms);
             // Overflow was just cleared, so later entries in this pass do not imply it.
             imply_overflow = false;
             sent_count += 1;
         }
 
         sent_count
+    }
+
+    /// Records that every segment of the BRCB entry `entry_id` was accepted:
+    /// advances the transmit anchor and SqNum and clears the overflow flag.
+    fn brcb_entry_sent(
+        &self,
+        brcb: &BufferedReportControl,
+        conn_id: ConnectionId,
+        entry_id: super::buffer::EntryId,
+        time_of_entry_ms: u64,
+    ) {
+        if self.set_brcb_blocked(&brcb.mms_path, false) {
+            tracing::debug!(
+                conn_id,
+                mms_path = %brcb.mms_path,
+                "report channel drained, brcb transmission resumed"
+            );
+        }
+        if let Ok(mut state) = brcb.state.lock() {
+            state.sq_num = state.sq_num.wrapping_add(1);
+            state.transmit_anchor = TransmitAnchor::AfterEntryId(entry_id);
+            state.last_sent_entry_id = entry_id;
+            state.last_sent_time_of_entry_ms = time_of_entry_ms;
+        }
+        if let Ok(mut buf) = brcb.lock_buffer() {
+            buf.clear_overflow();
+        }
+    }
+
+    /// Logs once per blocked run that a BRCB waits for room in the channel.
+    fn note_brcb_blocked(
+        &self,
+        brcb: &BufferedReportControl,
+        conn_id: ConnectionId,
+        entry_id: super::buffer::EntryId,
+    ) {
+        if self.set_brcb_blocked(&brcb.mms_path, true) {
+            tracing::warn!(
+                conn_id,
+                mms_path = %brcb.mms_path,
+                entry_id = entry_id.as_u64(),
+                "report channel full, brcb entries stay buffered until it drains"
+            );
+        }
     }
 
     /// Marks the BRCB at `mms_path` as blocked by a full channel, or as no
@@ -4040,8 +4269,50 @@ mod tests {
         assert_eq!(received as u64, dropped, "every segment of the report");
     }
 
+    /// SqNum (when present), SubSeqNum and MoreSegmentsFollow of a segmented
+    /// report PDU whose SubSeqNum is access result `sub_seq_at`.
+    fn segment_header(pdu: &[u8], sub_seq_at: usize) -> (Option<u64>, u64, bool) {
+        use iec61850_mms::mms::pdu::common::MmsData;
+        use iec61850_mms::mms::pdu::information_report::decode_information_report;
+        let (len, hdr) = iec61850_asn1::decode_length(&pdu[1..]).expect("outer length");
+        let report = decode_information_report(&pdu[1 + hdr..1 + hdr + len]).expect("decode");
+        let r = &report.list_of_access_result;
+        let unsigned = |v: &MmsData| match v {
+            MmsData::Unsigned(n) => *n,
+            other => panic!("unsigned expected, got {other:?}"),
+        };
+        let sq = (sub_seq_at == 3).then(|| unsigned(&r[2]));
+        let more = match &r[sub_seq_at + 1] {
+            MmsData::Boolean(b) => *b,
+            other => panic!("MoreSegmentsFollow expected, got {other:?}"),
+        };
+        (sq, unsigned(&r[sub_seq_at]), more)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, into: &mut Vec<Bytes>) {
+        while let Ok(p) = rx.try_recv() {
+            into.push(p);
+        }
+    }
+
+    /// Checks that `pdus` are the segments of one report, each once and in
+    /// order, and returns how many there are.
+    fn assert_one_report_in_order(pdus: &[Bytes], sub_seq_at: usize) -> usize {
+        let mut sq = None;
+        for (n, p) in pdus.iter().enumerate() {
+            let (s, sub, more) = segment_header(p, sub_seq_at);
+            assert_eq!(sub, n as u64, "segment {n} out of order or repeated");
+            assert_eq!(more, n + 1 < pdus.len(), "MoreSegmentsFollow of {n}");
+            if n == 0 {
+                sq = s;
+            }
+            assert_eq!(s, sq, "every segment carries the same SqNum");
+        }
+        pdus.len()
+    }
+
     #[test]
-    fn urcb_report_longer_than_the_channel_starts_on_an_empty_channel() {
+    fn urcb_report_longer_than_the_channel_is_sent_in_parts_once_each() {
         use crate::reporting::sink::REPORT_CHANNEL_CAP;
         let ch_sink = Arc::new(ChannelReportSink::new());
         let mut engine =
@@ -4049,24 +4320,182 @@ mod tests {
         let rcb = Rcb::new("urcb01", "GGIO1$ds1")
             .with_trg_ops(TriggerOptions::GI)
             .with_opt_flds(OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$RP$urcb01";
         engine
-            .register_rcb(
-                ReportControl::new("IED1LD0/GGIO1$RP$urcb01", rcb),
-                wide_ds(150),
-            )
+            .register_rcb(ReportControl::new(path, rcb), wide_ds(150))
             .unwrap();
         engine.register_peer(7, "10.0.0.7".parse().unwrap(), 200);
-        let rc_arc = engine.get_rcb("IED1LD0/GGIO1$RP$urcb01").unwrap();
+        let rc_arc = engine.get_rcb(path).unwrap();
         enable_rcb(&rc_arc, 7);
-        let (tx, _rx) = ChannelReportSink::create_channel();
+        let (tx, mut rx) = ChannelReportSink::create_channel();
         ch_sink.register(7, tx);
+
         request_gi(&rc_arc);
         engine.tick_at(Instant::now(), 1_000);
-        // The reader takes nothing, so the channel fills and the rest is dropped.
-        assert_eq!(ch_sink.available_capacity(7), Some(0));
+        assert_eq!(
+            ch_sink.available_capacity(7),
+            Some(0),
+            "the channel is full"
+        );
+        assert!(engine.has_partial(path), "the rest of the report waits");
+
+        // The reader drains the channel between ticks; every tick sends the
+        // next segments until the report is complete.
+        let mut pdus = Vec::new();
+        for t in 0..20 {
+            drain(&mut rx, &mut pdus);
+            if !engine.has_partial(path) {
+                break;
+            }
+            engine.tick_at(Instant::now(), 2_000 + t);
+        }
+        drain(&mut rx, &mut pdus);
+        let n = assert_one_report_in_order(&pdus, 2);
+        assert!(n > REPORT_CHANNEL_CAP, "{n} segments");
         let snap = rc_arc.lock().unwrap().metrics_snapshot();
-        assert_eq!(snap.sent, REPORT_CHANNEL_CAP as u64);
-        assert!(snap.dropped_socket_full > 0);
+        assert_eq!(snap.sent, n as u64);
+        assert_eq!(snap.dropped_socket_full, 0, "nothing is dropped");
+
+        // Nothing more goes out.
+        engine.tick_at(Instant::now(), 3_000);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A BRCB over `wide_ds(150)` for association 5 on a channel sink, with a
+    /// 200-byte negotiated PDU: a general interrogation entry takes more
+    /// segments than the channel holds. A small data-change entry follows it.
+    fn long_brcb_entry_engine() -> LongBrcbEntry {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI | TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(150))
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 200);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let snap = eng.snapshot_full_dataset(path).unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(1_000, false, true, snap)
+            .unwrap();
+        let mut one = EnqueuedSnapshot::new(150);
+        one.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+        one.values[0] = Some(MmsValue::Integer(-1));
+        brcb_arc
+            .enqueue_entry_with_snapshot(2_000, false, false, one)
+            .unwrap();
+        let entries = brcb_arc.lock_buffer().unwrap().iter_entries();
+        let (tx, rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+        LongBrcbEntry {
+            eng,
+            ch_sink,
+            brcb_arc,
+            rx,
+            entries,
+        }
+    }
+
+    /// The fixture `long_brcb_entry_engine` builds.
+    struct LongBrcbEntry {
+        eng: ReportingEngine,
+        ch_sink: Arc<ChannelReportSink>,
+        brcb_arc: Arc<crate::reporting::brcb::BufferedReportControl>,
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+        entries: Vec<Arc<crate::reporting::buffer::ReportEntry>>,
+    }
+
+    #[test]
+    fn brcb_entry_longer_than_the_channel_is_resumed_where_it_stopped() {
+        use crate::reporting::brcb::TransmitAnchor;
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let LongBrcbEntry {
+            eng,
+            ch_sink,
+            brcb_arc,
+            mut rx,
+            entries,
+        } = long_brcb_entry_engine();
+
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0, "not complete yet");
+        assert_eq!(ch_sink.available_capacity(5), Some(0));
+        {
+            let s = brcb_arc.state.lock().unwrap();
+            assert_eq!(s.transmit_anchor, TransmitAnchor::FromHead);
+            assert_eq!(s.sq_num, 0);
+        }
+
+        let mut pdus = Vec::new();
+        let mut sent = 0;
+        for _ in 0..20 {
+            drain(&mut rx, &mut pdus);
+            sent += eng.flush_brcb_pending(&brcb_arc, 5);
+            if sent == 2 {
+                break;
+            }
+        }
+        drain(&mut rx, &mut pdus);
+        assert_eq!(sent, 2, "both entries are sent");
+        // The long entry first, each segment once and in order, then the next
+        // entry, unsegmented, with the next SqNum.
+        let last = pdus.pop().expect("the second entry");
+        let n = assert_one_report_in_order(&pdus, 3);
+        assert!(n > REPORT_CHANNEL_CAP, "{n} segments");
+        assert_eq!(segment_header(&pdus[0], 3).0, Some(0));
+        assert!(contains(&last, &[0x86, 0x01, 0x01]), "SqNum 1");
+        let s = brcb_arc.state.lock().unwrap();
+        assert_eq!(
+            s.transmit_anchor,
+            TransmitAnchor::AfterEntryId(entries[1].entry_id)
+        );
+        assert_eq!(s.sq_num, 2);
+        assert_eq!(s.last_sent_entry_id, entries[1].entry_id);
+    }
+
+    #[test]
+    fn disabling_a_brcb_forgets_its_partly_sent_entry() {
+        let LongBrcbEntry {
+            eng,
+            brcb_arc,
+            mut rx,
+            ..
+        } = long_brcb_entry_engine();
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        brcb_arc.state.lock().unwrap().rpt_ena = false;
+        eng.tick_brcb(Instant::now(), 3_000);
+        assert!(!eng.has_partial(&brcb_arc.mms_path));
+
+        // Enabled again, the entry starts over from its first segment.
+        let mut stale = Vec::new();
+        drain(&mut rx, &mut stale);
+        brcb_arc.state.lock().unwrap().rpt_ena = true;
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        let mut again = Vec::new();
+        drain(&mut rx, &mut again);
+        assert_eq!(segment_header(&again[0], 3).1, 0, "SubSeqNum 0 again");
+    }
+
+    #[test]
+    fn a_lost_connection_forgets_its_partly_sent_reports() {
+        // The receiver stays alive, so the connection is not seen as gone.
+        let LongBrcbEntry {
+            eng,
+            brcb_arc,
+            rx: _rx,
+            ..
+        } = long_brcb_entry_engine();
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        assert!(eng.has_partial(&brcb_arc.mms_path));
+        eng.on_connection_dropped(5);
+        assert!(!eng.has_partial(&brcb_arc.mms_path));
     }
 
     #[test]
