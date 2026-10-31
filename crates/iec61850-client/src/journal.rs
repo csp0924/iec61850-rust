@@ -16,7 +16,7 @@
 //! decoding.
 
 use crate::error::ClientError;
-use crate::prelude::{format, String, ToString, Vec};
+use crate::prelude::{format, BTreeSet, String, ToString, Vec};
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
 use iec61850_mms::mms::pdu::{
@@ -208,36 +208,28 @@ impl JournalQuery {
     }
 }
 
-/// Removes from `page`, the answer to a request that resumes after `cursor`,
-/// the entries a server sends again although they are not after the cursor.
+/// Keeps in `page` only the entries a read has not received yet, and adds
+/// their EntryIDs to `received`.
 ///
-/// When the cursor entry is in `page`, it and every entry ahead of it are
-/// removed: a server that treats entryToStartAfter as inclusive starts with
-/// it, and a server that resumes at the cursor's time starts with the entries
-/// of that time ahead of it. Otherwise the leading entries of the cursor's
-/// time that `received` already ends with are removed. `received` is what the
-/// read has collected so far, in order. EntryIDs are compared only for
-/// equality; entries after the first new one are kept.
-fn drop_resent(
-    cursor: &JournalCursor,
-    received: &[ClientJournalEntry],
+/// When `page` answers a request that resumes after `cursor` and holds the
+/// cursor entry, that entry and every entry ahead of it are removed: a server
+/// that treats entryToStartAfter as inclusive starts with it, and a server
+/// that resumes at the cursor's time starts with the entries of that time
+/// ahead of it. Then every entry whose EntryID is in `received`, or appears
+/// earlier in `page`, is removed. EntryIDs are compared only for equality,
+/// and times not at all, so a journal whose clock steps back reads as any
+/// other.
+fn keep_new_entries(
+    cursor: Option<&JournalCursor>,
+    received: &mut BTreeSet<[u8; 8]>,
     page: &mut Vec<ClientJournalEntry>,
 ) {
-    if let Some(at) = page.iter().rposition(|e| e.entry_id == cursor.entry_id) {
-        page.drain(..=at);
-        return;
+    if let Some(cursor) = cursor {
+        if let Some(at) = page.iter().rposition(|e| e.entry_id == cursor.entry_id) {
+            page.drain(..=at);
+        }
     }
-    let at_cursor_time = received
-        .iter()
-        .rev()
-        .take_while(|r| r.time_ms == cursor.time_ms);
-    let resent = page
-        .iter()
-        .take_while(|e| {
-            e.time_ms == cursor.time_ms && at_cursor_time.clone().any(|r| r.entry_id == e.entry_id)
-        })
-        .count();
-    page.drain(..resent);
+    page.retain(|e| received.insert(e.entry_id.0));
 }
 
 /// Removes from `page` the entries later than `end_ms`, and returns whether
@@ -354,28 +346,31 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     /// the end time of a time-range query bounds every page, and an entry
     /// count bounds the total.
     ///
-    /// The result holds each selected entry once, and none past the end time,
-    /// also from a server that does not follow the selection exactly:
+    /// The result holds each selected entry once, none past the end time and
+    /// no more than the entry count, also from a server that does not follow
+    /// the selection exactly:
     ///
-    /// - Entries that are not after the entry a page resumes after are
-    ///   dropped. When the page holds the cursor entry, it and the entries
-    ///   ahead of it go: a server that treats entryToStartAfter as inclusive
-    ///   sends the cursor entry again, and a server that resumes at the
-    ///   cursor's time also sends the entries of that time ahead of it.
-    ///   Otherwise the leading entries of the cursor's time that were already
-    ///   received go. EntryIDs are compared only for equality. This applies to
-    ///   the first page as well when `query` sets entryToStartAfter.
+    /// - When a page holds the entry it resumes after, that entry and the
+    ///   entries ahead of it are dropped: a server that treats
+    ///   entryToStartAfter as inclusive sends that entry again, and a server
+    ///   that resumes at its time also sends the entries of that time ahead of
+    ///   it. This applies to the first page as well when `query` sets
+    ///   entryToStartAfter. An entry whose EntryID was already received is
+    ///   dropped wherever it appears. EntryIDs are compared only for equality
+    ///   and the order of the entry times is not checked, so a journal whose
+    ///   clock steps back reads to the end.
     /// - With an end time, entries later than it are dropped, and the first
     ///   page that holds one ends the read, whatever `moreFollows` says.
+    /// - With an entry count, the read ends once that many entries are
+    ///   received, whatever `moreFollows` says.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::query_journal`];
     /// [`ClientError::JournalNotAdvancing`] when the server reports that more
-    /// entries follow but a page holds none beyond the entries dropped above,
-    /// or when a continuation begins before the time of the entry it resumes
-    /// after, as from a server that ignores entryToStartAfter. Either would
-    /// otherwise repeat the same request forever.
+    /// entries follow but a page brings no entry not yet received, as from a
+    /// server that ignores entryToStartAfter; following `moreFollows` would
+    /// repeat the same request forever.
     pub async fn query_journal_all(
         &self,
         log_ref: &str,
@@ -385,26 +380,28 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
             Some(JournalStop::Time(ms)) => Some(ms),
             _ => None,
         };
-        let mut all = Vec::new();
+        let max_entries = match query.stop {
+            Some(JournalStop::Count(n)) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+            _ => None,
+        };
+        let mut all: Vec<ClientJournalEntry> = Vec::new();
+        let mut received = BTreeSet::new();
         let mut next = query.clone();
-        let mut resumed = false;
         loop {
             let (mut page, more) = self.query_journal(log_ref, &next).await?;
-            if let Some(cursor) = &next.after {
-                drop_resent(cursor, &all, &mut page);
-                if resumed && page.first().is_some_and(|e| e.time_ms < cursor.time_ms) {
-                    return Err(ClientError::JournalNotAdvancing);
-                }
-            }
+            keep_new_entries(next.after.as_ref(), &mut received, &mut page);
             let past_end = end_ms.is_some_and(|end| drop_past_end(end, &mut page));
-            if !more || past_end {
+            if let Some(max) = max_entries {
+                page.truncate(max.saturating_sub(all.len()));
+            }
+            let full = max_entries.is_some_and(|max| all.len() + page.len() >= max);
+            if !more || past_end || full {
                 all.extend(page);
                 return Ok(all);
             }
             next = next
                 .continuation(&page)
                 .ok_or(ClientError::JournalNotAdvancing)?;
-            resumed = true;
             all.extend(page);
         }
     }
@@ -489,52 +486,68 @@ mod tests {
         }
     }
 
+    fn received(ids: &[u64]) -> BTreeSet<[u8; 8]> {
+        ids.iter().map(|id| id.to_be_bytes()).collect()
+    }
+
     #[test]
-    fn a_page_after_the_cursor_is_kept_whole() {
-        let received = [entry(1, 140), entry(2, 150)];
+    fn a_page_of_new_entries_is_kept_whole() {
+        let mut seen = received(&[1, 2]);
         let mut page = vec![entry(3, 150), entry(4, 160)];
-        drop_resent(&cursor(2, 150), &received, &mut page);
+        keep_new_entries(Some(&cursor(2, 150)), &mut seen, &mut page);
         assert_eq!(ids(&page), [3, 4]);
+        assert_eq!(seen, received(&[1, 2, 3, 4]));
         let mut page = Vec::new();
-        drop_resent(&cursor(2, 150), &received, &mut page);
+        keep_new_entries(Some(&cursor(4, 160)), &mut seen, &mut page);
         assert!(page.is_empty());
     }
 
     #[test]
     fn the_cursor_entry_at_the_head_is_dropped() {
+        let mut seen = received(&[2]);
         let mut page = vec![entry(2, 150), entry(3, 150), entry(4, 160)];
-        drop_resent(&cursor(2, 150), &[], &mut page);
+        keep_new_entries(Some(&cursor(2, 150)), &mut seen, &mut page);
         assert_eq!(ids(&page), [3, 4]);
     }
 
     #[test]
     fn the_entries_ahead_of_the_cursor_entry_are_dropped() {
         let mut page = vec![entry(1, 150), entry(2, 150), entry(3, 150), entry(4, 160)];
-        drop_resent(&cursor(2, 150), &[], &mut page);
+        keep_new_entries(Some(&cursor(2, 150)), &mut BTreeSet::new(), &mut page);
         assert_eq!(ids(&page), [3, 4]);
         let mut page = vec![entry(9, 140), entry(1, 150), entry(2, 150), entry(3, 160)];
-        drop_resent(&cursor(2, 150), &[], &mut page);
+        keep_new_entries(Some(&cursor(2, 150)), &mut BTreeSet::new(), &mut page);
         assert_eq!(ids(&page), [3]);
     }
 
     #[test]
-    fn received_entries_of_the_cursor_time_are_dropped_without_the_cursor() {
-        let received = [entry(7, 140), entry(1, 150), entry(5, 150), entry(2, 150)];
-        let mut page = vec![entry(5, 150), entry(1, 150), entry(3, 150), entry(1, 150)];
-        drop_resent(&cursor(2, 150), &received, &mut page);
-        assert_eq!(ids(&page), [3, 1]);
+    fn received_entries_are_dropped_anywhere_in_the_page() {
+        let mut seen = received(&[7, 1, 5, 2]);
+        let mut page = vec![
+            entry(5, 150),
+            entry(1, 150),
+            entry(3, 150),
+            entry(1, 150),
+            entry(8, 160),
+            entry(7, 140),
+        ];
+        keep_new_entries(Some(&cursor(2, 150)), &mut seen, &mut page);
+        assert_eq!(ids(&page), [3, 8]);
     }
 
     #[test]
-    fn entries_received_at_another_time_are_kept() {
-        let received = [entry(7, 140), entry(2, 150)];
-        let mut page = vec![entry(7, 140), entry(3, 150)];
-        drop_resent(&cursor(2, 150), &received, &mut page);
-        assert_eq!(ids(&page), [7, 3]);
-        let received = [entry(5, 150), entry(6, 160), entry(2, 170)];
-        let mut page = vec![entry(5, 170)];
-        drop_resent(&cursor(2, 170), &received, &mut page);
-        assert_eq!(ids(&page), [5]);
+    fn an_entry_repeated_within_a_page_is_kept_once() {
+        let mut page = vec![entry(1, 100), entry(2, 110), entry(1, 100)];
+        keep_new_entries(None, &mut BTreeSet::new(), &mut page);
+        assert_eq!(ids(&page), [1, 2]);
+    }
+
+    #[test]
+    fn a_new_entry_older_than_the_cursor_is_kept() {
+        let mut seen = received(&[1, 2]);
+        let mut page = vec![entry(3, 90), entry(4, 95)];
+        keep_new_entries(Some(&cursor(2, 150)), &mut seen, &mut page);
+        assert_eq!(ids(&page), [3, 4]);
     }
 
     #[test]

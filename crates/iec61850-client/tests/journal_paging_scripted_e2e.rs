@@ -60,6 +60,22 @@ enum Paging {
     /// entries, older than the entry it resumes after, always with
     /// moreFollows.
     GoesBack,
+    /// Pages like `Exact` a journal whose clock steps back after the first
+    /// page: every entry from `PAGE` on is `CLOCK_STEP_BACK` older than its
+    /// time.
+    ClockBack,
+}
+
+/// How far the clock of the `ClockBack` journal steps back.
+const CLOCK_STEP_BACK: u64 = 100 * STEP;
+
+/// The time of entry `i` in the journal `paging` serves.
+fn entry_time(paging: Paging, i: usize) -> u64 {
+    if paging == Paging::ClockBack && i >= PAGE {
+        time(i) - CLOCK_STEP_BACK
+    } else {
+        time(i)
+    }
 }
 
 fn time(i: usize) -> u64 {
@@ -128,13 +144,13 @@ fn select(paging: Paging, req: &ReadJournalRequest, requests: u32) -> (Vec<usize
     (selected.into_iter().take(PAGE).collect(), more)
 }
 
-fn journal_page(invoke_id: u32, indices: &[usize], more: bool) -> Plan {
+fn journal_page(paging: Paging, invoke_id: u32, indices: &[usize], more: bool) -> Plan {
     let entries = indices
         .iter()
         .map(|&i| {
             WireJournalEntry::new(
                 entry_id(i),
-                time(i),
+                entry_time(paging, i),
                 vec![WireJournalVariable::new(
                     "IED1LD0/GGIO1$ST$Ind1$stVal",
                     MmsData::Boolean(i % 2 == 0),
@@ -188,7 +204,7 @@ async fn read_all(paging: Paging, query: &JournalQuery) -> Read {
         if let Some(latest_time) = indices.iter().map(|&i| time(i)).max() {
             latest.fetch_max(latest_time, Ordering::SeqCst);
         }
-        Some(journal_page(invoke_id, &indices, more))
+        Some(journal_page(paging, invoke_id, &indices, more))
     }))
     .await;
     let conn = IedConnection::with_mms_client(
@@ -308,4 +324,25 @@ async fn a_server_that_ignores_the_cursor_is_an_error() {
         assert_eq!(read.result, Err(ClientError::JournalNotAdvancing));
         assert_eq!(read.requests, 2);
     }
+}
+
+/// A journal whose clock steps back between two pages reads to the end: the
+/// entries are new, although older than the entry the page resumes after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_whose_clock_steps_back_reads_to_the_end() {
+    let read = read_all(Paging::ClockBack, &JournalQuery::new()).await;
+    assert_eq!(read.result.unwrap(), (0..TOTAL).collect::<Vec<_>>());
+}
+
+/// An entry count ends the read once that many entries are received, from a
+/// server that ignores numberOfEntries and sends the cursor entry again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_count_ends_the_read_once_received() {
+    let read = read_all(
+        Paging::CursorIncluded,
+        &JournalQuery::new().with_max_entries(120),
+    )
+    .await;
+    assert_eq!(read.result.unwrap(), (0..120).collect::<Vec<_>>());
+    assert_eq!(read.requests, 3);
 }
