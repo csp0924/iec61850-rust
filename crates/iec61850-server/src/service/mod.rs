@@ -79,14 +79,11 @@ use iec61850_model::IedModel;
 // Each import group is gated on the sub-feature that owns it.
 #[cfg(feature = "control")]
 use crate::control::ControlObjectsRegistry;
-// Only `GoCBRegistry` is named by a field; the helpers are reached from the
-// read and write routing paths, which carry their own gates.
 #[cfg(feature = "goose-mapping")]
 use crate::goose_mapping::{
     apply_gocb_write, encode_gocb_da, encode_gocb_structure, parse_go_item_id, GoCBRegistry,
 };
 use crate::handler::HandlerRegistry;
-// These helpers serve the read and write routing paths, so they are available
 #[cfg(feature = "logging")]
 use crate::logging::{
     new_log_control_registry, LogControl, LogControlRegistry, LogEntryId, LogStorageError,

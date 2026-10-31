@@ -133,7 +133,8 @@ impl GoCBHandle {
     /// VMD-scope reference `/<name>` and an association-scope reference
     /// `@<name>` are kept; one in the form `<LN>$<dsName>` gains the domain,
     /// and a bare data set name gains the domain and this control block's
-    /// logical node.
+    /// logical node. A control block whose logical device is empty adds no
+    /// domain.
     pub fn qualify_data_set_ref(&self, data_set_ref: &str) -> String {
         let bare = !data_set_ref.is_empty()
             && !data_set_ref.contains(['/', '$'])

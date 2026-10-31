@@ -250,8 +250,10 @@ pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
     /// - `DropNewest` and `Reject`: `true` when the buffer was full and this entry
     ///   was rejected, `false` when it was stored
     ///
-    /// Either way a full buffer sets `is_overflow`. A caller that has to tell
-    /// eviction from rejection reads `overflow_strategy()`.
+    /// `DropNewest` and `Reject` set `is_overflow` whenever they reject an
+    /// entry; `DropOldest` sets it when an evicted entry was not yet formatted
+    /// for transmission. A caller that has to tell eviction from rejection
+    /// reads `overflow_strategy()`.
     fn push(&mut self, entry: Arc<ReportEntry>) -> bool;
 
     /// Returns the entry with this EntryID, for resynchronization.

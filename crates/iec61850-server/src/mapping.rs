@@ -916,6 +916,9 @@ pub(crate) fn flat_paths(prefix: &str, spec: &MmsTypeSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iec61850_model::{
+        DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder, MmsValue, TrgOps,
+    };
 
     /// A data set name without a scope is qualified with the domain; every other
     /// form of IEC 61850-8-1 §8.1.3.2.2 is kept as it is.
@@ -930,9 +933,6 @@ mod tests {
             assert_eq!(qualified_object_reference("IED1LD0", kept), kept);
         }
     }
-    use iec61850_model::{
-        DataAttribute, DataAttributeType, DataObject, DoChild, IedModelBuilder, MmsValue, TrgOps,
-    };
 
     /// Builds a data attribute list carrying data under functional constraint
     /// SP, so that a logical node has an SP group.

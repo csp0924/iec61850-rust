@@ -499,9 +499,8 @@ mod tests {
     ///
     /// The expected bytes are the BER encoding of the ISO 9506-2
     /// InformationReport written out by hand; they carry exactly three nested
-    /// tags. An encoder that adds two
-    /// more `0xa0` wrappers produces a report peers cannot parse, so this test pins
-    /// the nesting down.
+    /// tags. An encoder that adds two more `0xa0` wrappers produces a report
+    /// peers cannot parse, so this test pins the nesting down.
     #[test]
     fn ct_positive_minimal_byte_exact() {
         // an empty structure encodes as 0xa2 0x00
