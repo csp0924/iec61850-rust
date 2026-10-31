@@ -365,7 +365,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     ///
     /// `NotConnected` if the association is not established, and also if the
     /// receive finds the connection lost, which marks it disconnected. Any other
-    /// receive failure is returned as `Mms`.
+    /// receive failure is returned as the error variant the MMS layer maps to,
+    /// such as `Mms` for a PDU that does not decode.
     ///
     /// Requires `std` for its monotonic deadline. An embedded caller drives
     /// `MmsClient::recv_unconfirmed_pdu_with_timeout` and
