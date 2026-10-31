@@ -503,3 +503,70 @@ async fn every_gocb_name_reads_the_type_it_is_described_with() {
     client.disconnect().await.expect("disconnect");
     handle.stop().await;
 }
+
+// ── SetGoCBValues ───────────────────────────────────────────────────────
+
+/// Under the default edition, a DatSet write while the GoCB is disabled
+/// replaces the publication's datSet and increments ConfRev, also when the
+/// value is unchanged (IEC 61850-7-2 §18.2.1.6); while it is enabled the write
+/// is refused (7-2 §18.2.2.6.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dat_set_write_increments_conf_rev_even_when_unchanged() {
+    use iec61850_client::connection::IedConnection;
+    use iec61850_client::gocb::GoCBValuesWrite;
+    use iec61850_client::ClientError;
+    use iec61850_mms::mms::pdu::DataAccessError;
+
+    let (handle, publisher) = start_server(IedServerConfig::default()).await;
+    let conn = IedConnection::new();
+    conn.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+
+    for (written, conf_rev) in [("LLN0$ds2", 8), ("TESTLD0/LLN0$ds2", 9)] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.set_gocb_values(
+                "TESTLD0/LLN0.gcb01",
+                GoCBValuesWrite::new().with_dat_set(written),
+            ),
+        )
+        .await
+        .expect("timeout")
+        .expect("set DatSet");
+        let v = conn.get_gocb_values("TESTLD0/LLN0.gcb01").await.unwrap();
+        assert_eq!(v.dat_set, "TESTLD0/LLN0$ds2");
+        assert_eq!(v.conf_rev, conf_rev, "after writing {written}");
+    }
+    {
+        let p = publisher.lock().unwrap();
+        assert_eq!(p.data_set_ref(), "TESTLD0/LLN0$ds2");
+        assert_eq!(p.conf_rev(), 9);
+    }
+
+    conn.set_gocb_values(
+        "TESTLD0/LLN0.gcb01",
+        GoCBValuesWrite::new().with_go_ena(true),
+    )
+    .await
+    .expect("enable");
+    let refused = conn
+        .set_gocb_values(
+            "TESTLD0/LLN0.gcb01",
+            GoCBValuesWrite::new().with_dat_set("LLN0$ds1"),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ClientError::DataAccessError(
+                DataAccessError::TemporarilyUnavailable
+            ))
+        ),
+        "a DatSet write while enabled is refused, got {refused:?}"
+    );
+    assert_eq!(publisher.lock().unwrap().conf_rev(), 9);
+
+    conn.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}

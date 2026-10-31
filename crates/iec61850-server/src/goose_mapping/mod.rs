@@ -11,7 +11,7 @@
 //! |---|---|---|---|
 //! | GoEna | GO | BOOLEAN | read and write |
 //! | GoID | GO | VisibleString | read and write |
-//! | DatSet | GO | VisibleString | read |
+//! | DatSet | GO | VisibleString | read and write |
 //! | ConfRev | GO | UINT32 | read |
 //! | NdsCom | GO | BOOLEAN | read |
 //! | DstAddress | GO | PhyComAddress structure | read |
@@ -33,7 +33,9 @@
 //!
 //! Writing GoEna sets the publisher's enabled flag; it does not start or stop a
 //! publishing thread. A caller decides from `enabled()` whether to transmit, which
-//! keeps this mapping independent of how frames reach the network.
+//! keeps this mapping independent of how frames reach the network. Writing
+//! DatSet replaces the publisher's datSet and increments its confRev; the
+//! caller reads `data_set_ref()` to know which data set to publish.
 //!
 //! DstAddress is exposed as a structure of four members: the six-byte destination
 //! MAC address as an OctetString, then the VLAN priority, VLAN identifier, and
@@ -240,6 +242,9 @@ impl GoCBRegistry {
     }
 }
 
+/// Longest ObjectReference, VISIBLE STRING129 (IEC 61850-7-2 §6.1.2.3 Table 4).
+const MAX_OBJECT_REFERENCE_LEN: usize = 129;
+
 /// The nine components of the GoCB MMS structure, in the order of
 /// IEC 61850-8-1 §18.1.1.1.1 Table 83.
 pub const GOCB_DA_NAMES: &[&str] = &[
@@ -384,9 +389,18 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 
 /// Applies an MMS write to one GoCB component.
 ///
-/// GoEna, a boolean, and GoID, a visible string, are writable; GoID only while
-/// the publisher is disabled, and otherwise it is refused with
-/// `TemporarilyUnavailable`. The other seven components are read-only and are
+/// GoEna, a boolean, and GoID and DatSet, visible strings, are writable; GoID
+/// and DatSet only while the publisher is disabled, and otherwise they are
+/// refused with `TemporarilyUnavailable` (IEC 61850-7-2 §18.2.2.6.3).
+///
+/// A DatSet write takes a data set reference with or without its domain and
+/// stores it qualified with the control block's domain. Every accepted DatSet
+/// write increments ConfRev, also when the value is unchanged, skipping the
+/// reserved value 0 (IEC 61850-7-2 §18.2.1.6). A reference that is empty or
+/// longer than an ObjectReference's 129 characters is refused with
+/// `ObjectValueInvalid`.
+///
+/// The other six components are read-only and are
 /// refused with `ObjectAccessDenied`, and so is a member below a component,
 /// such as `DstAddress$APPID`. An unknown component is refused with
 /// `ObjectNonExistent` and a value of the wrong type with `ObjectValueInvalid`.
@@ -443,8 +457,50 @@ pub fn apply_gocb_write(handle: &GoCBHandle, da_name: &str, value: &MmsData) -> 
             tracing::info!(gocb = handle.go_cb_ref(), go_id = %s, "GoCB GoID changed");
             WriteOutcome::Success
         }
+        "DatSet" => {
+            let MmsData::VisibleString(s) = value else {
+                tracing::warn!(
+                    da_name,
+                    ?value,
+                    "write DatSet refused: a VisibleString is required"
+                );
+                return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
+            };
+            let qualified = handle.qualify_data_set_ref(s);
+            if s.is_empty() || qualified.len() > MAX_OBJECT_REFERENCE_LEN {
+                tracing::warn!(
+                    da_name,
+                    len = qualified.len(),
+                    "write DatSet refused: not a data set reference"
+                );
+                return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
+            }
+            let mut p = match lock_publisher(handle) {
+                Ok(p) => p,
+                Err(e) => return WriteOutcome::Failure(e),
+            };
+            if p.enabled() {
+                tracing::warn!(da_name, "write DatSet refused: GoEna is true");
+                return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
+            }
+            if p.set_data_set_ref(qualified.clone()).is_err() {
+                return WriteOutcome::Failure(DataAccessError::ObjectValueInvalid);
+            }
+            let conf_rev = match p.conf_rev().wrapping_add(1) {
+                0 => 1,
+                next => next,
+            };
+            p.set_conf_rev(conf_rev);
+            tracing::info!(
+                gocb = handle.go_cb_ref(),
+                dat_set = %qualified,
+                conf_rev,
+                "GoCB DatSet changed"
+            );
+            WriteOutcome::Success
+        }
         // Read-only components.
-        "DatSet" | "ConfRev" | "NdsCom" | "DstAddress" | "MinTime" | "MaxTime" | "FixedOffs" => {
+        "ConfRev" | "NdsCom" | "DstAddress" | "MinTime" | "MaxTime" | "FixedOffs" => {
             tracing::warn!(da_name, "write to a read-only GoCB component refused");
             WriteOutcome::Failure(DataAccessError::ObjectAccessDenied)
         }
@@ -748,7 +804,6 @@ mod tests {
     fn write_readonly_da_rejects() {
         let h = sample_handle();
         for da in [
-            "DatSet",
             "ConfRev",
             "NdsCom",
             "DstAddress",
@@ -763,6 +818,56 @@ mod tests {
                 "{da} must be refused as read-only"
             );
         }
+    }
+
+    #[test]
+    fn write_dat_set_qualifies_it_and_increments_conf_rev() {
+        let h = sample_handle();
+        for (written, stored, conf_rev) in [
+            ("IED1LD0/LLN0$ds2", "IED1LD0/LLN0$ds2", 6),
+            ("LLN0$ds3", "IED1LD0/LLN0$ds3", 7),
+            // The same value again still counts as a change.
+            ("IED1LD0/LLN0$ds3", "IED1LD0/LLN0$ds3", 8),
+        ] {
+            let r = apply_gocb_write(&h, "DatSet", &MmsData::VisibleString(written.into()));
+            assert_eq!(r, WriteOutcome::Success, "{written}");
+            assert_eq!(read(&h, "DatSet"), MmsData::VisibleString(stored.into()));
+            assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(conf_rev));
+        }
+    }
+
+    #[test]
+    fn write_dat_set_skips_the_reserved_conf_rev() {
+        let h = sample_handle();
+        h.publisher.lock().unwrap().set_conf_rev(u32::MAX);
+        let r = apply_gocb_write(&h, "DatSet", &MmsData::VisibleString("ds2".into()));
+        assert_eq!(r, WriteOutcome::Success);
+        assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(1));
+    }
+
+    #[test]
+    fn write_dat_set_refused_while_enabled_or_malformed() {
+        let h = sample_handle();
+        for bad in [
+            MmsData::Boolean(true),
+            MmsData::VisibleString(String::new()),
+            MmsData::VisibleString("x".repeat(130)),
+        ] {
+            assert_eq!(
+                apply_gocb_write(&h, "DatSet", &bad),
+                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid)
+            );
+        }
+        apply_gocb_write(&h, "GoEna", &MmsData::Boolean(true));
+        assert_eq!(
+            apply_gocb_write(&h, "DatSet", &MmsData::VisibleString("ds2".into())),
+            WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable)
+        );
+        assert_eq!(
+            read(&h, "DatSet"),
+            MmsData::VisibleString("IED1LD0/LLN0$ds1".into())
+        );
+        assert_eq!(read(&h, "ConfRev"), MmsData::Unsigned(5));
     }
 
     #[test]

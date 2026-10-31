@@ -11,8 +11,9 @@
 //!
 //! A write is partial: [`GoCBValuesWrite`] carries `Some` for each attribute
 //! to write and `None` for the rest, and the attributes are written one
-//! request at a time. Only GoEna and GoID are writable; a server answers a
-//! write to any other attribute with `ObjectAccessDenied`.
+//! request at a time. GoEna, GoID and DatSet are the writable attributes of
+//! IEC 61850-7-2 §18.2.1 Table 42; a server answers a write to any other
+//! attribute with `ObjectAccessDenied`.
 
 use core::sync::atomic::Ordering;
 
@@ -80,6 +81,8 @@ pub struct GoCBValuesWrite {
     pub go_ena: Option<bool>,
     /// GoID.
     pub go_id: Option<String>,
+    /// DatSet: the data set reference, `<LD>/<LN>$<dsName>`.
+    pub dat_set: Option<String>,
 }
 
 impl GoCBValuesWrite {
@@ -97,6 +100,12 @@ impl GoCBValuesWrite {
     /// Sets GoID.
     pub fn with_go_id(mut self, id: impl Into<String>) -> Self {
         self.go_id = Some(id.into());
+        self
+    }
+
+    /// Sets DatSet.
+    pub fn with_dat_set(mut self, dat_set: impl Into<String>) -> Self {
+        self.dat_set = Some(dat_set.into());
         self
     }
 }
@@ -343,9 +352,10 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
 
     /// Writes attributes of a GOOSE control block (ACSI SetGoCBValues).
     ///
-    /// Only GoEna and GoID are writable; a server answers a write to any other
-    /// attribute with `ObjectAccessDenied`. The attributes are written one
-    /// request at a time and the first failure ends the call.
+    /// DatSet is written first, then GoID, then GoEna, one request at a time,
+    /// and the first failure ends the call. A server refuses DatSet and GoID
+    /// while the control block is enabled, and one that follows
+    /// IEC 61850-8-1 Ed2.1 refuses them always (8-1 §18.1.1.1.1 Table 83).
     ///
     /// # Errors
     ///
@@ -362,8 +372,13 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         let (domain, item_base) = parse_gocb_ref(reference)?;
         let arc = self.mms_client_arc();
         let mut client = arc.lock().await;
-        // GoID is written before GoEna, so publishing never starts under the
-        // old identifier and then changes it mid-stream.
+        // DatSet and GoID are written before GoEna, so publishing never starts
+        // under the old configuration and then changes it mid-stream.
+        if let Some(dat_set) = write.dat_set {
+            let item = format!("{item_base}$DatSet");
+            let value = mms_value_to_mms_data(&MmsValue::VisibleString(dat_set));
+            client.write(&domain, &item, value).await?;
+        }
         if let Some(go_id) = write.go_id {
             let item = format!("{item_base}$GoID");
             let value = mms_value_to_mms_data(&MmsValue::VisibleString(go_id));
@@ -547,8 +562,12 @@ mod tests {
 
     #[test]
     fn write_builder_chains() {
-        let w = GoCBValuesWrite::new().with_go_ena(true).with_go_id("X");
+        let w = GoCBValuesWrite::new()
+            .with_go_ena(true)
+            .with_go_id("X")
+            .with_dat_set("LD/LLN0$ds");
         assert_eq!(w.go_ena, Some(true));
         assert_eq!(w.go_id.as_deref(), Some("X"));
+        assert_eq!(w.dat_set.as_deref(), Some("LD/LLN0$ds"));
     }
 }
