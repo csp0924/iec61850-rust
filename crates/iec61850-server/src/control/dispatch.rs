@@ -243,6 +243,7 @@ pub(crate) fn write(
     target: &CoTarget<'_>,
     value: &MmsValue,
 ) -> CoWriteResult {
+    entry.object.bind_model(model);
     match declared_co_attribute(
         model,
         target.domain,

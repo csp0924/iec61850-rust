@@ -3,6 +3,12 @@
 //! One instance per controllable data object, holding the state machine of
 //! IEC 61850-7-2 control, the selection timer, and the selection change handler.
 //!
+//! The control model of an object is defined by the configuration attributes
+//! `ctlModel`, `sboTimeout`, `sboClass` and `operTimeout` of its data object,
+//! IEC 61850-7-2 §20.1. An object bound to the model reads them from it, so a
+//! change of one takes effect at the next request; a selection or a command
+//! already under way completes under the settings it started with.
+//!
 //! The mutable state sits behind a `Mutex`, so several tasks may drive the same
 //! object. A selection expires on a timer task of the current tokio runtime,
 //! whose clock a test can pause; without a runtime it expires when the next
@@ -15,8 +21,8 @@ use super::model::{
 };
 use super::state::ControlState;
 use crate::error::ServerError;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use iec61850_model::{DoChild, IedModel, MmsValue, FC};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -24,7 +30,8 @@ use tokio::time::Instant;
 // ControlObjectConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Static configuration of one control object.
+/// Configuration of one control object: the data object it controls, and the
+/// settings used where the model declares no configuration attribute.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ControlObjectConfig {
@@ -34,15 +41,17 @@ pub struct ControlObjectConfig {
     pub ln_name: String,
     /// Logical device domain, the IED name and LD instance, for example `IED1LD0`.
     pub domain: String,
-    /// Control model, from the `ctlModel` data attribute.
+    /// Control model, used when the model declares no `ctlModel` attribute.
     pub ctl_model: ControlModel,
-    /// Select timeout in milliseconds; 0 disables it.
-    ///
-    /// From the `sboTimeout` attribute, defaulting to 30000 ms when absent.
+    /// Select timeout in milliseconds, 0 disabling it; used when the model
+    /// declares no `sboTimeout` attribute.
     pub sbo_timeout_ms: u32,
-    /// Select class, from the `sboClass` attribute: whether one selection admits a
-    /// single Operate or several.
+    /// Select class, whether one selection admits a single Operate or several;
+    /// used when the model declares no `sboClass` attribute.
     pub sbo_class: SboClass,
+    /// Time limit of an executing command in milliseconds, 0 for none; used
+    /// when the model declares no `operTimeout` attribute.
+    pub oper_timeout_ms: u32,
 }
 
 impl ControlObjectConfig {
@@ -50,8 +59,8 @@ impl ControlObjectConfig {
     /// logical node `ln_name` of the logical device `domain`, using the
     /// control model `ctl_model`.
     ///
-    /// `sbo_timeout_ms` is 30000, the value used when the `sboTimeout`
-    /// attribute is absent, and `sbo_class` is [`SboClass::OperateOnce`].
+    /// `sbo_timeout_ms` is 30000, `sbo_class` is [`SboClass::OperateOnce`], and
+    /// `oper_timeout_ms` is 0, leaving a command unlimited.
     pub fn new(
         name: impl Into<String>,
         ln_name: impl Into<String>,
@@ -65,6 +74,7 @@ impl ControlObjectConfig {
             ctl_model,
             sbo_timeout_ms: 30_000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         }
     }
 
@@ -93,6 +103,138 @@ impl ControlObjectConfig {
             }
         }
     }
+
+    fn settings(&self) -> ControlSettings {
+        ControlSettings {
+            ctl_model: self.ctl_model,
+            sbo_timeout_ms: self.sbo_timeout_ms,
+            sbo_class: self.sbo_class,
+            oper_timeout_ms: self.oper_timeout_ms,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ControlSettings and the configuration attributes of the model
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The settings that define the control model of an object, per
+/// IEC 61850-7-2 §20.1 and the configuration attributes of IEC 61850-7-3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ControlSettings {
+    /// Control model, `ctlModel`.
+    pub ctl_model: ControlModel,
+    /// Select timeout in milliseconds, `sboTimeout`; 0 disables it.
+    pub sbo_timeout_ms: u32,
+    /// Select class, `sboClass`.
+    pub sbo_class: SboClass,
+    /// Time limit of an executing command in milliseconds, `operTimeout`; 0
+    /// for none.
+    pub oper_timeout_ms: u32,
+}
+
+impl ControlSettings {
+    fn is_sbo(&self) -> bool {
+        matches!(
+            self.ctl_model,
+            ControlModel::SboNormal | ControlModel::SboEnhanced
+        )
+    }
+}
+
+type ValueCell = Arc<RwLock<MmsValue>>;
+
+/// The configuration attributes of the data object, as value cells of the
+/// model; an attribute the model does not declare is `None`.
+#[derive(Default)]
+struct CfBinding {
+    ctl_model: Option<ValueCell>,
+    sbo_timeout: Option<ValueCell>,
+    sbo_class: Option<ValueCell>,
+    oper_timeout: Option<ValueCell>,
+}
+
+impl CfBinding {
+    /// Binds the configuration attributes of `<domain>/<ln_name>.<do_name>`.
+    fn from_model(model: &IedModel, domain: &str, ln_name: &str, do_name: &str) -> Self {
+        let mut binding = Self::default();
+        let Some(data_object) = model
+            .ld_by_domain(domain)
+            .and_then(|ld| ld.ln_by_name(ln_name))
+            .and_then(|ln| ln.do_by_name(do_name))
+        else {
+            return binding;
+        };
+        for child in &data_object.children {
+            let DoChild::Da(da) = child else { continue };
+            if da.fc != FC::Cf {
+                continue;
+            }
+            let slot = match da.name.as_str() {
+                "ctlModel" => &mut binding.ctl_model,
+                "sboTimeout" => &mut binding.sbo_timeout,
+                "sboClass" => &mut binding.sbo_class,
+                "operTimeout" => &mut binding.oper_timeout,
+                _ => continue,
+            };
+            *slot = Some(Arc::clone(&da.value));
+        }
+        binding
+    }
+
+    /// Returns the settings the bound attributes hold, taking `fallback` for
+    /// an attribute that is absent or holds a value out of its range.
+    fn read(&self, name: &str, fallback: ControlSettings) -> ControlSettings {
+        let ctl_model = read_cell(&self.ctl_model, name, "ctlModel", |v| {
+            integer(v)
+                .and_then(|n| i32::try_from(n).ok())
+                .and_then(|n| ControlObjectConfig::validate_ctl_model(n).ok())
+        });
+        let sbo_class = read_cell(&self.sbo_class, name, "sboClass", |v| match integer(v) {
+            Some(0) => Some(SboClass::OperateOnce),
+            Some(1) => Some(SboClass::OperateMany),
+            _ => None,
+        });
+        let millis = |v: &MmsValue| integer(v).and_then(|n| u32::try_from(n).ok());
+        ControlSettings {
+            ctl_model: ctl_model.unwrap_or(fallback.ctl_model),
+            sbo_timeout_ms: read_cell(&self.sbo_timeout, name, "sboTimeout", millis)
+                .unwrap_or(fallback.sbo_timeout_ms),
+            sbo_class: sbo_class.unwrap_or(fallback.sbo_class),
+            oper_timeout_ms: read_cell(&self.oper_timeout, name, "operTimeout", millis)
+                .unwrap_or(fallback.oper_timeout_ms),
+        }
+    }
+}
+
+/// Reads one bound attribute through `parse`; a value it rejects is logged and
+/// yields `None`.
+fn read_cell<T>(
+    cell: &Option<ValueCell>,
+    name: &str,
+    attribute: &str,
+    parse: impl FnOnce(&MmsValue) -> Option<T>,
+) -> Option<T> {
+    let guard = cell.as_ref()?.read().ok()?;
+    let parsed = parse(&guard);
+    if parsed.is_none() {
+        tracing::warn!(
+            name,
+            attribute,
+            value = ?*guard,
+            "control setting out of range in the model, using the configured value"
+        );
+    }
+    parsed
+}
+
+fn integer(v: &MmsValue) -> Option<i64> {
+    match v {
+        MmsValue::Integer(n) => Some(*n),
+        MmsValue::Unsigned(n) => i64::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +250,10 @@ struct ControlObjectInner {
 
     /// Connection holding the selection, or 0 when none does.
     owner_conn_id: u64,
+
+    /// The settings in force while the object is not unselected, taken when it
+    /// left the unselected state.
+    active: Option<ControlSettings>,
 
     /// When the object last entered the ready state, for the select timeout.
     select_time: Option<Instant>,
@@ -127,16 +273,19 @@ impl ControlObjectInner {
             state: ControlState::default(),
             last_oper_params: None,
             owner_conn_id: 0,
+            active: None,
             select_time: None,
             ready_period: 0,
             owner_lost: false,
         }
     }
 
-    /// Enters the ready state for `conn_id` and returns the new ready period.
-    fn enter_ready(&mut self, conn_id: u64) -> u64 {
+    /// Enters the ready state for `conn_id` under `settings` and returns the
+    /// new ready period.
+    fn enter_ready(&mut self, conn_id: u64, settings: ControlSettings) -> u64 {
         self.state = ControlState::Ready;
         self.owner_conn_id = conn_id;
+        self.active = Some(settings);
         self.select_time = Some(Instant::now());
         self.ready_period = self.ready_period.wrapping_add(1);
         self.ready_period
@@ -148,6 +297,7 @@ impl ControlObjectInner {
         let owner = self.owner_conn_id;
         self.state = ControlState::Unselected;
         self.owner_conn_id = 0;
+        self.active = None;
         self.select_time = None;
         self.last_oper_params = None;
         self.owner_lost = false;
@@ -185,15 +335,17 @@ impl SelectionChange {
 /// Control state of one controllable data object.
 ///
 /// Implements the control object of IEC 61850-7-2 with a mutex around the mutable
-/// state rather than a semaphore.
+/// state rather than a semaphore. Its settings come from the configuration
+/// attributes of the data object once it is bound to the model, which
+/// [`ControlObject::from_model`] does at creation and the server does when the
+/// object first serves a request; a setting the model does not declare comes
+/// from [`config`](Self::config).
 #[derive(Clone)]
 pub struct ControlObject {
-    /// Static configuration, shared by every clone of this handle.
+    /// Configuration, shared by every clone of this handle.
     pub config: Arc<ControlObjectConfig>,
     inner: Arc<Mutex<ControlObjectInner>>,
-
-    /// Time limit of an executing command in milliseconds, 0 for none.
-    oper_timeout_ms: Arc<AtomicU32>,
+    binding: Arc<OnceLock<CfBinding>>,
 
     /// Selection change handler, installed by `set_select_state_handler`.
     pub select_state_handler: Arc<Mutex<Option<Arc<dyn SelectStateChangedHandler>>>>,
@@ -204,19 +356,89 @@ impl std::fmt::Debug for ControlObject {
         f.debug_struct("ControlObject")
             .field("name", &self.config.name)
             .field("ln_name", &self.config.ln_name)
-            .field("ctl_model", &self.config.ctl_model)
+            .field("domain", &self.config.domain)
             .finish()
     }
 }
 
 impl ControlObject {
-    /// Creates a control object in the unselected state.
+    /// Creates a control object in the unselected state, not yet bound to a
+    /// model.
     pub fn new(config: ControlObjectConfig) -> Self {
         Self {
             config: Arc::new(config),
             inner: Arc::new(Mutex::new(ControlObjectInner::new())),
-            oper_timeout_ms: Arc::new(AtomicU32::new(0)),
+            binding: Arc::new(OnceLock::new()),
             select_state_handler: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Creates the control object of the data object `<domain>/<ln_name>.<do_name>`
+    /// of `model`, bound to its configuration attributes.
+    ///
+    /// Returns `None` when the model does not declare the data object or its
+    /// `ctlModel` attribute, or `ctlModel` holds a value outside 0..=4. A
+    /// setting whose attribute the model does not declare takes the default of
+    /// [`ControlObjectConfig::new`].
+    pub fn from_model(
+        model: &IedModel,
+        domain: &str,
+        ln_name: &str,
+        do_name: &str,
+    ) -> Option<Self> {
+        let binding = CfBinding::from_model(model, domain, ln_name, do_name);
+        let cell = binding.ctl_model.as_ref()?;
+        let ctl_model = cell
+            .read()
+            .ok()
+            .and_then(|v| integer(&v))
+            .and_then(|n| i32::try_from(n).ok())
+            .and_then(|n| ControlObjectConfig::validate_ctl_model(n).ok())?;
+        let mut config = ControlObjectConfig::new(do_name, ln_name, domain, ctl_model);
+        let settings = binding.read(do_name, config.settings());
+        config.sbo_timeout_ms = settings.sbo_timeout_ms;
+        config.sbo_class = settings.sbo_class;
+        config.oper_timeout_ms = settings.oper_timeout_ms;
+        let obj = Self::new(config);
+        let _ = obj.binding.set(binding);
+        Some(obj)
+    }
+
+    /// Binds the object to the configuration attributes `model` declares for
+    /// its data object, unless it is bound already.
+    pub(crate) fn bind_model(&self, model: &IedModel) {
+        self.binding.get_or_init(|| {
+            CfBinding::from_model(
+                model,
+                &self.config.domain,
+                &self.config.ln_name,
+                &self.config.name,
+            )
+        });
+    }
+
+    /// Returns the settings the configuration attributes currently hold.
+    fn live_settings(&self) -> ControlSettings {
+        let fallback = self.config.settings();
+        match self.binding.get() {
+            Some(binding) => binding.read(&self.config.name, fallback),
+            None => fallback,
+        }
+    }
+
+    /// Returns the settings in force: those a selection or command under way
+    /// started with, or else those the configuration attributes hold.
+    pub fn settings(&self) -> ControlSettings {
+        match self.inner.lock() {
+            Ok(g) => self.settings_locked(&g),
+            Err(_) => self.live_settings(),
+        }
+    }
+
+    fn settings_locked(&self, g: &ControlObjectInner) -> ControlSettings {
+        match g.active {
+            Some(active) if g.state != ControlState::Unselected => active,
+            _ => self.live_settings(),
         }
     }
 
@@ -228,37 +450,11 @@ impl ControlObject {
             .unwrap_or(ControlState::Unselected)
     }
 
-    /// Returns the time limit of an executing command in milliseconds, or 0
-    /// when it is not limited.
-    pub fn oper_timeout_ms(&self) -> u32 {
-        self.oper_timeout_ms.load(Ordering::Relaxed)
-    }
-
-    /// Sets the time limit of an executing command, the `operTimeout` attribute
-    /// of IEC 61850-7-3, in milliseconds; 0, the default, disables it.
-    ///
-    /// The limit covers the control handler, which runs once the Operate has
-    /// been answered positively. When the handler has not finished within it,
-    /// the command ends with the add cause `TimeLimitOver`, reported in a
-    /// negative CommandTermination under enhanced security, and the object
-    /// returns to ready or unselected according to its select class. Every clone
-    /// of this handle shares the setting.
-    pub fn set_oper_timeout_ms(&self, timeout_ms: u32) {
-        self.oper_timeout_ms.store(timeout_ms, Ordering::Relaxed);
-    }
-
     /// Installs the select state changed handler.
     pub fn set_select_state_handler(&self, h: Arc<dyn SelectStateChangedHandler>) {
         if let Ok(mut g) = self.select_state_handler.lock() {
             *g = Some(h);
         }
-    }
-
-    fn is_sbo(&self) -> bool {
-        matches!(
-            self.config.ctl_model,
-            ControlModel::SboNormal | ControlModel::SboEnhanced
-        )
     }
 
     // ─── Select and deselect ─────────────────────────────────────────────
@@ -281,14 +477,15 @@ impl ControlObject {
 
         match g.state {
             ControlState::Unselected => {
-                let period = g.enter_ready(conn_id);
+                let settings = self.live_settings();
+                let period = g.enter_ready(conn_id, settings);
                 drop(g);
                 tracing::debug!(
                     name = %self.config.name,
                     conn_id,
                     "select accepted, object is now ready"
                 );
-                self.arm_select_timer(period);
+                self.arm_select_timer(period, settings.sbo_timeout_ms);
                 self.notify(SelectionChange {
                     conn_id,
                     is_selected: true,
@@ -365,16 +562,14 @@ impl ControlObject {
     ///
     /// A timer task does this on its own; a request calls it first so that a
     /// selection made without a tokio runtime also expires. Returns whether the
-    /// timeout fired. A configured timeout of 0 never fires.
+    /// timeout fired. A select timeout of 0 never fires.
     pub fn check_sbo_timeout(&self) -> bool {
-        let timeout_ms = self.config.sbo_timeout_ms;
-        if timeout_ms == 0 {
-            return false;
-        }
         let period = match self.inner.lock() {
-            Ok(g) => match (g.state, g.select_time) {
-                (ControlState::Ready, Some(t))
-                    if t.elapsed() >= Duration::from_millis(u64::from(timeout_ms)) =>
+            Ok(g) => match (g.state, g.select_time, g.active) {
+                (ControlState::Ready, Some(t), Some(active))
+                    if active.sbo_timeout_ms != 0
+                        && t.elapsed()
+                            >= Duration::from_millis(u64::from(active.sbo_timeout_ms)) =>
                 {
                     g.ready_period
                 }
@@ -385,10 +580,9 @@ impl ControlObject {
         self.expire_selection(period)
     }
 
-    /// Starts the timer that ends the ready period `period` once the select
-    /// timeout elapses, when a tokio runtime is available.
-    fn arm_select_timer(&self, period: u64) {
-        let timeout_ms = self.config.sbo_timeout_ms;
+    /// Starts the timer that ends the ready period `period` after `timeout_ms`,
+    /// when it is not 0 and a tokio runtime is available.
+    fn arm_select_timer(&self, period: u64, timeout_ms: u32) {
         if timeout_ms == 0 {
             return;
         }
@@ -415,11 +609,7 @@ impl ControlObject {
             }
             g.clear()
         };
-        tracing::warn!(
-            name = %self.config.name,
-            timeout_ms = self.config.sbo_timeout_ms,
-            "select timeout elapsed, deselecting"
-        );
+        tracing::warn!(name = %self.config.name, "select timeout elapsed, deselecting");
         self.notify(SelectionChange::ended(
             owner,
             SelectStateChangedReason::Timeout,
@@ -448,9 +638,10 @@ impl ControlObject {
         let mut g = self.inner.lock().map_err(|_| {
             ServerError::Protocol("ControlObject Mutex poisoned on begin_operate".into())
         })?;
+        let settings = self.settings_locked(&g);
 
         // A status-only object never accepts a control request.
-        if self.config.ctl_model == ControlModel::StatusOnly {
+        if settings.ctl_model == ControlModel::StatusOnly {
             tracing::warn!(name = %self.config.name, "operate refused: ctlModel is status-only");
             return Ok(Some(OperateBeginResult::Denied(
                 ControlAddCause::NotSupported,
@@ -470,7 +661,7 @@ impl ControlObject {
             )));
         }
 
-        if !self.is_sbo() {
+        if !settings.is_sbo() {
             // Direct control is idle in the unselected state.
             if g.state != ControlState::Unselected {
                 tracing::warn!(
@@ -484,6 +675,7 @@ impl ControlObject {
             }
             g.state = ControlState::WaitForExecution;
             g.owner_conn_id = conn_id;
+            g.active = Some(settings);
             g.last_oper_params = Some(params.clone());
             return Ok(Some(OperateBeginResult::Accepted));
         }
@@ -510,7 +702,7 @@ impl ControlObject {
                 ControlAddCause::LockedByOtherClient,
             )));
         }
-        if self.config.ctl_model == ControlModel::SboEnhanced {
+        if settings.ctl_model == ControlModel::SboEnhanced {
             // Enhanced security requires the parameters of the SelectWithValue.
             let consistent = g
                 .last_oper_params
@@ -551,15 +743,16 @@ impl ControlObject {
         if !g.state.is_executing() {
             return;
         }
-        if !self.is_sbo() {
+        let settings = self.settings_locked(&g);
+        if !settings.is_sbo() {
             g.clear();
             return;
         }
-        if self.config.sbo_class == SboClass::OperateMany && !g.owner_lost {
+        if settings.sbo_class == SboClass::OperateMany && !g.owner_lost {
             let owner = g.owner_conn_id;
-            let period = g.enter_ready(owner);
+            let period = g.enter_ready(owner, settings);
             drop(g);
-            self.arm_select_timer(period);
+            self.arm_select_timer(period, settings.sbo_timeout_ms);
             return;
         }
         let reason = if g.owner_lost {
@@ -593,10 +786,10 @@ impl ControlObject {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
-        let held = g.state != ControlState::Unselected;
+        let held = g.state != ControlState::Unselected && self.settings_locked(&g).is_sbo();
         let owner = g.clear();
         drop(g);
-        if held && self.is_sbo() {
+        if held {
             self.notify(SelectionChange::ended(owner, reason));
         }
     }
@@ -654,11 +847,12 @@ impl ControlObject {
             return Ok(Err(ControlAddCause::InconsistentParameters));
         }
 
-        let period = g.enter_ready(conn_id);
+        let settings = self.live_settings();
+        let period = g.enter_ready(conn_id, settings);
         g.last_oper_params = Some(params.clone());
         drop(g);
         tracing::debug!(name = %self.config.name, conn_id, "select-with-value accepted");
-        self.arm_select_timer(period);
+        self.arm_select_timer(period, settings.sbo_timeout_ms);
         self.notify(SelectionChange {
             conn_id,
             is_selected: true,
@@ -716,7 +910,7 @@ impl ControlObject {
             return CancelResult::Accepted;
         }
 
-        if !self.is_sbo() {
+        if !self.settings_locked(&g).is_sbo() {
             tracing::warn!(
                 name = %self.config.name,
                 "cancel refused: direct control has no selection to cancel"
@@ -853,6 +1047,7 @@ mod tests {
             ctl_model: model,
             sbo_timeout_ms: 5000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         }
     }
 
@@ -1343,6 +1538,7 @@ mod tests {
             ctl_model: ControlModel::DirectNormal,
             sbo_timeout_ms: 30000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         };
         let obj = ControlObject::new(config);
         // Formatting cannot panic, however long the names are.

@@ -17,7 +17,7 @@
 
 use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
 use super::model::{CancelParams, ControlAction, ControlAddCause, ControlModel, OperParams};
-use super::object::{CancelResult, ControlObject, OperateBeginResult};
+use super::object::{CancelResult, ControlObject, ControlSettings, OperateBeginResult};
 use bytes::{Bytes, BytesMut};
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
@@ -330,8 +330,10 @@ pub fn handle_read_sbo(
     // unselected again and a fresh select can succeed.
     obj.check_sbo_timeout();
 
+    let ctl_model = obj.settings().ctl_model;
+
     // A status-only object never accepts a control request.
-    if obj.config.ctl_model == ControlModel::StatusOnly {
+    if ctl_model == ControlModel::StatusOnly {
         tracing::warn!(
             name = %obj.config.name,
             "read SBO refused: the object is status-only"
@@ -340,10 +342,10 @@ pub fn handle_read_sbo(
     }
 
     // Only the normal-security select-before-operate model has an SBO attribute.
-    if obj.config.ctl_model != ControlModel::SboNormal {
+    if ctl_model != ControlModel::SboNormal {
         tracing::warn!(
             name = %obj.config.name,
-            ctl_model = ?obj.config.ctl_model,
+            ?ctl_model,
             "read SBO refused: the control model is not select-before-operate with normal security"
         );
         return None;
@@ -444,10 +446,11 @@ pub(crate) fn select_with_value(
 
     // SelectWithValue belongs to the enhanced-security select-before-operate
     // model alone; any other model answers unknown, IEC 61850-7-2 Table 47.
-    if obj.config.ctl_model != ControlModel::SboEnhanced {
+    let ctl_model = obj.settings().ctl_model;
+    if ctl_model != ControlModel::SboEnhanced {
         tracing::warn!(
             name = %obj.config.name,
-            ctl_model = ?obj.config.ctl_model,
+            ?ctl_model,
             "SBOw refused: the control model is not select-before-operate with enhanced security"
         );
         return Err(Refusal::by_check(ControlAddCause::Unknown));
@@ -567,6 +570,9 @@ pub async fn handle_operate(
 /// the object in ready or unselected.
 pub(crate) struct AcceptedOperate {
     obj: ControlObject,
+    /// The settings in force when the Operate was admitted, which the command
+    /// keeps however the configuration attributes change meanwhile.
+    settings: ControlSettings,
     conn_id: u64,
     action: ControlAction,
     params: OperParams,
@@ -658,6 +664,7 @@ pub(crate) fn admit_operate(
 
     Ok(AcceptedOperate {
         obj: obj.clone(),
+        settings: obj.settings(),
         conn_id,
         action,
         params,
@@ -672,7 +679,7 @@ impl AcceptedOperate {
     /// in a CommandTermination rather than in the Operate response.
     pub(crate) fn is_enhanced(&self) -> bool {
         matches!(
-            self.obj.config.ctl_model,
+            self.settings.ctl_model,
             ControlModel::DirectEnhanced | ControlModel::SboEnhanced
         )
     }
@@ -712,7 +719,7 @@ impl AcceptedOperate {
     }
 
     /// Runs the command once the Operate has been answered positively, limited
-    /// by the operate timeout of the object.
+    /// by the operate timeout in force when it was admitted.
     ///
     /// The object returns to ready or unselected according to the select class
     /// however the command ends.
@@ -727,7 +734,7 @@ impl AcceptedOperate {
         let command =
             self.operate_handler
                 .operate(&self.action, &self.params.ctl_val, self.params.test);
-        let result = match self.obj.oper_timeout_ms() {
+        let result = match self.settings.oper_timeout_ms {
             0 => command.await,
             timeout_ms => {
                 match tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), command)
@@ -907,7 +914,15 @@ mod tests {
             ctl_model: model,
             sbo_timeout_ms: 5000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         })
+    }
+
+    fn make_timed_obj(oper_timeout_ms: u32) -> ControlObject {
+        let mut config =
+            ControlObjectConfig::new("SPCSO1", "GGIO1", "IED1LD0", ControlModel::DirectEnhanced);
+        config.oper_timeout_ms = oper_timeout_ms;
+        ControlObject::new(config)
     }
 
     fn make_oper_value() -> MmsValue {
@@ -1397,8 +1412,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn oper_timeout_ends_the_command_exactly_at_the_limit() {
-        let obj = make_direct_obj(ControlModel::DirectEnhanced);
-        obj.set_oper_timeout_ms(100);
+        let obj = make_timed_obj(100);
         let accepted = accept(&obj, None, DelayedOperate(None));
         assert_eq!(accepted.dynamic_check().await, Ok(()));
         let started = tokio::time::Instant::now();
@@ -1413,8 +1427,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn oper_timeout_lets_a_command_within_the_limit_finish() {
-        let obj = make_direct_obj(ControlModel::DirectEnhanced);
-        obj.set_oper_timeout_ms(100);
+        let obj = make_timed_obj(100);
         let accepted = accept(
             &obj,
             None,
@@ -1427,7 +1440,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_oper_timeout_waits_for_the_command() {
         let obj = make_direct_obj(ControlModel::DirectEnhanced);
-        assert_eq!(obj.oper_timeout_ms(), 0);
+        assert_eq!(obj.settings().oper_timeout_ms, 0);
         let accepted = accept(
             &obj,
             None,

@@ -2751,8 +2751,10 @@ fn handle_read_with_co_routing(
                     // SBO exists only under the normal-security
                     // select-before-operate model, IEC 61850-8-1 Table 94, and
                     // only where the model declares it.
+                    entry.object.bind_model(ied_model);
                     if crate::control::dispatch::sbo_absent(ied_model, domain, ln, do_name)
-                        || entry.object.config.ctl_model != crate::control::ControlModel::SboNormal
+                        || entry.object.settings().ctl_model
+                            != crate::control::ControlModel::SboNormal
                     {
                         tracing::warn!(
                             domain,

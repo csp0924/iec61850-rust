@@ -673,8 +673,12 @@ async fn operate_on_a_current_thread_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oper_timeout_ends_the_command_with_time_limit_over() {
     let s = server();
-    let obj = object("SPCSO3", ControlModel::DirectEnhanced);
-    obj.set_oper_timeout_ms(20);
+    let obj = ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO3", "GGIO1", DOMAIN, ControlModel::DirectEnhanced);
+        config.oper_timeout_ms = 20;
+        config
+    });
     register(&s, obj.clone(), Arc::new(NeverDone));
     let h = start(&s).await;
     let mut a = connect(&h).await;

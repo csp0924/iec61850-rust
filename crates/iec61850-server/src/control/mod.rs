@@ -28,7 +28,9 @@ pub use model::{
     CancelParams, ControlAction, ControlAddCause, ControlLastApplError, ControlModel, OperParams,
     OriginValue, SboClass,
 };
-pub use object::{CancelResult, ControlObject, ControlObjectConfig, OperateBeginResult};
+pub use object::{
+    CancelResult, ControlObject, ControlObjectConfig, ControlSettings, OperateBeginResult,
+};
 pub use registry::{ControlObjectEntry, ControlObjectKey, ControlObjectsRegistry};
 pub use service::{
     handle_cancel, handle_operate, handle_read_sbo, handle_sbow, parse_co_item_id,

@@ -16,8 +16,10 @@
 
 use super::dispatch::ControlOutbox;
 use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
+use super::model::ControlModel;
 use super::object::ControlObject;
 use super::service::CommandTerminationSink;
+use iec61850_model::IedModel;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -198,6 +200,54 @@ impl ControlObjectsRegistry {
         was_new
     }
 
+    /// Registers a control object for every controllable data object of
+    /// `model`, bound to its configuration attributes, and returns how many it
+    /// registered.
+    ///
+    /// A data object is controllable when it declares `ctlModel` with a value
+    /// other than status-only. An entry already registered under the same key
+    /// is left as it is, handlers included. A new entry has no handlers: until
+    /// a control handler is installed, every Operate is refused with
+    /// `NotSupported`.
+    ///
+    /// ```ignore
+    /// registry.register_from_model(&model);
+    /// if let Some(entry) = registry.lookup("IED1LD0", "XCBR1", "Pos") {
+    ///     registry.register(entry.with_operate(handler));
+    /// }
+    /// ```
+    pub fn register_from_model(&self, model: &IedModel) -> usize {
+        let mut registered = 0;
+        for ld in &model.lds {
+            let domain = ld.domain_name(&model.ied_name);
+            for ln in &ld.lns {
+                let ln_name = ln.full_name();
+                for data_object in &ln.dos {
+                    let Some(object) =
+                        ControlObject::from_model(model, &domain, &ln_name, &data_object.name)
+                    else {
+                        continue;
+                    };
+                    if object.settings().ctl_model == ControlModel::StatusOnly {
+                        continue;
+                    }
+                    let key = ControlObjectKey::new(&domain, &ln_name, &data_object.name);
+                    let Ok(mut g) = self.inner.write() else {
+                        tracing::warn!(
+                            "control object registry lock poisoned, entries not registered"
+                        );
+                        return registered;
+                    };
+                    if let std::collections::hash_map::Entry::Vacant(slot) = g.entry(key) {
+                        slot.insert(ControlObjectEntry::new(object));
+                        registered += 1;
+                    }
+                }
+            }
+        }
+        registered
+    }
+
     /// Looks up one control object entry.
     pub fn lookup(&self, domain: &str, ln_name: &str, do_name: &str) -> Option<ControlObjectEntry> {
         let g = self.inner.read().ok()?;
@@ -246,6 +296,7 @@ mod tests {
             ctl_model: ControlModel::DirectNormal,
             sbo_timeout_ms: 5000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         })
     }
 
@@ -295,6 +346,7 @@ mod tests {
             ctl_model: ControlModel::SboNormal,
             sbo_timeout_ms: 5000,
             sbo_class: SboClass::OperateOnce,
+            oper_timeout_ms: 0,
         };
         let obj = ControlObject::new(obj_cfg);
         obj.try_select(99).unwrap();
