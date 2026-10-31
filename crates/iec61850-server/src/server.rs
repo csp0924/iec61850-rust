@@ -52,6 +52,10 @@ pub struct IedServer {
 
 struct IedServerInner {
     model: Arc<IedModel>,
+    /// The MMS view the built-in dispatcher serves, whose value lock an
+    /// update of several leaves holds so a read sees it whole; `None` with a
+    /// dispatcher the application supplied.
+    mms_view: Option<Arc<MmsDeviceModel>>,
     /// Start-up settings, including the association limit the accept loop
     /// enforces.
     #[allow(dead_code)]
@@ -613,6 +617,67 @@ impl IedServer {
         })
     }
 
+    /// Updates every element of an array data attribute from an
+    /// `MmsValue::Array`, and raises the report and log triggers of all of
+    /// them as one batch.
+    ///
+    /// `value` holds one element per element of `da`, each a structure of one
+    /// member per sub-attribute for an array of a constructed type, down to
+    /// leaves that each take a value of the variant they hold. The whole shape
+    /// is checked before any element changes. The elements are stored under
+    /// the value lock MMS reads take, so a client read sees the update whole
+    /// or not at all. Each leaf raises the triggers its trigger options declare
+    /// for its change, as an `update_*` call does, and the triggers go out
+    /// together: a report control block without a buffer time sends one
+    /// report holding every member the update changed. While the data model is
+    /// locked the triggers are deferred until it is released.
+    ///
+    /// One element is updated with the typed `update_*` methods on
+    /// [`DataAttribute::element`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeMismatch` when `da` is not an array, when `value` is not an
+    /// array of its element count, or when an element, a member or a leaf
+    /// value does not have the shape or the variant the attribute holds; no
+    /// element changes then.
+    pub fn update_array(&self, da: &DataAttribute, value: MmsValue) -> Result<()> {
+        if !da.is_array() {
+            return Err(ServerError::TypeMismatch {
+                path: da.name.clone(),
+                expected: "array attribute",
+                actual: "scalar attribute",
+            });
+        }
+        let mut leaves = Vec::new();
+        collect_update_leaves(da, value, &mut leaves)?;
+        let triggers = {
+            let _values = self
+                .inner
+                .mms_view
+                .as_ref()
+                .map(|view| crate::compat::rwlock_write(view.value_lock()));
+            let mut triggers = Vec::new();
+            for (leaf, new_value) in leaves {
+                let mut guard = leaf.value.write().map_err(|_| {
+                    ServerError::InvalidModel("DataAttribute value RwLock poisoned".into())
+                })?;
+                let flag = update_triggers(leaf.trg_ops, &guard, &new_value);
+                *guard = new_value.clone();
+                // A leaf that raises nothing goes along with no reason, so a
+                // member above several elements takes every value of the update.
+                triggers.push(PendingTrigger {
+                    cell: Arc::clone(&leaf.value),
+                    value: new_value,
+                    flag,
+                });
+            }
+            triggers
+        };
+        self.dispatch_triggers(triggers);
+        Ok(())
+    }
+
     /// Checks that the attribute currently holds the same variant as the new
     /// value, writes it, and raises the report and log triggers of the update.
     fn update_typed(
@@ -701,6 +766,12 @@ impl IedServer {
                 flag: update_triggers(leaf.trg_ops, &leaf.old, &leaf.new),
             })
             .collect();
+        self.dispatch_triggers(triggers);
+    }
+
+    /// Raises `triggers` as one batch, or defers them while the data model is
+    /// locked; nothing when none of them raises a reason.
+    fn dispatch_triggers(&self, triggers: Vec<PendingTrigger>) {
         if !triggers.iter().any(|t| t.flag.has_trigger()) {
             return;
         }
@@ -1513,6 +1584,51 @@ fn leaf_index_entries(ds: &Dataset) -> Vec<(usize, DataAttributeRef)> {
         .collect()
 }
 
+/// Pairs each leaf of `da` with its part of `value`, an array of one element
+/// per element of `da`, a structure of one member per sub-attribute of a
+/// constructed node, and a value of the variant a leaf holds.
+fn collect_update_leaves<'a>(
+    da: &'a DataAttribute,
+    value: MmsValue,
+    out: &mut Vec<(&'a DataAttribute, MmsValue)>,
+) -> Result<()> {
+    if da.is_leaf() {
+        let held = mms_value_variant_name(&da.snapshot());
+        let given = mms_value_variant_name(&value);
+        if held != given {
+            return Err(ServerError::TypeMismatch {
+                path: da.name.clone(),
+                expected: held,
+                actual: given,
+            });
+        }
+        out.push((da, value));
+        return Ok(());
+    }
+    let (expected, members) = match value {
+        MmsValue::Array(members) if da.is_array() => ("Array", members),
+        MmsValue::Structure(members) if !da.is_array() => ("Structure", members),
+        other => {
+            return Err(ServerError::TypeMismatch {
+                path: da.name.clone(),
+                expected: if da.is_array() { "Array" } else { "Structure" },
+                actual: mms_value_variant_name(&other),
+            })
+        }
+    };
+    if members.len() != da.children.len() {
+        return Err(ServerError::TypeMismatch {
+            path: da.name.clone(),
+            expected,
+            actual: "another member count",
+        });
+    }
+    for (child, member) in da.children.iter().zip(members) {
+        collect_update_leaves(child, member, out)?;
+    }
+    Ok(())
+}
+
 /// An attribute update whose report and log triggers are still to be raised.
 /// One with no reason carries only its value, for the members above it.
 struct PendingTrigger {
@@ -1861,6 +1977,7 @@ impl IedServerBuilder<Bound> {
         let server = IedServer {
             inner: Arc::new(IedServerInner {
                 model,
+                mms_view: written_view.clone(),
                 config: self.config,
                 bind_addr,
                 connections: RwLock::new(HashMap::new()),
@@ -1972,6 +2089,93 @@ mod tests {
     #[test]
     fn builder_type_state_compiles() {
         let _server = test_server();
+    }
+
+    /// An array update stores every element under the value lock: while one
+    /// element is held, the elements before it are stored and no read can take
+    /// the lock, so none sees part of the update.
+    #[test]
+    fn array_update_stores_every_element_under_the_value_lock() {
+        use iec61850_model::{DataAttribute, DataAttributeType, DataObjectBuilder, DoChild};
+        let element = DataAttribute::new(
+            "vals",
+            FC::Sp,
+            DataAttributeType::Int32,
+            TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        let arr = DataObjectBuilder::scalar("Arr")
+            .add_da_node(DataAttribute::array(element, 2).expect("array"))
+            .build()
+            .expect("data object");
+        let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(arr)
+            .build()
+            .expect("ggio");
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().expect("lln0"))
+            .add_ln(ggio)
+            .build()
+            .expect("ld");
+        let model = Arc::new(
+            IedModelBuilder::new("TEST")
+                .add_ld(ld)
+                .expect("add_ld")
+                .build()
+                .expect("model"),
+        );
+        let server = IedServer::builder()
+            .model(Arc::clone(&model))
+            .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .build()
+            .expect("server");
+        let vals = || match model.lds[0].lns[1].dos[0].child_by_name("vals", None) {
+            Some(DoChild::Da(da)) => da,
+            _ => panic!("vals is an attribute"),
+        };
+        let view = server
+            .inner
+            .mms_view
+            .clone()
+            .expect("the built-in dispatcher");
+        let hold = vals().element(1).expect("element 1").value.read().unwrap();
+
+        let writer = std::thread::spawn({
+            let server = server.clone();
+            let model = Arc::clone(&model);
+            move || {
+                let Some(DoChild::Da(vals)) =
+                    model.lds[0].lns[1].dos[0].child_by_name("vals", None)
+                else {
+                    panic!("vals is an attribute");
+                };
+                server.update_array(
+                    vals,
+                    MmsValue::Array(vec![MmsValue::Integer(1), MmsValue::Integer(2)]),
+                )
+            }
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while vals().element(0).expect("element 0").snapshot() != MmsValue::Integer(1) {
+            assert!(
+                Instant::now() < deadline,
+                "the first element is never stored"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            view.value_lock().try_read().is_err(),
+            "the update holds the value lock across its elements"
+        );
+
+        drop(hold);
+        writer.join().unwrap().expect("update_array");
+        assert!(view.value_lock().try_read().is_ok());
+        assert_eq!(
+            vals().snapshot(),
+            MmsValue::Array(vec![MmsValue::Integer(1), MmsValue::Integer(2)])
+        );
     }
 
     // ── Buffered report control block registration ──────────────────────

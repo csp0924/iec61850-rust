@@ -4,7 +4,8 @@
 //! read returns (IEC 61850-8-1 §8.1.2.7, §24.2.2.4.1.2 Table 138). The model is
 //! served on a loopback association and driven with the MMS client, so each
 //! assertion covers the parser, the model builder and the MMS projection
-//! together.
+//! together. An array updated whole through the server raises the report
+//! triggers of its elements as one batch.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ const SCL: &str = r#"<SCL>
     <LNodeType id="MHAI_T" lnClass="MHAI"><DO name="HA" type="HWYE_T"/></LNodeType>
     <DOType id="ENC_T" cdc="ENC"><DA name="stVal" fc="ST" bType="BOOLEAN"/></DOType>
     <DOType id="ARR_T" cdc="HST">
-      <DA name="hstVal" fc="ST" bType="INT32" count="3"/>
+      <DA name="hstVal" fc="ST" bType="INT32" count="3" dchg="true"/>
       <DA name="setVals" fc="SP" bType="INT32" count="4"/>
       <DA name="pts" fc="SP" bType="Struct" type="PT_T" count="3"/>
       <DA name="cfg" fc="SP" bType="Struct" type="CFG_T"/>
@@ -843,4 +844,229 @@ async fn array_settings_follow_the_active_group() {
         MmsData::Array(vec![point(0.0, 2.5), point(0.0, 0.0)])
     );
     assert_eq!(vals_back, ints(&[0, 10, 0]));
+}
+
+/// A running server on `model()` whose BRCB `brcbHst` reports the elements 0
+/// and 2 of `GGIO1.Arr.hstVal` on a data change, with no buffer time, so one
+/// report per trigger batch, to an MMS association that enabled it.
+async fn start_reporting() -> (IedServer, ServerHandle, MmsClient) {
+    use iec61850_server::reporting::{Brcb, BufferedReportControl};
+    use iec61850_server::{Dataset, DatasetEntry, OptFlds, TriggerOptions};
+
+    let server = IedServer::builder()
+        .model(model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .build()
+        .expect("build server");
+    let model = server.model();
+    let mut ds = Dataset::new("LLN0$dsHst");
+    for index in [0, 2] {
+        let reference = format!("{DOMAIN}/GGIO1$ST$Arr$hstVal({index})");
+        let Some(NodeRef::Da(da)) =
+            model.node_by_object_ref(&ObjectRef::parse(&reference).unwrap())
+        else {
+            panic!("{reference} is an element");
+        };
+        ds.push(DatasetEntry::new(reference.clone(), Arc::clone(&da.value)));
+    }
+    let brcb = Brcb::new("brcbHst", "LLN0$dsHst")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_opt_flds(OptFlds::REASON | OptFlds::DATA_SET);
+    server
+        .register_brcb(
+            BufferedReportControl::new(format!("{DOMAIN}/LLN0$BR$brcbHst"), brcb),
+            ds,
+        )
+        .expect("register_brcb");
+    let handle = server.start().await.expect("start");
+    let mut client = connect_to(&handle).await;
+    write(
+        &mut client,
+        "LLN0$BR$brcbHst$RptEna",
+        MmsData::Boolean(true),
+    )
+    .await
+    .expect("enable the control block");
+    (server, handle, client)
+}
+
+async fn connect_to(handle: &ServerHandle) -> MmsClient {
+    let mut client = MmsClientBuilder::new()
+        .connect_timeout_ms(3_000)
+        .request_timeout_ms(3_000)
+        .build();
+    client
+        .connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+    client
+}
+
+/// The inclusion bitmap and the values of the next report; fails after four
+/// seconds without one.
+async fn next_report(client: &mut MmsClient) -> (Vec<bool>, Vec<MmsValue>) {
+    use iec61850_client::mms_compat::mms_data_to_mms_value;
+    use iec61850_client::report::parse::parse_report;
+    use iec61850_mms::mms::pdu::information_report::{
+        decode_information_report, VariableAccessSpec,
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "no report arrived");
+        let Some(inner) = client
+            .recv_unconfirmed_pdu_with_timeout(remaining)
+            .await
+            .expect("receive")
+        else {
+            continue;
+        };
+        let report = decode_information_report(&inner).expect("decode information report");
+        if !matches!(
+            &report.variable_access_spec,
+            VariableAccessSpec::VariableListName(ObjectName::VmdSpecific(s)) if s == "RPT"
+        ) {
+            continue;
+        }
+        let elements = report
+            .list_of_access_result
+            .iter()
+            .map(mms_data_to_mms_value)
+            .collect();
+        let parsed = parse_report(&MmsValue::Array(elements)).expect("parse report");
+        return (parsed.inclusion_bits, parsed.data_values);
+    }
+}
+
+/// `GGIO1.Arr.hstVal` of the model `server` serves.
+fn with_hst_val<R>(server: &IedServer, f: impl FnOnce(&iec61850_model::DataAttribute) -> R) -> R {
+    let model = server.model();
+    let r = ObjectRef::parse(&format!("{DOMAIN}/GGIO1$ST$Arr$hstVal")).unwrap();
+    match model.node_by_object_ref(&r) {
+        Some(NodeRef::Da(da)) => f(da),
+        _ => panic!("hstVal is an attribute"),
+    }
+}
+
+/// An update of a whole array stores every element and goes out as one
+/// report holding every member it changed; an update of one element is
+/// reported with that element alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_array_update_is_reported_as_one_batch() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle, mut client) = start_reporting().await;
+
+        with_hst_val(&server, |hst| {
+            server.update_array(
+                hst,
+                MmsValue::Array(vec![
+                    MmsValue::Integer(1),
+                    MmsValue::Integer(7),
+                    MmsValue::Integer(3),
+                ]),
+            )
+        })
+        .expect("update_array");
+        assert_eq!(
+            next_report(&mut client).await,
+            (
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(3)]
+            )
+        );
+        assert_eq!(
+            read(&mut client, "GGIO1$ST$Arr$hstVal").await,
+            ints(&[1, 7, 3])
+        );
+
+        with_hst_val(&server, |hst| {
+            server.update_int32(hst.element(2).unwrap(), 9)
+        })
+        .expect("update one element");
+        assert_eq!(
+            next_report(&mut client).await,
+            (vec![false, true], vec![MmsValue::Integer(9)])
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// While the data model is locked, the triggers of an array update wait for
+/// the release and then go out as one report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_array_update_under_the_model_lock_is_reported_on_release() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle, mut client) = start_reporting().await;
+
+        let guard = server.lock_data_model().expect("lock the data model");
+        with_hst_val(&server, |hst| {
+            server.update_array(
+                hst,
+                MmsValue::Array(vec![
+                    MmsValue::Integer(4),
+                    MmsValue::Integer(7),
+                    MmsValue::Integer(6),
+                ]),
+            )
+        })
+        .expect("update_array");
+        drop(guard);
+        assert_eq!(
+            next_report(&mut client).await,
+            (
+                vec![true, true],
+                vec![MmsValue::Integer(4), MmsValue::Integer(6)]
+            )
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// An array update of another element count or element variant, or on an
+/// attribute that is not an array, is refused and changes no element.
+#[test]
+fn an_array_update_of_another_shape_changes_nothing() {
+    let server = IedServer::builder()
+        .model(model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .build()
+        .expect("build server");
+    with_hst_val(&server, |hst| {
+        for bad in [
+            MmsValue::Array(vec![MmsValue::Integer(1), MmsValue::Integer(2)]),
+            MmsValue::Array(vec![
+                MmsValue::Integer(1),
+                MmsValue::Float32(2.0),
+                MmsValue::Integer(3),
+            ]),
+            MmsValue::Structure(vec![MmsValue::Integer(1); 3]),
+        ] {
+            assert!(
+                matches!(
+                    server.update_array(hst, bad.clone()),
+                    Err(iec61850_server::ServerError::TypeMismatch { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            server.update_array(hst.element(0).unwrap(), MmsValue::Array(vec![])),
+            Err(iec61850_server::ServerError::TypeMismatch { .. })
+        ));
+        assert_eq!(
+            hst.snapshot(),
+            MmsValue::Array(vec![
+                MmsValue::Integer(0),
+                MmsValue::Integer(7),
+                MmsValue::Integer(0)
+            ])
+        );
+    });
 }
