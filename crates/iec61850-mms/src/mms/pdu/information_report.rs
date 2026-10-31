@@ -497,7 +497,9 @@ mod tests {
     /// A byte-exact minimal InformationReport with domain "D", item "A" and an
     /// AccessResult of `0xa2 0x00`, an empty structure.
     ///
-    /// The expected bytes carry exactly three nested tags. An encoder that adds two
+    /// The expected bytes are the BER encoding of the ISO 9506-2
+    /// InformationReport written out by hand; they carry exactly three nested
+    /// tags. An encoder that adds two
     /// more `0xa0` wrappers produces a report peers cannot parse, so this test pins
     /// the nesting down.
     #[test]
@@ -507,7 +509,7 @@ mod tests {
         let pdu = encode_command_termination_positive("D", "A", oper_bytes);
 
         #[rustfmt::skip]
-        let oracle: &[u8] = &[
+        let expected: &[u8] = &[
             // 0xa3 <total=20> outer unconfirmedPDU
             0xa3, 0x14,
               // 0xa0 <body=18>, service merged with informationReport
@@ -530,7 +532,7 @@ mod tests {
 
         assert_eq!(
             pdu.as_ref(),
-            oracle,
+            expected,
             "the InformationReport must keep exactly three nested tags"
         );
     }
@@ -609,13 +611,14 @@ mod tests {
     /// The decoder must parse the byte-exact positive command termination above and
     /// recover the domain-specific name plus a listOfAccessResult of one empty structure.
     #[test]
-    fn decode_ct_positive_byte_exact_oracle() {
+    fn decode_ct_positive_byte_exact() {
         let oper_bytes = Bytes::from_static(&[0xa2, 0x00]);
         let pdu = encode_command_termination_positive("D", "A", oper_bytes);
 
         // strip the outer 0xa3 and its short-form length
         let inner = &pdu[2..];
-        let parsed = decode_information_report(inner).expect("decode CT+ oracle");
+        let parsed =
+            decode_information_report(inner).expect("decode the positive CommandTermination");
         match parsed.variable_access_spec {
             VariableAccessSpec::ListOfVariable(names) => {
                 assert_eq!(names.len(), 1);

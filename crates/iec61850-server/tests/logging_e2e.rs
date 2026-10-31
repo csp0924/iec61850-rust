@@ -605,30 +605,3 @@ async fn a_journal_page_stops_visiting_once_the_pdu_is_full() {
     c.disconnect().await.ok();
     h.stop().await;
 }
-
-/// Serves a journal of fresh entries on 0.0.0.0:18103 for thirty seconds, for
-/// a third-party client to read.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn serve_journal_for_an_external_client() {
-    let m = model();
-    let srv = IedServer::builder()
-        .model(m.clone())
-        .bind("0.0.0.0:18103".parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig::default())
-        .build()
-        .unwrap();
-    register_data_set(&srv, &m);
-    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
-    register_lcb(
-        &srv,
-        lcb(TriggerOptions::DATA_CHANGED.union(TriggerOptions::QUALITY_CHANGED)),
-        storage,
-        true,
-    );
-    srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
-    srv.update_boolean(ggio_da(&m, 0, 1), true).unwrap();
-    let h = srv.start().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-    h.stop().await;
-}

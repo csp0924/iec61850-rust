@@ -142,9 +142,8 @@ fn setting_sg(model: &IedModel) -> &DataAttribute {
     }
 }
 
-/// The sequence of the upstream setting group example: the group edited and
-/// committed while another group is active reads its committed value once it
-/// is selected, and keeps it across later selections.
+/// A group edited and committed while another group is active reads its
+/// committed value once it is selected, and keeps it across later selections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_committed_group_reads_its_values_once_selected() {
     let handle = build_server().start().await.expect("start");
