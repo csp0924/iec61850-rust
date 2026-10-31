@@ -30,6 +30,25 @@ SCL) written from the published standards. See the workspace
 [conformance statement](https://github.com/csp0924/iec61850-rust/blob/main/docs/PICS.md)
 for exactly which ACSI services are implemented.
 
+## Compatibility
+
+A libiec61850 TLS client built with mbedtls 3.6.0 closes the connection when
+it receives a TLS 1.3 session ticket; mbedtls 3.6.1 and later fix this. A
+server built by `TlsConfigBuilder` therefore sends no TLS 1.3 session ticket
+by default: TLS 1.3 sessions do not resume, and TLS 1.2 session ID resumption
+keeps working. `tls13_session_tickets(n)` sends `n` tickets after each
+handshake and lets TLS 1.3 sessions resume; leave it unset while such clients
+connect.
+
+The same clients, built with any mbedtls 3.6 release up to at least 3.6.7,
+also close the connection when they receive a TLS 1.3 KeyUpdate. rustls sends
+one on its own once a TLS 1.3 connection has sent 2^24 (16,777,216) records
+under one key, following the AES-GCM usage limits of RFC 8446 §5.5, and no
+configuration setting turns this off. A long-lived association from such a
+client is therefore dropped after the server has sent that many records, about
+46 hours at 100 records per second, and the client has to reconnect. Over TLS
+1.2, rustls closes the connection at the same count instead.
+
 ## The iec61850-* family
 
 All crates are layers of one workspace, versioned and released together.
