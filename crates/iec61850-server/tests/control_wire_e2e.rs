@@ -1159,6 +1159,114 @@ async fn closing_the_association_ends_its_selection() {
     h.stop().await;
 }
 
+// ── A handler that panics ──────────────────────────────────────────────────
+
+/// Control handler that panics while it executes.
+struct PanickingOperate;
+
+impl ControlHandler for PanickingOperate {
+    fn operate<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        _v: &'a MmsValue,
+        _t: bool,
+    ) -> OperateFuture<'a> {
+        Box::pin(async { panic!("control handler failure") })
+    }
+}
+
+/// Dynamic check that panics.
+struct PanickingCheck;
+
+impl WaitForExecutionHandler for PanickingCheck {
+    fn wait_for_execution<'a>(
+        &'a self,
+        _a: &'a ControlAction,
+        _v: &'a MmsValue,
+        _t: bool,
+        _s: bool,
+    ) -> WaitForExecFuture<'a> {
+        Box::pin(async { panic!("dynamic check failure") })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_control_handler_ends_the_command_negatively() {
+    let s = server();
+    let obj = object("SPCSO3", ControlModel::DirectEnhanced);
+    register(&s, obj.clone(), Arc::new(PanickingOperate));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 101))
+        .await
+        .expect("answered positively");
+    let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 2, "a negative termination");
+    let MmsData::Structure(lae) = &values[0] else {
+        panic!("LastApplError is not a structure")
+    };
+    assert_eq!(lae[1], MmsData::Integer(1), "Error Unknown");
+    assert_eq!(lae[3], MmsData::Unsigned(101));
+    assert_eq!(lae[4], MmsData::Integer(0), "AddCause Unknown");
+    assert_eq!(obj.state(), ControlState::Unselected);
+
+    // The object accepts the next command instead of answering 12.
+    a.write(DOMAIN, "GGIO1$CO$SPCSO3$Oper", oper(on(), 102))
+        .await
+        .expect("answered positively");
+    next_report(&mut a, WAIT).await.expect("CommandTermination");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_handler_under_normal_security_ends_the_selection() {
+    let s = server();
+    let obj = object("SPCSO2", ControlModel::SboNormal);
+    let mut changes = observe(&obj);
+    register(&s, obj.clone(), Arc::new(PanickingOperate));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("select");
+    a.write(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 103))
+        .await
+        .expect("answered positively");
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Selected
+    );
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::OperateDone
+    );
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_dynamic_check_answers_the_operate_negatively() {
+    let s = server();
+    let obj = object("SPCSO1", ControlModel::DirectNormal);
+    s.control_objects().register(
+        ControlObjectEntry::new(obj.clone())
+            .with_wait(Arc::new(PanickingCheck) as Arc<dyn WaitForExecutionHandler>)
+            .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>),
+    );
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO1$Oper", oper(on(), 104))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_eq!(lae[1], MmsData::Integer(1), "Error Unknown");
+    assert_eq!(lae[4], MmsData::Integer(0), "AddCause Unknown");
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
 // ── TimeActivatedOperate ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1139,6 +1139,7 @@ where
         ConnectionTerminationEvent::Negative {
             obj_ref,
             add_cause,
+            error,
             oper_value,
         } => {
             tracing::debug!(
@@ -1150,7 +1151,7 @@ where
             let echoed = echoed_oper(oper_value);
             let last_err = LastApplErrorRef {
                 ctl_obj: format!("{}/{}", domain_id, item_id),
-                error: crate::control::dispatch::termination_error_code(echoed.test) as i32,
+                error: *error as i32,
                 origin: echoed.origin,
                 ctl_num: echoed.ctl_num,
                 add_cause: cause_to_i32(*add_cause),
@@ -1191,12 +1192,11 @@ fn deferrable_write(response: &[u8], deferred: &[u64]) -> Option<u32> {
 }
 
 /// The members of an echoed Oper structure the LastApplError of a negative
-/// command termination depends on.
+/// command termination carries.
 #[derive(Default)]
 struct EchoedOper {
     origin: OriginRef,
     ctl_num: u8,
-    test: bool,
 }
 
 /// Decodes the Oper structure a command termination echoes; a structure that
@@ -1216,7 +1216,6 @@ fn echoed_oper(oper_value: &[u8]) -> EchoedOper {
                 or_ident: p.origin.or_ident,
             },
             ctl_num: p.ctl_num,
-            test: p.test,
         },
         None => {
             tracing::warn!("command termination: the echoed Oper structure did not decode");

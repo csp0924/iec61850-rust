@@ -381,18 +381,30 @@ fn operate(
     };
 
     let ct_sink = registry.ct_sink().clone();
+    let accepted = accepted.with_ct_sink(ct_sink.clone());
     let cntrl_obj = target.cntrl_obj();
     if !accepted.has_dynamic_check() {
         // Without a dynamic check the Operate is answered positively at once.
+        accepted.mark_answered();
         runtime.spawn(run_answered(accepted, ct_sink, cntrl_obj));
         return CoWriteResult::Accepted;
     }
 
-    let deferral = outbox.defer(conn_id);
+    let reply = outbox.defer(conn_id).map(|(id, tx)| DeferredReply {
+        id,
+        tx: Some(tx),
+        last_appl_error: encode_last_appl_error(
+            &cntrl_obj,
+            &origin_ref(&origin),
+            ctl_num,
+            Refusal::internal(),
+        ),
+        termination: accepted.negative_termination(ControlAddCause::Unknown, true),
+    });
     runtime.spawn(async move {
         let checked = accepted.dynamic_check().await;
-        match deferral {
-            Some((id, tx)) => {
+        match reply {
+            Some(reply) => {
                 let (outcome, last_appl_error, termination) = match checked {
                     Ok(()) => (WriteOutcome::Success, None, None),
                     Err(cause) => (
@@ -403,18 +415,16 @@ fn operate(
                             ctl_num,
                             Refusal::by_check(cause),
                         )),
-                        accepted.negative_termination(cause),
+                        accepted.negative_termination(cause, false),
                     ),
                 };
-                if tx
-                    .send(DeferredWrite {
-                        id,
-                        outcome,
-                        last_appl_error,
-                        termination,
-                    })
-                    .is_err()
-                {
+                let id = reply.id;
+                if !reply.send(DeferredWrite {
+                    id,
+                    outcome,
+                    last_appl_error,
+                    termination,
+                }) {
                     tracing::warn!(
                         cntrl_obj,
                         "operate response undeliverable: the connection has closed"
@@ -433,10 +443,47 @@ fn operate(
             }
         }
         if checked.is_ok() {
+            accepted.mark_answered();
             run_answered(accepted, ct_sink, cntrl_obj).await;
         }
     });
     CoWriteResult::Accepted
+}
+
+/// The pending answer of a deferred write.
+///
+/// Dropped unanswered, as when the dynamic check panics, it answers the write
+/// negatively as an internal failure of the server: `LastApplError` with
+/// `Unknown`, and the negative CommandTermination of an enhanced-security
+/// command whose write was already answered.
+struct DeferredReply {
+    id: u64,
+    tx: Option<mpsc::UnboundedSender<DeferredWrite>>,
+    last_appl_error: Bytes,
+    termination: Option<ConnectionTerminationEvent>,
+}
+
+impl DeferredReply {
+    /// Posts the outcome; returns whether the connection is still there to
+    /// receive it.
+    fn send(mut self, done: DeferredWrite) -> bool {
+        self.tx.take().is_some_and(|tx| tx.send(done).is_ok())
+    }
+}
+
+impl Drop for DeferredReply {
+    fn drop(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        tracing::warn!("operate ended before its dynamic check finished, answering negatively");
+        let _ = tx.send(DeferredWrite {
+            id: self.id,
+            outcome: WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+            last_appl_error: Some(self.last_appl_error.clone()),
+            termination: self.termination.take(),
+        });
+    }
 }
 
 /// Runs an Operate that has been answered positively and reports its outcome:
@@ -511,15 +558,13 @@ pub(crate) fn last_appl_error_code(refusal: Refusal) -> ControlLastApplError {
 
 /// Returns the `Error` member of the LastApplError of a negative
 /// CommandTermination, which ends a command that failed after its Operate was
-/// answered positively.
+/// answered positively, unless the server failed internally.
 ///
 /// A failed operate test command, one whose `Test` is set, carries `Operator
 /// Test Not OK`, per IEC 61850-8-1 §20.11. Any other command carries `No
 /// Error`, since its failure is the outcome its add cause describes. A
 /// time-activated command is never admitted, so `Timeout Test Not OK` does not
 /// occur.
-// Only the connection loop of the integrated server sends a CommandTermination.
-#[cfg_attr(not(feature = "full-server"), allow(dead_code))]
 pub(crate) fn termination_error_code(test: bool) -> ControlLastApplError {
     if test {
         ControlLastApplError::OperatorTestNotOk

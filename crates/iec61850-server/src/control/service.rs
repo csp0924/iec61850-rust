@@ -16,11 +16,14 @@
 //! routed through the `CommandTerminationSink` trait instead of the request path.
 
 use super::handler::{CheckHandler, ControlHandler, WaitForExecutionHandler};
-use super::model::{CancelParams, ControlAction, ControlAddCause, ControlModel, OperParams};
+use super::model::{
+    CancelParams, ControlAction, ControlAddCause, ControlLastApplError, ControlModel, OperParams,
+};
 use super::object::{CancelResult, ControlObject, ControlSettings, OperateBeginResult};
 use bytes::{Bytes, BytesMut};
 use iec61850_model::MmsValue;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -40,12 +43,14 @@ pub trait CommandTerminationSink: Send + Sync {
     /// `oper_value` is the encoded Oper structure the client sent, which the client
     /// decodes back into the Operate parameters when it receives the report.
     fn send_positive(&self, obj_ref: &str, conn_id: u64, oper_value: Bytes);
-    /// Sends a negative CommandTermination, carrying the cause of the failure.
+    /// Sends a negative CommandTermination, carrying the cause of the failure
+    /// and the `Error` member of its LastApplError.
     fn send_negative(
         &self,
         obj_ref: &str,
         conn_id: u64,
         add_cause: ControlAddCause,
+        error: ControlLastApplError,
         oper_value: Bytes,
     );
 }
@@ -61,6 +66,7 @@ impl CommandTerminationSink for NoOpCommandTermination {
         _obj_ref: &str,
         _conn_id: u64,
         _add_cause: ControlAddCause,
+        _error: ControlLastApplError,
         _oper_value: Bytes,
     ) {
     }
@@ -94,6 +100,8 @@ pub enum TerminationEvent {
         conn_id: u64,
         /// Cause reported to the client.
         add_cause: ControlAddCause,
+        /// `Error` member of the LastApplError.
+        error: ControlLastApplError,
         /// Encoded Oper structure.
         oper_value: Bytes,
     },
@@ -125,6 +133,8 @@ pub enum ConnectionTerminationEvent {
         obj_ref: String,
         /// Cause reported to the client.
         add_cause: ControlAddCause,
+        /// `Error` member of the LastApplError.
+        error: ControlLastApplError,
         /// Encoded Oper structure, which becomes the second AccessResult of the
         /// InformationReport.
         oper_value: Bytes,
@@ -227,6 +237,7 @@ impl CommandTerminationSink for ChannelCommandTermination {
         obj_ref: &str,
         conn_id: u64,
         add_cause: ControlAddCause,
+        error: ControlLastApplError,
         oper_value: Bytes,
     ) {
         self.dispatch(
@@ -234,6 +245,7 @@ impl CommandTerminationSink for ChannelCommandTermination {
             ConnectionTerminationEvent::Negative {
                 obj_ref: obj_ref.to_string(),
                 add_cause,
+                error,
                 oper_value,
             },
         );
@@ -255,6 +267,7 @@ impl CommandTerminationSink for RecordingCommandTermination {
         obj_ref: &str,
         conn_id: u64,
         add_cause: ControlAddCause,
+        error: ControlLastApplError,
         oper_value: Bytes,
     ) {
         if let Ok(mut g) = self.events.lock() {
@@ -262,6 +275,7 @@ impl CommandTerminationSink for RecordingCommandTermination {
                 obj_ref: obj_ref.into(),
                 conn_id,
                 add_cause,
+                error,
                 oper_value,
             });
         }
@@ -555,6 +569,7 @@ pub async fn handle_operate(
     if let Err(cause) = accepted.dynamic_check().await {
         return ServiceResult::Failure(cause);
     }
+    accepted.mark_answered();
     let result = accepted.run().await;
     accepted.terminate(ct_sink, result);
     match result {
@@ -568,6 +583,12 @@ pub async fn handle_operate(
 /// The object is in `WaitForExecution`. `dynamic_check` decides the Operate
 /// response; after a positive response `run` carries the command out and leaves
 /// the object in ready or unselected.
+///
+/// Dropping a command that has not finished, as when a handler panics,
+/// restores the object: one not yet answered returns to unselected, and one
+/// answered positively ends as a failed command, with a negative
+/// CommandTermination carrying `Unknown` under enhanced security when a sink
+/// is attached.
 pub(crate) struct AcceptedOperate {
     obj: ControlObject,
     /// The settings in force when the Operate was admitted, which the command
@@ -579,7 +600,19 @@ pub(crate) struct AcceptedOperate {
     oper_value: Bytes,
     wait_handler: Option<Arc<dyn WaitForExecutionHandler>>,
     operate_handler: Arc<dyn ControlHandler>,
+    /// Where an unfinished command dropped after its positive response reports
+    /// its end.
+    ct_sink: Option<Arc<dyn CommandTerminationSink>>,
+    /// How far the command has come: `ADMITTED`, `ANSWERED` or `FINISHED`.
+    phase: AtomicU8,
 }
+
+/// The command awaits its dynamic check and its Operate response.
+const ADMITTED: u8 = 0;
+/// The command was answered positively and is to run.
+const ANSWERED: u8 = 1;
+/// The command finished, or was refused or abandoned.
+const FINISHED: u8 = 2;
 
 /// Admits an Operate whose parameters have been parsed: the state machine, the
 /// parameter checks, and the static check handler.
@@ -671,10 +704,25 @@ pub(crate) fn admit_operate(
         oper_value: encode_mms_value_to_bytes(raw_value),
         wait_handler: wait_handler.cloned(),
         operate_handler: operate_handler.clone(),
+        ct_sink: None,
+        phase: AtomicU8::new(ADMITTED),
     })
 }
 
 impl AcceptedOperate {
+    /// Attaches the sink an unfinished command dropped after its positive
+    /// response reports its end through.
+    pub(crate) fn with_ct_sink(mut self, ct_sink: Arc<dyn CommandTerminationSink>) -> Self {
+        self.ct_sink = Some(ct_sink);
+        self
+    }
+
+    /// Records that the Operate was answered positively, so the command is to
+    /// run.
+    pub(crate) fn mark_answered(&self) {
+        self.phase.store(ANSWERED, Ordering::Release);
+    }
+
     /// Returns whether the object uses enhanced security, whose result travels
     /// in a CommandTermination rather than in the Operate response.
     pub(crate) fn is_enhanced(&self) -> bool {
@@ -713,6 +761,7 @@ impl AcceptedOperate {
             .await;
         if let Err(cause) = outcome {
             tracing::warn!(name = %self.obj.config.name, ?cause, "operate refused by the dynamic check");
+            self.phase.store(FINISHED, Ordering::Release);
             self.obj.abort_to_unselected();
         }
         outcome
@@ -753,6 +802,7 @@ impl AcceptedOperate {
             }
         };
         // Return to ready or unselected according to the select class.
+        self.phase.store(FINISHED, Ordering::Release);
         self.obj.finish_operate();
 
         match result {
@@ -764,16 +814,30 @@ impl AcceptedOperate {
         result
     }
 
+    /// Returns the `Error` member of the LastApplError that ends this command
+    /// negatively: `Unknown` for an internal failure of the server, otherwise
+    /// as `termination_error_code` decides from `Test`.
+    fn termination_error(&self, internal: bool) -> ControlLastApplError {
+        if internal {
+            ControlLastApplError::Unknown
+        } else {
+            super::dispatch::termination_error_code(self.params.test)
+        }
+    }
+
     /// Returns the negative CommandTermination that ends this command with
-    /// `cause` under enhanced security, or `None` under normal security.
+    /// `cause` under enhanced security, or `None` under normal security;
+    /// `internal` marks an internal failure of the server.
     pub(crate) fn negative_termination(
         &self,
         cause: ControlAddCause,
+        internal: bool,
     ) -> Option<ConnectionTerminationEvent> {
         self.is_enhanced()
             .then(|| ConnectionTerminationEvent::Negative {
                 obj_ref: self.obj.object_ref(),
                 add_cause: cause,
+                error: self.termination_error(internal),
                 oper_value: self.oper_value.clone(),
             })
     }
@@ -791,8 +855,43 @@ impl AcceptedOperate {
         let obj_ref = self.obj.object_ref();
         match result {
             Ok(()) => ct_sink.send_positive(&obj_ref, self.conn_id, self.oper_value.clone()),
-            Err(cause) => {
-                ct_sink.send_negative(&obj_ref, self.conn_id, cause, self.oper_value.clone())
+            Err(cause) => ct_sink.send_negative(
+                &obj_ref,
+                self.conn_id,
+                cause,
+                self.termination_error(false),
+                self.oper_value.clone(),
+            ),
+        }
+    }
+}
+
+impl Drop for AcceptedOperate {
+    fn drop(&mut self) {
+        match *self.phase.get_mut() {
+            FINISHED => {}
+            ADMITTED => {
+                tracing::warn!(
+                    name = %self.obj.config.name,
+                    "operate ended before its response, returning the object to unselected"
+                );
+                self.obj.abort_to_unselected();
+            }
+            _ => {
+                tracing::warn!(
+                    name = %self.obj.config.name,
+                    "operate ended without its control handler finishing, ending the command"
+                );
+                self.obj.finish_operate();
+                if let (true, Some(sink)) = (self.is_enhanced(), &self.ct_sink) {
+                    sink.send_negative(
+                        &self.obj.object_ref(),
+                        self.conn_id,
+                        ControlAddCause::Unknown,
+                        self.termination_error(true),
+                        self.oper_value.clone(),
+                    );
+                }
             }
         }
     }
