@@ -110,6 +110,8 @@ pub enum RcbWriteValue {
     Bool(bool),
     /// An UNSIGNED value.
     Unsigned(u32),
+    /// An INTEGER value, of any width the wire carries.
+    Integer(i64),
     /// A VisibleString value.
     VisibleString(String),
     /// A BIT_STRING as raw wire bytes, including the leading padding byte.
@@ -1079,16 +1081,23 @@ fn set_brcb_resv_tms(
     conn_id: ConnectionId,
     writer_ip: Option<std::net::IpAddr>,
 ) -> Option<Result<(), DataAccessError>> {
-    // ResvTms is an INT16 on the wire. `RcbWriteValue` has no signed variant, so a
-    // client encodes the positive range as an Unsigned.
-    let v_i16: i16 = match value {
-        RcbWriteValue::Unsigned(u) => {
-            if u > i16::MAX as u32 {
-                return Some(Err(DataAccessError::ObjectValueInvalid));
-            }
-            u as i16
-        }
+    // ResvTms is an INT16; an UNSIGNED in its non-negative range is accepted as
+    // well. A negative value or one past 32767 is refused.
+    let wide: i64 = match value {
+        RcbWriteValue::Integer(i) => i,
+        RcbWriteValue::Unsigned(u) => i64::from(u),
         _ => return Some(Err(DataAccessError::TypeInconsistent)),
+    };
+    let v_i16 = match i16::try_from(wide) {
+        Ok(v) if v >= 0 => v,
+        _ => {
+            tracing::warn!(
+                mms_path = %brcb.mms_path,
+                value = wide,
+                "SetBRCBValues ResvTms: outside 0..=32767, answering ObjectValueInvalid"
+            );
+            return Some(Err(DataAccessError::ObjectValueInvalid));
+        }
     };
     let mut state = match brcb.lock_state() {
         Ok(s) => s,
@@ -2194,6 +2203,47 @@ mod tests {
         ));
         assert_eq!(s.client_conn_id, Some(1));
         assert!(s.reservation_timeout.is_none());
+    }
+
+    /// ResvTms takes an INTEGER or an UNSIGNED from 0 to 32767; any other value is
+    /// refused as invalid and any other type as inconsistent.
+    #[test]
+    fn brcb_resv_tms_range_and_type_are_checked_by_the_field() {
+        let (engine, path) = make_engine_with_brcb("22", TriggerOptions::DATA_CHANGED);
+        let write = |value: RcbWriteValue| {
+            handle_set_brcb_field(
+                &engine,
+                &path,
+                RcbField::Unknown("ResvTms".to_string()),
+                value,
+                1,
+            )
+        };
+        assert_eq!(write(RcbWriteValue::Integer(32_767)), Some(Ok(())));
+        assert_eq!(write(RcbWriteValue::Unsigned(30)), Some(Ok(())));
+        for value in [
+            RcbWriteValue::Integer(-1),
+            RcbWriteValue::Integer(32_768),
+            RcbWriteValue::Unsigned(32_768),
+        ] {
+            assert_eq!(write(value), Some(Err(DataAccessError::ObjectValueInvalid)));
+        }
+        assert_eq!(
+            write(RcbWriteValue::Bool(true)),
+            Some(Err(DataAccessError::TypeInconsistent))
+        );
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        assert_eq!(brcb.state.lock().unwrap().resv_tms.to_wire(), 30);
+        assert_eq!(
+            handle_set_brcb_field(
+                &engine,
+                &path,
+                RcbField::IntgPd,
+                RcbWriteValue::Integer(100),
+                1
+            ),
+            Some(Err(DataAccessError::TypeInconsistent))
+        );
     }
 
     fn brcb_state(

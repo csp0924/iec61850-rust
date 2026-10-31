@@ -2240,7 +2240,8 @@ fn lcb_field_value(
 ///
 /// A bit string is passed on with its padding byte restored at the front of the
 /// buffer, which is the layout the option-flag and trigger-option decoders
-/// expect.
+/// expect. Whether the value suits the addressed field, by type and by range,
+/// is decided by the field handler.
 ///
 /// # Errors
 ///
@@ -2258,6 +2259,7 @@ fn mms_data_to_rcb_write_value(
         MmsData::Unsigned(u) => u32::try_from(*u)
             .map(RcbWriteValue::Unsigned)
             .map_err(|_| DataAccessError::ObjectValueInvalid),
+        MmsData::Integer(i) => Ok(RcbWriteValue::Integer(*i)),
         MmsData::VisibleString(s) => Ok(RcbWriteValue::VisibleString(s.clone())),
         MmsData::BitString { padding, data } => {
             // The decoders expect [padding_byte, data_bytes...].
@@ -2610,19 +2612,7 @@ fn handle_write_with_routing(
                 }
                 if let Some(field) = target.field.clone() {
                     use crate::reporting::service::handle_set_brcb_field;
-                    let rcb_value = match (field.as_str(), data) {
-                        // ResvTms is an INT16; the field handler takes its
-                        // non-negative range as an Unsigned.
-                        ("ResvTms", iec61850_mms::mms::pdu::common::MmsData::Integer(i)) => {
-                            i16::try_from(*i)
-                                .ok()
-                                .and_then(|v| u32::try_from(v).ok())
-                                .map(crate::reporting::service::RcbWriteValue::Unsigned)
-                                .ok_or(DataAccessError::ObjectValueInvalid)
-                        }
-                        _ => mms_data_to_rcb_write_value(data),
-                    };
-                    let rcb_value = match rcb_value {
+                    let rcb_value = match mms_data_to_rcb_write_value(data) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
