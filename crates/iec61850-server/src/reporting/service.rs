@@ -10,7 +10,7 @@
 //! | Resv | any client, moving the block from idle to reserved |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
 //! | RptEna = true | reserved, and the writer owns the reservation |
-//! | RptEna = false | enabled, and the writer owns the reservation |
+//! | RptEna = false | enabled, and the writer owns the reservation; the reservation is kept |
 //! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
 //! | ConfRev, SqNum, Owner, TimeOfEntry | never writable; answered with ObjectAccessDenied |
 //!
@@ -263,7 +263,9 @@ pub fn handle_set_rcb_field(
                     + std::time::Duration::from_millis(u64::from(state.intg_pd_ms))
             });
         } else {
-            // Disabling clears the pending report and the reservation.
+            // Disabling clears the pending report. The reservation stays with
+            // the holder: only Resv = false or the end of its association
+            // releases it, per the Resv semantics of IEC 61850-7-2.
             if !state.rpt_ena {
                 return Ok(());
             }
@@ -271,9 +273,6 @@ pub fn handle_set_rcb_field(
             state.pending = None;
             state.triggered = false;
             state.report_due = None;
-            // A lost or released control block always clears Resv.
-            state.resv = false;
-            state.client_conn_id = None;
         }
         return Ok(());
     }
@@ -1653,7 +1652,56 @@ mod tests {
         let rc2 = rc_arc2.lock().unwrap();
         let state2 = rc2.state.lock().unwrap();
         assert!(!state2.rpt_ena, "rpt_ena must be clear after disabling");
-        assert!(!state2.resv, "resv must be cleared on disable");
+        assert!(state2.resv, "disabling keeps the reservation");
+        assert_eq!(state2.client_conn_id, Some(5));
+    }
+
+    fn urcb_resv(engine: &Arc<Mutex<ReportingEngine>>, path: &str) -> (bool, Option<ConnectionId>) {
+        let rc_arc = engine.lock().unwrap().get_rcb(path).unwrap();
+        let rc = rc_arc.lock().unwrap();
+        let state = rc.state.lock().unwrap();
+        (state.resv, state.client_conn_id)
+    }
+
+    /// Disabling a URCB keeps it reserved for the client that holds it: the
+    /// holder may still configure it and another client is still refused.
+    #[test]
+    fn urcb_disable_keeps_the_reservation() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        let set = |field: RcbField, value: RcbWriteValue, conn_id: ConnectionId| {
+            handle_set_rcb_field(&engine, &path, field, value, conn_id)
+        };
+        set(RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        set(RcbField::RptEna, RcbWriteValue::Bool(true), 1).unwrap();
+        set(RcbField::RptEna, RcbWriteValue::Bool(false), 1).unwrap();
+        assert_eq!(urcb_resv(&engine, &path), (true, Some(1)));
+
+        assert_eq!(
+            set(RcbField::BufTm, RcbWriteValue::Unsigned(250), 1),
+            Ok(())
+        );
+        assert_eq!(
+            set(RcbField::Resv, RcbWriteValue::Bool(true), 2),
+            Err(DataAccessError::TemporarilyUnavailable)
+        );
+        assert_eq!(
+            set(RcbField::IntgPd, RcbWriteValue::Unsigned(1000), 2),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(urcb_resv(&engine, &path), (true, Some(1)));
+
+        // The holder releases it with Resv = false.
+        set(RcbField::Resv, RcbWriteValue::Bool(false), 1).unwrap();
+        assert_eq!(urcb_resv(&engine, &path), (false, None));
+    }
+
+    /// The end of the association releases a disabled URCB as well.
+    #[test]
+    fn urcb_reservation_ends_with_the_association() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        engine.lock().unwrap().on_connection_dropped(1);
+        assert_eq!(urcb_resv(&engine, &path), (false, None));
     }
 
     #[test]

@@ -8,11 +8,13 @@
 //!
 //! ```text
 //! IDLE ──(Resv=true)──► RESERVED ──(RptEna=true)──► ENABLED
-//!         ◄──(conn drop)──           ◄──(RptEna=false / conn drop)──
+//!      ◄──(Resv=false / conn drop)──  ◄──(RptEna=false)──
+//! IDLE ◄──────────────(conn drop)────────────────── ENABLED
 //! ```
 //!
-//! A URCB reservation has no timeout: it is released only when the owning
-//! connection goes away.
+//! A URCB reservation has no timeout: it is released only when the holder
+//! writes Resv = false or its connection goes away. Disabling reporting keeps
+//! it.
 
 use super::dataset::Dataset;
 use crate::connection::ConnectionId;
