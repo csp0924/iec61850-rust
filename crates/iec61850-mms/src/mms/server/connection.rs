@@ -123,18 +123,24 @@ pub const SERVER_PARAMETER_CBB: [u8; 3] = DEFAULT_PARAMETER_CBB_CLIENT;
 ///   DELETE_NAMED_VARIABLE_LIST
 /// - bytes 2 to 8 are `0x00`: no file, obtain-file or journal service
 /// - byte 9 `0x01` = INFORMATION_REPORT
-/// - byte 10 `0x18` = CONCLUDE | CANCEL
+/// - byte 10 `0x10` = CONCLUDE
+///
+/// CANCEL is never announced: this layer answers a Cancel-RequestPDU with a Reject
+/// before any dispatcher sees it. Every other bit is announced only as far as the
+/// dispatcher answers it; a dispatcher returns its own bitmap from
+/// `MmsServiceDispatcher::services_supported`, starting from this one and clearing
+/// what it does not serve.
 ///
 /// This must not be set to `DEFAULT_SERVICES_SUPPORTED_CLIENT`. The client and
-/// server bitmaps are independent: the client default sets the file and journal bits
-/// to say it would accept such responses, while a server without those services must
-/// not announce them. Announcing them makes a client believe the file service
-/// exists and fail when it tries to use it.
+/// server bitmaps are independent: the client default lists the services the client
+/// issues, while a server announces the services it answers. Announcing a service
+/// the server does not answer makes a client believe it exists and fail when it
+/// tries to use it.
 ///
 /// A build that adds reporting, logging or the file service should compute this
 /// bitmap from the features it enables, turning on the matching bits.
 pub const SERVER_SERVICES_SUPPORTED: [u8; 11] = [
-    0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x18,
+    0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10,
 ];
 
 /// Largest dataStructureNestingLevel the server accepts.

@@ -558,7 +558,8 @@ mod tests {
     /// - maxServOutstandingCalled = 5
     /// - dataStructureNestingLevel = 1
     /// - parameterCBB = `[05 f1 00]`
-    /// - servicesSupportedCalling = `[ee 1c 00 00 04 08 00 00 79 ef 18]`, the client bitmap
+    /// - servicesSupportedCalling = `[ee 1c 00 00 04 08 00 00 79 ef 18]`, a client bitmap
+    ///   that also lists file, journal and cancel services
     const WIRE_INITIATE_REQUEST: &[u8] = &[
         0xa8, 0x26, 0x80, 0x03, 0x00, 0xfd, 0xe8, 0x81, 0x01, 0x05, 0x82, 0x01, 0x05, 0x83, 0x01,
         0x01, 0xa4, 0x16, 0x80, 0x01, 0x01, 0x81, 0x03, 0x05, 0xf1, 0x00, 0x82, 0x0c, 0x03, 0xee,
@@ -569,12 +570,12 @@ mod tests {
     /// This implementation must reproduce these bytes exactly.
     ///
     /// The only difference from the request is servicesSupportedCalled, bytes 33 to 40:
-    /// `[ee 1c 00 00 00 00 00 00 00 01 18]`, a server bitmap without file, journal or
-    /// obtain-file support.
+    /// `[ee 1c 00 00 00 00 00 00 00 01 10]`, a server bitmap without file, journal,
+    /// obtain-file or cancel support.
     const WIRE_INITIATE_RESPONSE: &[u8] = &[
         0xa9, 0x26, 0x80, 0x03, 0x00, 0xfd, 0xe8, 0x81, 0x01, 0x05, 0x82, 0x01, 0x05, 0x83, 0x01,
         0x01, 0xa4, 0x16, 0x80, 0x01, 0x01, 0x81, 0x03, 0x05, 0xf1, 0x00, 0x82, 0x0c, 0x03, 0xee,
-        0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x18,
+        0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10,
     ];
 
     /// `SERVER_SERVICES_SUPPORTED` must stay the server bitmap and must not be set to
@@ -584,6 +585,14 @@ mod tests {
     /// Feeding the golden request through `negotiate_initiate` must reproduce the
     /// golden response byte for byte, so any change that echoes the client bitmap
     /// back fails here.
+    /// A Cancel-RequestPDU is rejected before any dispatcher sees it, so the
+    /// baseline bitmap never announces cancel, while conclude stays announced.
+    #[test]
+    fn server_services_supported_never_announces_cancel() {
+        assert_eq!(SERVER_SERVICES_SUPPORTED[10] & 0x08, 0, "cancel");
+        assert_eq!(SERVER_SERVICES_SUPPORTED[10] & 0x10, 0x10, "conclude");
+    }
+
     #[test]
     fn server_services_supported_reproduces_golden_response() {
         let outcome = negotiate_initiate(WIRE_INITIATE_REQUEST, SERVER_SERVICES_SUPPORTED);
@@ -595,7 +604,7 @@ mod tests {
                 // the constant itself
                 assert_eq!(
                     params.services_supported_called,
-                    [0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x18],
+                    [0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10],
                     "SERVER_SERVICES_SUPPORTED must be the server bitmap"
                 );
                 // and the encoded response, byte for byte
