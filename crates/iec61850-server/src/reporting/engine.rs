@@ -132,6 +132,9 @@ pub struct ReportingEngine {
     /// Attribute reference of every member a DatSet write bound a control
     /// block to.
     value_index: ValueIndex,
+    /// The value lock of the server's MMS view, held shared while a full data
+    /// set snapshot is taken; see [`ReportingEngine::set_value_lock`].
+    value_lock: Option<Arc<RwLock<()>>>,
 }
 
 /// Attribute reference of every leaf of the data set members a DatSet write
@@ -371,6 +374,7 @@ impl ReportingEngine {
             peers: HashMap::new(),
             dataset_registry: registry,
             value_index: ValueIndex::default(),
+            value_lock: None,
         }
     }
 
@@ -406,6 +410,7 @@ impl ReportingEngine {
             peers: HashMap::new(),
             dataset_registry: registry,
             value_index: ValueIndex::default(),
+            value_lock: None,
         }
     }
 
@@ -965,12 +970,34 @@ impl ReportingEngine {
         }
     }
 
+    /// Shares the lock a write of several attributes holds exclusively, so a
+    /// general interrogation or integrity snapshot of a data set sees such a
+    /// write whole or not at all.
+    ///
+    /// The engine takes the lock shared while it holds the engine lock, so the
+    /// order is always the engine lock first: whoever holds the value lock
+    /// must not take the engine lock.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn set_value_lock(&mut self, lock: Arc<RwLock<()>>) {
+        self.value_lock = Some(lock);
+    }
+
+    /// Holds the value lock shared for a full snapshot of a data set; `None`
+    /// when no lock is set.
+    fn read_values(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        self.value_lock.as_ref().map(|lock| {
+            lock.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+    }
+
     /// Takes a live snapshot of a BRCB data set, for integrity and general
-    /// interrogation reports.
+    /// interrogation reports, under the value lock.
     fn snapshot_full_dataset(&self, mms_path: &str) -> Option<EnqueuedSnapshot> {
         let ds = self.brcb_datasets.get(mms_path)?;
         let n = ds.len();
         let mut snap = EnqueuedSnapshot::new(n);
+        let _values = self.read_values();
         // The entry is flagged as integrity or general interrogation, which
         // includes every member; no member carries a data-change reason.
         for (i, entry) in ds.entries.iter().enumerate() {
@@ -1080,7 +1107,10 @@ impl ReportingEngine {
                         None
                     };
                     let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
-                    let gi_pending = make_gi_pending(ds_len, now_ms, &state);
+                    let gi_pending = {
+                        let _values = self.read_values();
+                        make_gi_pending(ds_len, now_ms, &state)
+                    };
                     state.gi = false;
                     TickAction::Gi {
                         conn_id,
@@ -1101,7 +1131,10 @@ impl ReportingEngine {
                         None
                     };
                     let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(0);
-                    let intg_pending = make_integrity_pending(ds_len, now_ms, &state);
+                    let intg_pending = {
+                        let _values = self.read_values();
+                        make_integrity_pending(ds_len, now_ms, &state)
+                    };
                     let intg_pd = Duration::from_millis(state.intg_pd_ms as u64);
                     state.next_intg_report = Some(now + intg_pd);
                     TickAction::Integrity {

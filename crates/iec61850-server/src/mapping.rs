@@ -169,9 +169,13 @@ pub struct MmsDeviceModel {
     domains: Vec<DomainView>,
     /// Name to position, so a lookup costs constant time.
     domain_index: HashMap<String, usize>,
-    /// Held shared while a read takes the values of several attributes, and
-    /// exclusively while a write stores them, so a read sees a write of a data
-    /// object or a constructed attribute whole or not at all.
+    /// Held shared while a read or a full data set snapshot of the reporting
+    /// engine takes the values of several attributes, and exclusively while a
+    /// write stores them, so a read sees a write of a data object or a
+    /// constructed attribute whole or not at all.
+    ///
+    /// The reporting engine takes it under the engine lock, so whoever holds
+    /// it must not take the engine lock.
     value_lock: Arc<RwLock<()>>,
     /// Where a write hands the leaves it stored, to raise their report and log
     /// triggers; unset for a view no server owns.
@@ -296,6 +300,13 @@ impl MmsDeviceModel {
     /// The lock that keeps a read from seeing part of a write; see the field.
     pub(crate) fn value_lock(&self) -> &RwLock<()> {
         &self.value_lock
+    }
+
+    /// A handle on the same lock as [`value_lock`](Self::value_lock), for the
+    /// reporting engine.
+    #[cfg(feature = "full-server")]
+    pub(crate) fn shared_value_lock(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.value_lock)
     }
 
     /// Lists every domain name.

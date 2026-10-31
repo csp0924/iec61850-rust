@@ -955,11 +955,17 @@ impl IedServer {
             let Some(ds) = self.log_data_set(&lc, data_set) else {
                 continue;
             };
-            let data: Vec<(String, MmsValue)> = ds
-                .entries
-                .iter()
-                .filter_map(|e| e.read_value().map(|v| (e.attr_ref.clone(), v)))
-                .collect();
+            let data: Vec<(String, MmsValue)> = {
+                let _values = self
+                    .inner
+                    .mms_view
+                    .as_ref()
+                    .and_then(|view| crate::compat::rwlock_read(view.value_lock()));
+                ds.entries
+                    .iter()
+                    .filter_map(|e| e.read_value().map(|v| (e.attr_ref.clone(), v)))
+                    .collect()
+            };
             if data.is_empty() {
                 continue;
             }
@@ -1964,6 +1970,15 @@ impl IedServerBuilder<Bound> {
             }
         };
 
+        // General interrogation and integrity snapshots take the values under
+        // the same lock as a read.
+        if let Some(view) = &written_view {
+            reporting_engine
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_value_lock(view.shared_value_lock());
+        }
+
         let server = IedServer {
             inner: Arc::new(IedServerInner {
                 model,
@@ -2166,6 +2181,174 @@ mod tests {
             vals().snapshot(),
             MmsValue::Array(vec![MmsValue::Integer(1), MmsValue::Integer(2)])
         );
+    }
+
+    /// A server whose `TESTLD0/GGIO1$SP$Set` holds the two Int32 leaves `a`
+    /// and `b`, with the data set `LLN0$dsSet` naming the data object, the
+    /// MMS view and the value lock of `b`.
+    fn server_with_a_data_object_data_set() -> (
+        IedServer,
+        crate::reporting::Dataset,
+        Arc<MmsDeviceModel>,
+        Arc<RwLock<MmsValue>>,
+    ) {
+        use crate::reporting::{Dataset, DatasetEntry};
+        use iec61850_model::{DataAttribute, DataAttributeType, DataObject, DoChild};
+        let leaf = |name: &str| {
+            DoChild::Da(DataAttribute::new(
+                name,
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::NONE,
+                MmsValue::Integer(0),
+            ))
+        };
+        let ggio = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(DataObject::new("Set", vec![leaf("a"), leaf("b")]))
+            .build()
+            .expect("ggio");
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().expect("lln0"))
+            .add_ln(ggio)
+            .build()
+            .expect("ld");
+        let model = Arc::new(
+            IedModelBuilder::new("TEST")
+                .add_ld(ld)
+                .expect("add_ld")
+                .build()
+                .expect("model"),
+        );
+        let server = IedServer::builder()
+            .model(Arc::clone(&model))
+            .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .build()
+            .expect("server");
+        let mut ds = Dataset::new("LLN0$dsSet");
+        ds.push(DatasetEntry::from_model(&model, "TESTLD0", "GGIO1$SP$Set").expect("member"));
+        let view = server
+            .inner
+            .mms_view
+            .clone()
+            .expect("the built-in dispatcher");
+        let b = match model.lds[0].lns[1].dos[0].child_by_name("b", None) {
+            Some(DoChild::Da(da)) => Arc::clone(&da.value),
+            _ => panic!("b is an attribute"),
+        };
+        (server, ds, view, b)
+    }
+
+    /// Runs `tick` on another thread while `b` is held, and checks that the
+    /// snapshot it takes holds the value lock: while the snapshot waits on
+    /// `b`, no write can take the lock, so none can store part of the data
+    /// object in the middle of it.
+    fn assert_snapshot_under_the_value_lock(
+        server: &IedServer,
+        view: &MmsDeviceModel,
+        b: &RwLock<MmsValue>,
+        tick: impl FnOnce(&ReportingEngine) + Send + 'static,
+    ) {
+        let hold = b.write().unwrap();
+        let ticking = std::thread::spawn({
+            let engine = server.reporting_engine();
+            move || tick(&engine.lock().unwrap())
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while view.value_lock().try_write().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the snapshot never takes the value lock"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(hold);
+        ticking.join().unwrap();
+        assert!(view.value_lock().try_write().is_ok());
+    }
+
+    /// The general interrogation of a buffered report control block takes its
+    /// snapshot under the value lock.
+    #[test]
+    fn brcb_general_interrogation_takes_its_snapshot_under_the_value_lock() {
+        use crate::reporting::{Brcb, BufferedReportControl};
+        let (server, ds, view, b) = server_with_a_data_object_data_set();
+        let path = "TESTLD0/LLN0$BR$brcbSet";
+        server
+            .register_brcb(
+                BufferedReportControl::new(
+                    path,
+                    Brcb::new("brcbSet", "LLN0$dsSet").with_trg_ops(TriggerOptions::GI),
+                ),
+                ds,
+            )
+            .expect("register_brcb");
+        let brcb = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_brcb(path)
+            .expect("the BRCB");
+        {
+            let mut state = brcb.lock_state().unwrap();
+            state.rpt_ena = true;
+            state.gi = true;
+        }
+        assert_snapshot_under_the_value_lock(&server, &view, &b, |engine| {
+            engine.tick_brcb(Instant::now(), 0)
+        });
+        assert_eq!(brcb.lock_buffer().unwrap().len(), 1, "the GI entry");
+    }
+
+    /// The general interrogation and the integrity report of an unbuffered
+    /// report control block take their snapshots under the value lock.
+    #[test]
+    fn urcb_snapshots_are_taken_under_the_value_lock() {
+        use crate::reporting::{Rcb, ReportControl};
+        for (trg_ops, gi) in [
+            (TriggerOptions::GI, true),
+            (TriggerOptions::INTEGRITY, false),
+        ] {
+            let (server, ds, view, b) = server_with_a_data_object_data_set();
+            let path = "TESTLD0/LLN0$RP$urcbSet";
+            server
+                .register_urcb(
+                    ReportControl::new(
+                        path,
+                        Rcb::new("urcbSet", "LLN0$dsSet")
+                            .with_trg_ops(trg_ops)
+                            .with_intg_pd_ms(1_000),
+                    ),
+                    ds,
+                )
+                .expect("register_urcb");
+            let rc = server
+                .reporting_engine()
+                .lock()
+                .unwrap()
+                .get_rcb(path)
+                .expect("the URCB");
+            let now = Instant::now();
+            {
+                let rc = rc.lock().unwrap();
+                let mut state = rc.state.lock().unwrap();
+                state.rpt_ena = true;
+                state.client_conn_id = Some(1);
+                state.gi = gi;
+                state.next_intg_report = Some(now);
+            }
+            assert_snapshot_under_the_value_lock(&server, &view, &b, move |engine| {
+                engine.tick_at(now, 0)
+            });
+            let rc = rc.lock().unwrap();
+            let state = rc.state.lock().unwrap();
+            if gi {
+                assert!(!state.gi, "the GI request is served");
+            } else {
+                assert_ne!(state.next_intg_report, Some(now), "the period restarts");
+            }
+        }
     }
 
     // ── Buffered report control block registration ──────────────────────
