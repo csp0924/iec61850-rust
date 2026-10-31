@@ -71,8 +71,9 @@ use iec61850_mms::mms::pdu::{
 // The ReadJournal PDU types belong to the logging subsystem.
 #[cfg(feature = "logging")]
 use iec61850_mms::mms::pdu::read_journal::{
-    encode_confirmed_read_journal_response, JournalRange, ReadJournalRequest, ReadJournalResponse,
-    WireJournalEntry, WireJournalVariable, SERVICE_TAG_READ_JOURNAL,
+    encode_confirmed_read_journal_response, JournalRangeStart, JournalRangeStop,
+    ReadJournalRequest, ReadJournalResponse, WireJournalEntry, WireJournalVariable,
+    SERVICE_TAG_READ_JOURNAL,
 };
 use iec61850_mms::mms::server::{
     connection::MmsServerConnection,
@@ -3202,8 +3203,8 @@ fn journal_names_in_domain(log_controls: &LogControlRegistry, domain: &str) -> V
 /// Dispatches a ReadJournal request (`0xbf 0x41`).
 ///
 /// The request names a journal by domain and item, which [`resolve_journal`]
-/// maps to a log control block; the range selects either a time window or a
-/// cursor position, and the matching entries are encoded into a
+/// maps to a log control block; its OPTIONAL fields select entries as
+/// [`JournalSelection`] describes, and the selected entries are encoded into a
 /// ReadJournalResponse.
 ///
 /// # Errors
@@ -3213,12 +3214,12 @@ fn journal_names_in_domain(log_controls: &LogControlRegistry, domain: &str) -> V
 /// no log control block answers object-non-existent.
 ///
 /// Entries are added while they fit the PDU budget. Once one does not, the
-/// response stops there and sets `moreFollows`, and the client continues from
-/// the entry id and occurrence time of the last entry it received. The budget
-/// is the negotiated maximum PDU size less the response frame and the overhead
-/// reserve; before negotiation completes it falls back to a hard cap, which
-/// keeps the encoded PDU inside the 65535-byte BER length limit. `moreFollows`
-/// is always set explicitly, never left absent.
+/// response stops there and sets `moreFollows`, and the client continues with
+/// the same request plus an entryToStartAfter naming the last entry it
+/// received. The budget is the negotiated maximum PDU size less the response
+/// frame and the overhead reserve; before negotiation completes it falls back
+/// to a hard cap, which keeps the encoded PDU inside the 65535-byte BER length
+/// limit. `moreFollows` is always set explicitly, never left absent.
 #[cfg(feature = "logging")]
 fn dispatch_read_journal(
     invoke_id: u32,
@@ -3259,22 +3260,13 @@ fn dispatch_read_journal(
     };
 
     // A log control block with no storage attached yields an empty list.
-    let mut visitor =
-        BudgetedJournalVisitor::new(invoke_id, read_journal_budget(negotiated_max_pdu_size));
-    let query_result = match &req.range {
-        JournalRange::TimeRange { start_ms, end_ms } => {
-            lc.query_by_time(*start_ms, *end_ms, &mut visitor)
-        }
-        JournalRange::StartAfter {
-            starting_time_ms,
-            entry_id,
-        } => {
-            // An entry id travels as eight big-endian bytes.
-            let id = LogEntryId::from_be_bytes(*entry_id);
-            lc.query_after(*starting_time_ms, id, &mut visitor)
-        }
-    };
-    if let Err(e) = query_result {
+    let selection = JournalSelection::from_request(&req);
+    let mut visitor = BudgetedJournalVisitor::new(
+        invoke_id,
+        read_journal_budget(negotiated_max_pdu_size),
+        &selection,
+    );
+    if let Err(e) = selection.query(&lc, &mut visitor) {
         tracing::warn!(
             invoke_id,
             error = %e,
@@ -3299,42 +3291,164 @@ fn dispatch_read_journal(
     ConfirmedResponse::Response(buf.freeze())
 }
 
+/// The entries a ReadJournal request selects.
+///
+/// Each OPTIONAL field of the request that is present narrows the selection,
+/// and an entry is selected when it meets every one of them, so every
+/// combination of fields is served:
+///
+/// - startingTime: the entry time is at or after it; startingEntry: the entry
+///   is that entry or follows it.
+/// - endingTime: the entry time is at or before it; numberOfEntries: at most
+///   that many entries are returned to this request, and once they are, the
+///   request is complete and `moreFollows` is false.
+/// - entryToStartAfter: the entry follows that entry and its time is at or
+///   after that entry's time. A continuation repeats the original request and
+///   adds this field, so the original start and stop still apply.
+/// - listOfVariables: each entry carries only the data points whose data
+///   reference is listed, each with its reason code, and an entry left with
+///   none is not selected. A listed `ReasonCode` selects nothing by itself.
+///
+/// Entry order is the storage order, ascending EntryID; "follows" compares
+/// EntryIDs as eight-octet big-endian numbers.
+#[cfg(feature = "logging")]
+struct JournalSelection {
+    start_time: Option<u64>,
+    start_entry: Option<LogEntryId>,
+    end_time: Option<u64>,
+    limit: Option<u32>,
+    after: Option<(u64, LogEntryId)>,
+    variables: Vec<String>,
+}
+
+#[cfg(feature = "logging")]
+impl JournalSelection {
+    fn from_request(req: &ReadJournalRequest) -> Self {
+        let (start_time, start_entry) = match req.range_start {
+            Some(JournalRangeStart::StartingTime(ms)) => (Some(ms), None),
+            Some(JournalRangeStart::StartingEntry(id)) => {
+                (None, Some(LogEntryId::from_be_bytes(id)))
+            }
+            None => (None, None),
+        };
+        let (end_time, limit) = match req.range_stop {
+            Some(JournalRangeStop::EndingTime(ms)) => (Some(ms), None),
+            Some(JournalRangeStop::NumberOfEntries(n)) => (None, Some(n)),
+            None => (None, None),
+        };
+        Self {
+            start_time,
+            start_entry,
+            end_time,
+            limit,
+            after: req
+                .entry_to_start_after
+                .map(|a| (a.time_ms, LogEntryId::from_be_bytes(a.entry_id))),
+            variables: req.list_of_variables.clone(),
+        }
+    }
+
+    /// Walks the storage with the narrowest query the backend offers; the
+    /// visitor still checks every condition through [`Self::admits`].
+    fn query(
+        &self,
+        lc: &LogControl,
+        visitor: &mut dyn crate::logging::LogEntryVisitor,
+    ) -> Result<(), LogStorageError> {
+        let earliest = self
+            .start_time
+            .into_iter()
+            .chain(self.after.map(|(t, _)| t))
+            .max()
+            .unwrap_or(0);
+        // The entry every selected entry follows: the cursor, or the one
+        // before startingEntry.
+        let floor = self
+            .after
+            .map(|(_, id)| id.0)
+            .into_iter()
+            .chain(self.start_entry.and_then(|id| id.0.checked_sub(1)))
+            .max();
+        match floor {
+            Some(id) => lc.query_after(earliest, LogEntryId(id), visitor),
+            None => lc.query_by_time(earliest, self.end_time.unwrap_or(u64::MAX), visitor),
+        }
+    }
+
+    /// Whether `entry` meets the start, stop and entryToStartAfter conditions.
+    fn admits(&self, entry: &crate::logging::JournalEntry) -> bool {
+        self.start_time.is_none_or(|t| entry.time_ms >= t)
+            && self.start_entry.is_none_or(|id| entry.entry_id >= id)
+            && self.end_time.is_none_or(|t| entry.time_ms <= t)
+            && self
+                .after
+                .is_none_or(|(t, id)| entry.entry_id > id && entry.time_ms >= t)
+    }
+
+    /// Converts `entry` into its wire form, keeping only the listed data
+    /// points; `None` when listOfVariables leaves it no data point.
+    fn to_wire(&self, entry: &crate::logging::JournalEntry) -> Option<WireJournalEntry> {
+        let wire = journal_entry_to_wire(entry, |data_ref| {
+            self.variables.is_empty() || self.variables.iter().any(|v| v == data_ref)
+        });
+        (self.variables.is_empty() || !wire.variables.is_empty()).then_some(wire)
+    }
+}
+
 /// Collects the journal entries of one ReadJournal response while they fit the
 /// PDU budget.
 ///
-/// Each entry is converted and measured as it is visited, and the walk stops
-/// at the first entry that does not fit, so a query holds one response worth
-/// of entries rather than every matching entry. Even a first entry larger than
-/// the whole budget stops the walk with `more_follows` set, so the client never
-/// mistakes a truncated result for a complete one.
+/// Each entry the selection admits is converted and measured as it is visited,
+/// and the walk stops at the first entry that does not fit, so a query holds
+/// one response worth of entries rather than every matching entry. Even a
+/// first entry larger than the whole budget stops the walk with `more_follows`
+/// set, so the client never mistakes a truncated result for a complete one.
+/// The walk also stops, with `more_follows` clear, once numberOfEntries
+/// entries are collected.
 #[cfg(feature = "logging")]
-struct BudgetedJournalVisitor {
+struct BudgetedJournalVisitor<'a> {
     invoke_id: u32,
     budget: usize,
     baseline: usize,
     consumed: usize,
+    selection: &'a JournalSelection,
     accepted: Vec<WireJournalEntry>,
     more_follows: bool,
 }
 
 #[cfg(feature = "logging")]
-impl BudgetedJournalVisitor {
-    fn new(invoke_id: u32, budget: usize) -> Self {
+impl<'a> BudgetedJournalVisitor<'a> {
+    fn new(invoke_id: u32, budget: usize, selection: &'a JournalSelection) -> Self {
         Self {
             invoke_id,
             budget,
             baseline: empty_response_baseline(),
             consumed: 0,
+            selection,
             accepted: Vec::new(),
             more_follows: false,
         }
     }
+
+    fn limit_reached(&self) -> bool {
+        self.selection
+            .limit
+            .is_some_and(|n| self.accepted.len() >= n as usize)
+    }
 }
 
 #[cfg(feature = "logging")]
-impl crate::logging::LogEntryVisitor for BudgetedJournalVisitor {
+impl crate::logging::LogEntryVisitor for BudgetedJournalVisitor<'_> {
     fn visit(&mut self, entry: &crate::logging::JournalEntry) -> bool {
-        let wire = journal_entry_to_wire(entry);
+        if !self.selection.admits(entry) {
+            return true;
+        }
+        let Some(wire) = self.selection.to_wire(entry) else {
+            return true;
+        };
+        if self.limit_reached() {
+            return false;
+        }
         let entry_size = estimate_entry_wire_size(&wire, self.baseline);
         if self.consumed + entry_size > self.budget {
             tracing::warn!(
@@ -3350,7 +3464,7 @@ impl crate::logging::LogEntryVisitor for BudgetedJournalVisitor {
         }
         self.consumed += entry_size;
         self.accepted.push(wire);
-        true
+        !self.limit_reached()
     }
 }
 
@@ -3416,22 +3530,29 @@ fn empty_response_baseline() -> usize {
     buf.len()
 }
 
-/// Converts a stored journal entry into its wire representation.
+/// Converts a stored journal entry into its wire representation, keeping the
+/// data points whose data reference `keep` accepts.
 #[cfg(feature = "logging")]
-fn journal_entry_to_wire(entry: &crate::logging::JournalEntry) -> WireJournalEntry {
-    WireJournalEntry {
-        entry_id: entry.entry_id.to_be_bytes(),
-        occurence_time_ms: entry.time_ms,
-        variables: entry
+fn journal_entry_to_wire(
+    entry: &crate::logging::JournalEntry,
+    keep: impl Fn(&str) -> bool,
+) -> WireJournalEntry {
+    WireJournalEntry::new(
+        entry.entry_id.to_be_bytes(),
+        entry.time_ms,
+        entry
             .variables
             .iter()
-            .map(|v| WireJournalVariable {
-                data_ref: v.data_ref.clone(),
-                value: crate::service::convert::mms_value_to_mms_data(&v.value),
-                reason_code: v.reason_code,
+            .filter(|v| keep(&v.data_ref))
+            .map(|v| {
+                WireJournalVariable::new(
+                    v.data_ref.clone(),
+                    crate::service::convert::mms_value_to_mms_data(&v.value),
+                    v.reason_code,
+                )
             })
             .collect(),
-    }
+    )
 }
 
 /// Dispatches a WriteJournal request (`0xbf 0x42`), which is answered with

@@ -12,13 +12,15 @@
 //!       0xa1 <len>             -- domain-specific [1] IMPLICIT
 //!         0x1a <len> <bytes>   -- domainId VisibleString
 //!         0x1a <len> <bytes>   -- itemId VisibleString
-//!     -- form A, a time range:
-//!     0xa1 <len>               -- rangeStartSpec [1] EXPLICIT
-//!       0x80 <len> <BinaryTime> -- startingTime
-//!     0xa2 <len>               -- rangeStopSpec  [2] EXPLICIT
-//!       0x80 <len> <BinaryTime> -- endingTime
-//!     -- or form B, starting after an entry:
-//!     0xa5 <len>               -- entryToStartAfter [5] EXPLICIT
+//!     0xa1 <len>               -- rangeStartSpecification [1] EXPLICIT, OPTIONAL
+//!       0x80 <len> <BinaryTime> -- startingTime, or
+//!       0x81 8 <entryID>        -- startingEntry OCTET STRING
+//!     0xa2 <len>               -- rangeStopSpecification [2] EXPLICIT, OPTIONAL
+//!       0x80 <len> <BinaryTime> -- endingTime, or
+//!       0x81 <len> <INTEGER>    -- numberOfEntries Integer32
+//!     0xa4 <len>               -- listOfVariables [4] IMPLICIT, OPTIONAL
+//!       0x1a <len> <bytes>     -- a variable tag VisibleString, repeated
+//!     0xa5 <len>               -- entryToStartAfter [5] IMPLICIT, OPTIONAL
 //!       0x80 <len> <BinaryTime> -- timeSpecification
 //!       0x81 <len> <bytes>      -- entrySpecification OCTET STRING (8 bytes)
 //! ```
@@ -49,8 +51,10 @@
 //! - `originatingApplication` is always the four bytes `[0xa1, 0x02, 0x30, 0x00]`,
 //!   a `[1]` wrapper around an empty SEQUENCE, emitted as a fixed constant rather
 //!   than derived from the association.
-//! - `entryToStartAfter.startingTime` is accepted and kept on the wire; the log
-//!   storage in this workspace honors both conditions.
+//! - Every combination of the four OPTIONAL request fields encodes and decodes;
+//!   what a combination selects is up to the server that answers it.
+//! - A startingEntry or entrySpecification must be the eight octets of an
+//!   EntryID (IEC 61850-8-1); any other length is rejected.
 //! - The long-form tag `0xbf 0x41` is a context-class constructed identifier whose
 //!   five tag-number bits are all ones, 11111, which is what selects the long form;
 //!   the tag number continues in the next byte, 0x41, that is 65. One continuation
@@ -58,7 +62,7 @@
 
 use super::super::binary_time::{binary_time6_from_epoch_ms, epoch_ms_from_binary_time6};
 use super::super::error::MmsError;
-use super::common::{DataAccessError, MmsData};
+use super::common::{decode_signed_int, encode_signed_int_minimal, DataAccessError, MmsData};
 use super::initiate::{decode_length, encode_length};
 use crate::compat::prelude::*;
 use bytes::BytesMut;
@@ -81,66 +85,130 @@ const ORIGINATING_APPLICATION_FIXED: [u8; 4] = [0xa1, 0x02, 0x30, 0x00];
 
 // ReadJournalRequest
 
-/// The query range CHOICE of a ReadJournal request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JournalRange {
-    /// Form A: a time range, rangeStartSpec through rangeStopSpec.
-    TimeRange {
-        /// Start of the range, in epoch milliseconds.
-        start_ms: u64,
-        /// End of the range, in epoch milliseconds.
-        end_ms: u64,
-    },
-    /// Form B: everything after a given entry, entryToStartAfter.
-    StartAfter {
-        /// Timestamp to resume from, in epoch milliseconds.
-        starting_time_ms: u64,
-        /// EntryID, 8 bytes big-endian.
-        entry_id: [u8; ENTRY_ID_SIZE],
-    },
+/// rangeStartSpecification of a ReadJournal request: where the selection
+/// begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalRangeStart {
+    /// startingTime: entries whose time is at or after this instant, in epoch
+    /// milliseconds.
+    StartingTime(u64),
+    /// startingEntry: the entry with this EntryID, 8 bytes big-endian, and the
+    /// entries after it.
+    StartingEntry([u8; ENTRY_ID_SIZE]),
+}
+
+/// rangeStopSpecification of a ReadJournal request: where the selection ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalRangeStop {
+    /// endingTime: entries whose time is at or before this instant, in epoch
+    /// milliseconds.
+    EndingTime(u64),
+    /// numberOfEntries: at most this many entries. The wire type is an
+    /// Integer32, so a value above `i32::MAX` is sent as `i32::MAX`.
+    NumberOfEntries(u32),
+}
+
+/// entryToStartAfter of a ReadJournal request: the entry a selection resumes
+/// after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalEntryToStartAfter {
+    /// timeSpecification: the time of that entry, in epoch milliseconds.
+    pub time_ms: u64,
+    /// entrySpecification: its EntryID, 8 bytes big-endian.
+    pub entry_id: [u8; ENTRY_ID_SIZE],
 }
 
 /// An MMS ReadJournalRequest.
+///
+/// The journal name is mandatory; the other four fields are the OPTIONAL
+/// fields of the request and may appear in any combination. A request with
+/// none of them selects the whole journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReadJournalRequest {
     /// journalName.domain-specific.domainId, a VisibleString.
     pub domain_id: String,
     /// journalName.domain-specific.itemId, a VisibleString.
     pub item_id: String,
-    /// The query range.
-    pub range: JournalRange,
+    /// rangeStartSpecification, or `None` when absent.
+    pub range_start: Option<JournalRangeStart>,
+    /// rangeStopSpecification, or `None` when absent.
+    pub range_stop: Option<JournalRangeStop>,
+    /// listOfVariables, the variable tags the response is to carry. An empty
+    /// list stands for an absent one: it is not sent, and a received empty
+    /// list decodes to it.
+    pub list_of_variables: Vec<String>,
+    /// entryToStartAfter, or `None` when absent.
+    pub entry_to_start_after: Option<JournalEntryToStartAfter>,
 }
 
 impl ReadJournalRequest {
-    /// Builds a request covering a time range.
+    /// Builds a request for the whole journal, with no OPTIONAL field set.
+    pub fn new(domain_id: impl Into<String>, item_id: impl Into<String>) -> Self {
+        Self {
+            domain_id: domain_id.into(),
+            item_id: item_id.into(),
+            range_start: None,
+            range_stop: None,
+            list_of_variables: Vec::new(),
+            entry_to_start_after: None,
+        }
+    }
+
+    /// Builds a request covering a time range, a startingTime together with an
+    /// endingTime.
     pub fn time_range(
         domain_id: impl Into<String>,
         item_id: impl Into<String>,
         start_ms: u64,
         end_ms: u64,
     ) -> Self {
-        Self {
-            domain_id: domain_id.into(),
-            item_id: item_id.into(),
-            range: JournalRange::TimeRange { start_ms, end_ms },
-        }
+        Self::new(domain_id, item_id)
+            .with_range_start(JournalRangeStart::StartingTime(start_ms))
+            .with_range_stop(JournalRangeStop::EndingTime(end_ms))
     }
 
-    /// Builds a request starting after a given entry.
+    /// Builds a request starting after a given entry, an entryToStartAfter
+    /// alone.
     pub fn start_after(
         domain_id: impl Into<String>,
         item_id: impl Into<String>,
-        starting_time_ms: u64,
+        time_ms: u64,
         entry_id: [u8; ENTRY_ID_SIZE],
     ) -> Self {
-        Self {
-            domain_id: domain_id.into(),
-            item_id: item_id.into(),
-            range: JournalRange::StartAfter {
-                starting_time_ms,
-                entry_id,
-            },
-        }
+        Self::new(domain_id, item_id).with_entry_to_start_after(time_ms, entry_id)
+    }
+
+    /// Sets rangeStartSpecification.
+    pub fn with_range_start(mut self, start: JournalRangeStart) -> Self {
+        self.range_start = Some(start);
+        self
+    }
+
+    /// Sets rangeStopSpecification.
+    pub fn with_range_stop(mut self, stop: JournalRangeStop) -> Self {
+        self.range_stop = Some(stop);
+        self
+    }
+
+    /// Sets listOfVariables.
+    pub fn with_list_of_variables<I, S>(mut self, variables: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.list_of_variables = variables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets entryToStartAfter.
+    pub fn with_entry_to_start_after(
+        mut self,
+        time_ms: u64,
+        entry_id: [u8; ENTRY_ID_SIZE],
+    ) -> Self {
+        self.entry_to_start_after = Some(JournalEntryToStartAfter { time_ms, entry_id });
+        self
     }
 
     /// Encodes the request, including the `0xbf 0x41 <len>` service wrapper.
@@ -149,17 +217,23 @@ impl ReadJournalRequest {
     pub fn encode(&self, buf: &mut BytesMut) {
         let mut inner = BytesMut::new();
         encode_journal_name(&self.domain_id, &self.item_id, &mut inner);
-        match &self.range {
-            JournalRange::TimeRange { start_ms, end_ms } => {
-                encode_time_range_spec(0xa1, *start_ms, &mut inner);
-                encode_time_range_spec(0xa2, *end_ms, &mut inner);
+        match self.range_start {
+            Some(JournalRangeStart::StartingTime(ms)) => encode_time_choice(0xa1, ms, &mut inner),
+            Some(JournalRangeStart::StartingEntry(id)) => {
+                encode_entry_choice(0xa1, &id, &mut inner)
             }
-            JournalRange::StartAfter {
-                starting_time_ms,
-                entry_id,
-            } => {
-                encode_entry_to_start_after(*starting_time_ms, entry_id, &mut inner);
-            }
+            None => {}
+        }
+        match self.range_stop {
+            Some(JournalRangeStop::EndingTime(ms)) => encode_time_choice(0xa2, ms, &mut inner),
+            Some(JournalRangeStop::NumberOfEntries(n)) => encode_number_of_entries(n, &mut inner),
+            None => {}
+        }
+        if !self.list_of_variables.is_empty() {
+            encode_list_of_variables(&self.list_of_variables, &mut inner);
+        }
+        if let Some(after) = &self.entry_to_start_after {
+            encode_entry_to_start_after(after, &mut inner);
         }
 
         buf.extend_from_slice(&SERVICE_TAG_READ_JOURNAL);
@@ -168,6 +242,14 @@ impl ReadJournalRequest {
     }
 
     /// Decodes a request; `data` starts at the `0xbf` byte.
+    ///
+    /// # Errors
+    ///
+    /// `TruncatedPdu` when the journal name is missing or a length runs past
+    /// the data; `InvalidTag` for an unknown alternative of a range
+    /// specification; `InvalidLength` for an EntryID that is not eight octets
+    /// or a time that is not a six-octet TimeOfDay; `InvalidPdu` for a
+    /// negative numberOfEntries or a variable tag that is not UTF-8.
     pub fn decode(data: &[u8]) -> Result<Self, MmsError> {
         let inner = check_service_tag_and_take(data)?;
         decode_request_inner(inner)
@@ -198,9 +280,8 @@ fn encode_object_name_domain_specific(domain_id: &str, item_id: &str, buf: &mut 
     buf.extend_from_slice(ib);
 }
 
-fn encode_time_range_spec(outer_tag: u8, time_ms: u64, buf: &mut BytesMut) {
-    // 0xa1 / 0xa2 <len>
-    //   0x80 6 <BinaryTime6>
+/// Encodes `outer_tag <len> 0x80 6 <BinaryTime6>`, a time alternative.
+fn encode_time_choice(outer_tag: u8, time_ms: u64, buf: &mut BytesMut) {
     let bt = binary_time6_from_epoch_ms(time_ms);
     buf.extend_from_slice(&[outer_tag]);
     encode_length(2 + bt.len(), buf);
@@ -209,24 +290,53 @@ fn encode_time_range_spec(outer_tag: u8, time_ms: u64, buf: &mut BytesMut) {
     buf.extend_from_slice(&bt);
 }
 
-fn encode_entry_to_start_after(
-    starting_time_ms: u64,
-    entry_id: &[u8; ENTRY_ID_SIZE],
-    buf: &mut BytesMut,
-) {
+/// Encodes `outer_tag <len> 0x81 8 <entryID>`, the startingEntry alternative.
+fn encode_entry_choice(outer_tag: u8, entry_id: &[u8; ENTRY_ID_SIZE], buf: &mut BytesMut) {
+    buf.extend_from_slice(&[outer_tag]);
+    encode_length(2 + entry_id.len(), buf);
+    buf.extend_from_slice(&[0x81]);
+    encode_length(entry_id.len(), buf);
+    buf.extend_from_slice(entry_id);
+}
+
+/// Encodes `0xa2 <len> 0x81 <len> <INTEGER>`, the numberOfEntries alternative.
+fn encode_number_of_entries(n: u32, buf: &mut BytesMut) {
+    let clamped = n.min(i32::MAX as u32);
+    let int = encode_signed_int_minimal(i64::from(clamped));
+    buf.extend_from_slice(&[0xa2]);
+    encode_length(2 + int.len(), buf);
+    buf.extend_from_slice(&[0x81]);
+    encode_length(int.len(), buf);
+    buf.extend_from_slice(&int);
+}
+
+/// Encodes `0xa4 <len>` followed by one VisibleString per variable tag.
+fn encode_list_of_variables(variables: &[String], buf: &mut BytesMut) {
+    let mut list = BytesMut::new();
+    for v in variables {
+        list.extend_from_slice(&[0x1a]);
+        encode_length(v.len(), &mut list);
+        list.extend_from_slice(v.as_bytes());
+    }
+    buf.extend_from_slice(&[0xa4]);
+    encode_length(list.len(), buf);
+    buf.extend_from_slice(&list);
+}
+
+fn encode_entry_to_start_after(after: &JournalEntryToStartAfter, buf: &mut BytesMut) {
     // 0xa5 <len>
     //   0x80 6 <BinaryTime6 timeSpecification>
     //   0x81 8 <entryID OctetString>
-    let bt = binary_time6_from_epoch_ms(starting_time_ms);
-    let inner_len = (2 + bt.len()) + (2 + entry_id.len());
+    let bt = binary_time6_from_epoch_ms(after.time_ms);
+    let inner_len = (2 + bt.len()) + (2 + after.entry_id.len());
     buf.extend_from_slice(&[0xa5]);
     encode_length(inner_len, buf);
     buf.extend_from_slice(&[0x80]);
     encode_length(bt.len(), buf);
     buf.extend_from_slice(&bt);
     buf.extend_from_slice(&[0x81]);
-    encode_length(entry_id.len(), buf);
-    buf.extend_from_slice(entry_id);
+    encode_length(after.entry_id.len(), buf);
+    buf.extend_from_slice(&after.entry_id);
 }
 
 fn check_service_tag_and_take(data: &[u8]) -> Result<&[u8], MmsError> {
@@ -249,11 +359,11 @@ fn check_service_tag_and_take(data: &[u8]) -> Result<&[u8], MmsError> {
 
 fn decode_request_inner(data: &[u8]) -> Result<ReadJournalRequest, MmsError> {
     let mut pos = 0usize;
-    let mut domain_id: Option<String> = None;
-    let mut item_id: Option<String> = None;
-    let mut range_start: Option<u64> = None;
-    let mut range_stop: Option<u64> = None;
-    let mut after: Option<JournalRange> = None;
+    let mut name: Option<(String, String)> = None;
+    let mut range_start: Option<JournalRangeStart> = None;
+    let mut range_stop: Option<JournalRangeStop> = None;
+    let mut list_of_variables: Vec<String> = Vec::new();
+    let mut entry_to_start_after: Option<JournalEntryToStartAfter> = None;
 
     while pos < data.len() {
         let tag = data[pos];
@@ -266,38 +376,89 @@ fn decode_request_inner(data: &[u8]) -> Result<ReadJournalRequest, MmsError> {
         pos = val_start + len;
 
         match tag {
-            0xa0 => {
-                let (d, i) = decode_journal_name(val)?;
-                domain_id = Some(d);
-                item_id = Some(i);
-            }
-            0xa1 => {
-                range_start = Some(decode_time_range_spec(val)?);
-            }
-            0xa2 => {
-                range_stop = Some(decode_time_range_spec(val)?);
-            }
-            0xa5 => {
-                after = Some(decode_entry_to_start_after(val)?);
-            }
+            0xa0 => name = Some(decode_journal_name(val)?),
+            0xa1 => range_start = Some(decode_range_start(val)?),
+            0xa2 => range_stop = Some(decode_range_stop(val)?),
+            0xa4 => list_of_variables = decode_list_of_variables(val)?,
+            0xa5 => entry_to_start_after = Some(decode_entry_to_start_after(val)?),
             other => {
                 tracing::debug!("skipping unknown readjournalrequest tag 0x{:02X}", other);
             }
         }
     }
 
-    let domain_id = domain_id.ok_or(MmsError::TruncatedPdu)?;
-    let item_id = item_id.ok_or(MmsError::TruncatedPdu)?;
-    let range = match (range_start, range_stop, after) {
-        (Some(start_ms), Some(end_ms), None) => JournalRange::TimeRange { start_ms, end_ms },
-        (None, None, Some(r)) => r,
-        _ => return Err(MmsError::TruncatedPdu),
-    };
+    let (domain_id, item_id) = name.ok_or(MmsError::TruncatedPdu)?;
     Ok(ReadJournalRequest {
         domain_id,
         item_id,
-        range,
+        range_start,
+        range_stop,
+        list_of_variables,
+        entry_to_start_after,
     })
+}
+
+/// Splits the content of an EXPLICIT CHOICE wrapper into the tag and value of
+/// its one alternative.
+fn decode_choice(val: &[u8]) -> Result<(u8, &[u8]), MmsError> {
+    if val.is_empty() {
+        return Err(MmsError::TruncatedPdu);
+    }
+    let (len, hdr) = decode_length(&val[1..])?;
+    let start = 1 + hdr;
+    if start + len > val.len() {
+        return Err(MmsError::TruncatedPdu);
+    }
+    Ok((val[0], &val[start..start + len]))
+}
+
+fn decode_range_start(val: &[u8]) -> Result<JournalRangeStart, MmsError> {
+    match decode_choice(val)? {
+        (0x80, t) => Ok(JournalRangeStart::StartingTime(decode_binary_time_to_ms(
+            t,
+        )?)),
+        (0x81, id) => Ok(JournalRangeStart::StartingEntry(decode_entry_id(id)?)),
+        (actual, _) => Err(MmsError::InvalidTag {
+            expected: 0x80,
+            actual,
+        }),
+    }
+}
+
+fn decode_range_stop(val: &[u8]) -> Result<JournalRangeStop, MmsError> {
+    match decode_choice(val)? {
+        (0x80, t) => Ok(JournalRangeStop::EndingTime(decode_binary_time_to_ms(t)?)),
+        (0x81, n) => {
+            let n = decode_signed_int(n)?;
+            let Ok(n) = u32::try_from(n) else {
+                tracing::warn!(n, "numberOfEntries is negative, rejecting the pdu");
+                return Err(MmsError::InvalidPdu);
+            };
+            Ok(JournalRangeStop::NumberOfEntries(n))
+        }
+        (actual, _) => Err(MmsError::InvalidTag {
+            expected: 0x80,
+            actual,
+        }),
+    }
+}
+
+fn decode_list_of_variables(val: &[u8]) -> Result<Vec<String>, MmsError> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p < val.len() {
+        out.push(decode_visible_string_field(val, &mut p, val.len())?);
+    }
+    Ok(out)
+}
+
+fn decode_entry_id(v: &[u8]) -> Result<[u8; ENTRY_ID_SIZE], MmsError> {
+    if v.len() != ENTRY_ID_SIZE {
+        return Err(MmsError::InvalidLength);
+    }
+    let mut id = [0u8; ENTRY_ID_SIZE];
+    id.copy_from_slice(v);
+    Ok(id)
 }
 
 fn decode_journal_name(data: &[u8]) -> Result<(String, String), MmsError> {
@@ -337,23 +498,10 @@ fn decode_visible_string_field(
     Ok(s)
 }
 
-fn decode_time_range_spec(val: &[u8]) -> Result<u64, MmsError> {
-    // val = 0x80 <len> <BinaryTime>
-    if val.is_empty() || val[0] != 0x80 {
-        return Err(MmsError::TruncatedPdu);
-    }
-    let (blen, bhdr) = decode_length(&val[1..])?;
-    let b_start = 1 + bhdr;
-    if b_start + blen > val.len() {
-        return Err(MmsError::TruncatedPdu);
-    }
-    decode_binary_time_to_ms(&val[b_start..b_start + blen])
-}
-
-fn decode_entry_to_start_after(val: &[u8]) -> Result<JournalRange, MmsError> {
+fn decode_entry_to_start_after(val: &[u8]) -> Result<JournalEntryToStartAfter, MmsError> {
     // val = 0x80 <len> <BinaryTime>  0x81 <len> <entryID>
     let mut p = 0usize;
-    let mut starting_time_ms: Option<u64> = None;
+    let mut time_ms: Option<u64> = None;
     let mut entry_id: Option<[u8; ENTRY_ID_SIZE]> = None;
 
     while p < val.len() {
@@ -366,25 +514,16 @@ fn decode_entry_to_start_after(val: &[u8]) -> Result<JournalRange, MmsError> {
         let v = &val[v_start..v_start + l];
         p = v_start + l;
         match tag {
-            0x80 => {
-                starting_time_ms = Some(decode_binary_time_to_ms(v)?);
-            }
-            0x81 => {
-                if v.len() != ENTRY_ID_SIZE {
-                    return Err(MmsError::InvalidLength);
-                }
-                let mut id = [0u8; ENTRY_ID_SIZE];
-                id.copy_from_slice(v);
-                entry_id = Some(id);
-            }
+            0x80 => time_ms = Some(decode_binary_time_to_ms(v)?),
+            0x81 => entry_id = Some(decode_entry_id(v)?),
             other => {
                 tracing::debug!("skipping unknown entrytostartafter tag 0x{:02X}", other);
             }
         }
     }
 
-    Ok(JournalRange::StartAfter {
-        starting_time_ms: starting_time_ms.ok_or(MmsError::TruncatedPdu)?,
+    Ok(JournalEntryToStartAfter {
+        time_ms: time_ms.ok_or(MmsError::TruncatedPdu)?,
         entry_id: entry_id.ok_or(MmsError::TruncatedPdu)?,
     })
 }
@@ -412,6 +551,7 @@ fn decode_binary_time_to_ms(b: &[u8]) -> Result<u64, MmsError> {
 
 /// One journal entry as it appears on the wire.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct WireJournalEntry {
     /// EntryID, 8 bytes big-endian.
     pub entry_id: [u8; ENTRY_ID_SIZE],
@@ -424,6 +564,7 @@ pub struct WireJournalEntry {
 
 /// One data point of a journal entry.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct WireJournalVariable {
     /// dataRef, a UTF-8 string.
     pub data_ref: String,
@@ -437,6 +578,34 @@ pub struct WireJournalVariable {
     /// is the most significant bit of the first octet; bit 7 of this byte is
     /// not sent, and wire bits after bit 7 are not kept.
     pub reason_code: u8,
+}
+
+impl WireJournalEntry {
+    /// Builds an entry from its EntryID, its occurrence time in epoch
+    /// milliseconds, and its data points.
+    pub fn new(
+        entry_id: [u8; ENTRY_ID_SIZE],
+        occurence_time_ms: u64,
+        variables: Vec<WireJournalVariable>,
+    ) -> Self {
+        Self {
+            entry_id,
+            occurence_time_ms,
+            variables,
+        }
+    }
+}
+
+impl WireJournalVariable {
+    /// Builds a data point from its data reference, its value, and its reason
+    /// code byte as [`Self::reason_code`] describes it.
+    pub fn new(data_ref: impl Into<String>, value: MmsData, reason_code: u8) -> Self {
+        Self {
+            data_ref: data_ref.into(),
+            value,
+            reason_code,
+        }
+    }
 }
 
 /// An MMS ReadJournalResponse.
@@ -1242,11 +1411,174 @@ mod tests {
         let t6 = binary_time6_from_epoch_ms(1_600_000_000_000);
         let r = ReadJournalRequest::decode(&time_range_request_with(&t6)).expect("decodes");
         assert_eq!(
-            r.range,
-            JournalRange::TimeRange {
-                start_ms: 1_600_000_000_000,
-                end_ms: 1_700_000_000_000,
-            }
+            r,
+            ReadJournalRequest::time_range("D", "I", 1_600_000_000_000, 1_700_000_000_000)
         );
+    }
+
+    // the four OPTIONAL fields
+
+    const T1: u64 = 1_700_000_000_000;
+    const T2: u64 = 1_700_000_005_000;
+    const ID: [u8; ENTRY_ID_SIZE] = [0, 0, 0, 0, 0, 0, 0x12, 0x34];
+
+    fn round_trip(req: &ReadJournalRequest) -> ReadJournalRequest {
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        ReadJournalRequest::decode(&buf).expect("decodes")
+    }
+
+    /// Wraps a request body in the `0xbf 0x41` service tag, after the journal
+    /// name `D`/`I`.
+    fn request_with(fields: &[u8]) -> Vec<u8> {
+        let mut body = vec![0xa0, 0x08, 0xa1, 0x06, 0x1a, 0x01, b'D', 0x1a, 0x01, b'I'];
+        body.extend_from_slice(fields);
+        let mut v = vec![0xbf, 0x41, body.len() as u8];
+        v.extend(body);
+        v
+    }
+
+    fn time_field(outer: u8, ms: u64) -> Vec<u8> {
+        let mut v = vec![outer, 0x08, 0x80, 0x06];
+        v.extend_from_slice(&binary_time6_from_epoch_ms(ms));
+        v
+    }
+
+    fn after_field(ms: u64, id: [u8; ENTRY_ID_SIZE]) -> Vec<u8> {
+        let mut v = vec![0xa5, 0x12, 0x80, 0x06];
+        v.extend_from_slice(&binary_time6_from_epoch_ms(ms));
+        v.extend_from_slice(&[0x81, 0x08]);
+        v.extend_from_slice(&id);
+        v
+    }
+
+    #[test]
+    fn a_request_with_no_optional_field_selects_the_whole_journal() {
+        let req = ReadJournalRequest::new("D", "I");
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        assert_eq!(buf.to_vec(), request_with(&[]));
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn a_start_time_alone_decodes() {
+        let r = ReadJournalRequest::decode(&request_with(&time_field(0xa1, T1))).expect("decodes");
+        assert_eq!(r.range_start, Some(JournalRangeStart::StartingTime(T1)));
+        assert_eq!(r.range_stop, None);
+        assert_eq!(r.entry_to_start_after, None);
+    }
+
+    #[test]
+    fn an_entry_to_start_after_with_an_ending_time_decodes() {
+        let fields = [time_field(0xa2, T2), after_field(T1, ID)].concat();
+        let r = ReadJournalRequest::decode(&request_with(&fields)).expect("decodes");
+        assert_eq!(r.range_start, None);
+        assert_eq!(r.range_stop, Some(JournalRangeStop::EndingTime(T2)));
+        assert_eq!(
+            r.entry_to_start_after,
+            Some(JournalEntryToStartAfter {
+                time_ms: T1,
+                entry_id: ID,
+            })
+        );
+    }
+
+    #[test]
+    fn a_start_time_with_an_entry_to_start_after_decodes() {
+        let fields = [time_field(0xa1, T1), after_field(T2, ID)].concat();
+        let r = ReadJournalRequest::decode(&request_with(&fields)).expect("decodes");
+        assert_eq!(r.range_start, Some(JournalRangeStart::StartingTime(T1)));
+        assert_eq!(r.entry_to_start_after.map(|a| a.time_ms), Some(T2));
+    }
+
+    #[test]
+    fn a_starting_entry_travels_as_the_second_alternative() {
+        let req = ReadJournalRequest::new("D", "I")
+            .with_range_start(JournalRangeStart::StartingEntry(ID));
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        let mut field = vec![0xa1, 0x0a, 0x81, 0x08];
+        field.extend_from_slice(&ID);
+        assert_eq!(buf.to_vec(), request_with(&field));
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn a_number_of_entries_travels_as_an_integer() {
+        let req = ReadJournalRequest::new("D", "I")
+            .with_range_stop(JournalRangeStop::NumberOfEntries(300));
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        assert_eq!(
+            buf.to_vec(),
+            request_with(&[0xa2, 0x04, 0x81, 0x02, 0x01, 0x2c])
+        );
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn a_number_of_entries_above_integer32_is_sent_as_its_maximum() {
+        let req = ReadJournalRequest::new("D", "I")
+            .with_range_stop(JournalRangeStop::NumberOfEntries(u32::MAX));
+        assert_eq!(
+            round_trip(&req).range_stop,
+            Some(JournalRangeStop::NumberOfEntries(i32::MAX as u32))
+        );
+    }
+
+    #[test]
+    fn a_negative_number_of_entries_is_rejected() {
+        let r = ReadJournalRequest::decode(&request_with(&[0xa2, 0x03, 0x81, 0x01, 0xff]));
+        assert!(matches!(r, Err(MmsError::InvalidPdu)), "{r:?}");
+    }
+
+    #[test]
+    fn a_list_of_variables_travels_as_visible_strings() {
+        let req = ReadJournalRequest::new("D", "I").with_list_of_variables(["A", "BC"]);
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        assert_eq!(
+            buf.to_vec(),
+            request_with(&[0xa4, 0x07, 0x1a, 0x01, b'A', 0x1a, 0x02, b'B', b'C'])
+        );
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn an_empty_list_of_variables_decodes_as_an_absent_one() {
+        let r = ReadJournalRequest::decode(&request_with(&[0xa4, 0x00])).expect("decodes");
+        assert_eq!(r, ReadJournalRequest::new("D", "I"));
+    }
+
+    #[test]
+    fn all_four_optional_fields_round_trip_together() {
+        let req = ReadJournalRequest::new("LD0", "LLN0$GeneralLog")
+            .with_range_start(JournalRangeStart::StartingEntry(ID))
+            .with_range_stop(JournalRangeStop::EndingTime(T2))
+            .with_list_of_variables(["LD0/GGIO1$ST$Ind1$stVal"])
+            .with_entry_to_start_after(T1, [0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn an_unknown_range_alternative_is_rejected() {
+        let r = ReadJournalRequest::decode(&request_with(&[0xa1, 0x03, 0x82, 0x01, 0x00]));
+        assert!(
+            matches!(
+                r,
+                Err(MmsError::InvalidTag {
+                    expected: 0x80,
+                    actual: 0x82
+                })
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_starting_entry_that_is_not_eight_octets_is_rejected() {
+        let r = ReadJournalRequest::decode(&request_with(&[0xa1, 0x04, 0x81, 0x02, 0x00, 0x01]));
+        assert!(matches!(r, Err(MmsError::InvalidLength)), "{r:?}");
     }
 }

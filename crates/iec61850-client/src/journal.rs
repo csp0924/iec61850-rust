@@ -12,10 +12,7 @@
 use crate::error::ClientError;
 use crate::prelude::{format, String, ToString, Vec};
 use iec61850_mms::mms::pdu::common::MmsData;
-use iec61850_mms::mms::pdu::{
-    JournalRange as WireJournalRange, ReadJournalRequest as WireReadJournalRequest,
-    WireJournalEntry,
-};
+use iec61850_mms::mms::pdu::{ReadJournalRequest as WireReadJournalRequest, WireJournalEntry};
 use iec61850_model::MmsValue;
 
 /// Journal entry identifier, an 8-byte big-endian value on the wire.
@@ -151,22 +148,14 @@ pub(crate) fn build_wire_request(
     item: String,
     query: &JournalQuery,
 ) -> WireReadJournalRequest {
-    let range = match *query {
+    match *query {
         JournalQuery::TimeRange { start_ms, end_ms } => {
-            WireJournalRange::TimeRange { start_ms, end_ms }
+            WireReadJournalRequest::time_range(domain, item, start_ms, end_ms)
         }
         JournalQuery::StartAfter {
             starting_time_ms,
             entry_id,
-        } => WireJournalRange::StartAfter {
-            starting_time_ms,
-            entry_id: entry_id.0,
-        },
-    };
-    WireReadJournalRequest {
-        domain_id: domain,
-        item_id: item,
-        range,
+        } => WireReadJournalRequest::start_after(domain, item, starting_time_ms, entry_id.0),
     }
 }
 
@@ -258,15 +247,10 @@ mod tests {
     fn build_wire_request_time_range_maps_directly() {
         let q = JournalQuery::by_time(100, 999);
         let req = build_wire_request("IED1LD0".into(), "MMXU1$LG$lcb01".into(), &q);
-        assert_eq!(req.domain_id, "IED1LD0");
-        assert_eq!(req.item_id, "MMXU1$LG$lcb01");
-        match req.range {
-            iec61850_mms::mms::pdu::JournalRange::TimeRange { start_ms, end_ms } => {
-                assert_eq!(start_ms, 100);
-                assert_eq!(end_ms, 999);
-            }
-            _ => panic!("expected a TimeRange range"),
-        }
+        assert_eq!(
+            req,
+            WireReadJournalRequest::time_range("IED1LD0", "MMXU1$LG$lcb01", 100, 999)
+        );
     }
 
     #[test]
@@ -274,29 +258,23 @@ mod tests {
         let q =
             JournalQuery::after_entry(500, ClientJournalEntryId([0, 0, 0, 0, 0, 0, 0xab, 0xcd]));
         let req = build_wire_request("D".into(), "I".into(), &q);
-        match req.range {
-            iec61850_mms::mms::pdu::JournalRange::StartAfter {
-                starting_time_ms,
-                entry_id,
-            } => {
-                assert_eq!(starting_time_ms, 500);
-                assert_eq!(entry_id, [0, 0, 0, 0, 0, 0, 0xab, 0xcd]);
-            }
-            _ => panic!("expected a StartAfter range"),
-        }
+        assert_eq!(
+            req,
+            WireReadJournalRequest::start_after("D", "I", 500, [0, 0, 0, 0, 0, 0, 0xab, 0xcd])
+        );
     }
 
     #[test]
     fn wire_entry_to_client_carries_reason_code() {
-        let wire = WireJournalEntry {
-            entry_id: [0, 0, 0, 0, 0, 0, 0, 1],
-            occurence_time_ms: 1_700_000_000_000,
-            variables: vec![iec61850_mms::mms::pdu::WireJournalVariable {
-                data_ref: "LD0/A".into(),
-                value: MmsData::Boolean(true),
-                reason_code: 0x10,
-            }],
-        };
+        let wire = WireJournalEntry::new(
+            [0, 0, 0, 0, 0, 0, 0, 1],
+            1_700_000_000_000,
+            vec![iec61850_mms::mms::pdu::WireJournalVariable::new(
+                "LD0/A",
+                MmsData::Boolean(true),
+                0x10,
+            )],
+        );
         let c = wire_entry_to_client(wire);
         assert_eq!(c.entry_id.as_u64(), 1);
         assert_eq!(c.time_ms, 1_700_000_000_000);

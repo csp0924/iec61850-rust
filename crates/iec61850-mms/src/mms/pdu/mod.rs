@@ -103,8 +103,9 @@ pub use read::{
 };
 pub use read_journal::{
     decode_confirmed_read_journal_request, decode_confirmed_read_journal_response,
-    encode_confirmed_read_journal_request, encode_confirmed_read_journal_response, JournalRange,
-    ReadJournalRequest, ReadJournalResponse, WireJournalEntry, WireJournalVariable, ENTRY_ID_SIZE,
+    encode_confirmed_read_journal_request, encode_confirmed_read_journal_response,
+    JournalEntryToStartAfter, JournalRangeStart, JournalRangeStop, ReadJournalRequest,
+    ReadJournalResponse, WireJournalEntry, WireJournalVariable, ENTRY_ID_SIZE,
     SERVICE_TAG_READ_JOURNAL,
 };
 pub use reject::{
