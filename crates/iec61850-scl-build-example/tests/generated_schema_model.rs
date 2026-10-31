@@ -72,10 +72,19 @@ fn generated_control_blocks_carry_the_schema() {
         lln0.rcbs[0].trg_ops,
         TrgOps::DCHG | TrgOps::INTEGRITY | TrgOps::GI
     );
+    assert_eq!(lln0.rcbs[0].buf_tm_ms, 50);
+    assert_eq!(lln0.rcbs[0].intg_pd_ms, 1000);
+    assert_eq!(
+        lln0.rcbs[0].opt_flds,
+        iec61850_scl::__private::OptFlds::SEQ_NUM
+            | iec61850_scl::__private::OptFlds::ENTRY_ID
+            | iec61850_scl::__private::OptFlds::BUFFER_OVERFLOW
+    );
     let lcb = &lln0.lcbs[0];
     assert!(lcb.log_ena);
     assert!(!lcb.reason_code);
     assert_eq!(lcb.intg_pd_ms, 2000);
+    assert_eq!(lcb.buf_tm_ms, 25);
     assert_eq!(lcb.trg_ops, TrgOps::DCHG | TrgOps::INTEGRITY);
 }
 

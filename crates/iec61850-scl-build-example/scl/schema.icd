@@ -10,11 +10,12 @@
             <DataSet name="dsSeq">
               <FCDA ldInst="LD0" lnClass="MSQI" lnInst="1" doName="SeqA" fc="MX"/>
             </DataSet>
-            <ReportControl name="brcbSeq" datSet="dsSeq" buffered="true" confRev="1">
+            <ReportControl name="brcbSeq" datSet="dsSeq" buffered="true" confRev="1" bufTime="50" intgPd="1000">
               <TrgOps dchg="true" period="true"/>
+              <OptFields seqNum="true" entryID="true"/>
               <RptEnabled max="3"/>
             </ReportControl>
-            <LogControl name="lcbSeq" datSet="dsSeq" logName="Log" reasonCode="false" intgPd="2000">
+            <LogControl name="lcbSeq" datSet="dsSeq" logName="Log" reasonCode="false" bufTime="25" intgPd="2000">
               <TrgOps dchg="true" period="true" gi="true"/>
             </LogControl>
             <SettingControl numOfSGs="2" actSG="1"/>

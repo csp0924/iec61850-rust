@@ -146,6 +146,32 @@ fn log_trg_ops_drop_the_gi_default() {
     assert_eq!(lcbs(&m)[0].trg_ops, TrgOps::DCHG);
 }
 
+/// The summary line of a report control block carries every setting the
+/// model holds, so two models that differ in any of them summarize apart.
+#[test]
+fn report_control_summary_carries_every_setting() {
+    let m = build(&wrap(
+        r#"<ReportControl name="brcb" datSet="ds1" rptID="R1" confRev="3" buffered="true" bufTime="50" intgPd="1000">
+             <TrgOps dchg="true" period="true"/>
+             <OptFields seqNum="true"/>
+           </ReportControl>"#,
+    ));
+    let summary = iec61850_scl::summarize::summarize_model(&m);
+    let line = summary
+        .lines()
+        .find(|l| l.trim_start().starts_with("RCB name=brcb "))
+        .unwrap_or_else(|| panic!("no RCB line in:\n{summary}"));
+    let rcb = &rcbs(&m)[0];
+    for field in [
+        format!("trg=0x{:02x}", rcb.trg_ops.0),
+        format!("optFlds=0x{:04x}", rcb.opt_flds.0),
+        "bufTm=50".to_string(),
+        "intgPd=1000".to_string(),
+    ] {
+        assert!(line.contains(&field), "{field} missing from {line}");
+    }
+}
+
 /// The raw `<TrgOps>` of a report and a log control block both carry the
 /// `gi` default.
 #[test]
