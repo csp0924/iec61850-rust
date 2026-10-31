@@ -5,6 +5,7 @@
 //!
 //! ```sh
 //! ip link add vf0 type veth peer name vf1
+//! sysctl -w net.ipv6.conf.vf0.disable_ipv6=1 net.ipv6.conf.vf1.disable_ipv6=1
 //! ip link set vf0 up && ip link set vf1 up
 //! IEC61850_VETH=vf0,vf1 cargo test -p iec61850-hal --features ethernet-pcap \
 //!     --test pcap_veth -- --ignored
@@ -18,9 +19,26 @@ use std::time::{Duration, Instant};
 use iec61850_hal::ethernet::pcap::PcapSocket;
 use iec61850_hal::ethernet::{EthernetConfig, EthernetError, EthernetSource};
 
-/// Receives once on the receiving end of the veth pair with `timeout`, from a
-/// socket opened with `cfg_timeout`, and returns the result and how long the
-/// call took. A call that never returns fails the test after 10 s.
+/// Returns whether `frame` carries the GOOSE or Sampled Values EtherType,
+/// behind an optional 802.1Q tag.
+fn is_goose_or_sv(frame: &[u8]) -> bool {
+    let at = |i: usize| {
+        frame
+            .get(i..i + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let ether_type = match at(12) {
+        Some(0x8100) => at(16),
+        other => other,
+    };
+    matches!(ether_type, Some(0x88B8 | 0x88BA))
+}
+
+/// Receives on the receiving end of the veth pair with `timeout`, from a
+/// socket opened with `cfg_timeout`, and returns the result and how long it
+/// took. Frames other than GOOSE and SV, such as IPv6 neighbor discovery on
+/// a link just brought up, are skipped and the call is repeated. A call that
+/// never returns fails the test after 10 s.
 fn recv_once(
     cfg_timeout: Option<Duration>,
     timeout: Option<Duration>,
@@ -36,7 +54,12 @@ fn recv_once(
         let mut sock = PcapSocket::open(&cfg).expect("open pcap on the receiver");
         let mut buf = [0u8; 1522];
         let started = Instant::now();
-        let r = sock.recv(&mut buf, timeout);
+        let r = loop {
+            match sock.recv(&mut buf, timeout) {
+                Ok(n) if !is_goose_or_sv(&buf[..n]) => continue,
+                r => break r,
+            }
+        };
         let _ = done.send((r, started.elapsed()));
     });
     result
