@@ -203,13 +203,66 @@ pub enum SboClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ControlOutcome {
-    /// The command succeeded: the confirmed response in a normal model, or a
-    /// positive command termination in an enhanced one.
+    /// The command succeeded: a granted selection, the confirmed response in a
+    /// normal model, or a positive command termination in an enhanced one.
     Success,
-    /// The command failed, with the additional cause the server reported: from
-    /// the LastApplError ahead of a negative response, or from a negative
-    /// command termination. `Unknown` when the server reported none.
-    Failure(ControlAddCause),
+    /// The command failed: the server refused it, or an accepted enhanced
+    /// Operate ended with a negative command termination.
+    ///
+    /// IEC 61850-8-1 has the server report a refused SelectWithValue,
+    /// Operate or Cancel with a LastApplError ahead of the negative response;
+    /// the report is mandatory in the enhanced-security models and optional
+    /// in the normal-security ones. A negative command termination always
+    /// carries one.
+    #[non_exhaustive]
+    Failure {
+        /// AddCause of `last_appl_error`, or `Unknown` when there is none.
+        add_cause: ControlAddCause,
+        /// The LastApplError the server reported for this command, matched on
+        /// the control object and, except for a Select, on ctlNum and origin.
+        /// `None` when the server sent none.
+        last_appl_error: Option<LastApplError>,
+    },
+}
+
+impl ControlOutcome {
+    /// Builds a failure from the LastApplError reported for the command, if
+    /// any; the cause is that error's AddCause, or `Unknown` without one.
+    ///
+    /// This is the only way to build a `Failure`, so `add_cause` always
+    /// agrees with `last_appl_error`.
+    pub fn failure(last_appl_error: Option<LastApplError>) -> Self {
+        Self::Failure {
+            add_cause: last_appl_error
+                .as_ref()
+                .map_or(ControlAddCause::Unknown, |e| e.add_cause),
+            last_appl_error,
+        }
+    }
+
+    /// Reports whether the command succeeded.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    /// Returns the AddCause of a failure, or `None` for a success.
+    pub fn add_cause(&self) -> Option<ControlAddCause> {
+        match self {
+            Self::Failure { add_cause, .. } => Some(*add_cause),
+            Self::Success => None,
+        }
+    }
+
+    /// Returns the LastApplError of a failure, or `None` for a success or a
+    /// failure the server reported no LastApplError for.
+    pub fn last_appl_error(&self) -> Option<&LastApplError> {
+        match self {
+            Self::Failure {
+                last_appl_error, ..
+            } => last_appl_error.as_ref(),
+            Self::Success => None,
+        }
+    }
 }
 
 /// A parsed command termination.
@@ -240,6 +293,25 @@ pub struct LastApplError {
     pub ctl_num: u8,
     /// Additional cause of the failure.
     pub add_cause: ControlAddCause,
+}
+
+impl LastApplError {
+    /// Creates a LastApplError from its five components.
+    pub fn new(
+        ctl_obj: impl Into<String>,
+        error: ControlLastApplError,
+        origin: OriginValue,
+        ctl_num: u8,
+        add_cause: ControlAddCause,
+    ) -> Self {
+        Self {
+            ctl_obj: ctl_obj.into(),
+            error,
+            origin,
+            ctl_num,
+            add_cause,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +350,31 @@ mod tests {
             or_ident: vec![],
         };
         assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn failure_takes_its_cause_from_the_last_appl_error() {
+        let e = LastApplError::new(
+            "LD/GGIO1$CO$SPCSO1$Oper",
+            ControlLastApplError::NoError,
+            OriginValue::bay_control(),
+            7,
+            ControlAddCause::BlockedByMode,
+        );
+        assert_eq!(e.ctl_obj, "LD/GGIO1$CO$SPCSO1$Oper");
+        assert_eq!(e.ctl_num, 7);
+        let outcome = ControlOutcome::failure(Some(e.clone()));
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.add_cause(), Some(ControlAddCause::BlockedByMode));
+        assert_eq!(outcome.last_appl_error(), Some(&e));
+
+        let bare = ControlOutcome::failure(None);
+        assert_eq!(bare.add_cause(), Some(ControlAddCause::Unknown));
+        assert_eq!(bare.last_appl_error(), None);
+
+        assert!(ControlOutcome::Success.is_success());
+        assert_eq!(ControlOutcome::Success.add_cause(), None);
+        assert_eq!(ControlOutcome::Success.last_appl_error(), None);
     }
 
     #[test]

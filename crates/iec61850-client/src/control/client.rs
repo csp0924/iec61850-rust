@@ -17,10 +17,11 @@
 //! | any               | `cancel` writes Cancel                           |
 //!
 //! A refused command is answered with a negative response, preceded by an
-//! InformationReport carrying only `LastApplError`; its AddCause becomes the
-//! failure cause, and a refused command has no command termination. An
-//! accepted enhanced Operate is concluded by the command termination that
-//! follows the positive response.
+//! InformationReport carrying only `LastApplError`; that LastApplError and its
+//! AddCause are returned in [`ControlOutcome::Failure`], and a refused command
+//! has no command termination. An accepted enhanced Operate is concluded by
+//! the command termination that follows the positive response; a negative one
+//! returns the LastApplError it carries the same way.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
@@ -49,13 +50,6 @@ use super::model::{
 /// Default wait for a command termination, used by the enhanced models.
 #[cfg(feature = "std")]
 const DEFAULT_CT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Holds the LastApplError of the most recent command. It is locked only to
-/// copy a value in or out, never across an await.
-#[cfg(feature = "std")]
-type LastApplErrorSlot = std::sync::Mutex<Option<LastApplError>>;
-#[cfg(not(feature = "std"))]
-type LastApplErrorSlot = spin::Mutex<Option<LastApplError>>;
 
 // ControlObjectClient
 
@@ -91,8 +85,6 @@ pub struct ControlObjectClient<T = tokio::net::TcpStream, Tm = iec61850_hal::tim
     synchro_check: AtomicBool,
     /// Default `Test` flag.
     test: AtomicBool,
-    /// LastApplError reported for the most recent command.
-    last_appl_error: LastApplErrorSlot,
     /// Shared with the originating connection.
     mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     is_connected: Arc<AtomicBool>,
@@ -111,7 +103,6 @@ pub struct ControlObjectClient<T, Tm> {
     interlock_check: AtomicBool,
     synchro_check: AtomicBool,
     test: AtomicBool,
-    last_appl_error: LastApplErrorSlot,
     mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     is_connected: Arc<AtomicBool>,
 }
@@ -145,7 +136,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             interlock_check: AtomicBool::new(false),
             synchro_check: AtomicBool::new(false),
             test: AtomicBool::new(false),
-            last_appl_error: LastApplErrorSlot::new(None),
             mms_client,
             is_connected,
         })
@@ -199,36 +189,22 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         self.ctl_model
     }
 
-    /// Returns the LastApplError the server reported for the most recent
-    /// Select, SelectWithValue, Operate or Cancel issued through this handle.
-    ///
-    /// A server reports one ahead of the negative response to a refused
-    /// command, and inside a negative command termination. `None` when the
-    /// most recent command drew neither, which includes every success.
-    pub fn last_appl_error(&self) -> Option<LastApplError> {
-        #[cfg(feature = "std")]
-        let slot = self
-            .last_appl_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(not(feature = "std"))]
-        let slot = self.last_appl_error.lock();
-        slot.clone()
-    }
-
     // Services.
 
     /// Selects the object by reading `<LN>$CO$<DO>$SBO` (ACSI Select).
     ///
-    /// Returns `true` when the server answers with the object reference and
-    /// `false` when it answers with an empty string, which denies the selection;
-    /// the cause of a denial is then available from `last_appl_error`.
+    /// `Success` when the server answers with the object reference. An empty
+    /// string denies the selection, as does a value that is not a string; the
+    /// denial is `Failure` with the LastApplError the server reported ahead of
+    /// the response, matched on the control object only, as a Select carries
+    /// no ctlNum or origin. IEC 61850-8-1 does not require that report for a
+    /// Select, so a denial may carry `None` and `Unknown`.
     ///
     /// # Errors
     ///
     /// `NotConnected` if the association is closed, `InvalidArgument` unless the
     /// control model is sbo-normal, and any error from the MMS layer.
-    pub async fn select(&self) -> Result<bool, ClientError> {
+    pub async fn select(&self) -> Result<ControlOutcome, ClientError> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err(ClientError::NotConnected);
         }
@@ -240,15 +216,13 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         }
         let item = format!("{}$SBO", self.item_base);
         let mut client = self.mms_client.lock().await;
-        self.store_last_appl_error(None);
         let resp = client.read(&self.domain, &item).await?;
         // A non-empty VisibleString means the selection was granted.
         match resp {
-            MmsData::VisibleString(s) if !s.is_empty() => Ok(true),
+            MmsData::VisibleString(s) if !s.is_empty() => Ok(ControlOutcome::Success),
             MmsData::VisibleString(_) => {
                 let last = self.take_last_appl_error(&mut client, None).await;
-                self.store_last_appl_error(last);
-                Ok(false)
+                Ok(ControlOutcome::failure(last))
             }
             other => {
                 tracing::warn!(
@@ -256,8 +230,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
                     "select: server answered with a non-string value, treating as denied"
                 );
                 let last = self.take_last_appl_error(&mut client, None).await;
-                self.store_last_appl_error(last);
-                Ok(false)
+                Ok(ControlOutcome::failure(last))
             }
         }
     }
@@ -267,8 +240,8 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// Must precede `operate`, and `ctl_val` must equal the value passed to it;
     /// otherwise the server answers with InconsistentParameters. A refusal is
-    /// `Failure` with the AddCause of the server's LastApplError, or `Unknown`
-    /// when the server sent none.
+    /// `Failure` with the server's LastApplError for this command, or with
+    /// `None` and `Unknown` when the server sent none.
     ///
     /// # Errors
     ///
@@ -301,7 +274,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         );
         let item = format!("{}$SBOw", self.item_base);
         let mut client = self.mms_client.lock().await;
-        self.store_last_appl_error(None);
         match client
             .write(&self.domain, &item, mms_value_to_mms_data(&sbow))
             .await
@@ -326,19 +298,22 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     /// other services on the same connection wait meanwhile; releasing it in
     /// between would let a background report dispatcher consume the
     /// termination. A refused command concludes at the negative response in
-    /// every model, as `Failure` with the AddCause of the server's
-    /// LastApplError, or `Unknown` when the server sent none.
+    /// every model, as `Failure` with the server's LastApplError for this
+    /// command, or with `None` and `Unknown` when the server sent none; a
+    /// normal-security server need not send one. A negative command
+    /// termination is `Failure` with the LastApplError it carries.
     ///
     /// The wait needs a monotonic deadline, so the enhanced models require
     /// `std`; an embedded caller uses the normal models.
     ///
     /// # Errors
     ///
-    /// `NotConnected` if the association is closed, `Mms` if no command
-    /// termination arrives within the timeout or the MMS layer fails other than
-    /// by the server refusing the write, such as a timeout or a lost
-    /// connection, after which the fate of the command is unknown; and
-    /// `InvalidArgument` for an enhanced model on a build without `std`.
+    /// `NotConnected` if the association is closed; `Mms` if no command
+    /// termination arrives within the timeout; the typed error of the MMS
+    /// layer, such as `Timeout` or `ConnectionLost`, when it fails other than
+    /// by the server refusing the write, after which the fate of the command
+    /// is unknown; and `InvalidArgument` for an enhanced model on a build
+    /// without `std`.
     pub async fn operate(&self, ctl_val: MmsValue) -> Result<ControlOutcome, ClientError> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err(ClientError::NotConnected);
@@ -373,7 +348,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
 
         // The lock is held across the write and the wait; see the item doc.
         let mut client = self.mms_client.lock().await;
-        self.store_last_appl_error(None);
         let written = client
             .write(&self.domain, &item, mms_value_to_mms_data(&oper))
             .await;
@@ -393,11 +367,7 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             match Self::recv_ct_locked(&mut client, DEFAULT_CT_TIMEOUT, &expected).await? {
                 Some(ct) => match ct.last_appl_error {
                     None => Ok(ControlOutcome::Success),
-                    Some(err) => {
-                        let cause = err.add_cause;
-                        self.store_last_appl_error(Some(err));
-                        Ok(ControlOutcome::Failure(cause))
-                    }
+                    Some(err) => Ok(ControlOutcome::failure(Some(err))),
                 },
                 None => Err(ClientError::Mms(format!(
                     "timed out waiting for a command termination after {:?}",
@@ -416,8 +386,8 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
     ///
     /// Accepted for every control model; the server checks that the cancel
     /// comes from the association that holds the selection. A refusal is
-    /// `Failure` with the AddCause of the server's LastApplError, or `Unknown`
-    /// when the server sent none.
+    /// `Failure` with the server's LastApplError for this command, or with
+    /// `None` and `Unknown` when the server sent none.
     ///
     /// # Errors
     ///
@@ -438,7 +408,6 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         );
         let item = format!("{}$Cancel", self.item_base);
         let mut client = self.mms_client.lock().await;
-        self.store_last_appl_error(None);
         match client
             .write(&self.domain, &item, mms_value_to_mms_data(&cancel))
             .await
@@ -456,25 +425,13 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
         prev.wrapping_add(1)
     }
 
-    /// Replaces the LastApplError reported by `last_appl_error`.
-    fn store_last_appl_error(&self, value: Option<LastApplError>) {
-        #[cfg(feature = "std")]
-        let mut slot = self
-            .last_appl_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(not(feature = "std"))]
-        let mut slot = self.last_appl_error.lock();
-        *slot = value;
-    }
-
     /// Maps a failed control write onto the result of the command.
     ///
     /// A data access error or a confirmed service error is the server refusing
-    /// the command: the outcome is `Failure` with the AddCause of the
-    /// LastApplError report that preceded the response for the command with
-    /// `ctl_num`, or `Unknown` without one. Any other error leaves the fate of
-    /// the command unknown and is returned unchanged.
+    /// the command: the outcome is `Failure` with the LastApplError report
+    /// that preceded the response for the command with `ctl_num`, if any. Any
+    /// other error leaves the fate of the command unknown and is returned
+    /// unchanged.
     async fn refused_outcome(
         &self,
         client: &mut MmsClient<T, Tm>,
@@ -488,17 +445,14 @@ impl<T: AsyncTransport, Tm: Timer> ControlObjectClient<T, Tm> {
             return Err(error.into());
         }
         let last = self.take_last_appl_error(client, Some(ctl_num)).await;
-        let cause = last
-            .as_ref()
-            .map_or(ControlAddCause::Unknown, |e| e.add_cause);
+        let outcome = ControlOutcome::failure(last);
         tracing::warn!(
             object = %self.object_ref,
             %error,
-            ?cause,
+            cause = ?outcome.add_cause(),
             "control command refused"
         );
-        self.store_last_appl_error(last);
-        Ok(ControlOutcome::Failure(cause))
+        Ok(outcome)
     }
 
     /// Takes the LastApplError report of a refused command from the reports

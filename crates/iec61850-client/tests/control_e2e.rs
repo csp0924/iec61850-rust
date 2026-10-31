@@ -14,7 +14,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use iec61850_client::control::{ControlAddCause, ControlObjectClient, ControlOutcome};
+use iec61850_client::control::{
+    ControlAddCause, ControlLastApplError, ControlObjectClient, ControlOutcome, LastApplError,
+    OriginValue,
+};
 use iec61850_client::IedConnection;
 use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_model::{
@@ -134,6 +137,30 @@ async fn make_connected_client(port: u16) -> IedConnection {
     conn
 }
 
+/// The originator the refused-command tests send.
+fn operator() -> OriginValue {
+    OriginValue {
+        or_cat: 2,
+        or_ident: b"operator 1".to_vec(),
+    }
+}
+
+/// Returns the LastApplError of a failed outcome, checking that the failure
+/// carries its AddCause.
+fn failure_last_appl_error(outcome: &ControlOutcome) -> &LastApplError {
+    let ControlOutcome::Failure {
+        add_cause,
+        last_appl_error,
+        ..
+    } = outcome
+    else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    let e = last_appl_error.as_ref().expect("last appl error");
+    assert_eq!(*add_cause, e.add_cause);
+    e
+}
+
 fn make_control_handle(
     conn: &IedConnection,
     do_name: &str,
@@ -188,15 +215,21 @@ async fn direct_normal_operate_check_rejects() {
     let port = handle.bound_addr.port();
 
     let conn = make_connected_client(port).await;
-    let spc = make_control_handle(&conn, "SPCDN_BLK", ControlModel::DirectNormal);
+    let mut spc = make_control_handle(&conn, "SPCDN_BLK", ControlModel::DirectNormal);
+    spc.set_origin(operator());
 
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     // The refusal carries its cause in the LastApplError ahead of the negative
-    // response.
+    // response, which names the command it refuses.
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
+        outcome.add_cause(),
+        Some(ControlAddCause::BlockedByInterlocking)
     );
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCDN_BLK$Oper"));
+    assert_eq!(e.error, ControlLastApplError::NoError);
+    assert_eq!(e.origin, operator());
+    assert_eq!(e.ctl_num, 1);
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -249,15 +282,17 @@ async fn direct_enhanced_operate_failure_with_ct_negative() {
     let port = handle.bound_addr.port();
 
     let conn = make_connected_client(port).await;
-    let spc = make_control_handle(&conn, "SPCDE_FAIL", ControlModel::DirectEnhanced);
+    let mut spc = make_control_handle(&conn, "SPCDE_FAIL", ControlModel::DirectEnhanced);
+    spc.set_origin(operator());
 
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     // The write is accepted, so the failure arrives as the negative command
     // termination that follows, carrying the cause the handler reported.
-    assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByProcess)
-    );
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::BlockedByProcess));
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCDE_FAIL$Oper"));
+    assert_eq!(e.origin, operator());
+    assert_eq!(e.ctl_num, 1);
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -281,7 +316,7 @@ async fn sbo_normal_select_then_operate_success() {
     let conn = make_connected_client(port).await;
     let spc = make_control_handle(&conn, "SPCSN", ControlModel::SboNormal);
 
-    let selected = spc.select().await.expect("select");
+    let selected = spc.select().await.expect("select").is_success();
     assert!(selected, "sbo-normal select should be accepted");
 
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
@@ -312,8 +347,8 @@ async fn sbo_normal_operate_without_select_rejects() {
     // Operate without selecting first.
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
+        outcome.add_cause(),
+        Some(ControlAddCause::ObjectNotSelected)
     );
 
     let _ = conn.disconnect().await;
@@ -377,7 +412,8 @@ async fn sbo_enhanced_inconsistent_params_are_refused() {
     let port = handle.bound_addr.port();
 
     let conn = make_connected_client(port).await;
-    let spc = make_control_handle(&conn, "SPCSE_INC", ControlModel::SboEnhanced);
+    let mut spc = make_control_handle(&conn, "SPCSE_INC", ControlModel::SboEnhanced);
+    spc.set_origin(operator());
 
     // Select with true.
     let _ = spc
@@ -392,9 +428,16 @@ async fn sbo_enhanced_inconsistent_params_are_refused() {
         .await
         .expect("operate");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::InconsistentParameters)
+        outcome.add_cause(),
+        Some(ControlAddCause::InconsistentParameters)
     );
+    // The LastApplError names the refused Operate, whose ctlNum is that of
+    // the selection.
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCSE_INC$Oper"));
+    assert_eq!(e.error, ControlLastApplError::NoError);
+    assert_eq!(e.origin, operator());
+    assert_eq!(e.ctl_num, 1);
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -418,7 +461,7 @@ async fn sbo_normal_cancel_after_select() {
     let conn = make_connected_client(port).await;
     let spc = make_control_handle(&conn, "SPCSN_CXL", ControlModel::SboNormal);
 
-    assert!(spc.select().await.expect("select"));
+    assert!(spc.select().await.expect("select").is_success());
 
     let cancel_outcome = spc.cancel(MmsValue::Boolean(true)).await.expect("cancel");
     assert_eq!(cancel_outcome, ControlOutcome::Success);
@@ -426,10 +469,7 @@ async fn sbo_normal_cancel_after_select() {
     // After a cancel the object is unselected, so an operate is refused with
     // Object-not-selected.
     let after = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(
-        after,
-        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
-    );
+    assert_eq!(after.add_cause(), Some(ControlAddCause::ObjectNotSelected));
 
     let _ = conn.disconnect().await;
     handle.stop().await;
@@ -463,7 +503,7 @@ async fn sbo_normal_timeout_releases_then_reselect_succeeds() {
     let spc = make_control_handle(&conn, "SPCSN_TO", ControlModel::SboNormal);
 
     // The first selection is accepted.
-    let selected_1 = spc.select().await.expect("select #1");
+    let selected_1 = spc.select().await.expect("select #1").is_success();
     assert!(selected_1, "the first select should succeed");
 
     // Wait well past the selection timeout.
@@ -476,12 +516,12 @@ async fn sbo_normal_timeout_releases_then_reselect_succeeds() {
         .await
         .expect("operate after timeout");
     assert_eq!(
-        after_timeout,
-        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
+        after_timeout.add_cause(),
+        Some(ControlAddCause::ObjectNotSelected)
     );
 
     // The object can be selected again once the selection has been released.
-    let selected_2 = spc.select().await.expect("select #2");
+    let selected_2 = spc.select().await.expect("select #2").is_success();
     assert!(
         selected_2,
         "select after the timeout should succeed; a failure means the server did not release the expired selection"

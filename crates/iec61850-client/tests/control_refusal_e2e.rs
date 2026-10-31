@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use iec61850_client::control::{
-    ControlAddCause, ControlLastApplError, ControlObjectClient, ControlOutcome, OriginValue,
+    ControlAddCause, ControlLastApplError, ControlObjectClient, ControlOutcome, LastApplError,
+    OriginValue,
 };
 use iec61850_client::{ClientError, IedConnection};
 use iec61850_mms::mms::pdu::information_report::{
@@ -183,6 +184,8 @@ fn script_write(invoke_id: u32, item: &str, value: &MmsData, seq: u32) -> Plan {
             reply: Some(write_refused(invoke_id)),
             ..Plan::default()
         },
+        // Refused with no LastApplError.
+        "SPCNOLAE" => Plan::reply(write_refused(invoke_id)),
         // Refused with a confirmed error and ObjectNotSelected.
         "SPCCONFERR" => {
             let mut buf = BytesMut::new();
@@ -370,11 +373,11 @@ fn handle(conn: &IedConnection, dobj: &str, ctl_model: ControlModel) -> ControlO
         .expect("create_control_object")
 }
 
-// A refused command reports the AddCause of the LastApplError ahead of the
-// negative response.
+// A refused command returns the LastApplError reported ahead of the negative
+// response, with its AddCause.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_normal_operate_reports_the_last_appl_error_cause() {
+async fn refused_normal_operate_returns_the_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
     let mut spc = handle(&conn, "SPCREFUSE", ControlModel::DirectNormal);
     let origin = OriginValue {
@@ -383,31 +386,66 @@ async fn refused_normal_operate_reports_the_last_appl_error_cause() {
     };
     spc.set_origin(origin.clone());
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
-    );
-    let e = spc.last_appl_error().expect("last appl error");
+    let ControlOutcome::Failure {
+        add_cause,
+        last_appl_error,
+        ..
+    } = outcome
+    else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(add_cause, ControlAddCause::BlockedByInterlocking);
+    let e = last_appl_error.expect("last appl error");
     assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCREFUSE$Oper"));
     assert_eq!(e.error, ControlLastApplError::NoError);
     assert_eq!(e.origin, origin);
     assert_eq!(e.ctl_num, 1);
     assert_eq!(e.add_cause, ControlAddCause::BlockedByInterlocking);
+    // A caller, such as a test double, builds the same outcome from its parts.
+    let expected = ControlOutcome::failure(Some(LastApplError::new(
+        format!("{DOMAIN}/{LN}$CO$SPCREFUSE$Oper"),
+        ControlLastApplError::NoError,
+        origin,
+        1,
+        ControlAddCause::BlockedByInterlocking,
+    )));
+    assert_eq!(ControlOutcome::failure(Some(e)), expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_operate_with_a_confirmed_error_reports_the_last_appl_error_cause() {
+async fn refused_normal_operate_without_a_last_appl_error_is_an_unknown_failure() {
+    // A normal-security server may refuse without a LastApplError.
     let conn = connect(start_server().await, 3_000).await;
-    let spc = handle(&conn, "SPCCONFERR", ControlModel::SboNormal);
+    let spc = handle(&conn, "SPCNOLAE", ControlModel::DirectNormal);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::ObjectNotSelected)
+    assert!(
+        matches!(
+            outcome,
+            ControlOutcome::Failure {
+                add_cause: ControlAddCause::Unknown,
+                last_appl_error: None,
+                ..
+            }
+        ),
+        "got {outcome:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_select_with_value_reports_the_last_appl_error_cause() {
+async fn refused_operate_with_a_confirmed_error_returns_the_last_appl_error() {
+    let conn = connect(start_server().await, 3_000).await;
+    let spc = handle(&conn, "SPCCONFERR", ControlModel::SboNormal);
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    assert_eq!(
+        outcome.add_cause(),
+        Some(ControlAddCause::ObjectNotSelected)
+    );
+    let e = outcome.last_appl_error().expect("last appl error");
+    assert_eq!(e.add_cause, ControlAddCause::ObjectNotSelected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_select_with_value_returns_the_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCREFUSE", ControlModel::SboEnhanced);
     let outcome = spc
@@ -415,35 +453,44 @@ async fn refused_select_with_value_reports_the_last_appl_error_cause() {
         .await
         .expect("select_with_value");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
+        outcome.add_cause(),
+        Some(ControlAddCause::BlockedByInterlocking)
     );
-    let e = spc.last_appl_error().expect("last appl error");
+    let e = outcome.last_appl_error().expect("last appl error");
     assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCREFUSE$SBOw"));
+    assert_eq!(e.ctl_num, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_cancel_reports_the_last_appl_error_cause() {
+async fn refused_cancel_returns_the_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCREFUSE", ControlModel::SboNormal);
     let outcome = spc.cancel(MmsValue::Boolean(true)).await.expect("cancel");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
+        outcome.add_cause(),
+        Some(ControlAddCause::BlockedByInterlocking)
     );
+    let e = outcome.last_appl_error().expect("last appl error");
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCREFUSE$Cancel"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn denied_select_keeps_the_last_appl_error() {
+async fn denied_select_returns_the_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCSELDENY", ControlModel::SboNormal);
-    assert!(!spc.select().await.expect("select"));
-    let e = spc.last_appl_error().expect("last appl error");
-    assert_eq!(e.add_cause, ControlAddCause::ObjectAlreadySelected);
+    let outcome = spc.select().await.expect("select");
+    assert!(!outcome.is_success());
+    assert_eq!(
+        outcome.add_cause(),
+        Some(ControlAddCause::ObjectAlreadySelected)
+    );
+    let e = outcome.last_appl_error().expect("last appl error");
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCSELDENY$SBO"));
 
     let granted = handle(&conn, "SPCSELOK", ControlModel::SboNormal);
-    assert!(granted.select().await.expect("select"));
-    assert_eq!(granted.last_appl_error(), None);
+    let outcome = granted.select().await.expect("select");
+    assert_eq!(outcome, ControlOutcome::Success);
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -451,8 +498,8 @@ async fn last_appl_error_of_another_object_is_not_taken() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCOTHERLAE", ControlModel::DirectNormal);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(outcome, ControlOutcome::Failure(ControlAddCause::Unknown));
-    assert_eq!(spc.last_appl_error(), None);
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::Unknown));
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -460,8 +507,8 @@ async fn last_appl_error_of_another_logical_device_is_not_taken() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCOTHERLD", ControlModel::DirectNormal);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(outcome, ControlOutcome::Failure(ControlAddCause::Unknown));
-    assert_eq!(spc.last_appl_error(), None);
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::Unknown));
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -469,8 +516,8 @@ async fn last_appl_error_of_another_originator_is_not_taken() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCOTHERORIGIN", ControlModel::DirectNormal);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(outcome, ControlOutcome::Failure(ControlAddCause::Unknown));
-    assert_eq!(spc.last_appl_error(), None);
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::Unknown));
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,8 +531,8 @@ async fn late_last_appl_error_of_an_earlier_command_is_not_taken() {
     );
     // The LastApplError ahead of this response carries the previous ctlNum.
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert_eq!(outcome, ControlOutcome::Failure(ControlAddCause::Unknown));
-    assert_eq!(spc.last_appl_error(), None);
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::Unknown));
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -494,56 +541,52 @@ async fn empty_information_report_does_not_hide_the_last_appl_error() {
     let spc = handle(&conn, "SPCEMPTYIR", ControlModel::DirectNormal);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
+        outcome.add_cause(),
+        Some(ControlAddCause::BlockedByInterlocking)
     );
+    assert!(outcome.last_appl_error().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_command_clears_the_previous_last_appl_error() {
+async fn each_outcome_carries_only_its_own_last_appl_error() {
     // Each object is refused the first time and accepted afterwards.
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCSTRAYCT", ControlModel::SboEnhanced);
-    let _ = spc.select_with_value(MmsValue::Boolean(true)).await;
-    assert!(spc.last_appl_error().is_some());
+    let refused = spc
+        .select_with_value(MmsValue::Boolean(true))
+        .await
+        .expect("select_with_value");
+    assert!(refused.last_appl_error().is_some());
     assert_eq!(
         spc.select_with_value(MmsValue::Boolean(true))
             .await
             .expect("select_with_value"),
         ControlOutcome::Success
     );
-    assert_eq!(spc.last_appl_error(), None);
 
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCSTRAYCT", ControlModel::SboNormal);
-    let _ = spc.cancel(MmsValue::Boolean(true)).await;
-    assert!(spc.last_appl_error().is_some());
+    let refused = spc.cancel(MmsValue::Boolean(true)).await.expect("cancel");
+    assert!(refused.last_appl_error().is_some());
     assert_eq!(
         spc.cancel(MmsValue::Boolean(true)).await.expect("cancel"),
         ControlOutcome::Success
     );
-    assert_eq!(spc.last_appl_error(), None);
 
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCSELFLIP", ControlModel::SboNormal);
-    assert!(!spc.select().await.expect("select"));
-    assert!(spc.last_appl_error().is_some());
-    assert!(spc.select().await.expect("select"));
-    assert_eq!(spc.last_appl_error(), None);
-}
+    let denied = spc.select().await.expect("select");
+    assert!(denied.last_appl_error().is_some());
+    assert_eq!(spc.select().await.expect("select"), ControlOutcome::Success);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_command_clears_the_previous_last_appl_error() {
     let conn = connect(start_server().await, 3_000).await;
-    // Refused the first time, accepted afterwards.
     let spc = handle(&conn, "SPCSTRAYCT", ControlModel::DirectNormal);
-    let _ = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
-    assert!(spc.last_appl_error().is_some());
+    let refused = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    assert!(refused.last_appl_error().is_some());
     assert_eq!(
         spc.operate(MmsValue::Boolean(true)).await.expect("operate"),
         ControlOutcome::Success
     );
-    assert_eq!(spc.last_appl_error(), None);
 }
 
 // A refused enhanced command concludes at the negative response.
@@ -556,8 +599,8 @@ async fn refused_enhanced_operate_does_not_wait_for_a_command_termination() {
     // command's conclusion: the cause comes from the LastApplError.
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByInterlocking)
+        outcome.add_cause(),
+        Some(ControlAddCause::BlockedByInterlocking)
     );
     // The stray CT- carries the previous ctlNum, so the next command's
     // termination is the CT+ that follows its own response.
@@ -568,16 +611,16 @@ async fn refused_enhanced_operate_does_not_wait_for_a_command_termination() {
 // An enhanced command concludes at its own command termination.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enhanced_operate_reports_a_negative_command_termination() {
+async fn enhanced_operate_returns_the_last_appl_error_of_a_negative_termination() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCOTHERCT", ControlModel::DirectEnhanced);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     // The CT+ of another object ahead of it is not this command's.
-    assert_eq!(
-        outcome,
-        ControlOutcome::Failure(ControlAddCause::BlockedByProcess)
-    );
-    let e = spc.last_appl_error().expect("last appl error");
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::BlockedByProcess));
+    let e = outcome.last_appl_error().expect("last appl error");
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCOTHERCT$Oper"));
+    assert_eq!(e.ctl_num, 1);
+    assert_eq!(e.origin, OriginValue::bay_control());
     assert_eq!(e.add_cause, ControlAddCause::BlockedByProcess);
 }
 
@@ -587,7 +630,7 @@ async fn enhanced_operate_skips_a_late_termination_of_an_earlier_command() {
     let spc = handle(&conn, "SPCLATECT", ControlModel::DirectEnhanced);
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(outcome, ControlOutcome::Success);
-    assert_eq!(spc.last_appl_error(), None);
+    assert_eq!(outcome.last_appl_error(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

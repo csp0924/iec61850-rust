@@ -22,7 +22,9 @@
 //! spc.set_origin(OriginValue::bay_control());
 //! match spc.operate(MmsValue::Boolean(true)).await? {
 //!     ControlOutcome::Success => println!("operate ok"),
-//!     ControlOutcome::Failure(c) => println!("operate failed: {c:?}"),
+//!     ControlOutcome::Failure { add_cause, last_appl_error, .. } => {
+//!         println!("operate failed: {add_cause:?}, {last_appl_error:?}")
+//!     }
 //!     other => println!("operate ended with {other:?}"),
 //! }
 //! # Ok(()) }
