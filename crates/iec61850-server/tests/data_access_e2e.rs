@@ -621,3 +621,60 @@ async fn data_object_read_handler_decides_reads_beneath_it() {
     .await
     .expect("timed out");
 }
+
+/// A read of a whole logical node or of one of its functional-constraint
+/// groups asks the handlers of the data objects in it: a value replaces its
+/// node, a refusal refuses the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logical_node_and_group_reads_ask_the_read_handlers() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        let quality = MmsData::BitString {
+            padding: 3,
+            data: vec![0, 0],
+        };
+
+        let hit = FixedRead::new(ReadOutcome::CacheHit(MmsValue::Boolean(false)));
+        server
+            .handler_registry()
+            .install_read_handler("GGIO1$ST$Ind$stVal", hit.clone())
+            .unwrap();
+        let st_group = client.read(DOMAIN, "GGIO1$ST").await.unwrap();
+        let MmsData::Structure(objects) = &st_group else {
+            panic!("a structure, got {st_group:?}");
+        };
+        assert_eq!(
+            objects.last(),
+            Some(&MmsData::Structure(vec![MmsData::Boolean(false), quality]))
+        );
+        client
+            .read(DOMAIN, "GGIO1")
+            .await
+            .expect("whole logical node");
+        assert_eq!(hit.asked(), 2);
+
+        server
+            .handler_registry()
+            .install_read_handler(
+                "GGIO1$ST$Ind$q",
+                FixedRead::new(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+        for item in ["GGIO1$ST", "GGIO1"] {
+            assert_eq!(
+                access_error(client.read(DOMAIN, item).await),
+                DataAccessError::ObjectAccessDenied,
+                "{item}"
+            );
+        }
+        client
+            .read(DOMAIN, "GGIO1$SP")
+            .await
+            .expect("another group");
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}

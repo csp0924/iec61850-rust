@@ -917,7 +917,8 @@ pub(crate) type LeadingMembers<'a> =
 /// group appears when it has a leading member or a data object, in the
 /// IEC 61850-8-1 order. `None` means `item_id` names something below a group,
 /// which the caller reads by its own route. The leading members are charged to
-/// the budget like the rest of the value.
+/// the budget like the rest of the value. Each data object passes through the
+/// read handlers of `handlers` that sit on it or below it.
 #[cfg(any(
     feature = "reporting",
     feature = "logging",
@@ -929,6 +930,7 @@ pub(crate) fn read_ln_with_leading_members(
     domain: &str,
     item_id: &str,
     leading: &mut LeadingMembers<'_>,
+    handlers: Option<(&HandlerRegistry, u64)>,
     budget: Option<usize>,
 ) -> Option<LookupResult> {
     let mut parts = item_id.split('$');
@@ -947,6 +949,10 @@ pub(crate) fn read_ln_with_leading_members(
         return Some(not_found());
     };
 
+    let scope = match handlers {
+        Some((registry, conn_id)) => ReadHandlerScope::around(registry, item_id, conn_id),
+        None => ReadHandlerScope::none(),
+    };
     let mut guard = BudgetGuard::new(budget);
     let mut group = |fc: FC, guard: &mut BudgetGuard| -> Result<Option<MmsData>, LookupResult> {
         let lead = leading(ln, fc).map_err(|e| LookupResult::Result(AccessResult::Failure(e)))?;
@@ -955,7 +961,7 @@ pub(crate) fn read_ln_with_leading_members(
                 return Err(LookupResult::OverBudget);
             }
         }
-        expand_ln_for_fc(ln, fc, lead, &ReadHandlerScope::none(), guard).map_err(Halt::into_lookup)
+        expand_ln_for_fc(ln, fc, lead, &scope, guard).map_err(Halt::into_lookup)
     };
 
     let Some(fc_name) = fc_name else {

@@ -1227,6 +1227,7 @@ fn dispatch_read(
             gocb_registry,
             #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
             &route,
+            (handler_registry, conn_id),
             &entry_name,
             entry_alt_access,
             remaining_budget,
@@ -1303,7 +1304,8 @@ type ReadRoute<'a> = dyn Fn(
 /// [`ln_spec_with_control_blocks`](crate::mapping::ln_spec_with_control_blocks)
 /// gives GetVariableAccessAttributes. Each control block is read through its
 /// own route, so its value is the one a read of the block alone returns, and a
-/// control block that fails to read fails the whole entry.
+/// control block that fails to read fails the whole entry. The data objects
+/// pass through the read handlers of `handlers` on the association it names.
 ///
 /// `None` means the entry names something below a group, or carries an
 /// alternate access, which the ordinary routes handle.
@@ -1322,6 +1324,7 @@ fn read_ln_with_control_blocks(
     #[cfg(feature = "goose-mapping")] gocb_registry: &GoCBRegistry,
     #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
     route: &ReadRoute<'_>,
+    handlers: (&HandlerRegistry, u64),
     name: &iec61850_mms::mms::pdu::common::ObjectName,
     alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
     remaining_budget: Option<usize>,
@@ -1383,8 +1386,14 @@ fn read_ln_with_control_blocks(
         Ok(members)
     };
 
-    match read_ln_with_leading_members(ied_model, domain, item_id, &mut leading, remaining_budget)?
-    {
+    match read_ln_with_leading_members(
+        ied_model,
+        domain,
+        item_id,
+        &mut leading,
+        Some(handlers),
+        remaining_budget,
+    )? {
         LookupResult::Result(r) => Some(ReadRoutingOutcome::Result(r)),
         LookupResult::OverBudget => Some(ReadRoutingOutcome::OverBudget),
     }
