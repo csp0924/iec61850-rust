@@ -547,3 +547,51 @@ async fn client_writes_back_the_dat_set_it_read() {
         assert_eq!(after.conf_rev(), 1);
     }
 }
+
+/// Resv of an enabled URCB and ResvTms of an enabled BRCB are refused with
+/// temporarily-unavailable, whatever the value, and change nothing; once the
+/// holder disables reporting it can release them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resv_and_resv_tms_refused_while_enabled() {
+    let f = start().await;
+    let mut mms = f.connect().await;
+    write_urcb(&mut mms, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the URCB");
+    write_brcb(&mut mms, "ResvTms", MmsData::Integer(30))
+        .await
+        .expect("reserve the BRCB");
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+
+    for v in [false, true] {
+        assert_refused_with(
+            write_urcb(&mut mms, "Resv", MmsData::Boolean(v)).await,
+            DataAccessError::TemporarilyUnavailable,
+        );
+    }
+    for v in [0, 60] {
+        assert_refused_with(
+            write_brcb(&mut mms, "ResvTms", MmsData::Integer(v)).await,
+            DataAccessError::TemporarilyUnavailable,
+        );
+    }
+    assert_eq!(read_urcb(&mut mms, "Resv").await, MmsData::Boolean(true));
+    assert_eq!(read_brcb(&mut mms, "ResvTms").await, MmsData::Integer(30));
+
+    write_urcb(&mut mms, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable the URCB");
+    write_urcb(&mut mms, "Resv", MmsData::Boolean(false))
+        .await
+        .expect("release the URCB");
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable the BRCB");
+    write_brcb(&mut mms, "ResvTms", MmsData::Integer(0))
+        .await
+        .expect("release the BRCB");
+    assert_eq!(read_urcb(&mut mms, "Resv").await, MmsData::Boolean(false));
+    assert_eq!(read_brcb(&mut mms, "ResvTms").await, MmsData::Integer(0));
+}

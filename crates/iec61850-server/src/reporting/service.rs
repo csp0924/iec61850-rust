@@ -5,14 +5,24 @@
 //!
 //! Write rules, Edition 2.1 model:
 //!
+//! URCB:
+//!
 //! | Field | Condition for a write to be accepted |
 //! |---|---|
-//! | Resv | any client, moving the block from idle to reserved |
+//! | Resv = true | not reserved by another client, and RptEna is false |
+//! | Resv = false | reserved by the writer, and RptEna is false |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
 //! | RptEna = true | reserved by the writer, or unreserved, in which case the write reserves it for the writer |
 //! | RptEna = false | enabled, and the writer owns the reservation; the reservation is kept |
 //! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
-//! | ConfRev, SqNum, Owner, TimeOfEntry | never writable; answered with ObjectAccessDenied |
+//! | ConfRev, SqNum, Owner | never writable; answered with ObjectAccessDenied |
+//!
+//! A refused enable-time write is answered with TemporarilyUnavailable, a write
+//! from a client that does not hold the reservation with ObjectAccessDenied.
+//!
+//! BRCB: the rules of IEC 61850-8-1 Table 72, documented on
+//! `handle_set_brcb_field`; ConfRev, SqNum, TimeOfEntry and Owner are never
+//! writable.
 //!
 //! A DatSet write must name a data set the server knows; a name it does not
 //! know is refused with ObjectValueInvalid. An accepted DatSet write binds the
@@ -209,22 +219,30 @@ pub fn handle_set_rcb_field(
                 );
                 return Err(DataAccessError::TemporarilyUnavailable);
             }
+        } else if state.client_conn_id.is_some() && state.client_conn_id != Some(conn_id) {
+            // Only the holder may clear the reservation.
+            tracing::warn!(
+                mms_path,
+                conn_id,
+                "SetURCBValues Resv=false: writer does not hold the reservation"
+            );
+            return Err(DataAccessError::ObjectAccessDenied);
+        }
+        // Resv is not writable while RptEna is true, per IEC 61850-8-1 Table 73.
+        if state.rpt_ena {
+            tracing::warn!(
+                mms_path,
+                conn_id,
+                "SetURCBValues Resv: the control block is enabled"
+            );
+            return Err(DataAccessError::TemporarilyUnavailable);
+        }
+        if v {
             state.resv = true;
             state.client_conn_id = Some(conn_id);
         } else {
-            // Only the holder may clear the reservation.
-            if state.client_conn_id.is_some() && state.client_conn_id != Some(conn_id) {
-                tracing::warn!(
-                    mms_path,
-                    conn_id,
-                    "SetURCBValues Resv=false: writer does not hold the reservation"
-                );
-                return Err(DataAccessError::ObjectAccessDenied);
-            }
-            if !state.rpt_ena {
-                state.resv = false;
-                state.client_conn_id = None;
-            }
+            state.resv = false;
+            state.client_conn_id = None;
         }
         return Ok(());
     }
@@ -518,7 +536,8 @@ use iec61850_mms::binary_time6_from_epoch_ms;
 ///   the owner of a reservation whose association has ended, every write gives
 ///   ObjectAccessDenied
 /// - a positive ResvTms reserves the BRCB for `conn_id` and its peer address;
-///   the reservation outlives the association by ResvTms seconds
+///   the reservation outlives the association by ResvTms seconds; ResvTms is
+///   refused with TemporarilyUnavailable while RptEna is true
 /// - DatSet, OptFlds, TrgOps, IntgPd, BufTm, RptID, EntryID, and PurgeBuf are
 ///   refused with TemporarilyUnavailable while RptEna is true, per
 ///   IEC 61850-8-1 Table 72
@@ -1181,8 +1200,8 @@ fn set_brcb_opt_flds(
 ///
 /// A positive value received on connection `conn_id` reserves the BRCB for that
 /// association, owned by `writer_ip`; the reservation timer starts only when the
-/// association ends. Zero releases the reservation; an enabled BRCB keeps its
-/// connection.
+/// association ends. Zero releases the reservation. While RptEna is true the
+/// write is refused with TemporarilyUnavailable.
 fn set_brcb_resv_tms(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
@@ -1213,6 +1232,14 @@ fn set_brcb_resv_tms(
     };
     if let Err(e) = claim_brcb_locked(brcb, &mut state, conn_id, writer_ip) {
         return Some(Err(e));
+    }
+    // ResvTms is not writable while RptEna is true, per IEC 61850-8-1 Table 72.
+    if state.rpt_ena {
+        tracing::warn!(
+            mms_path = %brcb.mms_path,
+            "SetBRCBValues ResvTms: the control block is enabled"
+        );
+        return Some(Err(DataAccessError::TemporarilyUnavailable));
     }
     let new_state = super::brcb::ResvTmsState::from_wire(v_i16);
     state.resv_tms = new_state;
@@ -1911,6 +1938,31 @@ mod tests {
             ),
             Err(DataAccessError::TemporarilyUnavailable)
         );
+        assert_eq!(urcb_resv(&engine, &path), (false, None));
+    }
+
+    /// Resv is not writable while the URCB is enabled: the holder writing either
+    /// value is refused with TemporarilyUnavailable and stays the holder.
+    #[test]
+    fn urcb_resv_refused_while_enabled() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        let set = |field: RcbField, value: RcbWriteValue, conn_id: ConnectionId| {
+            handle_set_rcb_field(&engine, &path, field, value, conn_id)
+        };
+        set(RcbField::RptEna, RcbWriteValue::Bool(true), 1).unwrap();
+        for v in [false, true] {
+            assert_eq!(
+                set(RcbField::Resv, RcbWriteValue::Bool(v), 1),
+                Err(DataAccessError::TemporarilyUnavailable)
+            );
+        }
+        assert_eq!(
+            set(RcbField::Resv, RcbWriteValue::Bool(false), 2),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(urcb_resv(&engine, &path), (true, Some(1)));
+        set(RcbField::RptEna, RcbWriteValue::Bool(false), 1).unwrap();
+        assert_eq!(set(RcbField::Resv, RcbWriteValue::Bool(false), 1), Ok(()));
         assert_eq!(urcb_resv(&engine, &path), (false, None));
     }
 
@@ -3175,20 +3227,43 @@ mod tests {
         assert_eq!(brcb.state.lock().unwrap().reservation_timeout, None);
     }
 
+    /// ResvTms is not writable while the BRCB is enabled: the holder is refused
+    /// with TemporarilyUnavailable and the reservation stays as it was.
     #[test]
-    fn resv_tms_zero_keeps_an_enabled_brcb_bound() {
+    fn resv_tms_refused_while_enabled() {
         let (engine, path) = reservation_fixture(plain_brcb());
         reserve(&engine, &path, OWNER);
         assert_eq!(
             write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(true)),
             Some(Ok(()))
         );
+        for value in [0, 5] {
+            assert_eq!(
+                write_brcb(
+                    &engine,
+                    &path,
+                    OWNER,
+                    "ResvTms",
+                    RcbWriteValue::Unsigned(value)
+                ),
+                Some(Err(DataAccessError::TemporarilyUnavailable))
+            );
+        }
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        {
+            let state = brcb.state.lock().unwrap();
+            assert_eq!(state.client_conn_id, Some(OWNER));
+            assert_eq!(state.resv_tms.to_wire(), RESV_TMS_S as i16);
+        }
+        assert_eq!(
+            write_brcb(&engine, &path, OWNER, "RptEna", RcbWriteValue::Bool(false)),
+            Some(Ok(()))
+        );
         assert_eq!(
             write_brcb(&engine, &path, OWNER, "ResvTms", RcbWriteValue::Unsigned(0)),
             Some(Ok(()))
         );
-        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
-        assert_eq!(brcb.state.lock().unwrap().client_conn_id, Some(OWNER));
+        assert_eq!(brcb.state.lock().unwrap().client_conn_id, None);
     }
 
     #[test]
