@@ -59,33 +59,39 @@ them together; a Python binding is published on PyPI as
 ```rust
 use iec61850_goose::frame::VlanPriority;
 use iec61850_goose::publisher::{CommParameters, GoosePublisher};
+use iec61850_hal::ethernet::EthernetSink;
 use iec61850_model::MmsValue;
 use std::time::Instant;
 
-// Communication parameters: APPID, destination MAC, VLAN priority. The
-// destination is from the 01:0c:cd:01:xx:xx range IEC 61850-8-1 reserves.
-let comm = CommParameters::new(0x1000, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
-    .with_priority(VlanPriority::new(4).unwrap())
-    .with_src_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+// `sock` is any L2 sink of iec61850-hal, such as the AF_PACKET socket of its
+// `ethernet-linux-afpacket` feature.
+fn publish(sock: &mut impl EthernetSink) -> Result<(), Box<dyn std::error::Error>> {
+    // Communication parameters: APPID, destination MAC, VLAN priority. The
+    // destination is from the 01:0c:cd:01:xx:xx range IEC 61850-8-1 reserves.
+    let comm = CommParameters::new(0x1000, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
+        .with_priority(VlanPriority::new(4).unwrap())
+        .with_src_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
-// confRev 1, and no goID, which falls back to the gocbRef.
-let mut publisher = GoosePublisher::new(
-    comm,
-    "DemoIED/LLN0$GO$gcbStatus",
-    None,
-    "DemoIED/LLN0$dsStatus",
-    1,
-)?;
+    // confRev 1, and no goID, which falls back to the gocbRef.
+    let mut publisher = GoosePublisher::new(
+        comm,
+        "DemoIED/LLN0$GO$gcbStatus",
+        None,
+        "DemoIED/LLN0$dsStatus",
+        1,
+    )?;
 
-// A data change bumps stNum, which restarts the retransmission at T1.
-publisher.increase_st_num();
+    // A data change bumps stNum, which restarts the retransmission at T1.
+    publisher.increase_st_num();
 
-// `tick` decides when a frame is due; the caller owns the L2 socket.
-let now = Instant::now();
-if publisher.tick(now).is_some() {
-    let dataset = vec![MmsValue::Boolean(true), MmsValue::Integer(100)];
-    let frame = publisher.publish_at(&dataset, now)?;
-    sock.send_l2(&frame)?;
+    // `tick` decides when a frame is due; the caller owns the L2 socket.
+    let now = Instant::now();
+    if publisher.tick(now).is_some() {
+        let dataset = vec![MmsValue::Boolean(true), MmsValue::Integer(100)];
+        let frame = publisher.publish_at(&dataset, now)?;
+        sock.send(&frame)?;
+    }
+    Ok(())
 }
 ```
 
