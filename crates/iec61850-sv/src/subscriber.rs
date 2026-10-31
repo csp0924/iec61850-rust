@@ -16,7 +16,10 @@
 //! configured limit, or at a smpRate sent with smpMod samples-per-second;
 //! without either, a smpCnt below its predecessor is taken as the
 //! once-a-second reset of a synchronized stream, and only the samples from 0
-//! up to it count as missed.
+//! up to it count as missed. A smpCnt equal to its predecessor is a
+//! duplicate, such as a frame a PRP or HSR network delivered twice without
+//! removing the copy; it is counted in `duplicate_count`, not as a gap, and
+//! still delivered.
 //! Continuity is followed per svID, so a subscriber without an svID filter
 //! checks each stream against its own predecessor; the number of streams it
 //! follows is bounded.
@@ -273,6 +276,7 @@ impl SvSubscriberBuilder {
             max_streams: self.max_streams.unwrap_or(DEFAULT_MAX_STREAMS).max(1),
             streams: Mutex::new(StreamTable::default()),
             missed_count: AtomicU64::new(0),
+            duplicate_count: AtomicU64::new(0),
         }
     }
 }
@@ -301,6 +305,8 @@ pub struct SvSubscriber {
     streams: Mutex<StreamTable>,
     /// Number of samples missed, summed over every detected gap.
     missed_count: AtomicU64,
+    /// Number of ASDUs whose smpCnt repeated the previous one of their stream.
+    duplicate_count: AtomicU64,
 }
 
 /// Last smpCnt of each followed stream.
@@ -409,6 +415,12 @@ impl SvSubscriber {
         self.missed_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the number of ASDUs whose smpCnt repeated the previous one of
+    /// their stream.
+    pub fn duplicate_count(&self) -> u64 {
+        self.duplicate_count.load(Ordering::Relaxed)
+    }
+
     /// Sets the listener.
     ///
     /// Call this before the subscriber is added to a receiver, which
@@ -443,7 +455,8 @@ impl SvSubscriber {
     ///
     /// When a sample length is configured, an ASDU of a different length is
     /// reported and dropped. A smpCnt that skips ahead adds the gap to
-    /// `missed_count` but is still delivered.
+    /// `missed_count`, and one that repeats its predecessor adds one to
+    /// `duplicate_count`; either ASDU is still delivered.
     pub fn dispatch(&self, asdu_view: &SvSubscriberAsdu<'_>) {
         let sample_len = asdu_view.sample.len();
         if let Some(expected) = self.expected_sample_size {
@@ -464,7 +477,9 @@ impl SvSubscriber {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .swap(asdu_view.sv_id, cur_cnt, self.max_streams);
-        if let Some(prev) = prev {
+        if prev == Some(cur_cnt) {
+            self.duplicate_count.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(prev) = prev {
             let limit = self.smp_cnt_limit.or_else(|| announced_limit(asdu_view));
             let diff = smp_cnt_gap(prev, cur_cnt, limit);
             if diff != 0 {
@@ -755,6 +770,40 @@ mod tests {
             1,
             "a differing sample length is not delivered"
         );
+    }
+
+    #[test]
+    fn repeated_smp_cnt_is_a_duplicate_not_a_gap() {
+        for limit in [None, Some(4000)] {
+            let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+            let c = counter.clone();
+            let mut b = SvSubscriberBuilder::new().listener(move |_| {
+                *c.lock().unwrap() += 1;
+            });
+            if let Some(l) = limit {
+                b = b.smp_cnt_limit(l);
+            }
+            let sub = b.build();
+
+            for cnt in [7, 7, 8, 8, 9] {
+                let a = make_asdu("sv1", cnt, vec![0u8; 8]);
+                sub.dispatch(&SvSubscriberAsdu::from_asdu(&a));
+            }
+            assert_eq!(sub.missed_count(), 0, "limit {limit:?}");
+            assert_eq!(sub.duplicate_count(), 2, "limit {limit:?}");
+            assert_eq!(*counter.lock().unwrap(), 5, "duplicates are delivered");
+        }
+    }
+
+    #[test]
+    fn duplicates_are_tracked_per_stream() {
+        let sub = SvSubscriberBuilder::new().build();
+        for (id, cnt) in [("a", 3), ("b", 3), ("a", 4), ("b", 4)] {
+            let a = make_asdu(id, cnt, vec![0u8; 8]);
+            sub.dispatch(&SvSubscriberAsdu::from_asdu(&a));
+        }
+        assert_eq!(sub.duplicate_count(), 0, "equal counters of two streams");
+        assert_eq!(sub.missed_count(), 0);
     }
 
     #[test]
