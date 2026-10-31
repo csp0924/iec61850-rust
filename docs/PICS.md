@@ -94,7 +94,7 @@ source address is sent as the publisher sets it.
 | Release | Y | Y | ACSE RLRQ / RLRE, with MMS Conclude and a Session FINISH timeout on the server; the client sends the RLRQ in a Session FINISH after the Conclude response |
 | Association authentication: none | Y | Y | Default |
 | Association gating on calling AP-title and AE-qualifier | N | – | The MMS layer decodes the calling application reference and can consult an authenticator, but `IedServer` installs none and exposes no hook, so every AARQ is accepted regardless of the calling AP-title |
-| Association authentication: ACSE password | N | N | The AARQ encoder can emit the charstring password mechanism, but the server skips `calling-authentication-value` and always invokes the authenticator with no credentials, and no client API exposes a password |
+| Association authentication: ACSE password | N | N | The AARQ encoder can emit the charstring password mechanism, and the MMS layer decodes a received charstring password and hands it to an `AcseAuthenticator`, but `IedServer` installs none and exposes no hook, and no client API exposes a password |
 | Association authentication: certificate (IEC 62351-4 mechanism OID) | N | N | Peer authentication is performed by TLS; the ACSE mechanism-name OID is not emitted |
 
 ### 3.2 Server, logical device, logical node and data
@@ -146,7 +146,7 @@ The server does not keep the values of each setting group. The model holds one v
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
 | Report | Y | Y | MMS InformationReport |
-| GetURCBValues | Y | Y | Whole-block read returns the twelve attributes in the order of IEC 61850-8-1 Table 30 |
+| GetURCBValues | Y | Y | Whole-block read returns the twelve attributes in the order of IEC 61850-8-1 Table 73 |
 | SetURCBValues | Y | Y | Per attribute; the client orders the sequence so that `RptEna = false` is first and a general interrogation is last |
 | Trigger option: data-change | Y | Y | |
 | Trigger option: quality-change | Y | Y | |
@@ -169,7 +169,7 @@ The server does not keep the values of each setting group. The model holds one v
 | Service | Server | Client | Remark |
 |---|:---:|:---:|---|
 | Report | Y | Y | |
-| GetBRCBValues | Y | Y | The whole control block, in the order of IEC 61850-8-1, or any attribute individually: `RptID`, `RptEna`, `DatSet`, `ConfRev`, `OptFlds`, `BufTm`, `SqNum`, `TrgOps`, `IntgPd`, `GI`, `PurgeBuf`, `EntryID`, `TimeofEntry`, `ResvTms` and `Owner`. A read of `Resv` answers `object-access-unsupported` |
+| GetBRCBValues | Y | Y | The whole control block, in the order of IEC 61850-8-1 Table 72, or any attribute individually: `RptID`, `RptEna`, `DatSet`, `ConfRev`, `OptFlds`, `BufTm`, `SqNum`, `TrgOps`, `IntgPd`, `GI`, `PurgeBuf`, `EntryID`, `TimeofEntry`, `ResvTms` and `Owner`. A read of `Resv` answers `object-access-unsupported` |
 | SetBRCBValues | Y | Y | `ConfRev`, `SqNum` and `Owner` are refused as read-only; a configuration attribute is refused while `RptEna` is true. A `DatSet` write must name a known persistent data set or be empty, and binds the control block to its members |
 | EntryID resynchronization | Y | Y | An eight-octet EntryID; an unknown identifier is refused with `object-value-invalid` |
 | PurgeBuf | Y | Y | Purges while `RptEna` is false |
@@ -302,6 +302,8 @@ separately.
 | `definition [2]` invalid-address | 2 | A data set member reference, or the name of a data set a client defines, is malformed |
 | `definition [2]` object-exists | 5 | DefineNamedVariableList names a data set that is already defined |
 | `resource [3]` other | 0 | The response would exceed the negotiated maximum PDU size, or an internal lock is unusable |
+| `resource [3]` capability-unavailable | 4 | DefineNamedVariableList would exceed `IedServerConfig::max_dynamic_datasets` or `max_dynamic_datasets_per_association` |
+| `service [4]` other | 0 | DeleteNamedVariableList finds the reporting engine lock unusable |
 | `service [4]` object-constraint-conflict | 5 | DeleteNamedVariableList names a data set created at run time that a report control block uses; the error carries `numberDeleted` |
 
 The client decodes a Confirmed-ErrorPDU into the errorClass alternative and
