@@ -87,15 +87,29 @@ stand between a publisher and an injected frame.
 
 **TLS.** Enable the `tls` feature on `iec61850-client` and `iec61850-server` and
 serve MMS on port 3782. `TlsConfigBuilder` applies the IEC 62351-3 constraints —
-TLS 1.2 as the floor, a fixed cipher suite whitelist — and requires client
-certificates when configured to. Two settings weaken the profile and exist only
-for interoperating with equipment that cannot be fixed:
+TLS 1.2 as the floor, a fixed cipher suite whitelist. A server requires a
+client certificate only with `require_client_auth(true)` or
+`allow_only_known_peers(true)`; by default a server with trust anchors still
+accepts a client that presents none and reports it as `WrnNoPeerCert`.
+`allow_only_known_peers(true)` tightens the profile further: a peer must then
+also present one of the leaf certificates added with `add_known_peer_pem` or
+`add_known_peer_der`, beyond passing chain validation. Two settings weaken the
+profile and exist only for interoperating with equipment that cannot be fixed:
 
-- `allow_only_known_peers` pins the acceptable leaf certificates. Leaving it off
-  falls back to ordinary chain validation.
-- Switching validity-time checking off makes an expired peer certificate
+- `with_dangerous_no_sni_verify()` skips matching the server certificate against
+  the server name the client connects to. Chain validation, revocation,
+  validity time and the known-peer list still apply.
+- `time_validation(false)` makes an expired or not yet valid peer certificate
   acceptable. Every other chain error is still rejected, and each downgrade is
   reported through the event handler. Do not use it in production.
+
+A server sends no TLS 1.3 session ticket by default, because libiec61850 TLS
+clients built with mbedtls 3.6.0 drop the connection on receiving one; mbedtls
+3.6.1 and later fix this. `tls13_session_tickets(n)` turns tickets back on.
+Those clients, built with any mbedtls 3.6 release up to at least 3.6.7, also
+drop the connection on a TLS 1.3 KeyUpdate, which rustls sends after 2^24
+records under one key; the `iec61850-tls` README describes the effect on
+long-lived associations.
 
 **Server limits.** `IedServerConfig::max_mms_connections` bounds concurrent
 associations; a connection beyond the limit has its socket closed. The
