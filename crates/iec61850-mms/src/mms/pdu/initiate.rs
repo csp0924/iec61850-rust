@@ -49,9 +49,21 @@ pub const MMS_VERSION_NUMBER: u8 = 1;
 /// Three bytes: padding 5 and data 0xf1 0x00, covering str1, str2, vnam, valt and vlis.
 pub const DEFAULT_PARAMETER_CBB_CLIENT: [u8; 3] = [0x05, 0xf1, 0x00];
 
-/// Default client servicesSupported: 85 bits carried in 11 data bytes.
+/// Default client servicesSupportedCalling: 85 bits carried in 11 data bytes.
+///
+/// Each bit set is a service the client issues or, for the unconfirmed
+/// informationReport, receives:
+///
+/// - byte 0 `0xee` = STATUS | GET_NAME_LIST | IDENTIFY | READ | WRITE |
+///   GET_VARIABLE_ACCESS_ATTRIBUTES
+/// - byte 1 `0x1c` = DEFINE_NAMED_VARIABLE_LIST | GET_NAMED_VARIABLE_LIST_ATTRS |
+///   DELETE_NAMED_VARIABLE_LIST
+/// - bytes 2 to 7 are `0x00`
+/// - byte 8 `0x40` = READ_JOURNAL
+/// - byte 9 `0x01` = INFORMATION_REPORT
+/// - byte 10 `0x10` = CONCLUDE
 pub const DEFAULT_SERVICES_SUPPORTED_CLIENT: [u8; 11] = [
-    0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18,
+    0xee, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x10,
 ];
 
 /// Padding for the servicesSupported BIT STRING: 8 * 11 - 85 = 3 unused bits.
@@ -930,6 +942,39 @@ mod tests {
         // DEFAULT_SERVICES_SUPPORTED_CLIENT[0] = 0xee = 0b11101110
         // 0xee is 0b11101110: bit 7 is status, bit 6 getNameList, and so on
         assert_eq!(decoded.services_supported_called[0], 0xee);
+    }
+
+    /// Bit `n` of a servicesSupported bitmap, numbered from the most significant
+    /// bit of the first byte.
+    fn service_bit(map: &[u8; 11], n: usize) -> bool {
+        map[n / 8] & (0x80 >> (n % 8)) != 0
+    }
+
+    /// The client announces exactly the services it issues, plus the
+    /// informationReport it receives, numbered as in ISO 9506-2
+    /// ServiceSupportOptions.
+    #[test]
+    fn default_client_bitmap_lists_only_issued_services() {
+        // status, getNameList, identify, read, write, getVariableAccessAttributes,
+        // defineNamedVariableList, getNamedVariableListAttributes,
+        // deleteNamedVariableList, readJournal, informationReport, conclude
+        const ISSUED: [usize; 12] = [0, 1, 2, 4, 5, 6, 11, 12, 13, 65, 79, 83];
+        for n in 0..85 {
+            assert_eq!(
+                service_bit(&DEFAULT_SERVICES_SUPPORTED_CLIENT, n),
+                ISSUED.contains(&n),
+                "service bit {n}"
+            );
+        }
+        // getDomainAttributes 37, kill 44, writeJournal 66, initializeJournal 67,
+        // reportJournalStatus 68, getCapabilityList 71, the file services 72 to 77,
+        // unsolicitedStatus 78 and cancel 84 have no client path
+        for n in [37, 44, 66, 67, 68, 71, 72, 73, 74, 76, 77, 78, 84] {
+            assert!(
+                !service_bit(&DEFAULT_SERVICES_SUPPORTED_CLIENT, n),
+                "bit {n}"
+            );
+        }
     }
 
     #[test]
