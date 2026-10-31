@@ -17,7 +17,7 @@ use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa,
     KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SanType, SerialNumber,
 };
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -1068,6 +1068,57 @@ async fn no_sni_verify_still_rejects_an_expired_certificate() {
 // -----------------------------------------------------------------------------
 // Events
 // -----------------------------------------------------------------------------
+
+/// Serves one fixed certificate chain, whatever the client asks for.
+#[derive(Debug)]
+struct FixedCert(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for FixedCert {
+    fn resolve(
+        &self,
+        _: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+#[tokio::test]
+async fn badly_encoded_server_certificate_raises_cert_bad_encoding() {
+    let key = KeyPair::generate().unwrap();
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
+        PrivatePkcs8KeyDer::from(key.serialize_der()),
+    ))
+    .unwrap();
+    // A SEQUENCE holding one INTEGER: well-formed DER, but no certificate.
+    let chain = vec![CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00])];
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(FixedCert(Arc::new(
+        rustls::sign::CertifiedKey::new(chain, signing_key),
+    ))));
+    let events = Arc::new(Recorder::default());
+    let client = client_trusting(&Ca::new())
+        .with_event_handler(events.clone())
+        .build_client()
+        .unwrap();
+
+    let (_, cli) = handshake(
+        TlsAcceptor::from_rustls(Arc::new(server)),
+        &TlsConnector::new(client),
+    )
+    .await;
+
+    assert!(cli.is_err(), "client side: {cli:?}");
+    assert!(
+        events.has(TlsEventLevel::Incident, TlsEventCode::AlmCertBadEncoding),
+        "events: {:?}",
+        events.codes()
+    );
+}
 
 #[tokio::test]
 async fn completed_handshake_raises_session_established_on_both_sides() {
