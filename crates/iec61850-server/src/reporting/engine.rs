@@ -3751,4 +3751,44 @@ mod tests {
         );
         assert_eq!(engine.peer(9), None);
     }
+
+    /// A member that triggers again inside the buffer time restarts the buffer
+    /// time from the retrigger, not from the first trigger (IEC 61850-7-2
+    /// §17.2.2.9).
+    #[test]
+    fn urcb_retrigger_restarts_the_buffer_time() {
+        let sink = Arc::new(CollectReportSink::default());
+        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let (rc, ds) = make_rcb_and_ds("urcb01", &attr, TriggerOptions::DATA_CHANGED);
+        let path = rc.mms_path.clone();
+        engine.register_rcb(rc, ds).unwrap();
+        let rc_arc = engine.get_rcb(&path).unwrap();
+        enable_rcb(&rc_arc, 4);
+        rc_arc.lock().unwrap().state.lock().unwrap().buf_tm_ms = 60_000;
+
+        let flag = InclusionFlag::VALUE_CHANGED;
+        engine.on_value_updated(&attr, MmsValue::Boolean(true), flag, 1_000);
+        // The buffer time of the first trigger has run out by the time the
+        // member triggers again.
+        let first_due = Instant::now() - Duration::from_secs(1);
+        rc_arc.lock().unwrap().state.lock().unwrap().report_due = Some(first_due);
+        engine.on_value_updated(&attr, MmsValue::Boolean(false), flag, 2_000);
+        assert_eq!(
+            sink.pdus.lock().unwrap().len(),
+            1,
+            "the first value at once"
+        );
+
+        // Due by the first trigger, not by the retrigger: nothing is sent.
+        engine.tick_at(Instant::now(), 3_000);
+        assert_eq!(
+            sink.pdus.lock().unwrap().len(),
+            1,
+            "the retrigger waits BufTm"
+        );
+        // A full buffer time after the retrigger, the second value goes out.
+        engine.tick_at(Instant::now() + Duration::from_secs(61), 63_000);
+        assert_eq!(sink.pdus.lock().unwrap().len(), 2);
+    }
 }
