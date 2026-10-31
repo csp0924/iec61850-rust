@@ -104,7 +104,7 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
     for rcb in rcbs {
         let _ = writeln!(
             out,
-            "      RCB name={} buffered={} dataset={} confRev={} rptID={} indexed={} max={}",
+            "      RCB name={} buffered={} dataset={} confRev={} rptID={} indexed={} max={} trg=0x{:02x}",
             rcb.name,
             rcb.is_buffered,
             rcb.dataset_ref,
@@ -112,6 +112,7 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
             rcb.rpt_id,
             rcb.indexed,
             rcb.max_instances,
+            rcb.trg_ops.0,
         );
     }
 
