@@ -973,11 +973,14 @@ fn read_results_budget(req: &ReadRequest, negotiated_max_pdu_size: Option<u32>) 
 /// Reports whether a read of `name` addresses the edit buffer of a setting
 /// group, FC SE, in a domain where no setting group is being edited: EditSG is
 /// 0, or the domain has no setting group control block and so nothing to edit.
-/// IEC 61850-7-2 §16.2.2.5 answers GetEditSGValue negatively in that case.
+/// IEC 61850-7-2 §16.2.2.5 answers GetEditSGValue negatively in that case, and
+/// table 20 makes an SE value available only once SelectEditSG has been
+/// processed, so a data set member under SE is refused the same way.
 ///
 /// The functional constraint is the second segment of every path below a
-/// logical node, so this covers `LN$SE` and every name beneath it. A data set
-/// member is read by GetDataSetValues, not GetEditSGValue, and is not covered.
+/// logical node, so this covers `LN$SE` and every name beneath it. A read of a
+/// whole logical node is one access result that cannot fail for its SE part
+/// alone, and is not covered.
 #[cfg(feature = "setting-groups")]
 fn reads_closed_edit_buffer(
     setting_groups: &crate::setting_groups::SettingGroupRegistry,
@@ -1104,6 +1107,18 @@ fn dispatch_read(
                     None => AccessResult::Failure(DataAccessError::HardwareFault),
                 };
                 let result = match get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref) {
+                    #[cfg(feature = "setting-groups")]
+                    Some((domain_id, item_id))
+                        if reads_closed_edit_buffer(
+                            setting_groups,
+                            &iec61850_mms::ObjectName::DomainSpecific {
+                                domain_id: domain_id.clone(),
+                                item_id: item_id.clone(),
+                            },
+                        ) =>
+                    {
+                        AccessResult::Failure(DataAccessError::TemporarilyUnavailable)
+                    }
                     Some((domain_id, item_id)) => crate::service::read::apply_read_handlers(
                         ied_model,
                         handler_registry,

@@ -484,9 +484,9 @@ fn access_error(result: Result<MmsData, ClientError>) -> DataAccessError {
 }
 
 /// While EditSG is 0, a read of FC SE answers temporarily-unavailable whether
-/// it names an attribute, a data object or the whole SE group, and a read of
-/// the active group under SG still answers. Once a group is selected for
-/// editing, SE reads answer from the edit buffer.
+/// it names an attribute, a data object, the whole SE group or a data set
+/// member, and a read of the active group under SG still answers. Once a group
+/// is selected for editing, SE reads answer from the edit buffer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edit_buffer_reads_wait_for_a_selected_edit_group() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -506,12 +506,44 @@ async fn edit_buffer_reads_wait_for_a_selected_edit_group() {
         );
 
         client
+            .define_named_variable_list(
+                DOMAIN,
+                "GGIO1$dsSet",
+                vec![
+                    DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$SE$Set$setVal"),
+                    DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$SG$Set$setVal"),
+                ],
+            )
+            .await
+            .expect("CreateDataSet");
+        assert_eq!(
+            client
+                .read_named_variable_list_values(DOMAIN, "GGIO1$dsSet")
+                .await
+                .expect("GetDataSetValues"),
+            vec![
+                AccessResult::Failure(DataAccessError::TemporarilyUnavailable),
+                AccessResult::Success(MmsData::Integer(5)),
+            ]
+        );
+
+        client
             .write(DOMAIN, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(1))
             .await
             .expect("select the edit group");
         assert_eq!(
             client.read(DOMAIN, "GGIO1$SE$Set$setVal").await.unwrap(),
             MmsData::Integer(5)
+        );
+        assert_eq!(
+            client
+                .read_named_variable_list_values(DOMAIN, "GGIO1$dsSet")
+                .await
+                .expect("GetDataSetValues"),
+            vec![
+                AccessResult::Success(MmsData::Integer(5)),
+                AccessResult::Success(MmsData::Integer(5)),
+            ]
         );
 
         handle.stop().await;

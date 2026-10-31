@@ -272,6 +272,10 @@ async fn data_set_created_at_run_time_takes_an_sg_member() {
     )
     .await
     .expect("CreateDataSet with FC=SG members");
+    // An SE value is available once a setting group is selected for editing.
+    write(&mut c, "LLN0$SP$SGCB$EditSG", MmsData::Unsigned(1))
+        .await
+        .expect("select the edit group");
     let values = c
         .read_named_variable_list_values(DOMAIN, "PTOC1$dsSg")
         .await
