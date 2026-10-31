@@ -14,7 +14,9 @@
 //!
 //! A domain-specific list name has the form `<LN>$<name>` that IEC 61850-8-1
 //! gives a persistent data set, and the logical node must exist in the domain;
-//! any other name is refused before a member is resolved.
+//! any other name is refused before a member is resolved. A member naming an
+//! object that does not exist answers `Definition(ObjectUndefined)`, as
+//! IEC 61850-8-1 §8.1.3.4.3.4 requires.
 //!
 //! Such a data set is persistent: it outlives the association that created it.
 //! [`DynamicDatasetQuota`] bounds how many exist across the server and how many
@@ -257,15 +259,17 @@ pub(crate) fn handle_define_named_variable_list(
                 ErrorClass::Definition(definition::OBJECT_EXISTS),
             )
         }
+        // A member naming an object that does not exist is an undefined
+        // object of the definition (IEC 61850-8-1 §8.1.3.4.3.4, table 23).
         Err(DatasetError::MemberNotFound { path }) => {
             tracing::warn!(
                 invoke_id,
                 path,
-                "define-named-variable-list member does not resolve, answering object-non-existent"
+                "define-named-variable-list member does not resolve, answering object-undefined"
             );
             crate::service::make_confirmed_error_pub(
                 invoke_id,
-                ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+                ErrorClass::Definition(definition::OBJECT_UNDEFINED),
             )
         }
         Err(DatasetError::MemberInvalidPath { path }) => {

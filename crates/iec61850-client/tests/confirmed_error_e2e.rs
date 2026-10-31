@@ -144,7 +144,7 @@ async fn duplicate_data_set_name_yields_the_definition_error_class() {
 }
 
 /// A member reference that does not resolve against the model is answered with
-/// errorClass access object-non-existent.
+/// errorClass definition object-undefined (IEC 61850-8-1 §8.1.3.4.3.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_member_yields_a_typed_service_error() {
     let server = build_server();
@@ -166,8 +166,8 @@ async fn unknown_member_yields_a_typed_service_error() {
     match result {
         Err(ClientError::ServiceError { error_class }) => assert_eq!(
             error_class,
-            ErrorClass::Access(access::OBJECT_NON_EXISTENT),
-            "an unresolvable member must answer object-non-existent"
+            ErrorClass::Definition(definition::OBJECT_UNDEFINED),
+            "an unresolvable member must answer object-undefined"
         ),
         other => panic!("expected a service error carrying an errorClass, got {other:?}"),
     }

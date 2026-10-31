@@ -546,3 +546,54 @@ async fn a_client_write_of_an_unchanged_value_reports_only_a_data_update() {
     assert_eq!(r.data_values, [MmsValue::Integer(0)]);
     handle.stop().await;
 }
+
+/// A CreateDataSet member naming an object that does not exist, whether by
+/// its name, its functional constraint or its logical device, answers
+/// definition object-undefined (IEC 61850-8-1 §8.1.3.4.3.4, table 23); a
+/// list name in a logical node that does not exist still answers access
+/// object-non-existent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undefined_member_answers_object_undefined() {
+    use iec61850_mms::mms::client::ClientError;
+    use iec61850_mms::mms::pdu::service_error::subcode::{access, definition};
+    use iec61850_mms::mms::pdu::service_error::ErrorClass;
+
+    let server = server();
+    let handle = server.start().await.unwrap();
+    let mut mms = connect(&handle, None).await;
+    let undefined = [
+        DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$NoSuchDo"),
+        DefineNamedVariableEntry::domain(DOM, "GGIO1$MX$Ind1"),
+        DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$Ind1$noSuchDa"),
+        DefineNamedVariableEntry::domain("IED1NOLD", "GGIO1$ST$Ind1"),
+    ];
+    for entry in undefined {
+        let item = format!("{}/{}", entry.domain_id, entry.item_id);
+        match mms
+            .define_named_variable_list(DOM, "LLN0$dynBad", vec![entry])
+            .await
+        {
+            Err(ClientError::ServiceError { error_class }) => assert_eq!(
+                error_class,
+                ErrorClass::Definition(definition::OBJECT_UNDEFINED),
+                "{item}"
+            ),
+            other => panic!("{item}: {other:?}"),
+        }
+    }
+    match mms
+        .define_named_variable_list(
+            DOM,
+            "NOSUCH1$dynBad",
+            vec![DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$Ind1")],
+        )
+        .await
+    {
+        Err(ClientError::ServiceError { error_class }) => {
+            assert_eq!(error_class, ErrorClass::Access(access::OBJECT_NON_EXISTENT))
+        }
+        other => panic!("{other:?}"),
+    }
+    define(&mut mms, "LLN0$dynGood", &["GGIO1$ST$Ind1"]).await;
+    handle.stop().await;
+}
