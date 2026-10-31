@@ -1579,6 +1579,22 @@ mod tests {
         assert_eq!(obj.state(), ControlState::Unselected);
     }
 
+    /// A selection lost with its association reports that association.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_selection_reports_the_association_that_held_it() {
+        let (obj, mut rx) = observed(make_config(ControlModel::SboNormal));
+        assert!(obj.try_select(5).unwrap());
+        obj.on_connection_closed(5);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((SelectStateChangedReason::Selected, 5, 0))
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((SelectStateChangedReason::Disconnected, 5, 0))
+        );
+    }
+
     // ── Losing another connection changes nothing ────────────────────────
 
     #[test]

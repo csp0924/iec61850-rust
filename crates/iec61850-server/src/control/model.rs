@@ -7,6 +7,7 @@
 //! Enum discriminants are the integer values that go on the wire, so a value here
 //! may not be renumbered.
 
+use crate::connection::ConnectionId;
 use iec61850_model::MmsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,7 +236,7 @@ pub struct ControlAction {
     /// Whether this is a select rather than an Operate.
     is_select: bool,
     /// Connection that issued this control request, or 0 when there is none.
-    conn_id: u64,
+    conn_id: ConnectionId,
 }
 
 impl ControlAction {
@@ -249,7 +250,7 @@ impl ControlAction {
         synchro_check: bool,
         interlock_check: bool,
         is_select: bool,
-        conn_id: u64,
+        conn_id: ConnectionId,
     ) -> Self {
         Self {
             ctl_num,
@@ -298,12 +299,13 @@ impl ControlAction {
         self.is_select
     }
 
-    /// Returns the identifier of the association that issued the request, or
-    /// 0 when no association issued it.
+    /// Returns the identifier of the association that issued the request, as
+    /// [`ClientConnection::id`](crate::ClientConnection::id) reports it, or 0
+    /// when no association issued it.
     ///
     /// A selection that ends without a request, by timeout or by the loss of
     /// its association, reports the association that held the selection.
-    pub fn conn_id(&self) -> u64 {
+    pub fn conn_id(&self) -> ConnectionId {
         self.conn_id
     }
 }
