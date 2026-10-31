@@ -1695,12 +1695,16 @@ impl ReportingEngine {
             }
         }
 
-        let (anchor, resynced_on) = {
+        let (anchor, resynced_on, overflow_on_enable) = {
             let Ok(state) = brcb.state.lock() else {
                 tracing::warn!(mms_path = %brcb.mms_path, "brcb state mutex poisoned");
                 return sent_count;
             };
-            (state.transmit_anchor.clone(), state.last_committed_entry_id)
+            (
+                state.transmit_anchor.clone(),
+                state.last_committed_entry_id,
+                state.overflow_on_enable,
+            )
         };
         let snap = match brcb_encode_snapshot(brcb) {
             Ok(s) => s,
@@ -1766,6 +1770,10 @@ impl ReportingEngine {
         if entries.is_empty() {
             return sent_count;
         }
+        // The first report after the control block was enabled indicates a
+        // possible loss of information, whatever the anchor
+        // (IEC 61850-7-2 §17.2.3.2.2.8).
+        imply_overflow |= overflow_on_enable;
 
         // Prefer the data set bound by register_brcb_with_dataset; fall back to an
         // empty data set when the BRCB was registered without one.
@@ -1901,13 +1909,17 @@ impl ReportingEngine {
     }
 
     /// Records that the first segment of the BRCB entry `entry_id`, which
-    /// carries the BufOvfl value, has been accepted: the overflow flag is
-    /// cleared, and the entry counts as formatted, so evicting it later does
-    /// not set the flag again (IEC 61850-7-2 §17.2.3.2.2.8, figures 30 and 31).
+    /// carries the BufOvfl value, has been accepted: the overflow flag and the
+    /// indication owed since the control block was enabled are cleared, and
+    /// the entry counts as formatted, so evicting it later does not set the
+    /// flag again (IEC 61850-7-2 §17.2.3.2.2.8, figures 30 and 31).
     fn entry_formatted(&self, brcb: &BufferedReportControl, entry_id: super::buffer::EntryId) {
         if let Ok(mut buf) = brcb.lock_buffer() {
             buf.clear_overflow();
             buf.mark_formatted(&entry_id);
+        }
+        if let Ok(mut state) = brcb.state.lock() {
+            state.overflow_on_enable = false;
         }
     }
 

@@ -392,6 +392,11 @@ pub struct BrcbState {
     /// `is_resync`: set once a client has written EntryID, so the next
     /// `RptEna = true` does not reset the transmit anchor.
     pub is_resync: bool,
+    /// Set when RptEna goes from false to true and cleared once a report has
+    /// gone out: the first report sent after the control block is enabled
+    /// carries `BufOvfl = TRUE` (IEC 61850-7-2 §17.2.3.2.2.8), whatever the
+    /// transmit anchor.
+    pub overflow_on_enable: bool,
     /// EntryID assigned most recently, as a host-order `u64` for the monotonic
     /// bump; it becomes big-endian when written into the buffer.
     pub last_entry_id_ms: u64,
@@ -446,6 +451,7 @@ impl BrcbState {
             // before a client enables reporting.
             is_buffering: !brcb.dataset_name.is_empty(),
             is_resync: false,
+            overflow_on_enable: false,
             last_entry_id_ms: 0,
             transmit_anchor: TransmitAnchor::None,
             last_committed_entry_id: EntryId::ZERO,

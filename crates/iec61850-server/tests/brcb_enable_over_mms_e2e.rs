@@ -307,7 +307,9 @@ async fn brcb_enabled_by_another_association_refuses_rpt_ena() {
 /// When the association that enabled a BRCB ends, the BRCB is disabled and
 /// keeps buffering; a client that reconnects and enables it again receives the
 /// entry buffered in between, after the last entry sent or after the `EntryID`
-/// it writes, and nothing it already received.
+/// it writes, and nothing it already received. As the first report after the
+/// control block is enabled, it carries `BufOvfl = TRUE`
+/// (IEC 61850-7-2 §17.2.3.2.2.8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn brcb_resumes_after_the_client_reconnects() {
     for resync in [false, true] {
@@ -339,7 +341,7 @@ async fn brcb_resumes_after_the_client_reconnects() {
         let resumed = next_report(&mut second).await;
         assert_brcb_report(&resumed, dbpos(1));
         assert!(resumed.entry_id > sent.entry_id, "resync {resync}");
-        assert_eq!(resumed.buf_ovfl, Some(false), "resync {resync}");
+        assert_eq!(resumed.buf_ovfl, Some(true), "resync {resync}");
     }
 }
 

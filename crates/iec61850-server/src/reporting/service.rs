@@ -1013,6 +1013,9 @@ fn set_brcb_rpt_ena(
             return Ok(false);
         }
         state.rpt_ena = true;
+        // The first report after the transition from disabled to enabled
+        // indicates a possible loss of information.
+        state.overflow_on_enable = true;
         // A client that enables reporting without writing EntryID first receives
         // the buffer from its oldest entry.
         if state.transmit_anchor == super::brcb::TransmitAnchor::None {
@@ -1029,9 +1032,8 @@ fn set_brcb_rpt_ena(
         if state.resv_tms == super::brcb::ResvTmsState::NotReserved {
             state.owner = None;
         }
-        // Disabling a BRCB keeps the buffer; only the overflow indication matters,
-        // and the send path already implies it for a from-head or unset anchor, so
-        // the backend is left untouched here.
+        // Disabling a BRCB keeps the buffer; the overflow indication of the next
+        // enable is set when it happens, so the backend is left untouched here.
     }
     Ok(v)
 }
