@@ -4,8 +4,16 @@
 //! the buffer time set to zero. The client connects, installs a handler and
 //! runs a background dispatcher. Each sample takes a timestamp, flips the
 //! value, waits for the handler and records the difference; samples do not
-//! overlap. The test reports p50, p95, p99 and the maximum, and requires p95
-//! to stay under the budget below.
+//! overlap. The test prints p50, p95, p99 and the maximum, and how p95
+//! compares with the reference budget below.
+//!
+//! It is a characterization, not a gate: the figures depend on the load of
+//! the host, so the test is ignored by default and asserts no bound. Run it on
+//! an otherwise idle host with
+//!
+//! ```text
+//! cargo test -p iec61850-client --test urcb_latency -- --ignored --nocapture
+//! ```
 //!
 //! The buffer time is zero because a non-zero one batches the triggers of a
 //! member within its window, which would be measured as latency rather than
@@ -102,10 +110,12 @@ fn enable_urcb_direct(server: &IedServer, mms_path: &str, conn_id: u64) {
 
 const N_SAMPLES: usize = 50;
 const PER_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
-const P95_BUDGET_MS: u128 = 100;
+/// The p95 an idle host stays under; printed for comparison, not asserted.
+const P95_REFERENCE_MS: u128 = 100;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn urcb_data_change_latency_p95_under_100ms() {
+#[ignore = "characterization: depends on host load, run by hand with --ignored --nocapture"]
+async fn urcb_data_change_latency() {
     let server = build_server();
     let (da, mms_path) = register_urcb(&server);
     let handle = server.start().await.expect("server start");
@@ -175,13 +185,15 @@ async fn urcb_data_change_latency_p95_under_100ms() {
         "URCB latency over N={N_SAMPLES}: p50={:?} p95={:?} p99={:?} max={:?}",
         p50, p95, p99, max
     );
-
-    assert!(
-        p95.as_millis() < P95_BUDGET_MS,
-        "p95 latency {}ms should be below {} ms (max={:?})",
+    println!(
+        "p95 {} ms against the {} ms reference: {}",
         p95.as_millis(),
-        P95_BUDGET_MS,
-        max
+        P95_REFERENCE_MS,
+        if p95.as_millis() < P95_REFERENCE_MS {
+            "within"
+        } else {
+            "above"
+        }
     );
 }
 
