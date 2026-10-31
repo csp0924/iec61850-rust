@@ -256,14 +256,18 @@ fn expand_do_type(
 ) -> Result<DataObject, SclParseError> {
     let mut do_b = DataObjectBuilder::scalar(do_name);
 
-    // Data attributes first
+    // Data attributes first; an FC=SE attribute is followed by its FC=SG view.
     for raw_da in &dot.das {
         let da = build_da(
             raw_da,
             dtt,
             &format!("{}/DA[name=\"{}\"]", parent_path, raw_da.name),
         )?;
+        let view = derives_setting_view(raw_da, dot).then(|| setting_view(&da));
         do_b = do_b.add_da_node(da);
+        if let Some(view) = view {
+            do_b = do_b.add_da_node(view);
+        }
     }
 
     // Then the sub-objects
@@ -299,6 +303,42 @@ fn build_sdo(
         .get(&raw_sdo.do_type_ref)
         .expect("the sub-object type_ref was checked in stage 2");
     expand_do_type(&raw_sdo.name, dot, dtt, sdo_path, lnt)
+}
+
+/// Whether a `<DA>` of a DOType also yields an FC=SG data attribute.
+///
+/// An attribute declared with `fc="SE"` is visible under FC=SG as well
+/// (IEC 61850-6, DA fc attribute), unless the DOType declares an attribute of
+/// the same name with `fc="SG"` itself.
+///
+/// Also used by the build-script path through [`crate::__build_internals`].
+#[doc(hidden)]
+pub fn derives_setting_view(raw_da: &RawDaDef, dot: &RawDoType) -> bool {
+    raw_da.fc == "SE"
+        && !dot
+            .das
+            .iter()
+            .any(|d| d.name == raw_da.name && d.fc == "SG")
+}
+
+/// Builds the FC=SG view of an FC=SE data attribute: the same name, type and
+/// structure under FC=SG, with values of its own that start as copies of the
+/// current values of `da`.
+///
+/// Also used by the code a build script generates, through [`crate::__rt`].
+#[doc(hidden)]
+pub fn setting_view(da: &DataAttribute) -> DataAttribute {
+    if da.ty == DataAttributeType::Constructed {
+        let mut view = DataAttribute::constructed(
+            da.name.clone(),
+            FC::Sg,
+            da.children.iter().map(setting_view).collect(),
+        );
+        view.trg_ops = da.trg_ops;
+        view
+    } else {
+        DataAttribute::new(da.name.clone(), FC::Sg, da.ty, da.trg_ops, da.snapshot())
+    }
 }
 
 /// Expands a raw data attribute into a [`DataAttribute`].
@@ -931,6 +971,11 @@ fn apply_instances_at_do(
                     };
                     let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
                     apply_instances_at_da(&sdi.children, da, dat_def, dtt, &path)?;
+                    if derives_setting_view(da_def, dot) {
+                        if let Some(view) = setting_view_of(dobj, &sdi.name) {
+                            apply_instances_at_da(&sdi.children, view, dat_def, dtt, &path)?;
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "SDI name=\"{}\" has no matching SDO or DA in DOType id=\"{}\", skipping",
@@ -962,18 +1007,30 @@ fn apply_instances_at_do(
                     }
                 };
                 let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
-                apply_dai_value(
-                    dai,
-                    da,
-                    da_def.b_type.as_str(),
-                    da_def.type_ref.as_deref(),
-                    dtt,
-                    &path,
-                )?;
+                let view = if derives_setting_view(da_def, dot) {
+                    setting_view_of(dobj, &dai.name)
+                } else {
+                    None
+                };
+                for target in std::iter::once(da).chain(view) {
+                    apply_dai_value(
+                        dai,
+                        target,
+                        da_def.b_type.as_str(),
+                        da_def.type_ref.as_deref(),
+                        dtt,
+                        &path,
+                    )?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Finds the FC=SG data attribute named `name` directly below `dobj`.
+fn setting_view_of<'a>(dobj: &'a DataObject, name: &str) -> Option<&'a DataAttribute> {
+    dobj.children_with_fc(FC::Sg).find(|da| da.name == name)
 }
 
 /// Applies the `<SDI>` and `<DAI>` children below a constructed attribute and
@@ -1163,6 +1220,35 @@ pub fn instance_target<'a>(
                     continue;
                 }
                 iec61850_model::tree::DoChild::Da(a) => a,
+            },
+            Some(a) => a.child_by_name(name)?,
+        });
+    }
+    da
+}
+
+/// Finds, as [`instance_target`] does, the leaf that an instance path names,
+/// except that the data attribute named right below the data object, or below
+/// its sub-objects, is the one under FC=SG.
+///
+/// The code a build script generates applies the `<DAI>` values of an FC=SE
+/// attribute through this lookup to its FC=SG view as well.
+#[doc(hidden)]
+pub fn setting_view_target<'a>(
+    ln: &'a iec61850_model::LogicalNode,
+    do_name: &str,
+    path: &[&str],
+) -> Option<&'a DataAttribute> {
+    let mut dobj = ln.do_by_name(do_name)?;
+    let mut da: Option<&DataAttribute> = None;
+    for name in path {
+        da = Some(match da {
+            None => match dobj.child_by_name(name)? {
+                iec61850_model::tree::DoChild::SubDo(s) => {
+                    dobj = s;
+                    continue;
+                }
+                iec61850_model::tree::DoChild::Da(_) => setting_view_of(dobj, name)?,
             },
             Some(a) => a.child_by_name(name)?,
         });

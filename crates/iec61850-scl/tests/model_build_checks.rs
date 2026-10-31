@@ -3,7 +3,7 @@
 
 use iec61850_model::tree::{DataAttribute, DoChild, IedModel};
 use iec61850_model::types::DataAttributeType;
-use iec61850_model::MmsValue;
+use iec61850_model::{MmsValue, FC};
 
 fn try_build(xml: &str) -> Result<IedModel, String> {
     let raw = iec61850_scl::parse_scl(xml).map_err(|e| format!("parse: {e}"))?;
@@ -729,5 +729,174 @@ fn malformed_octet_string_or_timestamp_val_fails_the_build() {
         r#"<DAI name="t"><Val>31.12.2007 21:01</Val></DAI>"#,
     ] {
         assert!(try_build(&octet_time_scl(doi)).is_err(), "{doi} accepted");
+    }
+}
+
+const SETTINGS: &str = r#"
+    <LNodeType id="PTOC_T" lnClass="PTOC">
+      <DO name="OpDlTmms" type="ING_SE_T"/>
+      <DO name="StrVal" type="ASG_SE_T"/>
+      <DO name="TmMult" type="ING_SG_T"/>
+      <DO name="MinOpTmms" type="ING_BOTH_T"/>
+    </LNodeType>
+    <DOType id="ING_SE_T" cdc="ING">
+      <DA name="setVal" fc="SE" bType="INT32"><Val>100</Val></DA>
+      <DA name="minVal" fc="CF" bType="INT32"/>
+    </DOType>
+    <DOType id="ASG_SE_T" cdc="ASG">
+      <DA name="setMag" fc="SE" bType="Struct" type="AnVal_T"/>
+    </DOType>
+    <DOType id="ING_SG_T" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"><Val>7</Val></DA>
+    </DOType>
+    <DOType id="ING_BOTH_T" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"><Val>3</Val></DA>
+      <DA name="setVal" fc="SE" bType="INT32"><Val>4</Val></DA>
+    </DOType>
+    <DAType id="AnVal_T"><BDA name="f" bType="FLOAT32"/></DAType>"#;
+
+fn settings_model(doi: &str) -> IedModel {
+    let ln = format!(r#"<LN lnClass="PTOC" inst="1" lnType="PTOC_T">{doi}</LN>"#);
+    build(&wrap(SETTINGS, "", &ln))
+}
+
+/// The data attributes of `do_name` under `fc`, by name.
+fn under_fc<'a>(model: &'a IedModel, do_name: &str, fc: FC) -> Vec<&'a DataAttribute> {
+    let ln = model
+        .ld_by_inst("LD0")
+        .unwrap()
+        .ln_by_name("PTOC1")
+        .unwrap();
+    ln.do_by_name(do_name)
+        .unwrap()
+        .children_with_fc(fc)
+        .collect()
+}
+
+/// A `<DA>` with `fc="SE"` is also an FC=SG data attribute of the same name and
+/// type, starting at the same value, with a value of its own.
+#[test]
+fn se_attribute_is_also_an_sg_attribute() {
+    let m = settings_model("");
+    let se = under_fc(&m, "OpDlTmms", FC::Se);
+    let sg = under_fc(&m, "OpDlTmms", FC::Sg);
+    assert_eq!(se.len(), 1);
+    assert_eq!(sg.len(), 1);
+    assert_eq!(sg[0].name, "setVal");
+    assert_eq!(sg[0].ty, DataAttributeType::Int32);
+    assert_eq!(sg[0].snapshot(), MmsValue::Integer(100));
+    assert_eq!(under_fc(&m, "OpDlTmms", FC::Cf).len(), 1);
+
+    se[0].store(MmsValue::Integer(5));
+    assert_eq!(sg[0].snapshot(), MmsValue::Integer(100));
+
+    let sg_mag = under_fc(&m, "StrVal", FC::Sg);
+    assert_eq!(sg_mag.len(), 1);
+    let f = sg_mag[0].child_by_name("f").unwrap();
+    assert_eq!(f.fc, FC::Sg);
+    assert_eq!(f.snapshot(), MmsValue::Float32(0.0));
+}
+
+/// A `<DAI>` value of an FC=SE attribute is the initial value under FC=SG too,
+/// for a leaf and for a member of a constructed attribute.
+#[test]
+fn dai_value_of_an_se_attribute_reaches_the_sg_attribute() {
+    let m = settings_model(
+        r#"<DOI name="OpDlTmms"><DAI name="setVal"><Val>250</Val></DAI></DOI>
+           <DOI name="StrVal"><SDI name="setMag"><DAI name="f"><Val>1.5</Val></DAI></SDI></DOI>"#,
+    );
+    for fc in [FC::Se, FC::Sg] {
+        assert_eq!(
+            under_fc(&m, "OpDlTmms", fc)[0].snapshot(),
+            MmsValue::Integer(250),
+            "{fc:?}"
+        );
+        let mag = under_fc(&m, "StrVal", fc)[0];
+        assert_eq!(
+            mag.child_by_name("f").unwrap().snapshot(),
+            MmsValue::Float32(1.5),
+            "{fc:?}"
+        );
+    }
+}
+
+/// A `<DA>` with `fc="SG"` stays a view only, and a DOType that declares a
+/// setting under both constraints keeps exactly those two attributes.
+#[test]
+fn sg_attribute_does_not_yield_an_se_attribute() {
+    let m = settings_model("");
+    assert!(under_fc(&m, "TmMult", FC::Se).is_empty());
+    let sg = under_fc(&m, "TmMult", FC::Sg);
+    assert_eq!(sg.len(), 1);
+    assert_eq!(sg[0].snapshot(), MmsValue::Integer(7));
+
+    let se = under_fc(&m, "MinOpTmms", FC::Se);
+    let sg = under_fc(&m, "MinOpTmms", FC::Sg);
+    assert_eq!((se.len(), sg.len()), (1, 1));
+    assert_eq!(se[0].snapshot(), MmsValue::Integer(4));
+    assert_eq!(sg[0].snapshot(), MmsValue::Integer(3));
+}
+
+fn settings_model_with_data_set(fcda: &str) -> Result<IedModel, String> {
+    let ln0 = format!(r#"<DataSet name="ds">{fcda}</DataSet>"#);
+    let ln = r#"<LN lnClass="PTOC" inst="1" lnType="PTOC_T"/>"#;
+    try_build(&wrap(SETTINGS, &ln0, ln))
+}
+
+/// An `<FCDA>` resolves the setting under the constraint it names, at the data
+/// attribute level as well as the data object level, whichever of the two
+/// attributes the DOType declares first.
+#[test]
+fn fcda_resolves_a_setting_under_se_and_sg() {
+    for fcda in [
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="OpDlTmms" daName="setVal" fc="SG"/>"#,
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="OpDlTmms" daName="setVal" fc="SE"/>"#,
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="OpDlTmms" fc="SG"/>"#,
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="MinOpTmms" daName="setVal" fc="SE"/>"#,
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="MinOpTmms" daName="setVal" fc="SG"/>"#,
+    ] {
+        settings_model_with_data_set(fcda).unwrap_or_else(|e| panic!("{fcda}: {e}"));
+    }
+    let err = settings_model_with_data_set(
+        r#"<FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="TmMult" daName="setVal" fc="SE"/>"#,
+    )
+    .expect_err("a setting declared under FC=SG only has no FC=SE attribute");
+    assert!(err.contains("does not exist"), "{err}");
+}
+
+/// A setting declared under FC=SG and FC=SE with two different types is
+/// refused.
+#[test]
+fn setting_declared_with_two_types_is_rejected() {
+    let t = r#"
+    <LNodeType id="X_T" lnClass="PTOC"><DO name="Spt" type="X_DO"/></LNodeType>
+    <DOType id="X_DO" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"/>
+      <DA name="setVal" fc="SE" bType="INT64"/>
+    </DOType>"#;
+    let ln = r#"<LN lnClass="PTOC" inst="1" lnType="X_T"/>"#;
+    let err = try_build(&wrap(t, "", ln)).expect_err("two types for one setting");
+    assert!(err.contains("setVal"), "{err}");
+}
+
+/// An `fc="SE"` attribute below a sub-object is also an FC=SG attribute there.
+#[test]
+fn se_attribute_below_a_sub_object_is_also_an_sg_attribute() {
+    let t = r#"
+    <LNodeType id="X_T" lnClass="PTOC"><DO name="TmSet" type="X_DO"/></LNodeType>
+    <DOType id="X_DO" cdc="ING"><SDO name="tm" type="X_SUB"/></DOType>
+    <DOType id="X_SUB" cdc="ING"><DA name="setVal" fc="SE" bType="INT32"><Val>8</Val></DA></DOType>"#;
+    let ln = r#"<LN lnClass="PTOC" inst="1" lnType="X_T">
+      <DOI name="TmSet"><SDI name="tm"><DAI name="setVal"><Val>9</Val></DAI></SDI></DOI></LN>"#;
+    let m = build(&wrap(t, "", ln));
+    let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("PTOC1").unwrap();
+    let sub = match ln.do_by_name("TmSet").unwrap().child_by_name("tm") {
+        Some(DoChild::SubDo(s)) => s,
+        other => panic!("tm: {other:?}"),
+    };
+    for fc in [FC::Se, FC::Sg] {
+        let da: Vec<_> = sub.children_with_fc(fc).collect();
+        assert_eq!(da.len(), 1, "{fc:?}");
+        assert_eq!(da[0].snapshot(), MmsValue::Integer(9), "{fc:?}");
     }
 }
