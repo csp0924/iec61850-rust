@@ -31,6 +31,7 @@ use tracing::warn;
 pub enum AcseError {
     /// The PDU is shorter than a tag plus one length byte.
     #[error("acse pdu too short (len={len}, at least 2 bytes required)")]
+    #[non_exhaustive]
     TooShort {
         /// Length of the PDU received.
         len: usize,
@@ -38,6 +39,7 @@ pub enum AcseError {
 
     /// A BER length runs past the buffer.
     #[error("ber length {claimed} exceeds the {remaining} bytes remaining in the buffer")]
+    #[non_exhaustive]
     OobRead {
         /// Length the BER field declared.
         claimed: usize,
@@ -47,6 +49,7 @@ pub enum AcseError {
 
     /// The PDU tag is not one of the five ACSE types.
     #[error("unknown acse pdu tag 0x{tag:02X}")]
+    #[non_exhaustive]
     UnknownPduType {
         /// PDU tag received.
         tag: u8,

@@ -13,6 +13,7 @@ use thiserror::Error;
 pub enum MmsError {
     /// A BER tag differs from the expected one.
     #[error("ber tag mismatch: expected=0x{expected:02X}, actual=0x{actual:02X}")]
+    #[non_exhaustive]
     InvalidTag {
         /// Tag the decoder expected.
         expected: u8,
@@ -34,6 +35,7 @@ pub enum MmsError {
     /// Rejected rather than ignored, so a peer with a different capability encoding
     /// is reported instead of silently mis-parsed.
     #[error("invalid parametercbb bit string length (expected 3, got {actual})")]
+    #[non_exhaustive]
     InvalidParameterCbbLength {
         /// Length received; it must be 3.
         actual: usize,
@@ -43,6 +45,7 @@ pub enum MmsError {
     ///
     /// The ceiling bounds recursion depth during decoding.
     #[error("datastructurenestinglevel {got} exceeds the limit of {max}")]
+    #[non_exhaustive]
     NestingLevelExceeded {
         /// Ceiling in force.
         max: u8,
@@ -60,6 +63,7 @@ pub enum MmsError {
 
     /// The servicesSupported BIT STRING is not 12 bytes, 11 of data plus one of padding.
     #[error("invalid servicessupportedcalling bit string length (expected 12, got {actual})")]
+    #[non_exhaustive]
     InvalidServicesSupportedLength {
         /// Length received; it must be 12.
         actual: usize,
@@ -69,6 +73,7 @@ pub enum MmsError {
     ///
     /// An oversized identifier is rejected rather than silently truncated.
     #[error("objectname identifier length {actual} exceeds the limit of 64 bytes")]
+    #[non_exhaustive]
     IdentifierTooLong {
         /// Identifier length received.
         actual: usize,
@@ -94,6 +99,7 @@ pub enum MmsError {
     ///
     /// A different length is rejected rather than reinterpreted.
     #[error("invalid utctime length {actual}, expected 8")]
+    #[non_exhaustive]
     InvalidUtcTimeLength {
         /// Length received; it must be 8.
         actual: usize,
@@ -103,6 +109,7 @@ pub enum MmsError {
     ///
     /// A different length is rejected rather than reinterpreted.
     #[error("invalid floatingpoint length {actual}, expected 5 or 9")]
+    #[non_exhaustive]
     InvalidFloatSize {
         /// Length received; it must be 5 or 9.
         actual: usize,
@@ -114,6 +121,7 @@ pub enum MmsError {
 
     /// A WriteRequest names a different number of variables than it carries values.
     #[error("write item count mismatch: expected={expected}, actual={actual}")]
+    #[non_exhaustive]
     WriteCountMismatch {
         /// Number of variables named.
         expected: usize,
@@ -123,6 +131,7 @@ pub enum MmsError {
 
     /// A WriteRequest carries more than the 100 items accepted.
     #[error("write item count {count} exceeds the limit of 100")]
+    #[non_exhaustive]
     TooManyWriteItems {
         /// Number of items requested.
         count: usize,
@@ -187,6 +196,7 @@ pub enum MmsError {
 
     /// A DefineNamedVariableList request carries more than the 100 entries accepted.
     #[error("definenamedvariablelist entry count {count} exceeds the limit of 100")]
+    #[non_exhaustive]
     TooManyDefineEntries {
         /// Number of entries requested.
         count: usize,

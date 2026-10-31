@@ -66,6 +66,7 @@ pub enum ClientError {
     ///
     /// An oversized PDU is refused rather than truncated.
     #[error("pdu size {pdu_size} exceeds the negotiated maximum {max_size}, refusing to send")]
+    #[non_exhaustive]
     PduTooLarge {
         /// Size of the encoded PDU.
         pdu_size: usize,
@@ -90,6 +91,7 @@ pub enum ClientError {
 
     /// A service was called while the association was not established.
     #[error("client is not connected (state: {state:?})")]
+    #[non_exhaustive]
     NotConnected {
         /// Connection state at the time of the call.
         state: String,
@@ -102,6 +104,7 @@ pub enum ClientError {
 
     /// No answer arrived within the request timeout.
     #[error("request timed out after {timeout_ms} ms")]
+    #[non_exhaustive]
     ServiceTimeout {
         /// Request timeout that elapsed, in milliseconds.
         timeout_ms: u64,
@@ -133,6 +136,7 @@ pub enum ClientError {
 
     /// The peer answered with a ConfirmedError PDU carrying an MMS ServiceError.
     #[error("mms service error: class={error_class:?}")]
+    #[non_exhaustive]
     ServiceError {
         /// errorClass carried by the confirmed error PDU.
         error_class: ErrorClass,
@@ -144,6 +148,7 @@ pub enum ClientError {
 
     /// The peer answered with a Reject PDU.
     #[error("mms reject: {reason:?}")]
+    #[non_exhaustive]
     RejectError {
         /// rejectReason carried by the reject PDU.
         reason: RejectReason,
@@ -163,6 +168,7 @@ pub enum ClientError {
     /// `provider_reason` is filled in when the refusal carries a CPR PPDU whose
     /// provider-reason decodes.
     #[error("{}", session_refused_message(*reason_code, *transport_disconnect, *provider_reason))]
+    #[non_exhaustive]
     SessionRefused {
         /// Reason code carried by the RF SPDU.
         reason_code: Option<u8>,
@@ -174,6 +180,7 @@ pub enum ClientError {
 
     /// MMS Initiate negotiation failed and the peer answered with an Initiate error.
     #[error("mms initiate failed: errorCode={error_code}")]
+    #[non_exhaustive]
     InitiateFailed {
         /// Subcode carried by the Initiate error PDU.
         error_code: u8,
@@ -190,8 +197,74 @@ pub enum ClientError {
 
     /// The association was not established within the connect timeout.
     #[error("connect timed out after {timeout_ms} ms")]
+    #[non_exhaustive]
     ConnectTimeout {
         /// Connect timeout that elapsed, in milliseconds.
         timeout_ms: u64,
     },
+}
+
+impl ClientError {
+    /// Builds a [`ClientError::ServiceError`], for code that reports a
+    /// ServiceError itself, such as a test double of a peer.
+    pub fn service_error(
+        error_class: ErrorClass,
+        service_specific: Option<ServiceSpecificInfo>,
+    ) -> Self {
+        Self::ServiceError {
+            error_class,
+            service_specific,
+        }
+    }
+
+    /// Builds a [`ClientError::RejectError`].
+    pub fn reject(reason: RejectReason) -> Self {
+        Self::RejectError { reason }
+    }
+
+    /// Builds a [`ClientError::ServiceTimeout`] for a request timeout of
+    /// `timeout_ms` milliseconds.
+    pub fn service_timeout(timeout_ms: u64) -> Self {
+        Self::ServiceTimeout { timeout_ms }
+    }
+
+    /// Builds a [`ClientError::ConnectTimeout`] for a connect timeout of
+    /// `timeout_ms` milliseconds.
+    pub fn connect_timeout(timeout_ms: u64) -> Self {
+        Self::ConnectTimeout { timeout_ms }
+    }
+
+    /// Builds a [`ClientError::NotConnected`] for a call made in `state`.
+    pub fn not_connected(state: impl Into<String>) -> Self {
+        Self::NotConnected {
+            state: state.into(),
+        }
+    }
+
+    /// Builds a [`ClientError::PduTooLarge`] for a PDU of `pdu_size` octets
+    /// against a negotiated maximum of `max_size`.
+    pub fn pdu_too_large(pdu_size: usize, max_size: usize) -> Self {
+        Self::PduTooLarge { pdu_size, max_size }
+    }
+
+    /// Builds a [`ClientError::InitiateFailed`] carrying the errorCode of the
+    /// Initiate error PDU.
+    pub fn initiate_failed(error_code: u8) -> Self {
+        Self::InitiateFailed { error_code }
+    }
+
+    /// Builds a [`ClientError::SessionRefused`] from the reason code and the
+    /// transport disconnect parameter of the RF SPDU and the provider-reason of
+    /// the CPR PPDU inside it.
+    pub fn session_refused(
+        reason_code: Option<u8>,
+        transport_disconnect: Option<u8>,
+        provider_reason: Option<u8>,
+    ) -> Self {
+        Self::SessionRefused {
+            reason_code,
+            transport_disconnect,
+            provider_reason,
+        }
+    }
 }

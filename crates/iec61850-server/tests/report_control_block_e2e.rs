@@ -708,6 +708,7 @@ async fn dynamic_data_set_in_use_reports_and_cannot_be_deleted() {
             Err(ClientError::ServiceError {
                 error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
                 service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(0)),
+                ..
             })
         ),
         "{deleted:?}"
@@ -784,6 +785,7 @@ async fn dynamic_data_set_used_by_a_brcb_cannot_be_deleted() {
             Err(ClientError::ServiceError {
                 error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
                 service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(0)),
+                ..
             })
         ),
         "{deleted:?}"

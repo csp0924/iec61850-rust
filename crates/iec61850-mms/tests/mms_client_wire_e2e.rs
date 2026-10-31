@@ -235,7 +235,13 @@ async fn unanswered_request_times_out_and_leaves_the_association_usable() {
     // the first request is never answered in time
     let (first, held_id) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
     assert!(
-        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        matches!(
+            first,
+            Err(ClientError::ServiceTimeout {
+                timeout_ms: 300,
+                ..
+            })
+        ),
         "got {first:?}"
     );
     assert_eq!(c.state(), ConnectionState::Connected);
@@ -608,7 +614,13 @@ async fn outstanding_limit_waits_for_the_late_answer() {
     let (mut c, mut peer) = connected_with_max_calling(300, 1).await;
     let (first, held_id) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
     assert!(
-        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        matches!(
+            first,
+            Err(ClientError::ServiceTimeout {
+                timeout_ms: 300,
+                ..
+            })
+        ),
         "got {first:?}"
     );
 
@@ -628,7 +640,13 @@ async fn outstanding_limit_without_a_late_answer_refuses_to_send() {
     let (mut c, mut peer) = connected_with_max_calling(300, 1).await;
     let (first, _) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
     assert!(
-        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        matches!(
+            first,
+            Err(ClientError::ServiceTimeout {
+                timeout_ms: 300,
+                ..
+            })
+        ),
         "got {first:?}"
     );
 
@@ -651,7 +669,13 @@ async fn outstanding_limit_with_a_free_slot_sends_at_once() {
     let (mut c, mut peer) = connected_with_max_calling(300, 2).await;
     let (first, held_id) = tokio::join!(c.read("LD0", "GGIO1$ST$Ind1$stVal"), peer.recv_read());
     assert!(
-        matches!(first, Err(ClientError::ServiceTimeout { timeout_ms: 300 })),
+        matches!(
+            first,
+            Err(ClientError::ServiceTimeout {
+                timeout_ms: 300,
+                ..
+            })
+        ),
         "got {first:?}"
     );
 

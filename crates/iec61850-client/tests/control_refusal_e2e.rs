@@ -528,7 +528,7 @@ async fn late_last_appl_error_of_an_earlier_command_is_not_taken() {
     let spc = handle(&conn, "SPCLATELAE", ControlModel::DirectNormal);
     let first = spc.operate(MmsValue::Boolean(true)).await;
     assert!(
-        matches!(first, Err(ClientError::Timeout { after_ms: 300 })),
+        matches!(first, Err(ClientError::Timeout { after_ms: 300, .. })),
         "got {first:?}"
     );
     // The LastApplError ahead of this response carries the previous ctlNum.
@@ -660,7 +660,7 @@ async fn unanswered_operate_is_an_error() {
     let spc = handle(&conn, "SPCSILENT", ControlModel::DirectNormal);
     let r = spc.operate(MmsValue::Boolean(true)).await;
     assert!(
-        matches!(r, Err(ClientError::Timeout { after_ms: 300 })),
+        matches!(r, Err(ClientError::Timeout { after_ms: 300, .. })),
         "got {r:?}"
     );
 }
@@ -671,7 +671,7 @@ async fn unanswered_cancel_is_an_error() {
     let spc = handle(&conn, "SPCSILENT", ControlModel::SboNormal);
     let r = spc.cancel(MmsValue::Boolean(true)).await;
     assert!(
-        matches!(r, Err(ClientError::Timeout { after_ms: 300 })),
+        matches!(r, Err(ClientError::Timeout { after_ms: 300, .. })),
         "got {r:?}"
     );
 }
@@ -684,7 +684,10 @@ async fn accepted_enhanced_operate_without_a_termination_is_an_error() {
     assert!(
         matches!(
             r,
-            Err(ClientError::CommandTerminationTimeout { after_ms: 5_000 })
+            Err(ClientError::CommandTerminationTimeout {
+                after_ms: 5_000,
+                ..
+            })
         ),
         "got {r:?}"
     );
@@ -706,7 +709,7 @@ async fn waiting_for_a_termination_that_never_comes_is_an_error() {
     assert!(
         matches!(
             r,
-            Err(ClientError::CommandTerminationTimeout { after_ms: 200 })
+            Err(ClientError::CommandTerminationTimeout { after_ms: 200, .. })
         ),
         "got {r:?}"
     );

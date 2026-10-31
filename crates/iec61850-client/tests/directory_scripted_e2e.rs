@@ -169,11 +169,9 @@ async fn name_list_walk_past_the_name_limit_is_an_error() {
     let conn = connect("ENDLESS").await;
     assert_eq!(conn.max_name_list_names(), DEFAULT_MAX_NAME_LIST_NAMES);
     let r = conn.get_server_directory(false).await;
-    assert_eq!(
-        r,
-        Err(ClientError::NameListLimit {
-            limit: DEFAULT_MAX_NAME_LIST_NAMES
-        })
+    assert!(
+        matches!(r, Err(ClientError::NameListLimit { limit, .. }) if limit == DEFAULT_MAX_NAME_LIST_NAMES),
+        "{r:?}"
     );
 }
 
@@ -189,7 +187,10 @@ async fn name_list_walk_past_a_configured_limit_is_an_error() {
     .with_max_name_list_names(3_000);
     conn.connect("127.0.0.1", port).await.expect("connect");
     let r = conn.get_server_directory(false).await;
-    assert_eq!(r, Err(ClientError::NameListLimit { limit: 3_000 }));
+    assert!(
+        matches!(r, Err(ClientError::NameListLimit { limit: 3_000, .. })),
+        "{r:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

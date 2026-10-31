@@ -332,7 +332,11 @@ fn read_request_alternate_access_depth_bomb_err() {
     assert!(
         matches!(
             result,
-            Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+            Err(MmsError::NestingLevelExceeded {
+                max: 32,
+                got: 33,
+                ..
+            })
         ),
         "got {result:?}"
     );
@@ -369,7 +373,7 @@ fn read_request_domain_id_65_bytes_err() {
     let result = ObjectName::decode(&inner);
     assert!(matches!(
         result,
-        Err(MmsError::IdentifierTooLong { actual: 65 })
+        Err(MmsError::IdentifierTooLong { actual: 65, .. })
     ));
 }
 
@@ -380,7 +384,7 @@ fn access_result_floatingpoint_invalid_size_err() {
     let result = MmsData::decode(&bytes);
     assert!(matches!(
         result,
-        Err(MmsError::InvalidFloatSize { actual: 4 })
+        Err(MmsError::InvalidFloatSize { actual: 4, .. })
     ));
 }
 
@@ -391,7 +395,7 @@ fn access_result_utctime_wrong_size_err() {
     let result = MmsData::decode(&bytes);
     assert!(matches!(
         result,
-        Err(MmsError::InvalidUtcTimeLength { actual: 7 })
+        Err(MmsError::InvalidUtcTimeLength { actual: 7, .. })
     ));
 }
 

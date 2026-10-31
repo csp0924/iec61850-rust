@@ -222,7 +222,7 @@ fn parameter_cbb_wrong_length_returns_err() {
     assert!(
         matches!(
             result,
-            Err(MmsError::InvalidParameterCbbLength { actual: 2 })
+            Err(MmsError::InvalidParameterCbbLength { actual: 2, .. })
         ),
         "a parameterCBB length of 2 must return InvalidParameterCbbLength(2), got: {:?}",
         result
@@ -377,7 +377,11 @@ fn nesting_level_255_returns_err() {
     assert!(
         matches!(
             result,
-            Err(MmsError::NestingLevelExceeded { max: 32, got: 255 })
+            Err(MmsError::NestingLevelExceeded {
+                max: 32,
+                got: 255,
+                ..
+            })
         ),
         "a nesting level of 255 must return NestingLevelExceeded(max=32, got=255), got: {:?}",
         result

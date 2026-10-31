@@ -12,6 +12,7 @@ use thiserror::Error;
 pub enum CotpError {
     /// The TPKT version is not 0x03, or the reserved byte is not 0x00.
     #[error("invalid tpkt header (version={version}, reserved={reserved})")]
+    #[non_exhaustive]
     InvalidTpktVersion {
         /// Version byte received; RFC 1006 requires 0x03.
         version: u8,
@@ -21,6 +22,7 @@ pub enum CotpError {
 
     /// The TPKT packet length is too small; it must exceed the 4-byte header.
     #[error("tpkt declares a packet length of {packet_len}, which leaves no cotp payload")]
+    #[non_exhaustive]
     TpktLengthTooSmall {
         /// Packet length the TPKT header declared.
         packet_len: u16,
@@ -28,6 +30,7 @@ pub enum CotpError {
 
     /// The TPKT packet length exceeds the local buffer limit.
     #[error("tpkt packet length {packet_len} exceeds the buffer limit {max_size}")]
+    #[non_exhaustive]
     TpktLengthOverflow {
         /// Packet length the TPKT header declared.
         packet_len: u16,
@@ -37,6 +40,7 @@ pub enum CotpError {
 
     /// The COTP length indicator claims more bytes than the TPDU holds.
     #[error("cotp li {li} exceeds the tpdu length {tpdu_len}")]
+    #[non_exhaustive]
     LiOverflow {
         /// Length indicator the TPDU declared.
         li: u8,
@@ -46,6 +50,7 @@ pub enum CotpError {
 
     /// The protocol class is not class 0.
     #[error("unsupported cotp protocol class {class}, only class 0 is supported")]
+    #[non_exhaustive]
     UnsupportedProtocolClass {
         /// Protocol class byte received.
         class: u8,
@@ -53,6 +58,7 @@ pub enum CotpError {
 
     /// An option declares more bytes than the variable part holds.
     #[error("cotp option length {option_len} exceeds the {remaining} bytes remaining")]
+    #[non_exhaustive]
     OptionLenOverflow {
         /// Length the option declared.
         option_len: usize,
@@ -62,6 +68,7 @@ pub enum CotpError {
 
     /// A T-Selector is longer than the 4-byte maximum.
     #[error("t-selector length {len} exceeds the maximum of 4")]
+    #[non_exhaustive]
     TSelectorTooLong {
         /// Selector length received.
         len: usize,
@@ -69,6 +76,7 @@ pub enum CotpError {
 
     /// The TPDU size option, 0xC0, does not carry exactly one byte.
     #[error("tpdu size option must be 1 byte, got {len}")]
+    #[non_exhaustive]
     InvalidTpduSizeOption {
         /// Option length received; it must be 1.
         len: usize,
@@ -76,6 +84,7 @@ pub enum CotpError {
 
     /// A DT TPDU carries a length indicator other than 2.
     #[error("dt tpdu li must be 2, got {li}")]
+    #[non_exhaustive]
     InvalidDtLi {
         /// Length indicator received; a DT TPDU must carry 2.
         li: u8,
@@ -87,6 +96,7 @@ pub enum CotpError {
 
     /// The TPDU type code is not recognized.
     #[error("unknown tpdu type 0x{tpdu_type:02X}")]
+    #[non_exhaustive]
     UnknownTpduType {
         /// TPDU type code received.
         tpdu_type: u8,
@@ -94,6 +104,7 @@ pub enum CotpError {
 
     /// A Disconnect Request was received.
     #[error("received a cotp disconnect request, code={code}")]
+    #[non_exhaustive]
     DisconnectRequest {
         /// Disconnect reason code carried by the DR TPDU.
         code: u8,
@@ -105,6 +116,7 @@ pub enum CotpError {
 
     /// The operation is not allowed in the current connection state.
     #[error("cotp state {state:?} does not allow the operation {op}")]
+    #[non_exhaustive]
     InvalidState {
         /// Connection state at the time of the call.
         state: String,
@@ -126,6 +138,7 @@ pub enum CotpError {
     ///
     /// This variant appears only when a limit has been set; the default is unbounded.
     #[error("reassembled tsdu reached {accumulated} bytes, above the limit of {limit}")]
+    #[non_exhaustive]
     TsduTooLarge {
         /// Bytes accumulated in the reassembly buffer.
         accumulated: usize,

@@ -119,6 +119,7 @@ pub enum StateError {
     /// A report carries a different number of data set members than the first
     /// one did.
     #[error("dataset size changed from {prev} to {new} — discarding report")]
+    #[non_exhaustive]
     DataSetSizeChanged {
         /// Member count fixed by the first report.
         prev: usize,
@@ -128,6 +129,7 @@ pub enum StateError {
 
     /// The data set name exceeds the 128-byte MMS object-name limit.
     #[error("dataSetName length {len} exceeds upper bound 128")]
+    #[non_exhaustive]
     DataSetNameTooLong {
         /// Length of the offending data set name, in bytes.
         len: usize,

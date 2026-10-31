@@ -431,10 +431,7 @@ fn reject_pdu_decoded_with_correct_reason() {
 /// `ClientError::PduTooLarge` can be constructed and displayed.
 #[test]
 fn pdu_too_large_error_can_be_constructed() {
-    let err = ClientError::PduTooLarge {
-        pdu_size: 65536,
-        max_size: 4096,
-    };
+    let err = ClientError::pdu_too_large(65536, 4096);
     let msg = format!("{err}");
     assert!(
         msg.contains("65536"),
@@ -459,10 +456,7 @@ fn invoke_id_exhausted_error_can_be_constructed() {
 /// `ClientError::ServiceError` can be constructed and displayed.
 #[test]
 fn service_error_can_be_constructed() {
-    let err = ClientError::ServiceError {
-        error_class: ErrorClass::Access(0),
-        service_specific: None,
-    };
+    let err = ClientError::service_error(ErrorClass::Access(0), None);
     let msg = format!("{err}");
     assert!(!msg.is_empty());
 }

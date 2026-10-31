@@ -63,6 +63,7 @@ use super::initiate::{negotiate_initiate, InitiateOutcome};
 pub enum MessageOutcome {
     /// The Initiate request was accepted: send the Initiate response bytes and pass
     /// `params` to `MmsServerConnection::set_negotiated`.
+    #[non_exhaustive]
     SendInitiateResponse {
         /// Encoded Initiate response to send.
         response_bytes: Bytes,
@@ -72,6 +73,7 @@ pub enum MessageOutcome {
     /// The Initiate request was refused: send the Initiate error bytes, then close.
     ///
     /// The error is sent before closing so the peer learns why it was refused.
+    #[non_exhaustive]
     SendInitiateErrorAndClose {
         /// Encoded Initiate error to send before closing.
         error_bytes: Bytes,
@@ -80,6 +82,7 @@ pub enum MessageOutcome {
     SendBytes(Bytes),
     /// An MMS Conclude response (`0x8c 0x00`) is ready. After sending it the caller
     /// must call `conn.mark_concluded()` to start the release timeout.
+    #[non_exhaustive]
     SendConcludeResponse {
         /// Encoded Conclude response to send.
         response_bytes: Bytes,

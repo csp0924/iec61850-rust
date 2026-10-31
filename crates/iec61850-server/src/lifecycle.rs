@@ -551,6 +551,7 @@ where
         MessageOutcome::SendInitiateResponse {
             response_bytes,
             params,
+            ..
         } => {
             // From here on a TSDU carries at most one MMS PDU of the
             // negotiated size inside its Session and Presentation envelope.
@@ -581,7 +582,7 @@ where
             cotp.send_data(&sess_buf).await?;
             tracing::debug!(conn_id, "initiate negotiation complete");
         }
-        MessageOutcome::SendInitiateErrorAndClose { error_bytes } => {
+        MessageOutcome::SendInitiateErrorAndClose { error_bytes, .. } => {
             // The Initiate-ErrorPDU is the user information of the rejecting AARE.
             tracing::warn!(
                 conn_id,
@@ -1021,7 +1022,7 @@ where
                         )
                         .await?;
                     }
-                    MessageOutcome::SendConcludeResponse { response_bytes } => {
+                    MessageOutcome::SendConcludeResponse { response_bytes, .. } => {
                         send_bounded(
                             conn_id,
                             send_timeout,
@@ -1032,7 +1033,7 @@ where
                         // Starts the bounded wait for the client's release.
                         client_conn.with_mms_mut(|m| m.mark_concluded());
                     }
-                    MessageOutcome::SendInitiateErrorAndClose { error_bytes: _ } => {
+                    MessageOutcome::SendInitiateErrorAndClose { .. } => {
                         tracing::warn!(conn_id, "a second initiate arrived on an established association, closing the socket");
                         break;
                     }

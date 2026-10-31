@@ -325,7 +325,7 @@ async fn a_name_already_registered_fails_the_whole_call() {
     let server = build_server(build_model());
     server.register_dataset(DOMAIN, Dataset::new("LLN0$Events"));
     match server.register_from_model() {
-        Err(ServerError::AlreadyRegistered { reference }) => {
+        Err(ServerError::AlreadyRegistered { reference, .. }) => {
             assert_eq!(reference, format!("{DOMAIN}/LLN0$Events"))
         }
         other => panic!("expected AlreadyRegistered, got {other:?}"),
@@ -343,7 +343,7 @@ async fn a_name_already_registered_fails_the_whole_call() {
     let server = build_server(build_model());
     server.register_from_model().expect("first call");
     match server.register_from_model() {
-        Err(ServerError::AlreadyRegistered { reference }) => {
+        Err(ServerError::AlreadyRegistered { reference, .. }) => {
             assert_eq!(reference, format!("{DOMAIN}/LLN0$Events"))
         }
         other => panic!("expected AlreadyRegistered, got {other:?}"),

@@ -251,7 +251,8 @@ fn write_response_decode_with_expected_count_mismatch_err() {
             result,
             Err(MmsError::WriteCountMismatch {
                 expected: 2,
-                actual: 1
+                actual: 1,
+                ..
             })
         ),
         "got: {:?}",
@@ -377,7 +378,7 @@ fn write_request_101_items_too_many_err() {
 
     let result = WriteRequest::decode(&buf);
     assert!(
-        matches!(result, Err(MmsError::TooManyWriteItems { count: 101 })),
+        matches!(result, Err(MmsError::TooManyWriteItems { count: 101, .. })),
         "101 items must return TooManyWriteItems, got: {:?}",
         result
     );
@@ -473,7 +474,8 @@ fn write_request_wrong_service_tag_err() {
         result,
         Err(MmsError::InvalidTag {
             expected: 0xa5,
-            actual: 0xa4
+            actual: 0xa4,
+            ..
         })
     ));
 }
@@ -486,7 +488,8 @@ fn write_response_wrong_service_tag_err() {
         result,
         Err(MmsError::InvalidTag {
             expected: 0xa5,
-            actual: 0xa4
+            actual: 0xa4,
+            ..
         })
     ));
 }

@@ -265,6 +265,7 @@ async fn read_int32_on_boolean_returns_unexpected_type() {
                 ClientError::UnexpectedValueType {
                     expected: "Integer",
                     got: "Boolean",
+                    ..
                 }
             ),
             "got {err:?}"

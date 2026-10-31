@@ -204,6 +204,7 @@ pub enum ReportParseError {
 
     /// The PDU ends before a field the OptFlds announced.
     #[error("missing slot at index {idx}: expected {expected}")]
+    #[non_exhaustive]
     MissingSlot {
         /// Index of the element the parser expected.
         idx: usize,
@@ -213,6 +214,7 @@ pub enum ReportParseError {
 
     /// A field has a type the report format does not allow.
     #[error("type mismatch at field {field}: expected {expected}, got {got}")]
+    #[non_exhaustive]
     TypeMismatch {
         /// Name of the field that carried the wrong type.
         field: &'static str,
@@ -229,6 +231,7 @@ pub enum ReportParseError {
 
     /// A BINARY TIME is neither 4 nor 6 bytes long.
     #[error("invalid BinaryTime length {got} bytes (expected 4 or 6)")]
+    #[non_exhaustive]
     InvalidBinaryTimeLen {
         /// Length that was received, in bytes.
         got: usize,

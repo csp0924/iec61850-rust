@@ -39,6 +39,7 @@ use super::DatasetRegistry;
 pub enum DatasetError {
     /// A data set with this domain and name is already registered, whether it was
     /// created statically or dynamically.
+    #[non_exhaustive]
     NameAlreadyExists {
         /// MMS domain the data set was requested in.
         domain: String,
@@ -47,6 +48,7 @@ pub enum DatasetError {
     },
     /// The member path names a logical node, data object, or data attribute that is
     /// not in the model, or a functional constraint that does not exist.
+    #[non_exhaustive]
     MemberNotFound {
         /// The member path that did not resolve.
         path: String,
@@ -55,11 +57,13 @@ pub enum DatasetError {
     /// segment; it names a member past an array, whose elements have no
     /// names; or its array index is past the end of the array or selects no
     /// array.
+    #[non_exhaustive]
     MemberInvalidPath {
         /// The malformed member path.
         path: String,
     },
     /// A static data set was asked to be deleted; `mmsDeletable` is false for it.
+    #[non_exhaustive]
     StaticNotDeletable {
         /// Name of the static data set.
         name: String,
@@ -71,6 +75,7 @@ pub enum DatasetError {
     /// run-time data set holds more than [`DynamicDatasetOps::MAX_MEMBERS`]
     /// members or [`DynamicDatasetOps::MAX_LEAVES`] leaves, and `path` names
     /// the data set.
+    #[non_exhaustive]
     TooLarge {
         /// The member or data set over the limit.
         path: String,

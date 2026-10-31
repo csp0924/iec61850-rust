@@ -108,13 +108,17 @@ async fn refuse_with_reason_and_provider_reason() {
         let port = spawn_refusing_peer(refusal);
         let err = connect_error(port).await;
 
-        assert_eq!(
-            err,
-            ClientError::SessionRefused {
-                reason_code: Some(129),
-                transport_disconnect: None,
-                provider_reason: Some(3),
-            }
+        assert!(
+            matches!(
+                err,
+                ClientError::SessionRefused {
+                    reason_code: Some(129),
+                    transport_disconnect: None,
+                    provider_reason: Some(3),
+                    ..
+                }
+            ),
+            "{err:?}"
         );
         let text = err.to_string();
         assert!(
@@ -143,13 +147,17 @@ async fn refuse_without_user_data_has_no_provider_reason() {
         let port = spawn_refusing_peer(refusal);
         let err = connect_error(port).await;
 
-        assert_eq!(
-            err,
-            ClientError::SessionRefused {
-                reason_code: Some(2),
-                transport_disconnect: Some(1),
-                provider_reason: None,
-            }
+        assert!(
+            matches!(
+                err,
+                ClientError::SessionRefused {
+                    reason_code: Some(2),
+                    transport_disconnect: Some(1),
+                    provider_reason: None,
+                    ..
+                }
+            ),
+            "{err:?}"
         );
         let text = err.to_string();
         assert!(

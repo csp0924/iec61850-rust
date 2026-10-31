@@ -70,6 +70,7 @@ const OID_MAX_ARC_OCTETS: usize = 5;
 pub enum ApTitleError {
     /// Fewer than the two arcs an OBJECT IDENTIFIER requires.
     #[error("ap-title needs at least two arcs, got {count}")]
+    #[non_exhaustive]
     TooFewArcs {
         /// Number of arcs supplied.
         count: usize,
@@ -77,6 +78,7 @@ pub enum ApTitleError {
 
     /// An arc is not a decimal number, or does not fit in 32 bits.
     #[error("ap-title arc {arc} is not a 32-bit decimal number")]
+    #[non_exhaustive]
     InvalidArc {
         /// Text of the offending arc.
         arc: String,
@@ -85,6 +87,7 @@ pub enum ApTitleError {
     /// The first arc is above 2, or the second is above 39 while the first is
     /// 0 or 1; neither combination is encodable.
     #[error("ap-title arcs {first}.{second} are outside the encodable range")]
+    #[non_exhaustive]
     ArcOutOfRange {
         /// First arc value.
         first: u32,

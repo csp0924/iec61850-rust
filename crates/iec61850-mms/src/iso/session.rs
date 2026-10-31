@@ -106,6 +106,7 @@ const SSELECTOR_MAX_SIZE: usize = 16;
 pub enum SessionError {
     /// The message is too short: fewer than 2 bytes, or an LI beyond what remains.
     #[error("session message too short (len={len})")]
+    #[non_exhaustive]
     TooShort {
         /// Length of the message received.
         len: usize,
@@ -113,6 +114,7 @@ pub enum SessionError {
 
     /// The SPDU ID is NOT-FINISHED (0x08); segment reassembly is not supported.
     #[error("unsupported spdu (id=0x{id:02X})")]
+    #[non_exhaustive]
     UnsupportedSpdu {
         /// SPDU identifier received.
         id: u8,
@@ -120,6 +122,7 @@ pub enum SessionError {
 
     /// The protocol version, PI 22, is not 2.
     #[error("session version must be 2, got {version}")]
+    #[non_exhaustive]
     InvalidVersion {
         /// Protocol version received; it must be 2.
         version: u8,
@@ -127,6 +130,7 @@ pub enum SessionError {
 
     /// A selector is longer than 16 bytes.
     #[error("session selector length {len} exceeds the maximum of 16")]
+    #[non_exhaustive]
     SelectorTooLong {
         /// Selector length received.
         len: u8,
@@ -138,6 +142,7 @@ pub enum SessionError {
 
     /// The declared LI does not match the length of the buffer.
     #[error("spdu li={li} does not match the buffer length {buf_len}")]
+    #[non_exhaustive]
     LiMismatch {
         /// Length indicator the SPDU declared.
         li: usize,
@@ -147,6 +152,7 @@ pub enum SessionError {
 
     /// The SPDU ID is not recognized.
     #[error("unknown spdu id 0x{id:02X}")]
+    #[non_exhaustive]
     UnknownSpdu {
         /// SPDU identifier received.
         id: u8,
@@ -155,6 +161,7 @@ pub enum SessionError {
     /// The payload makes the parameter block longer than the 65 535 octets a
     /// long-form LI can express.
     #[error("payload size {size} makes the spdu exceed the li maximum of 65535")]
+    #[non_exhaustive]
     PayloadTooLarge {
         /// Payload size requested.
         size: usize,

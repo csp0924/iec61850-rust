@@ -40,6 +40,7 @@ use tracing::warn;
 pub enum PresentationError {
     /// The outer BER tag is not the expected CP/CPA tag 0x31.
     #[error("presentation pdu tag 0x{tag:02X} is not the expected 0x{expected:02X}")]
+    #[non_exhaustive]
     WrongTag {
         /// Tag received.
         tag: u8,
@@ -49,6 +50,7 @@ pub enum PresentationError {
 
     /// A BER length field runs past the end of the buffer.
     #[error("ber length {claimed} exceeds the {remaining} bytes remaining in the buffer")]
+    #[non_exhaustive]
     LengthOverflow {
         /// Length the BER field declared.
         claimed: usize,
@@ -58,6 +60,7 @@ pub enum PresentationError {
 
     /// The message is too short to hold the mandatory fields.
     #[error("presentation pdu too short (len={len})")]
+    #[non_exhaustive]
     TooShort {
         /// Length of the PDU received.
         len: usize,
@@ -65,6 +68,7 @@ pub enum PresentationError {
 
     /// The mode-selector inner tag is not 0x80, or its value is not normal-mode (1).
     #[error("invalid mode-selector: inner_tag=0x{inner_tag:02X}, mode_value={mode_value}")]
+    #[non_exhaustive]
     InvalidModeSelector {
         /// Inner tag received; it must be 0x80.
         inner_tag: u8,
@@ -88,6 +92,7 @@ pub enum PresentationError {
     ///
     /// An oversized selector is rejected rather than truncated.
     #[error("p-selector length {len} exceeds the maximum of 16")]
+    #[non_exhaustive]
     PSelectorTooLong {
         /// Selector length received.
         len: usize,
@@ -95,6 +100,7 @@ pub enum PresentationError {
 
     /// The PDU passed to `parse_user_data` is shorter than the 9-byte minimum.
     #[error("fully-encoded-data pdu too short (minimum 9 bytes, got {len})")]
+    #[non_exhaustive]
     UserDataTooShort {
         /// Length of the PDU received.
         len: usize,
@@ -106,6 +112,7 @@ pub enum PresentationError {
 
     /// The decoded context-id falls outside the 1-255 range this layer supports.
     #[error("context-id {value} is outside the valid range 1-255")]
+    #[non_exhaustive]
     ContextIdOutOfRange {
         /// Context identifier decoded.
         value: u32,
@@ -121,6 +128,7 @@ pub enum PresentationError {
 
     /// A field that must hold a single-octet value is empty or longer.
     #[error("cpr field 0x{tag:02X} has length {len}, expected a single octet")]
+    #[non_exhaustive]
     InvalidFieldLength {
         /// Tag of the offending field.
         tag: u8,

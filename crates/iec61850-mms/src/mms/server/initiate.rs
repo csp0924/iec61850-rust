@@ -44,6 +44,7 @@ use bytes::BytesMut;
 pub enum InitiateOutcome {
     /// The request was accepted: `response_bytes` holds the encoded Initiate response
     /// and `params` the values the caller writes into `MmsServerConnection`.
+    #[non_exhaustive]
     Accepted {
         /// Parameters the caller stores in the connection.
         params: NegotiatedParams,
@@ -53,6 +54,7 @@ pub enum InitiateOutcome {
     /// The request was refused: `error_bytes` holds the encoded Initiate error, and
     /// `reason` is local diagnostic detail that never reaches the wire, which always
     /// carries errorClass 8 and errorCode 0.
+    #[non_exhaustive]
     Rejected {
         /// Local diagnostic reason; it never reaches the wire.
         reason: InitiateRejectReason,
@@ -69,11 +71,13 @@ pub enum InitiateRejectReason {
     /// The Initiate request itself failed to decode.
     ParseFailed(MmsError),
     /// The proposed version number is below 1.
+    #[non_exhaustive]
     VersionTooLow {
         /// Version number the peer proposed.
         proposed: u16,
     },
     /// `localDetailCalling` is below `MIN_PDU_SIZE`.
+    #[non_exhaustive]
     PduSizeTooSmall {
         /// Maximum PDU size the peer proposed.
         proposed: u32,

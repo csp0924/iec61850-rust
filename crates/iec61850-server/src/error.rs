@@ -22,6 +22,7 @@ pub enum ServerError {
     /// type differs from the one the attribute holds, or a bit string's length,
     /// padding or integer width does not fit the attribute.
     #[error("data attribute type mismatch: DA `{path}` expects {expected}, got {actual}")]
+    #[non_exhaustive]
     TypeMismatch {
         /// Object reference of the data attribute that was written.
         path: String,
@@ -34,6 +35,7 @@ pub enum ServerError {
 
     /// An MMS domain name derived from a logical device exceeds 64 bytes.
     #[error("MMS domain name `{name}` exceeds 64 bytes")]
+    #[non_exhaustive]
     DomainNameTooLong {
         /// The domain name that exceeds the limit.
         name: String,
@@ -41,6 +43,7 @@ pub enum ServerError {
 
     /// Two logical devices map to the same MMS domain name.
     #[error("duplicate MMS domain name `{name}`: two logical devices resolve to it")]
+    #[non_exhaustive]
     DuplicateDomain {
         /// The domain name that two logical devices share.
         name: String,
@@ -75,6 +78,7 @@ pub enum ServerError {
     /// An item is already registered under the reference a registration would
     /// give another one.
     #[error("`{reference}` is already registered")]
+    #[non_exhaustive]
     AlreadyRegistered {
         /// The reference both would have.
         reference: String,
@@ -86,6 +90,7 @@ pub enum ServerError {
     /// fails immediately rather than serving a control model the engineer did
     /// not configure.
     #[error("ctlModel value {value} is outside the valid range 0..=4")]
+    #[non_exhaustive]
     InvalidCtlModel {
         /// The out-of-range value found in the model.
         value: i32,

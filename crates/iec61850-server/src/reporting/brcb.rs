@@ -147,6 +147,7 @@ pub enum ConfigChangeResult {
     NoChange,
     /// The change was applied and the buffer was purged; the count is how many
     /// entries were removed.
+    #[non_exhaustive]
     RequiresPurge {
         /// Number of entries the purge removed.
         purged_entries: usize,

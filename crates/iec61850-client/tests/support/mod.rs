@@ -139,6 +139,7 @@ async fn accept_association(
     let MessageOutcome::SendInitiateResponse {
         response_bytes,
         params,
+        ..
     } = parse_message(&mms_conn, &RejectAllDispatcher, &initiate)
     else {
         return None;
@@ -182,7 +183,7 @@ async fn serve(stream: TcpStream, script: Arc<Script>) {
             Some(plan) => plan,
             None => match parse_message(&mms_conn, &RejectAllDispatcher, &mms) {
                 MessageOutcome::SendBytes(b) => Plan::reply(b),
-                MessageOutcome::SendConcludeResponse { response_bytes } => {
+                MessageOutcome::SendConcludeResponse { response_bytes, .. } => {
                     Plan::reply(response_bytes)
                 }
                 _ => Plan::default(),

@@ -120,6 +120,7 @@ pub enum ReportEncodeError {
     /// segments than `subSeqNum` can number. `needed` is the encoded size in
     /// bytes, `max` the limit.
     #[error("report pdu too large: {needed} bytes exceeds the {max} byte limit")]
+    #[non_exhaustive]
     PduTooSmall {
         /// Encoded size in bytes.
         needed: usize,
@@ -130,6 +131,7 @@ pub enum ReportEncodeError {
     /// fields. `index` is its position in the data set, `needed` the size of
     /// the smallest PDU carrying it, in bytes, and `max` the limit.
     #[error("data set member {index} needs a {needed} byte pdu, over the {max} byte limit")]
+    #[non_exhaustive]
     MemberTooLarge {
         /// Position of the member in the data set.
         index: usize,

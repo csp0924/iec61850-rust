@@ -272,7 +272,10 @@ async fn read_after_a_timeout_returns_its_own_value() {
     assert!(
         matches!(
             first,
-            Err(MmsClientError::ServiceTimeout { timeout_ms: 300 })
+            Err(MmsClientError::ServiceTimeout {
+                timeout_ms: 300,
+                ..
+            })
         ),
         "got {first:?}"
     );
@@ -303,10 +306,9 @@ async fn ied_connection_read_after_a_timeout_returns_its_own_object() {
 
     proxy.send(Cmd::HoldNext, "hold").await;
     let first = conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await;
-    assert_eq!(
-        first,
-        Err(ClientError::Timeout { after_ms: 300 }),
-        "the held read times out"
+    assert!(
+        matches!(first, Err(ClientError::Timeout { after_ms: 300, .. })),
+        "the held read times out: {first:?}"
     );
     assert_eq!(proxy.ack.recv().await, Some("held"));
     assert!(conn.is_connected(), "a timeout keeps the association");
@@ -633,7 +635,7 @@ async fn pdu_at_the_negotiated_size_is_sent_and_one_above_is_refused() {
         )
         .await;
     assert!(
-        matches!(above, Err(MmsClientError::PduTooLarge { pdu_size, max_size }) if pdu_size == max + 1 && max_size == max),
+        matches!(above, Err(MmsClientError::PduTooLarge { pdu_size, max_size, .. }) if pdu_size == max + 1 && max_size == max),
         "got {above:?}"
     );
     handle.stop().await;

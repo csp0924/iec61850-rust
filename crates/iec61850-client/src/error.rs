@@ -31,6 +31,7 @@ use crate::report::ReportParseError;
 pub enum ClientError {
     /// The `rpt_id` argument is longer than the 128-byte MMS object-name limit.
     #[error("invalid rptId: length {len} exceeds upper bound 128")]
+    #[non_exhaustive]
     InvalidRptId {
         /// Length of the offending `rpt_id`, in bytes.
         len: usize,
@@ -67,6 +68,7 @@ pub enum ClientError {
     /// The mismatch is reported rather than skipped, and names the offending
     /// position along with the expected and received type.
     #[error("type mismatch at index {index}: expected {expected}, got {got}")]
+    #[non_exhaustive]
     TypeMismatch {
         /// Position of the offending element within the data set or sequence.
         index: usize,
@@ -84,6 +86,7 @@ pub enum ClientError {
     /// offending element inside a data set or sequence; this variant concerns
     /// a single variable.
     #[error("unexpected value type: expected {expected}, got {got}")]
+    #[non_exhaustive]
     UnexpectedValueType {
         /// Name of the type the wrapper reads.
         expected: &'static str,
@@ -96,6 +99,7 @@ pub enum ClientError {
     /// The length is reported rather than absorbed: a truncated or over-long
     /// field would otherwise decode to a plausible but wrong instant.
     #[error("invalid BinaryTime length {got} bytes (expected 4 or 6)")]
+    #[non_exhaustive]
     InvalidBinaryTimeLen {
         /// Length of the offending field, in bytes.
         got: usize,
@@ -108,6 +112,7 @@ pub enum ClientError {
     /// A GetNameList walk of the directory services reported more names than
     /// the connection's limit; see `IedConnection::with_max_name_list_names`.
     #[error("getnamelist returned more than {limit} names")]
+    #[non_exhaustive]
     NameListLimit {
         /// The limit that was exceeded.
         limit: usize,
@@ -124,6 +129,7 @@ pub enum ClientError {
     /// The association stays usable: the late answer, if it comes, is
     /// recognized by its invokeID and discarded.
     #[error("mms layer error: request timed out after {after_ms} ms")]
+    #[non_exhaustive]
     Timeout {
         /// Request timeout that elapsed, in milliseconds.
         after_ms: u64,
@@ -135,6 +141,7 @@ pub enum ClientError {
     /// The fate of the command is unknown: it may still be executing, and a
     /// termination that arrives later is not reported as its outcome.
     #[error("no command termination arrived within {after_ms} ms")]
+    #[non_exhaustive]
     CommandTerminationTimeout {
         /// Wait that elapsed, in milliseconds.
         after_ms: u64,
@@ -142,6 +149,7 @@ pub enum ClientError {
 
     /// The association was not established within the connect timeout.
     #[error("mms layer error: connect timed out after {after_ms} ms")]
+    #[non_exhaustive]
     ConnectTimeout {
         /// Connect timeout that elapsed, in milliseconds.
         after_ms: u64,
@@ -205,6 +213,7 @@ pub enum ClientError {
 
     /// The server answered the MMS Initiate request with an Initiate-ErrorPDU.
     #[error("mms layer error: mms initiate failed: errorCode={error_code}")]
+    #[non_exhaustive]
     InitiateFailed {
         /// Subcode of the errorClass carried by the Initiate-ErrorPDU.
         error_code: u8,
@@ -224,6 +233,7 @@ pub enum ClientError {
     #[error(
         "mms layer error: pdu size {pdu_size} exceeds the negotiated maximum {max_size}, refusing to send"
     )]
+    #[non_exhaustive]
     PduTooLarge {
         /// Size of the encoded MMS PDU, in bytes.
         pdu_size: usize,
@@ -238,6 +248,7 @@ pub enum ClientError {
     /// the RF SPDU, `transport_disconnect` PI 17, and `provider_reason` the
     /// provider-reason of the CPR PPDU the refusal carries, when present.
     #[error("{}", iec61850_mms::session_refused_message(*reason_code, *transport_disconnect, *provider_reason))]
+    #[non_exhaustive]
     SessionRefused {
         /// Reason code carried by the RF SPDU.
         reason_code: Option<u8>,
@@ -265,15 +276,16 @@ impl From<iec61850_mms::ClientError> for ClientError {
                 reason_code,
                 transport_disconnect,
                 provider_reason,
+                ..
             } => ClientError::SessionRefused {
                 reason_code,
                 transport_disconnect,
                 provider_reason,
             },
-            M::ServiceTimeout { timeout_ms } => ClientError::Timeout {
+            M::ServiceTimeout { timeout_ms, .. } => ClientError::Timeout {
                 after_ms: timeout_ms,
             },
-            M::ConnectTimeout { timeout_ms } => ClientError::ConnectTimeout {
+            M::ConnectTimeout { timeout_ms, .. } => ClientError::ConnectTimeout {
                 after_ms: timeout_ms,
             },
             M::ConnectionLost => ClientError::ConnectionLost,
@@ -284,17 +296,18 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::ServiceError {
                 error_class,
                 service_specific,
+                ..
             } => ClientError::Service {
                 error_class,
                 service_specific,
             },
-            M::RejectError { reason } => ClientError::Reject { reason },
+            M::RejectError { reason, .. } => ClientError::Reject { reason },
             M::ConcludeRejected => ClientError::ConcludeRejected,
             M::AssociateFailed => ClientError::AssociateFailed,
-            M::InitiateFailed { error_code } => ClientError::InitiateFailed { error_code },
-            M::PduTooLarge { pdu_size, max_size } => {
-                ClientError::PduTooLarge { pdu_size, max_size }
-            }
+            M::InitiateFailed { error_code, .. } => ClientError::InitiateFailed { error_code },
+            M::PduTooLarge {
+                pdu_size, max_size, ..
+            } => ClientError::PduTooLarge { pdu_size, max_size },
             M::OutstandingCallLimit => ClientError::OutstandingCallLimit,
             M::NotConnected { .. } => ClientError::NotConnected,
             other => ClientError::Mms(other.to_string()),
@@ -315,7 +328,7 @@ mod tests {
 
     #[test]
     fn a_request_timeout_is_typed_and_keeps_its_text() {
-        let e = map(M::ServiceTimeout { timeout_ms: 300 });
+        let e = map(M::service_timeout(300));
         assert_eq!(e, ClientError::Timeout { after_ms: 300 });
         assert_eq!(
             e.to_string(),
@@ -326,7 +339,7 @@ mod tests {
     #[test]
     fn a_connect_timeout_is_typed() {
         assert_eq!(
-            map(M::ConnectTimeout { timeout_ms: 7 }),
+            map(M::connect_timeout(7)),
             ClientError::ConnectTimeout { after_ms: 7 }
         );
     }
@@ -367,10 +380,7 @@ mod tests {
 
     #[test]
     fn a_confirmed_error_keeps_its_class_and_code() {
-        match map(M::ServiceError {
-            error_class: ErrorClass::Access(3),
-            service_specific: None,
-        }) {
+        match map(M::service_error(ErrorClass::Access(3), None)) {
             ClientError::Service { error_class, .. } => {
                 assert_eq!(error_class.context_tag(), 7);
                 assert_eq!(error_class.code(), 3);
@@ -381,10 +391,10 @@ mod tests {
 
     #[test]
     fn a_confirmed_error_keeps_its_service_specific_information() {
-        match map(M::ServiceError {
-            error_class: ErrorClass::Service(6),
-            service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(2)),
-        }) {
+        match map(M::service_error(
+            ErrorClass::Service(6),
+            Some(ServiceSpecificInfo::DeleteNamedVariableList(2)),
+        )) {
             ClientError::Service {
                 service_specific, ..
             } => assert_eq!(
@@ -398,9 +408,7 @@ mod tests {
     #[test]
     fn a_reject_keeps_its_reason() {
         let reason = RejectReason::ConfirmedRequest(ConfirmedRequestRejectReason::InvalidArgument);
-        match map(M::RejectError {
-            reason: reason.clone(),
-        }) {
+        match map(M::reject(reason.clone())) {
             ClientError::Reject { reason: r, .. } => {
                 assert_eq!(r, reason);
                 assert_eq!(r.reject_type(), 1);
@@ -414,7 +422,7 @@ mod tests {
         assert_eq!(map(M::ConcludeRejected), ClientError::ConcludeRejected);
         assert_eq!(map(M::AssociateFailed), ClientError::AssociateFailed);
         assert_eq!(
-            map(M::InitiateFailed { error_code: 2 }),
+            map(M::initiate_failed(2)),
             ClientError::InitiateFailed { error_code: 2 }
         );
     }
@@ -430,10 +438,7 @@ mod tests {
     #[test]
     fn an_oversized_request_is_typed() {
         assert_eq!(
-            map(M::PduTooLarge {
-                pdu_size: 10,
-                max_size: 9
-            }),
+            map(M::pdu_too_large(10, 9)),
             ClientError::PduTooLarge {
                 pdu_size: 10,
                 max_size: 9
@@ -443,12 +448,7 @@ mod tests {
 
     #[test]
     fn not_connected_and_data_access_errors_are_typed() {
-        assert_eq!(
-            map(M::NotConnected {
-                state: "Closed".to_string()
-            }),
-            ClientError::NotConnected
-        );
+        assert_eq!(map(M::not_connected("Closed")), ClientError::NotConnected);
         assert_eq!(
             map(M::DataAccessError(DataAccessError::ObjectNonExistent)),
             ClientError::DataAccessError(DataAccessError::ObjectNonExistent)
