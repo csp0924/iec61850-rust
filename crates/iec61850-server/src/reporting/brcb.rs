@@ -145,9 +145,6 @@ pub enum ConfigChangeResult {
     /// The value written was already in place: nothing changed and nothing was
     /// purged.
     NoChange,
-    /// The change was applied without a purge. No field takes this path today; it
-    /// is kept for fields added later.
-    Applied,
     /// The change was applied and the buffer was purged; the count is how many
     /// entries were removed.
     RequiresPurge {
