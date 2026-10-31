@@ -17,7 +17,9 @@
 //!   associated, until its socket closes.
 //! - A connection that has not completed the TLS handshake, if TLS is
 //!   configured, and association setup through the MMS Initiate response within
-//!   `association_setup_timeout_ms` is closed.
+//!   `association_setup_timeout_ms` is closed. On a TLS connection the expiry
+//!   raises the IEC 62351-3 event `AlmHandshakeTimeout` on the TLS event
+//!   handler.
 //! - Each presentation context of the CP is answered in the CPA: accepted for
 //!   ACSE and MMS with the BER transfer syntax, provider-rejected otherwise. A
 //!   CP without an acceptable ACSE and MMS context is answered with a Session
@@ -265,6 +267,9 @@ async fn run_accept_loop(
                                         Ok(Ok(tls_stream)) => {
                                             handle_connection_inner(
                                                 server_for_conn, tls_stream, peer, setup_deadline,
+                                                move || acceptor.report_handshake_timeout(
+                                                    "association setup did not complete within the association setup timeout after the TLS handshake",
+                                                ),
                                             ).await;
                                         }
                                         Ok(Err(e)) => {
@@ -272,13 +277,16 @@ async fn run_accept_loop(
                                         }
                                         Err(_) => {
                                             tracing::warn!(?peer, "TLS handshake did not complete within the association setup timeout, closing the connection");
+                                            acceptor.report_handshake_timeout(
+                                                "TLS handshake did not complete within the association setup timeout",
+                                            );
                                         }
                                     }
                                 });
                             } else {
                                 tokio::spawn(async move {
                                     let _slot = slot;
-                                    handle_connection_inner(server_for_conn, stream, peer, setup_deadline).await;
+                                    handle_connection_inner(server_for_conn, stream, peer, setup_deadline, || {}).await;
                                 });
                             }
                         }
@@ -286,7 +294,7 @@ async fn run_accept_loop(
                         {
                             tokio::spawn(async move {
                                 let _slot = slot;
-                                handle_connection_inner(server_for_conn, stream, peer, setup_deadline).await;
+                                handle_connection_inner(server_for_conn, stream, peer, setup_deadline, || {}).await;
                             });
                         }
                     }
@@ -336,12 +344,13 @@ enum ConnError {
 ///
 /// The stream is generic so that a plain TCP connection and a TLS connection
 /// take the same path. Setup through the Initiate response must finish by
-/// `setup_deadline`.
+/// `setup_deadline`; `on_setup_timeout` runs when it does not.
 async fn handle_connection_inner<S>(
     server: IedServer,
     stream: S,
     peer: std::net::SocketAddr,
     setup_deadline: tokio::time::Instant,
+    on_setup_timeout: impl FnOnce(),
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -352,7 +361,16 @@ async fn handle_connection_inner<S>(
     };
     tracing::debug!(conn_id, ?peer, "connection task started");
 
-    match run_connection(server.clone(), stream, peer, conn_id, setup_deadline).await {
+    match run_connection(
+        server.clone(),
+        stream,
+        peer,
+        conn_id,
+        setup_deadline,
+        on_setup_timeout,
+    )
+    .await
+    {
         Ok(()) => {
             tracing::debug!(conn_id, ?peer, "connection closed normally");
         }
@@ -402,6 +420,7 @@ async fn run_connection<S>(
     peer: std::net::SocketAddr,
     conn_id: ConnectionId,
     setup_deadline: tokio::time::Instant,
+    on_setup_timeout: impl FnOnce(),
 ) -> std::result::Result<(), ConnError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -415,6 +434,7 @@ where
                 conn_id,
                 "association setup did not complete within the setup timeout, closing the socket"
             );
+            on_setup_timeout();
             return Err(ConnError::SetupTimedOut);
         }
     };
@@ -1398,6 +1418,7 @@ mod tests {
                 server_end,
                 "127.0.0.1:102".parse().unwrap(),
                 deadline,
+                || {},
             )
             .await;
         });
@@ -1741,6 +1762,7 @@ mod control_channel_tests {
                 server_end,
                 "127.0.0.1:102".parse().unwrap(),
                 deadline,
+                || {},
             )
             .await;
         });
