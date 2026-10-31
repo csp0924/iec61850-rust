@@ -98,6 +98,7 @@ struct State {
 
 /// Values a read of the setting group control block reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SgcbSnapshot {
     /// Number of setting groups the device holds.
     pub num_of_sg: u8,
@@ -649,6 +650,7 @@ fn copy_values(from: &DataAttribute, to: &DataAttribute) {
 
 /// What part of a setting group control block an object name selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SgcbField {
     /// The whole control block, named as `LN$SP$SGCB`.
     Whole,

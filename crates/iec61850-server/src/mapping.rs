@@ -60,6 +60,7 @@ const MAX_DOMAIN_NAME_LEN: usize = 64;
 /// A leaf of an MMS type specification, as IEC 61850-8-1 §5.2 maps the data
 /// attribute types.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MmsLeafType {
     /// Boolean.
     Boolean,
@@ -106,6 +107,7 @@ pub enum StringSize {
 
 /// An MMS type specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MmsTypeSpec {
     /// A scalar value.
     Leaf(MmsLeafType),

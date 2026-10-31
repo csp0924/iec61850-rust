@@ -105,6 +105,7 @@ pub const MIN_REPORT_OVERHEAD_BYTES: usize = 30;
 /// error: it logs the failure and leaves the transmit anchor and sqNum untouched,
 /// so the entry is retried once the configuration is corrected rather than lost.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReportEncodeError {
     /// `max_pdu_size` is too small to hold a single data set element. `needed` is
     /// the encoded size in bytes, `max` the configured limit.
@@ -123,6 +124,7 @@ pub enum ReportEncodeError {
 
 /// Everything `encode_report_pdus` needs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReportEncodeParams<'a> {
     /// RptID, a VisibleString.
     pub rpt_id: &'a str,
@@ -142,6 +144,32 @@ pub struct ReportEncodeParams<'a> {
     pub pending: &'a PendingReport,
     /// Negotiated maximum MMS PDU size, in bytes.
     pub max_pdu_size_bytes: usize,
+}
+
+impl<'a> ReportEncodeParams<'a> {
+    /// Creates the parameters of a report with identifier `rpt_id` on the data
+    /// set `dat_set`, carrying the values of `dataset` that `pending` marks.
+    ///
+    /// `opt_flds` is empty, `sq_num`, `time_of_entry_ms` and `conf_rev` are
+    /// 0, and `max_pdu_size_bytes` is 65000.
+    pub fn new(
+        rpt_id: &'a str,
+        dat_set: &'a str,
+        dataset: &'a Dataset,
+        pending: &'a PendingReport,
+    ) -> Self {
+        Self {
+            rpt_id,
+            opt_flds: OptFlds::NONE,
+            sq_num: 0,
+            time_of_entry_ms: 0,
+            dat_set,
+            conf_rev: 0,
+            dataset,
+            pending,
+            max_pdu_size_bytes: 65000,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -683,6 +711,7 @@ use iec61850_asn1::encode_length;
 /// `sq_num` is a `u16` here where a URCB uses a `u8`: a BRCB sequence number is an
 /// UNSIGNED(16).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BrcbReportEncodeParams<'a> {
     /// RptID, a VisibleString.
     pub rpt_id: &'a str,
@@ -707,6 +736,36 @@ pub struct BrcbReportEncodeParams<'a> {
     pub pending: &'a PendingReport,
     /// Negotiated maximum MMS PDU size, in bytes.
     pub max_pdu_size_bytes: usize,
+}
+
+impl<'a> BrcbReportEncodeParams<'a> {
+    /// Creates the parameters of the buffered entry `entry_id`, reported with
+    /// identifier `rpt_id` on the data set `dat_set` and carrying the values
+    /// of `dataset` that `pending` marks.
+    ///
+    /// `opt_flds` is empty, `sq_num`, `time_of_entry_ms` and `conf_rev` are
+    /// 0, `is_overflow` is `false`, and `max_pdu_size_bytes` is 65000.
+    pub fn new(
+        rpt_id: &'a str,
+        dat_set: &'a str,
+        entry_id: EntryId,
+        dataset: &'a Dataset,
+        pending: &'a PendingReport,
+    ) -> Self {
+        Self {
+            rpt_id,
+            opt_flds: OptFlds::NONE,
+            sq_num: 0,
+            time_of_entry_ms: 0,
+            dat_set,
+            conf_rev: 0,
+            entry_id,
+            is_overflow: false,
+            dataset,
+            pending,
+            max_pdu_size_bytes: 65000,
+        }
+    }
 }
 
 /// Encodes one BRCB report into one or more MMS unconfirmedPDU byte strings.
@@ -838,6 +897,7 @@ pub fn brcb_encode_snapshot(
 /// Control block fields captured for encoding, so the send path does not hold the
 /// state lock while it encodes.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BrcbStateSnapshot {
     /// RptID of the control block.
     pub rpt_id: String,

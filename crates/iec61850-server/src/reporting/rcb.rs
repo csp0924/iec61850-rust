@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 /// Holds the configured values of IEC 61850-7-2 report control block fields; the
 /// runtime copies live in `RcbState`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Rcb {
     /// Control block name without a prefix, for example `"urcb01"`.
     pub name: String,
@@ -170,6 +171,7 @@ impl RcbMetrics {
 
 /// A one-shot read of `RcbMetrics`; plain `u64` fields, freely copyable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct RcbMetricsSnapshot {
     /// PDU segments sent successfully.
     pub sent: u64,
@@ -193,6 +195,7 @@ pub struct RcbMetricsSnapshot {
 /// buffer time, the pending report is flushed at once and a new one started,
 /// bypassing the buffer time per IEC 61850-7-2.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PendingReport {
     /// Trigger flag per data set entry; the vector is as long as the data set.
     pub inclusion_flags: Vec<InclusionFlag>,
@@ -232,6 +235,7 @@ impl PendingReport {
 /// The mutable runtime state of a URCB, held behind a single mutex that covers
 /// both the control block fields and the pending report.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RcbState {
     // ── Control block fields readable and writable by a client ───────────────
     /// RptID; a client may overwrite it.
@@ -360,6 +364,7 @@ impl RcbState {
 /// that lock. `AtomicU64` is `Sync` on its own and plain counting needs no ordering
 /// guarantees, so every access uses `Ordering::Relaxed`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ReportControl {
     /// Full key in the MMS namespace, for example `"IED1LD0/GGIO1$RP$urcb01"`.
     pub mms_path: String,

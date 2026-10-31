@@ -29,7 +29,7 @@ use iec61850_model::{
     LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, SettingGroupControlBlock, TrgOps, FC,
 };
 use iec61850_server::control::{
-    ControlModel, ControlObject, ControlObjectConfig, ControlObjectEntry, ControlState, SboClass,
+    ControlModel, ControlObject, ControlObjectConfig, ControlObjectEntry, ControlState,
 };
 use iec61850_server::reporting::rcb::Rcb;
 use iec61850_server::reporting::{Dataset, ReportControl};
@@ -87,9 +87,10 @@ fn build_server(model: Arc<IedModel>, cfg: IedServerConfig) -> IedServer {
     IedServer::builder()
         .model(model)
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig {
-            write_access_policies: policies,
-            ..cfg
+        .config({
+            let mut config = cfg;
+            config.write_access_policies = policies;
+            config
         })
         .build()
         .expect("build server")
@@ -218,13 +219,11 @@ async fn transport_error_releases_association_state() {
             Dataset::new("LLN0$ds1"),
         )
         .expect("register the URCB");
-    let pos = ControlObject::new(ControlObjectConfig {
-        name: "Pos".into(),
-        ln_name: "LLN0".into(),
-        domain: "TESTLD0".into(),
-        ctl_model: ControlModel::SboNormal,
-        sbo_timeout_ms: 600_000,
-        sbo_class: SboClass::OperateOnce,
+    let pos = ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("Pos", "LLN0", "TESTLD0", ControlModel::SboNormal);
+        config.sbo_timeout_ms = 600_000;
+        config
     });
     server
         .control_objects()
@@ -322,13 +321,11 @@ async fn try_connect(port: u16) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unassociated_socket_counts_against_the_limit() {
     let (model, _vendor) = model_with_writable_vendor();
-    let server = build_server(
-        model,
-        IedServerConfig {
-            max_mms_connections: 1,
-            ..Default::default()
-        },
-    );
+    let server = build_server(model, {
+        let mut config = IedServerConfig::default();
+        config.max_mms_connections = 1;
+        config
+    });
     let handle = server.start().await.expect("start");
     let port = handle.bound_addr.port();
 
@@ -357,14 +354,12 @@ async fn unassociated_socket_counts_against_the_limit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_setup_is_closed_after_the_setup_timeout() {
     let (model, _vendor) = model_with_writable_vendor();
-    let server = build_server(
-        model,
-        IedServerConfig {
-            max_mms_connections: 1,
-            association_setup_timeout_ms: 300,
-            ..Default::default()
-        },
-    );
+    let server = build_server(model, {
+        let mut config = IedServerConfig::default();
+        config.max_mms_connections = 1;
+        config.association_setup_timeout_ms = 300;
+        config
+    });
     let handle = server.start().await.expect("start");
     let port = handle.bound_addr.port();
 
@@ -398,13 +393,11 @@ async fn data_set_limit_applies_per_association() {
     use iec61850_mms::mms::pdu::DefineNamedVariableEntry;
 
     let (model, _vendor) = model_with_writable_vendor();
-    let server = build_server(
-        model,
-        IedServerConfig {
-            max_dynamic_datasets_per_association: 1,
-            ..Default::default()
-        },
-    );
+    let server = build_server(model, {
+        let mut config = IedServerConfig::default();
+        config.max_dynamic_datasets_per_association = 1;
+        config
+    });
     let handle = server.start().await.expect("start");
     let port = handle.bound_addr.port();
     let member = || {

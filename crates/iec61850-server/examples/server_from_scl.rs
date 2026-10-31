@@ -53,7 +53,7 @@ use iec61850_server::control::handler::OperateFuture;
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, CheckHandler, ControlAction,
     ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig, ControlObjectEntry,
-    SboClass, WaitForExecutionHandler,
+    WaitForExecutionHandler,
 };
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{
@@ -85,10 +85,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = IedServer::builder()
         .model(Arc::new(model))
         .bind(bind_addr)
-        .config(IedServerConfig {
-            max_mms_connections: 5,
-            write_access_policies: write_access,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 5;
+            config.write_access_policies = write_access;
+            config
         })
         .build()?;
 
@@ -284,14 +285,9 @@ fn register_control_object(
     let ctl_model = control_model(&model, domain, "GGIO1", "SPCSO1")?;
     let log: OperateLog = Arc::new(Mutex::new(HashMap::new()));
 
-    let obj = ControlObject::new(ControlObjectConfig {
-        name: "SPCSO1".into(),
-        ln_name: "GGIO1".into(),
-        domain: domain.into(),
-        ctl_model,
-        sbo_timeout_ms: 30_000,
-        sbo_class: SboClass::OperateOnce,
-    });
+    let obj = ControlObject::new(ControlObjectConfig::new(
+        "SPCSO1", "GGIO1", domain, ctl_model,
+    ));
     let entry = ControlObjectEntry::new(obj)
         .with_check(Arc::new(AlwaysAcceptCheckHandler) as Arc<dyn CheckHandler>)
         .with_wait(Arc::new(AlwaysAcceptWaitHandler) as Arc<dyn WaitForExecutionHandler>)

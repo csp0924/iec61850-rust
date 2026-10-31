@@ -35,6 +35,7 @@ impl EntryId {
 
 /// One journal entry: its metadata and the data points it carries.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JournalEntry {
     /// EntryID, sent as eight big-endian bytes.
     pub entry_id: EntryId,
@@ -44,8 +45,21 @@ pub struct JournalEntry {
     pub variables: Vec<JournalEntryData>,
 }
 
+impl JournalEntry {
+    /// Creates an entry with the identifier `entry_id`, the time `time_ms` in
+    /// milliseconds since the epoch, and the data points `variables`.
+    pub fn new(entry_id: EntryId, time_ms: u64, variables: Vec<JournalEntryData>) -> Self {
+        Self {
+            entry_id,
+            time_ms,
+            variables,
+        }
+    }
+}
+
 /// One data point of a journal entry: its reference, value, and reason code.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JournalEntryData {
     /// Data attribute reference.
     pub data_ref: String,
@@ -58,11 +72,24 @@ pub struct JournalEntryData {
     pub reason_code: u8,
 }
 
+impl JournalEntryData {
+    /// Creates a data point recording `value` for the reference `data_ref`
+    /// with the reason code `reason_code`.
+    pub fn new(data_ref: impl Into<String>, value: MmsValue, reason_code: u8) -> Self {
+        Self {
+            data_ref: data_ref.into(),
+            value,
+            reason_code,
+        }
+    }
+}
+
 /// An entry identifier with its time, as `oldest_and_newest` returns.
 pub type EntryMeta = (EntryId, u64);
 
 /// Why a `LogStorage` operation failed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LogStorageError {
     /// The entry identifier is not in the log.
     #[error("entry id {0:?} is not in the log")]

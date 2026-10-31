@@ -70,9 +70,10 @@ async fn start_server(bind: &str) -> ServerHandle {
     IedServer::builder()
         .model(build_model())
         .bind(bind.parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig {
-            max_mms_connections: 4,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 4;
+            config
         })
         .build()
         .expect("build server")

@@ -14,6 +14,7 @@ use crate::policy::WriteAccessPolicies;
 /// `Default` reproduces the behavior IEC 61850 prescribes when nothing is
 /// configured.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IedServerConfig {
     /// Maximum number of concurrent MMS connections. A connection counts from
     /// the moment its socket is accepted, before it has associated, until its
@@ -87,6 +88,7 @@ impl Default for IedServerConfig {
 
 /// IEC 61850 edition the server conforms to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Edition {
     /// Edition 1.
     Ed1 = 0,

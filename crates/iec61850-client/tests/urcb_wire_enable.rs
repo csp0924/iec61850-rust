@@ -46,9 +46,10 @@ fn build_server() -> IedServer {
     IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig {
-            max_mms_connections: 5,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 5;
+            config
         })
         .build()
         .unwrap()

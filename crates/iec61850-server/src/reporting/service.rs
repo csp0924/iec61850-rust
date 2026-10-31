@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Corresponds to the MMS variableName `<LN>$RP$<rcb>$<field>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RcbField {
     /// The RptID attribute.
     RptId,
@@ -103,6 +104,7 @@ impl RcbField {
 
 /// One field value to write, already decoded by the caller.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RcbWriteValue {
     /// A BOOLEAN value.
     Bool(bool),

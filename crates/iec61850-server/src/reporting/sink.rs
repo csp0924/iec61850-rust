@@ -39,6 +39,7 @@ pub const REPORT_CHANNEL_CAP: usize = 32;
 /// The engine reads this to decide whether to count a drop, log a warning, or
 /// close the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SendOutcome {
     /// The PDU is queued and the connection task will write it to the socket.
     Sent,

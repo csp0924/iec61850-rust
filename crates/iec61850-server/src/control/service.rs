@@ -75,6 +75,7 @@ pub struct RecordingCommandTermination {
 
 /// One CommandTermination that `RecordingCommandTermination` captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TerminationEvent {
     /// The command finished successfully.
     Positive {
@@ -108,6 +109,7 @@ pub enum TerminationEvent {
 /// The connection task receives this and encodes the InformationReport before
 /// writing it to the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionTerminationEvent {
     /// The command finished successfully.
     Positive {
@@ -272,6 +274,7 @@ impl CommandTerminationSink for RecordingCommandTermination {
 
 /// Result of an Operate, SBOw, or Cancel service.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ServiceResult {
     /// The service succeeded.
     Success,

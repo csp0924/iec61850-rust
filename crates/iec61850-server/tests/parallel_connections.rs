@@ -82,10 +82,8 @@ fn model_with_n_writable_vendors(n: usize) -> Arc<IedModel> {
 }
 
 fn build_server(model: Arc<IedModel>, max_connections: usize) -> IedServer {
-    let cfg = IedServerConfig {
-        max_mms_connections: max_connections,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = max_connections;
     IedServer::builder()
         .model(model)
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -97,11 +95,9 @@ fn build_server(model: Arc<IedModel>, max_connections: usize) -> IedServer {
 fn build_server_with_dc_writable(model: Arc<IedModel>, max_connections: usize) -> IedServer {
     let mut policies = WriteAccessPolicies::default();
     policies.set(FC::Dc, true);
-    let cfg = IedServerConfig {
-        max_mms_connections: max_connections,
-        write_access_policies: policies,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = max_connections;
+    cfg.write_access_policies = policies;
     IedServer::builder()
         .model(model)
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

@@ -31,6 +31,7 @@ use super::DatasetRegistry;
 /// Each variant maps to one IEC 61850-7-2 service error class, which the handler
 /// turns into the matching ConfirmedError code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DatasetError {
     /// A data set with this domain and name is already registered, whether it was
     /// created statically or dynamically.
@@ -88,6 +89,7 @@ pub struct DynamicDatasetOps;
 
 /// Result metadata from a successful `add_dynamic`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DatasetMeta {
     /// Number of entries in the data set that was created.
     pub entry_count: usize,

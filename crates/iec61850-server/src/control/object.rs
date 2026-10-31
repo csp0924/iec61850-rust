@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 /// Static configuration of one control object.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ControlObjectConfig {
     /// Data object name.
     pub name: String,
@@ -45,6 +46,28 @@ pub struct ControlObjectConfig {
 }
 
 impl ControlObjectConfig {
+    /// Creates the configuration of the control object `name` under the
+    /// logical node `ln_name` of the logical device `domain`, using the
+    /// control model `ctl_model`.
+    ///
+    /// `sbo_timeout_ms` is 30000, the value used when the `sboTimeout`
+    /// attribute is absent, and `sbo_class` is [`SboClass::OperateOnce`].
+    pub fn new(
+        name: impl Into<String>,
+        ln_name: impl Into<String>,
+        domain: impl Into<String>,
+        ctl_model: ControlModel,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ln_name: ln_name.into(),
+            domain: domain.into(),
+            ctl_model,
+            sbo_timeout_ms: 30_000,
+            sbo_class: SboClass::OperateOnce,
+        }
+    }
+
     /// Validates a raw `ctlModel` value.
     ///
     /// A value outside 0..=4 is refused rather than silently coerced, so a
@@ -755,6 +778,7 @@ impl ControlObject {
 
 /// Result of `begin_operate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OperateBeginResult {
     /// The command may proceed; the object is now awaiting the dynamic check.
     Accepted,
@@ -764,6 +788,7 @@ pub enum OperateBeginResult {
 
 /// Result of `try_cancel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CancelResult {
     /// The cancel was accepted.
     Accepted,

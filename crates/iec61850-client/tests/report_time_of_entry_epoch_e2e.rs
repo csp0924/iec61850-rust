@@ -42,17 +42,11 @@ fn data_change_pending(time_of_entry_ms: u64) -> PendingReport {
 fn round_trip_time_of_entry(time_of_entry_ms: u64) -> u64 {
     let ds = single_entry_dataset();
     let pending = data_change_pending(time_of_entry_ms);
-    let params = ReportEncodeParams {
-        rpt_id: "IED1LD0/GGIO1$RP$urcb01",
-        opt_flds: OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON,
-        sq_num: 1,
-        time_of_entry_ms,
-        dat_set: "GGIO1$ds1",
-        conf_rev: 1,
-        dataset: &ds,
-        pending: &pending,
-        max_pdu_size_bytes: 65000,
-    };
+    let mut params = ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending);
+    params.opt_flds = OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON;
+    params.sq_num = 1;
+    params.time_of_entry_ms = time_of_entry_ms;
+    params.conf_rev = 1;
 
     let pdus = encode_report_pdus(&params).expect("report encoding must succeed");
     assert_eq!(pdus.len(), 1, "a one-entry report fits in a single pdu");
@@ -112,17 +106,11 @@ fn time_of_entry_round_trips_at_the_last_millisecond_of_a_day() {
 fn wire_field_holds_the_1984_day_count_and_milliseconds_of_day() {
     let ds = single_entry_dataset();
     let pending = data_change_pending(INJECTED_TIME_OF_ENTRY_MS);
-    let params = ReportEncodeParams {
-        rpt_id: "IED1LD0/GGIO1$RP$urcb01",
-        opt_flds: OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON,
-        sq_num: 1,
-        time_of_entry_ms: INJECTED_TIME_OF_ENTRY_MS,
-        dat_set: "GGIO1$ds1",
-        conf_rev: 1,
-        dataset: &ds,
-        pending: &pending,
-        max_pdu_size_bytes: 65000,
-    };
+    let mut params = ReportEncodeParams::new("IED1LD0/GGIO1$RP$urcb01", "GGIO1$ds1", &ds, &pending);
+    params.opt_flds = OptFlds::SEQ_NUM | OptFlds::TIME_STAMP | OptFlds::REASON;
+    params.sq_num = 1;
+    params.time_of_entry_ms = INJECTED_TIME_OF_ENTRY_MS;
+    params.conf_rev = 1;
     let pdus = encode_report_pdus(&params).expect("report encoding must succeed");
 
     // Locate the BinaryTime6 TLV: tag 0x8c, length 6.

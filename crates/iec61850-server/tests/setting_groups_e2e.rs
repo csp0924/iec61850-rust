@@ -78,11 +78,9 @@ fn build_sg_demo_server() -> IedServer {
     policies.set(FC::Se, true);
     policies.set(FC::Sg, true); // allowed on purpose; SG writes are refused anyway
     policies.set(FC::Cf, true);
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        write_access_policies: policies,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
+    cfg.write_access_policies = policies;
     IedServer::builder()
         .model(build_sg_demo_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

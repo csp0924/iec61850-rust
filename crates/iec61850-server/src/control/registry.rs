@@ -53,6 +53,7 @@ impl ControlObjectKey {
 
 /// One controllable data object: its state machine and the three callbacks.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ControlObjectEntry {
     /// The control object and its state machine.
     pub object: ControlObject,

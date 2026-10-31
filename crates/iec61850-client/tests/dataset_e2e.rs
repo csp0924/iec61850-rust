@@ -130,10 +130,8 @@ fn build_model() -> (Arc<IedModel>, Members) {
 /// which SP is writable and ST is not.
 fn build_server() -> (IedServer, Members) {
     let (model, members) = build_model();
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
     let server = IedServer::builder()
         .model(model)
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

@@ -179,10 +179,11 @@ async fn stalled_tls_handshake_is_closed_after_the_setup_timeout() {
     let server = IedServer::builder()
         .model(minimal_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .config(iec61850_server::IedServerConfig {
-            max_mms_connections: 1,
-            association_setup_timeout_ms: 300,
-            ..Default::default()
+        .config({
+            let mut config = iec61850_server::IedServerConfig::default();
+            config.max_mms_connections = 1;
+            config.association_setup_timeout_ms = 300;
+            config
         })
         .with_tls(TlsAcceptor::new(server_tls_config))
         .build()

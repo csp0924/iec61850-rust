@@ -70,10 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = IedServer::builder()
         .model(Arc::new(model))
         .bind(bind_addr)
-        .config(IedServerConfig {
-            max_mms_connections: 5,
-            write_access_policies: write_access,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 5;
+            config.write_access_policies = write_access;
+            config
         })
         .build()?;
 

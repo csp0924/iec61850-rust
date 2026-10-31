@@ -23,7 +23,7 @@ use iec61850_model::{
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, AlwaysFailOperateHandler,
     AlwaysSuccessOperateHandler, CheckHandler, ControlAddCause as ServerControlAddCause,
-    ControlHandler, ControlObject, ControlObjectConfig, ControlObjectEntry, SboClass,
+    ControlHandler, ControlObject, ControlObjectConfig, ControlObjectEntry,
     WaitForExecutionHandler,
 };
 use iec61850_server::{IedServer, IedServerConfig};
@@ -52,9 +52,10 @@ fn build_server() -> IedServer {
     IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig {
-            max_mms_connections: 4,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 4;
+            config
         })
         .build()
         .expect("build server")
@@ -78,13 +79,10 @@ fn register_control_object_with_timeout(
     operate_handler: Arc<dyn ControlHandler>,
     sbo_timeout_ms: u32,
 ) {
-    let obj = ControlObject::new(ControlObjectConfig {
-        name: do_name.into(),
-        ln_name: LN.into(),
-        domain: DOMAIN.into(),
-        ctl_model,
-        sbo_timeout_ms,
-        sbo_class: SboClass::OperateOnce,
+    let obj = ControlObject::new({
+        let mut config = ControlObjectConfig::new(do_name, LN, DOMAIN, ctl_model);
+        config.sbo_timeout_ms = sbo_timeout_ms;
+        config
     });
     let entry = ControlObjectEntry::new(obj)
         .with_check(Arc::new(AlwaysAcceptCheckHandler) as Arc<dyn CheckHandler>)
@@ -100,14 +98,7 @@ fn register_control_object_with_check(
     ctl_model: ControlModel,
     check_handler: Arc<dyn CheckHandler>,
 ) {
-    let obj = ControlObject::new(ControlObjectConfig {
-        name: do_name.into(),
-        ln_name: LN.into(),
-        domain: DOMAIN.into(),
-        ctl_model,
-        sbo_timeout_ms: 30_000,
-        sbo_class: SboClass::OperateOnce,
-    });
+    let obj = ControlObject::new(ControlObjectConfig::new(do_name, LN, DOMAIN, ctl_model));
     let entry = ControlObjectEntry::new(obj)
         .with_check(check_handler)
         .with_wait(Arc::new(AlwaysAcceptWaitHandler) as Arc<dyn WaitForExecutionHandler>)

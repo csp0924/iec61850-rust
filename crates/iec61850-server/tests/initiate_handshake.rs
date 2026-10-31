@@ -27,10 +27,8 @@ fn minimal_model() -> Arc<IedModel> {
 }
 
 fn build_server_with_max(max: usize) -> IedServer {
-    let cfg = IedServerConfig {
-        max_mms_connections: max,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = max;
     IedServer::builder()
         .model(minimal_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

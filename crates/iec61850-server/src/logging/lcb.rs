@@ -50,6 +50,7 @@ pub enum LogState {
 
 /// Static definition of a log control block.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LogControlBlock {
     /// Control block name, for example `"lcb01"`.
     pub name: String,
@@ -114,6 +115,7 @@ impl LogControlBlock {
 ///
 /// The storage backend is shared through an `Arc`, so several control blocks may
 /// write into the same log.
+#[non_exhaustive]
 pub struct LogControl {
     /// Full key in the MMS namespace, for example `"IED1LD0/MMXU1$LG$lcb01"`.
     pub mms_path: String,
@@ -138,6 +140,7 @@ impl std::fmt::Debug for LogControl {
 
 /// Mutable runtime state of a log control block.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LogControlState {
     /// Current LogEna state.
     pub log_ena: LogState,

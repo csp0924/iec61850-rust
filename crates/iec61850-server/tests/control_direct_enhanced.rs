@@ -12,18 +12,16 @@ use iec61850_server::control::{
     handle_operate, state::ControlState, AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler,
     AlwaysFailOperateHandler, AlwaysSuccessOperateHandler, CheckHandler, ControlAddCause,
     ControlHandler, ControlModel, ControlObject, ControlObjectConfig, RecordingCommandTermination,
-    SboClass, ServiceResult, TerminationEvent, WaitForExecutionHandler,
+    ServiceResult, TerminationEvent, WaitForExecutionHandler,
 };
 use std::sync::Arc;
 
 fn make_obj() -> ControlObject {
-    ControlObject::new(ControlObjectConfig {
-        name: "SPCSO1".into(),
-        ln_name: "GGIO1".into(),
-        domain: "IED1LD0".into(),
-        ctl_model: ControlModel::DirectEnhanced,
-        sbo_timeout_ms: 5000,
-        sbo_class: SboClass::OperateOnce,
+    ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO1", "GGIO1", "IED1LD0", ControlModel::DirectEnhanced);
+        config.sbo_timeout_ms = 5000;
+        config
     })
 }
 
@@ -228,6 +226,7 @@ impl ObjRefCheck for TerminationEvent {
         match self {
             TerminationEvent::Positive { obj_ref, .. } => obj_ref.contains(sub),
             TerminationEvent::Negative { obj_ref, .. } => obj_ref.contains(sub),
+            _ => false,
         }
     }
 }

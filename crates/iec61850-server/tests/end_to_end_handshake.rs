@@ -46,10 +46,8 @@ fn model_with_ggio() -> Arc<IedModel> {
 }
 
 fn build_server() -> IedServer {
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
     IedServer::builder()
         .model(model_with_ggio())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -142,11 +140,9 @@ fn model_with_writable_vendor() -> Arc<IedModel> {
 async fn rust_client_write_round_trip() {
     let mut policies = WriteAccessPolicies::default();
     policies.set(FC::Dc, true);
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        write_access_policies: policies,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
+    cfg.write_access_policies = policies;
     let server = IedServer::builder()
         .model(model_with_writable_vendor())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

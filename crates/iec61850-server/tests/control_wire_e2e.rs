@@ -27,7 +27,7 @@ use iec61850_server::control::handler::{OperateFuture, WaitForExecFuture};
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysFailOperateHandler, AlwaysSuccessOperateHandler, CheckHandler,
     ControlAction, ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig,
-    ControlObjectEntry, ControlState, SboClass, WaitForExecutionHandler,
+    ControlObjectEntry, ControlState, WaitForExecutionHandler,
 };
 use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
 use tokio::sync::Notify;
@@ -73,23 +73,17 @@ fn server() -> IedServer {
     IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .config(IedServerConfig {
-            max_mms_connections: 4,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 4;
+            config
         })
         .build()
         .expect("server")
 }
 
 fn object(name: &str, ctl_model: ControlModel) -> ControlObject {
-    ControlObject::new(ControlObjectConfig {
-        name: name.into(),
-        ln_name: "GGIO1".into(),
-        domain: DOMAIN.into(),
-        ctl_model,
-        sbo_timeout_ms: 30_000,
-        sbo_class: SboClass::OperateOnce,
-    })
+    ControlObject::new(ControlObjectConfig::new(name, "GGIO1", DOMAIN, ctl_model))
 }
 
 fn register(server: &IedServer, obj: ControlObject, op: Arc<dyn ControlHandler>) {

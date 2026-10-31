@@ -63,6 +63,7 @@ const READ_RESPONSE_FRAME_OVERHEAD: usize = 24;
 /// resource ServiceError, not an individual failure entry, so the two cases
 /// cannot share one return type.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum LookupResult {
     /// A value, or an ordinary failure such as object-non-existent or
     /// type-inconsistent.

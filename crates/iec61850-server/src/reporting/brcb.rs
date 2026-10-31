@@ -105,6 +105,7 @@ pub const RESV_TMS_IMPLICIT_VALUE_S: u16 = 10;
 /// Every configuration write funnels through `set_config_field`, so a field added
 /// later cannot accidentally skip the buffer purge the change requires.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum BrcbConfigField {
     /// The referenced data set name.
     DatSet(String),
@@ -137,6 +138,7 @@ impl BrcbConfigField {
 /// itself, not by the caller; the variant only tells the caller that this change
 /// emptied the buffer, so it can be logged or counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigChangeResult {
     /// The value written was already in place: nothing changed and nothing was
     /// purged.
@@ -186,6 +188,7 @@ pub enum TransmitAnchor {
 /// Only one case exists today; it is an enum rather than a unit struct so a later
 /// case does not force every caller to change the shape of its match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApplyEntryIdError {
     /// The EntryID is not in the buffer, having been evicted or never stored. The
     /// dispatcher answers `DataAccessError::ObjectValueInvalid`.
@@ -202,6 +205,7 @@ pub enum ApplyEntryIdError {
 /// a URCB has; `with_resv_tms` and `with_owner` decide whether the Edition 2 fields
 /// are exposed; and the sequence number is 16 bits rather than 8.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Brcb {
     /// Control block name without a prefix, for example `"brcb01"`.
     pub name: String,
@@ -322,6 +326,7 @@ impl Brcb {
 /// Carries both the fields a BRCB shares with a URCB and the ones only a buffered
 /// control block has, per IEC 61850-7-2.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BrcbState {
     // ── Control block fields readable and writable by a client ───────────────
     /// RptID.
@@ -599,6 +604,7 @@ impl BrcbState {
 /// - `report_buffer`: the buffer backend behind its own mutex, held as a trait
 ///   object so another backend can be substituted without touching `BrcbState`
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BufferedReportControl {
     /// Full key in the MMS namespace, for example `"IED1LD0/GGIO1$BR$brcb01"`. A
     /// BRCB uses `$BR$` where a URCB uses `$RP$`.

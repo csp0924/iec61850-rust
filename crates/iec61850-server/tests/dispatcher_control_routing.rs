@@ -21,8 +21,7 @@ use iec61850_model::{
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, AlwaysSuccessOperateHandler, CheckHandler,
     ControlHandler, ControlModel, ControlObject, ControlObjectConfig, ControlObjectEntry,
-    ControlObjectsRegistry, RecordingCommandTermination, SboClass, TerminationEvent,
-    WaitForExecutionHandler,
+    ControlObjectsRegistry, RecordingCommandTermination, TerminationEvent, WaitForExecutionHandler,
 };
 use iec61850_server::mapping::MmsDeviceModel;
 use iec61850_server::policy::WriteAccessPolicies;
@@ -57,13 +56,10 @@ fn build_min_model() -> iec61850_model::IedModel {
 }
 
 fn make_control_object(model: ControlModel) -> ControlObject {
-    ControlObject::new(ControlObjectConfig {
-        name: "SPCSO1".into(),
-        ln_name: "GGIO1".into(),
-        domain: "IED1LD0".into(),
-        ctl_model: model,
-        sbo_timeout_ms: 5000,
-        sbo_class: SboClass::OperateOnce,
+    ControlObject::new({
+        let mut config = ControlObjectConfig::new("SPCSO1", "GGIO1", "IED1LD0", model);
+        config.sbo_timeout_ms = 5000;
+        config
     })
 }
 

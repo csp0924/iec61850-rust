@@ -69,10 +69,8 @@ fn build_model() -> Arc<IedModel> {
 }
 
 fn build_server() -> IedServer {
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
     IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

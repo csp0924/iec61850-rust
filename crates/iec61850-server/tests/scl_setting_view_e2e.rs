@@ -81,10 +81,8 @@ async fn start() -> ServerHandle {
     for fc in [FC::Sp, FC::Se, FC::Sg] {
         policies.set(fc, true);
     }
-    let cfg = IedServerConfig {
-        write_access_policies: policies,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.write_access_policies = policies;
     IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

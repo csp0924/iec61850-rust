@@ -24,6 +24,7 @@ use iec61850_model::MmsValue;
 /// succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ControlAddCause {
     /// Unknown cause; the initial value of a control action.
     #[default]
@@ -129,6 +130,7 @@ impl ControlAddCause {
 /// The `error` field of the LastApplError data attribute, per IEC 61850-7-2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ControlLastApplError {
     /// No error.
     #[default]
@@ -367,6 +369,7 @@ pub use iec61850_model::ControlModel;
 ///
 /// The wire structure has six elements, or seven when `operTm` is present.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OperParams {
     /// Control value, element 0.
     pub ctl_val: MmsValue,
@@ -460,6 +463,7 @@ impl OperParams {
 /// The wire structure has five elements, or six when `operTm` is present as
 /// element 1, which moves every later element up by one.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CancelParams {
     /// Control value, element 0.
     pub ctl_val: Option<MmsValue>,

@@ -126,6 +126,7 @@ use write::handle_single_write;
 /// A field left unset in the server configuration falls back to the matching
 /// `DEFAULT_` constant below.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IdentificationStrings {
     /// Vendor name reported by the Identify service.
     pub vendor_name: String,
@@ -169,6 +170,7 @@ impl Default for IdentificationStrings {
 /// A Read or Write under RP or BR is routed to `reporting_engine`, which
 /// answers `ObjectNonExistent` for a control block it does not hold.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MmsModelDispatcher {
     /// The live model, which Read and Write resolve against.
     pub model: Arc<IedModel>,

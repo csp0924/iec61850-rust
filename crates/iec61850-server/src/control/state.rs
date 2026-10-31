@@ -70,6 +70,7 @@ impl ControlState {
 
 /// Result of a state machine action, returned by `ControlObject` methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransitionResult {
     /// The action was accepted and the state has moved.
     Accepted,
@@ -79,6 +80,7 @@ pub enum TransitionResult {
 
 /// Why a control action was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RejectionReason {
     /// `ctlModel` is status-only, so no control request is accepted.
     StatusOnly,

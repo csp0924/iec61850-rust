@@ -28,6 +28,7 @@ const PAGE_SIZE: usize = 100;
 
 /// Outcome of a GetNameList request.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GetNameListResult {
     /// One page of names, together with the `more_follows` flag.
     Response(GetNameListResponse),

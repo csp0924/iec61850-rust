@@ -567,9 +567,10 @@ async fn last_activation_time_carries_the_configured_time_quality() {
     for (config, expected) in [
         (IedServerConfig::default(), TimeQuality::default().to_byte()),
         (
-            IedServerConfig {
-                time_quality: quality,
-                ..IedServerConfig::default()
+            {
+                let mut config = IedServerConfig::default();
+                config.time_quality = quality;
+                config
             },
             quality.to_byte(),
         ),

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 /// Errors raised by the IED server, its model mapping, and its runtime.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ServerError {
     /// `lock_data_model` was called while the data model was already locked.
     ///

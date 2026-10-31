@@ -16,13 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn make_obj(sbo_timeout_ms: u32) -> ControlObject {
-    ControlObject::new(ControlObjectConfig {
-        name: "SPCSO1".into(),
-        ln_name: "GGIO1".into(),
-        domain: "IED1LD0".into(),
-        ctl_model: ControlModel::SboNormal,
-        sbo_timeout_ms,
-        sbo_class: SboClass::OperateOnce,
+    ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO1", "GGIO1", "IED1LD0", ControlModel::SboNormal);
+        config.sbo_timeout_ms = sbo_timeout_ms;
+        config
     })
 }
 
@@ -201,13 +199,12 @@ async fn sbo_normal_cancel_wrong_conn_fails() {
 
 #[tokio::test]
 async fn sbo_normal_operate_many_stays_selected() {
-    let obj = ControlObject::new(ControlObjectConfig {
-        name: "SPCSO1".into(),
-        ln_name: "GGIO1".into(),
-        domain: "IED1LD0".into(),
-        ctl_model: ControlModel::SboNormal,
-        sbo_timeout_ms: 5000,
-        sbo_class: SboClass::OperateMany,
+    let obj = ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO1", "GGIO1", "IED1LD0", ControlModel::SboNormal);
+        config.sbo_timeout_ms = 5000;
+        config.sbo_class = SboClass::OperateMany;
+        config
     });
     let check_h: Arc<dyn CheckHandler> = Arc::new(AlwaysAcceptCheckHandler);
     handle_read_sbo(&obj, 1, Some(&check_h));

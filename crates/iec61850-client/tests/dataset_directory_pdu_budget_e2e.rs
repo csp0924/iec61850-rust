@@ -119,10 +119,8 @@ fn string_dataset(name: &str, members: usize) -> Dataset {
 
 /// Starts a server holding one oversized and one small configured data set.
 async fn start_server() -> (IedServer, u16) {
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
     let server = IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())

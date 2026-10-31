@@ -110,6 +110,7 @@ pub trait SelectStateChangedHandler: Send + Sync {
 
 /// Why the selection state changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelectStateChangedReason {
     /// The object was selected.
     Selected,

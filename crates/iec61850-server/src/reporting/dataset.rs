@@ -33,6 +33,7 @@ pub type DataAttributeRef = String;
 /// Holds an `Arc<RwLock<MmsValue>>` shared with the model's
 /// `DataAttribute::value`, so an entry always sees the live value.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DatasetEntry {
     /// Wire-level reference, emitted for the DATA_REFERENCE optional field.
     pub attr_ref: DataAttributeRef,
@@ -65,6 +66,7 @@ impl DatasetEntry {
 /// Entries are held in a `Vec`, which is append-only while the model is being
 /// built and treated as immutable once a control block is enabled.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Dataset {
     /// Data set reference name in the MMS namespace, for example `GGIO1$ds1`.
     pub name: String,

@@ -30,6 +30,7 @@ use iec61850_mms::mms::pdu::{
 
 /// Outcome of a GetVariableAccessAttributes request.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GetVarAccessAttrsResult {
     /// The requested object was found and its type specification encoded.
     Response(GetVariableAccessAttributesResponse),

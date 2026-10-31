@@ -43,6 +43,7 @@ use crate::flags::InclusionFlag;
 /// - `Reject`: same behavior as `DropNewest`, kept separate so the two can be
 ///   told apart by a future metric label
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OverflowStrategy {
     /// Default: evict the oldest entry and store the new one.
     #[default]
@@ -99,6 +100,7 @@ impl EntryId {
 /// length but saves the caller from having to infer the inclusion bitstring
 /// length.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EnqueuedSnapshot {
     /// One flag per data set position; `NONE` means this position did not trigger.
     pub inclusion_flags: Vec<InclusionFlag>,
@@ -128,6 +130,7 @@ impl EnqueuedSnapshot {
 /// storing encoded BER directly could reuse the type; entries built with a
 /// snapshot leave it empty.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReportEntry {
     /// Eight-byte big-endian EntryID, carried on the wire unchanged.
     pub entry_id: EntryId,
@@ -194,6 +197,7 @@ impl ReportEntry {
 /// Three states are needed because "found, and a later entry exists" and "found,
 /// and it is the newest entry" lead to different resynchronization handling.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SeekResult {
     /// The identifier was found and a later entry exists; `next` is where
     /// transmission resumes.

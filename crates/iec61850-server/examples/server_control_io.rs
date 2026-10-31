@@ -43,7 +43,7 @@ use iec61850_model::{ControlModel, MmsValue};
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, AlwaysSuccessOperateHandler, CheckHandler,
     ControlAction, ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig,
-    ControlObjectEntry, SboClass, WaitForExecutionHandler,
+    ControlObjectEntry, WaitForExecutionHandler,
 };
 use iec61850_server::{IedServer, IedServerConfig};
 
@@ -73,9 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = IedServer::builder()
         .model(Arc::new(model))
         .bind(bind_addr)
-        .config(IedServerConfig {
-            max_mms_connections: 5,
-            ..Default::default()
+        .config({
+            let mut config = IedServerConfig::default();
+            config.max_mms_connections = 5;
+            config
         })
         .build()?;
 
@@ -134,14 +135,9 @@ fn register_control_object(
     ctl_model: ControlModel,
     interlock: bool,
 ) {
-    let obj = ControlObject::new(ControlObjectConfig {
-        name: DO_NAME.into(),
-        ln_name: LN_NAME.into(),
-        domain: domain.into(),
-        ctl_model,
-        sbo_timeout_ms: 30_000,
-        sbo_class: SboClass::OperateOnce,
-    });
+    let obj = ControlObject::new(ControlObjectConfig::new(
+        DO_NAME, LN_NAME, domain, ctl_model,
+    ));
     let check: Arc<dyn CheckHandler> = if interlock {
         Arc::new(AlwaysBlockedCheck)
     } else {

@@ -36,6 +36,7 @@ use crate::error::{Result, ServerError};
 /// The path arrives canonicalized, so a handler can compare it as a string
 /// without trimming or changing case.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ReadContext<'a> {
     /// Canonical attribute path, `LN$FC$DO[$DA]*`.
     pub path: &'a str,
@@ -45,8 +46,17 @@ pub struct ReadContext<'a> {
     pub conn_id: u64,
 }
 
+impl<'a> ReadContext<'a> {
+    /// Creates the context of a read of `path` under `fc` on the association
+    /// `conn_id`.
+    pub fn new(path: &'a str, fc: FC, conn_id: u64) -> Self {
+        Self { path, fc, conn_id }
+    }
+}
+
 /// Context passed to [`AttributeAccessHandler::on_write`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct WriteContext<'a> {
     /// Canonical attribute path, `LN$FC$DO[$DA]*`.
     pub path: &'a str,
@@ -56,12 +66,21 @@ pub struct WriteContext<'a> {
     pub conn_id: u64,
 }
 
+impl<'a> WriteContext<'a> {
+    /// Creates the context of a write of `path` under `fc` on the association
+    /// `conn_id`.
+    pub fn new(path: &'a str, fc: FC, conn_id: u64) -> Self {
+        Self { path, fc, conn_id }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handler outcomes
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// What a read handler decided.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ReadOutcome {
     /// The handler supplies this value and the model is not consulted.
     ///
@@ -76,6 +95,7 @@ pub enum ReadOutcome {
 
 /// What a write handler decided.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WriteOutcome {
     /// The handler accepts the value and the server updates the cached value.
     Accept,

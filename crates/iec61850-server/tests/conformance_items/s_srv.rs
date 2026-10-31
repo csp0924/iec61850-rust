@@ -120,11 +120,9 @@ async fn spawn_server() -> (IedServer, ServerHandle) {
     let mut policies = WriteAccessPolicies::default();
     policies.set(FC::Dc, true);
     policies.set(FC::Sp, true);
-    let cfg = IedServerConfig {
-        max_mms_connections: 5,
-        write_access_policies: policies,
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.max_mms_connections = 5;
+    cfg.write_access_policies = policies;
     let server = IedServer::builder()
         .model(build_rich_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().expect("addr"))

@@ -86,12 +86,10 @@ async fn own_server_reports_its_built_in_identity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn own_server_reports_configured_identity() {
-    let cfg = IedServerConfig {
-        vendor_name: Some("Example Vendor".into()),
-        model_name: Some("Bay Controller 7".into()),
-        revision: Some("4.2.0-rc1".into()),
-        ..Default::default()
-    };
+    let mut cfg = IedServerConfig::default();
+    cfg.vendor_name = Some("Example Vendor".into());
+    cfg.model_name = Some("Bay Controller 7".into());
+    cfg.revision = Some("4.2.0-rc1".into());
     let handle = build_server(cfg).start().await.expect("server start");
     let conn = fresh_client(handle.bound_addr.port()).await;
 

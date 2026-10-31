@@ -216,6 +216,7 @@ struct BrcbBufTmPending {
 /// increments it on each eviction, `DropNewest` and `Reject` on each rejected
 /// entry; the SQLite backend behaves the same way.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ReportingEngineMetrics {
     /// Entries dropped because a BRCB buffer was full.
     ///
