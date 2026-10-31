@@ -38,11 +38,13 @@
 //! the declared size answers `TypeInconsistent`; one shorter than a `Max(n)`
 //! size is padded with zero bits to n bits before it is stored.
 //!
-//! A write below a data attribute is also a write of each attribute above it.
-//! The handler of every such ancestor, outermost first, decides the write with
-//! the ancestor's current value in which the target is replaced by the written
-//! value: a refusal refuses the write, and taking the value over leaves the
-//! cache alone, exactly as for a write of the ancestor itself.
+//! A write of a node is also a write of each node above it, up to the data
+//! object: sub-data-objects, the data attribute and constructed
+//! sub-attributes. The handler of every such ancestor, outermost first,
+//! decides the write with the ancestor's current value under the functional
+//! constraint in which the target is replaced by the written value: a refusal
+//! refuses the write, and taking the value over leaves the cache alone,
+//! exactly as for a write of the ancestor itself.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -407,9 +409,6 @@ fn write_to_target(
     // the target replaced by the written one, outermost ancestor first.
     if !handlers.is_empty() {
         for (depth, ancestor) in ancestors.iter().enumerate() {
-            if !matches!(ancestor, Node::Attribute(_)) {
-                continue;
-            }
             let path = leading_segments(item_id, depth + 3);
             let Some(handler) = handler_at(&handlers, path) else {
                 continue;
@@ -2374,6 +2373,91 @@ mod tests {
                 padding: 3,
                 data: vec![0x80, 0x00],
             }
+        );
+    }
+
+    // ── Handlers on data objects above the target ──────────────────────
+
+    /// A handler on a data object or a sub-data-object decides a write of any
+    /// node beneath it: a refusal refuses the write and the leaf keeps its
+    /// value, and the handler sees the object's value under the constraint
+    /// with the written node replaced.
+    #[test]
+    fn write_below_a_data_object_consults_its_handler() {
+        let (model, mms_model) = build_sdo_write_model();
+        for (installed_on, item_id) in [
+            ("GGIO1$SP$PhSet", "GGIO1$SP$PhSet$phsA$setMag"),
+            ("GGIO1$SP$PhSet$phsA", "GGIO1$SP$PhSet$phsA$setCplx$f"),
+            ("GGIO1$SP$PhSet", "GGIO1$SP$PhSet$phsB$cmv"),
+        ] {
+            let registry = HandlerRegistry::new();
+            registry
+                .install_write_access_handler(installed_on, Arc::new(Refuse))
+                .unwrap();
+            let name = ObjectName::DomainSpecific {
+                domain_id: "IED1LD0".to_string(),
+                item_id: item_id.to_string(),
+            };
+            let data = if item_id.ends_with("cmv") {
+                MmsData::Structure(vec![MmsData::Float32(8.0)])
+            } else {
+                MmsData::Float32(8.0)
+            };
+            let result = handle_single_write(
+                &model,
+                &mms_model,
+                &WriteAccessPolicies::default(),
+                Some(&registry),
+                None,
+                0,
+                &name,
+                &data,
+            );
+            assert_eq!(
+                result,
+                WriteOutcome::Failure(DataAccessError::ObjectAccessDenied),
+                "{installed_on} over {item_id}"
+            );
+        }
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setMag"),
+            MmsValue::Float32(0.0)
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsB$cmv$setDeep"),
+            MmsValue::Float32(0.0)
+        );
+
+        let accept = witness(HandlerWriteOutcome::Accept);
+        let registry = HandlerRegistry::new();
+        registry
+            .install_write_access_handler("GGIO1$SP$PhSet$phsA", accept.clone())
+            .unwrap();
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SP$PhSet$phsA$setCplx$f".to_string(),
+        };
+        let result = handle_single_write(
+            &model,
+            &mms_model,
+            &WriteAccessPolicies::default(),
+            Some(&registry),
+            None,
+            0,
+            &name,
+            &MmsData::Float32(9.0),
+        );
+        assert_eq!(result, WriteOutcome::Success);
+        assert_eq!(
+            *accept.seen.lock().unwrap(),
+            [MmsValue::Structure(vec![
+                MmsValue::Float32(0.0),
+                MmsValue::Structure(vec![MmsValue::Float32(9.0)]),
+            ])]
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$PhSet$phsA$setCplx$f"),
+            MmsValue::Float32(9.0)
         );
     }
 }

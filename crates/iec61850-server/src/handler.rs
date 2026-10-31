@@ -131,9 +131,11 @@ pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
     /// Decides what happens to a value written to the attribute this handler is
     /// registered against.
     ///
-    /// One write can consult several handlers: those of the attributes above
-    /// the written node, and, for a data object or a constructed attribute,
-    /// those of the nodes beneath it. The write fails as a whole when any of them refuses, after
+    /// One write can consult several handlers: those of the nodes above the
+    /// written one, up to its data object, and, for a data object or a
+    /// constructed attribute, those of the nodes beneath it. A handler on a
+    /// data object therefore decides every write that reaches the object
+    /// under the functional constraint of its path. The write fails as a whole when any of them refuses, after
     /// the earlier ones may already have answered `Accept` or `AcceptNoUpdate`.
     /// No cached value changes in that case, but a handler that applies a value
     /// itself on `AcceptNoUpdate` sees no notice of the failure, so it should

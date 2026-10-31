@@ -385,3 +385,33 @@ async fn short_quality_reads_back_at_its_declared_length() {
     .await
     .expect("timed out");
 }
+
+/// A write handler on a data object decides a write of a leaf beneath it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_handler_on_a_data_object_decides_a_leaf_write() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        server
+            .handler_registry()
+            .install_write_access_handler("GGIO1$SP$Pt", Arc::new(Refuse))
+            .unwrap();
+
+        assert_eq!(
+            data_access_error(
+                client
+                    .write(DOMAIN, "GGIO1$SP$Pt$phsA$lim", MmsData::Unsigned(3))
+                    .await
+            ),
+            DataAccessError::ObjectAccessDenied
+        );
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$SP$Pt$phsA$lim").await.unwrap(),
+            MmsData::Unsigned(0)
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
