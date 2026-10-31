@@ -121,11 +121,9 @@ pub use iec61850_mms::{ApTitle, ApTitleError, IsoConnectionParameters};
 // on `iec61850-mms` directly.
 pub use iec61850_mms::{StructComponent, TypeSpecification};
 #[cfg(feature = "reporting")]
-#[allow(deprecated)]
 pub use journal::{
     parse_journal_ref, wire_entry_to_client, ClientJournalEntry, ClientJournalEntryData,
     ClientJournalEntryId, JournalCursor, JournalQuery, JournalStart, JournalStop,
-    QueryJournalNotImplemented,
 };
 // Re-exported so that the fields of `ServerStatus` can be named without
 // depending on `iec61850-mms` directly.

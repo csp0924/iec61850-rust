@@ -16,7 +16,6 @@ use crate::error::ClientError;
 use crate::prelude::{format, String, ToString, Vec};
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
-use iec61850_mms::mms::pdu::common::MmsData;
 use iec61850_mms::mms::pdu::{
     JournalRangeStart, JournalRangeStop, ReadJournalRequest as WireReadJournalRequest,
     WireJournalEntry,
@@ -363,34 +362,10 @@ impl<T: AsyncTransport, Tm: Timer> crate::connection::IedConnection<T, Tm> {
     }
 }
 
-// `MmsData` is reached only through `mms_compat`; this keeps the import from
-// reading as unused.
-#[allow(dead_code)]
-fn _silence_unused(_d: MmsData) {}
-
-/// Retained so that downstream references keep compiling. The journal query
-/// API is implemented and never returns this type.
-#[deprecated(
-    since = "0.1.0",
-    note = "the journal query is implemented; use IedConnection::query_journal_by_time or query_journal_after_entry"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryJournalNotImplemented;
-
-#[allow(deprecated)]
-impl core::fmt::Display for QueryJournalNotImplemented {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("the journal query is implemented; this type is a deprecated marker")
-    }
-}
-
-// `core::error::Error` is available on both std and no_std targets.
-#[allow(deprecated)]
-impl core::error::Error for QueryJournalNotImplemented {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iec61850_mms::mms::pdu::common::MmsData;
 
     #[test]
     fn entry_id_round_trip() {
