@@ -2086,10 +2086,10 @@ fn read_brcb_structure(engine: &Arc<Mutex<ReportingEngine>>, mms_path: &str) -> 
         RcbField::TrgOps,
         RcbField::IntgPd,
         RcbField::Gi,
-        RcbField::Unknown("PurgeBuf".into()),
+        RcbField::PurgeBuf,
         RcbField::EntryId,
-        RcbField::Unknown("TimeofEntry".into()),
-        RcbField::Unknown("ResvTms".into()),
+        RcbField::TimeOfEntry,
+        RcbField::ResvTms,
         RcbField::Owner,
     ];
     let mut members: Vec<MmsData> = Vec::with_capacity(fields.len());

@@ -56,12 +56,19 @@ pub enum RcbField {
     Owner,
     /// EntryID, an eight-byte big-endian OCTET STRING; BRCB only.
     EntryId,
+    /// PurgeBuf, a request to discard the buffered entries; BRCB only.
+    PurgeBuf,
+    /// TimeOfEntry, MMS component `TimeofEntry`, the time of the exposed EntryID;
+    /// BRCB only, never writable.
+    TimeOfEntry,
+    /// ResvTms, the reservation time in seconds as an INT16; BRCB only.
+    ResvTms,
     /// A field name this server does not recognize.
     Unknown(String),
 }
 
 impl RcbField {
-    /// Parses an MMS field name.
+    /// Parses an MMS component name, as IEC 61850-8-1 Tables 72 and 73 spell it.
     pub fn from_name(name: &str) -> Self {
         match name {
             "RptID" => Self::RptId,
@@ -77,11 +84,14 @@ impl RcbField {
             "GI" => Self::Gi,
             "Owner" => Self::Owner,
             "EntryID" => Self::EntryId,
+            "PurgeBuf" => Self::PurgeBuf,
+            "TimeofEntry" => Self::TimeOfEntry,
+            "ResvTms" => Self::ResvTms,
             other => Self::Unknown(other.to_string()),
         }
     }
 
-    /// Returns the MMS field name.
+    /// Returns the MMS component name.
     pub fn as_str(&self) -> &str {
         match self {
             Self::RptId => "RptID",
@@ -97,6 +107,9 @@ impl RcbField {
             Self::Gi => "GI",
             Self::Owner => "Owner",
             Self::EntryId => "EntryID",
+            Self::PurgeBuf => "PurgeBuf",
+            Self::TimeOfEntry => "TimeofEntry",
+            Self::ResvTms => "ResvTms",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -453,9 +466,11 @@ pub fn handle_get_rcb_field(
             Some(std::net::IpAddr::V6(a)) => MmsData::OctetString(a.octets().to_vec()),
             None => MmsData::OctetString(vec![]),
         },
-        // EntryID exists only on a BRCB; a client that addressed $RP$ instead of
-        // $BR$ gets ObjectNonExistent from the caller.
-        RcbField::EntryId => return None,
+        // These exist only on a BRCB; a client that addressed $RP$ instead of $BR$
+        // gets ObjectNonExistent from the caller.
+        RcbField::EntryId | RcbField::PurgeBuf | RcbField::TimeOfEntry | RcbField::ResvTms => {
+            return None
+        }
         RcbField::Unknown(_) => return None,
     };
 
@@ -575,7 +590,7 @@ pub fn handle_set_brcb_field(
         }
 
         // PurgeBuf.
-        RcbField::Unknown(ref n) if n == "PurgeBuf" => set_brcb_purge_buf(&brcb, value),
+        RcbField::PurgeBuf => set_brcb_purge_buf(&brcb, value),
 
         // RptEna: enable or disable; the integrity period runs from the moment
         // reporting is enabled.
@@ -604,12 +619,17 @@ pub fn handle_set_brcb_field(
         RcbField::IntgPd => set_brcb_unsigned32(&brcb, value, "IntgPd"),
 
         // ResvTms, an INT16 introduced in Edition 2.
-        RcbField::Unknown(ref n) if n == "ResvTms" => {
-            set_brcb_resv_tms(&brcb, value, conn_id, writer_ip)
-        }
+        RcbField::ResvTms => set_brcb_resv_tms(&brcb, value, conn_id, writer_ip),
 
-        // Owner is never writable, per IEC 61850-7-2.
-        RcbField::Owner => Some(Err(DataAccessError::ObjectAccessDenied)),
+        // Owner and TimeOfEntry are never writable, per IEC 61850-8-1 Table 72.
+        RcbField::Owner | RcbField::TimeOfEntry => {
+            tracing::warn!(
+                mms_path,
+                field = field.as_str(),
+                "SetBRCBValues: the field is not writable"
+            );
+            Some(Err(DataAccessError::ObjectAccessDenied))
+        }
 
         // Remaining cases.
         RcbField::Unknown(_) => None,
@@ -643,7 +663,7 @@ pub fn handle_get_brcb_field(
             let (id, _) = exposed_entry(&brcb)?;
             return Some(AccessResult::Success(MmsData::OctetString(id.0.to_vec())));
         }
-        RcbField::Unknown(ref n) if n == "TimeofEntry" => {
+        RcbField::TimeOfEntry => {
             // BinaryTime6 wire format; the stored value is host-order milliseconds.
             let (_, ms) = exposed_entry(&brcb)?;
             return Some(AccessResult::Success(MmsData::BinaryTime(
@@ -700,11 +720,12 @@ pub fn handle_get_brcb_field(
         },
         // Read above, before the state lock is taken.
         RcbField::EntryId => return None,
-        RcbField::Unknown(ref n) if n == "PurgeBuf" => {
+        RcbField::TimeOfEntry => return None,
+        RcbField::PurgeBuf => {
             // PurgeBuf is a trigger flag: it reads back false once the purge has run.
             MmsData::Boolean(state_guard.purge_buf_pending)
         }
-        RcbField::Unknown(ref n) if n == "ResvTms" => {
+        RcbField::ResvTms => {
             // INT16 wire format.
             MmsData::Integer(state_guard.resv_tms.to_wire() as i64)
         }
@@ -1488,6 +1509,10 @@ mod tests {
             ("IntgPd", RcbField::IntgPd),
             ("GI", RcbField::Gi),
             ("Owner", RcbField::Owner),
+            ("EntryID", RcbField::EntryId),
+            ("PurgeBuf", RcbField::PurgeBuf),
+            ("TimeofEntry", RcbField::TimeOfEntry),
+            ("ResvTms", RcbField::ResvTms),
         ] {
             let parsed = RcbField::from_name(name);
             assert_eq!(parsed, expected, "from_name({}) parsed incorrectly", name);
@@ -2041,7 +2066,7 @@ mod tests {
         let res = handle_set_brcb_field(
             &engine,
             &path,
-            RcbField::Unknown("PurgeBuf".to_string()),
+            RcbField::PurgeBuf,
             RcbWriteValue::Bool(true),
             1,
         );
@@ -2080,7 +2105,7 @@ mod tests {
     fn brcb_get_resv_tms_returns_integer() {
         use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
         let (engine, path) = make_engine_with_brcb("13", TriggerOptions::DATA_CHANGED);
-        let r = handle_get_brcb_field(&engine, &path, RcbField::Unknown("ResvTms".to_string()));
+        let r = handle_get_brcb_field(&engine, &path, RcbField::ResvTms);
         match r {
             Some(AccessResult::Success(MmsData::Integer(0))) => {}
             other => panic!("ResvTms must start at Integer(0), got {:?}", other),
@@ -2091,7 +2116,7 @@ mod tests {
     fn brcb_get_time_of_entry_returns_binary_time() {
         use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
         let (engine, path) = make_engine_with_brcb("14", TriggerOptions::DATA_CHANGED);
-        let r = handle_get_brcb_field(&engine, &path, RcbField::Unknown("TimeofEntry".to_string()));
+        let r = handle_get_brcb_field(&engine, &path, RcbField::TimeOfEntry);
         match r {
             Some(AccessResult::Success(MmsData::BinaryTime(b))) => {
                 assert_eq!(b.len(), 6, "a BinaryTime must be 6 bytes");
@@ -2124,7 +2149,7 @@ mod tests {
             Some(AccessResult::Success(d)) => d,
             other => panic!("expected a value, got {other:?}"),
         };
-        let time_of_entry = || RcbField::Unknown("TimeofEntry".to_string());
+        let time_of_entry = || RcbField::TimeOfEntry;
 
         assert_eq!(
             read(RcbField::EntryId),
@@ -2188,7 +2213,7 @@ mod tests {
         let res = handle_set_brcb_field(
             &engine,
             &path,
-            RcbField::Unknown("ResvTms".to_string()),
+            RcbField::ResvTms,
             RcbWriteValue::Unsigned(30),
             1,
         );
@@ -2205,19 +2230,38 @@ mod tests {
         assert!(s.reservation_timeout.is_none());
     }
 
+    /// TimeOfEntry is never writable and is refused as read-only, like Owner.
+    #[test]
+    fn brcb_set_time_of_entry_denied() {
+        let (engine, path) = make_engine_with_brcb("23", TriggerOptions::DATA_CHANGED);
+        let res = handle_set_brcb_field(
+            &engine,
+            &path,
+            RcbField::from_name("TimeofEntry"),
+            RcbWriteValue::OctetString(vec![0; 6]),
+            1,
+        );
+        assert_eq!(res, Some(Err(DataAccessError::ObjectAccessDenied)));
+        assert_eq!(
+            handle_set_brcb_field(
+                &engine,
+                &path,
+                RcbField::from_name("TimeOfEntry"),
+                RcbWriteValue::OctetString(vec![0; 6]),
+                1,
+            ),
+            None,
+            "only the MMS component name of IEC 61850-8-1 Table 72 is recognized"
+        );
+    }
+
     /// ResvTms takes an INTEGER or an UNSIGNED from 0 to 32767; any other value is
     /// refused as invalid and any other type as inconsistent.
     #[test]
     fn brcb_resv_tms_range_and_type_are_checked_by_the_field() {
         let (engine, path) = make_engine_with_brcb("22", TriggerOptions::DATA_CHANGED);
         let write = |value: RcbWriteValue| {
-            handle_set_brcb_field(
-                &engine,
-                &path,
-                RcbField::Unknown("ResvTms".to_string()),
-                value,
-                1,
-            )
+            handle_set_brcb_field(&engine, &path, RcbField::ResvTms, value, 1)
         };
         assert_eq!(write(RcbWriteValue::Integer(32_767)), Some(Ok(())));
         assert_eq!(write(RcbWriteValue::Unsigned(30)), Some(Ok(())));
@@ -2327,10 +2371,7 @@ mod tests {
             Some(Err(DataAccessError::ObjectAccessDenied))
         );
         for (field, value) in [
-            (
-                RcbField::Unknown("ResvTms".to_string()),
-                RcbWriteValue::Unsigned(30),
-            ),
+            (RcbField::ResvTms, RcbWriteValue::Unsigned(30)),
             (RcbField::Gi, RcbWriteValue::Bool(true)),
             (RcbField::EntryId, RcbWriteValue::OctetString(vec![0; 8])),
         ] {

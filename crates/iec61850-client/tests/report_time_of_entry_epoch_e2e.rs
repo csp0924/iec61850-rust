@@ -163,7 +163,7 @@ fn round_trip_brcb_time_of_entry(time_of_entry_ms: u64) -> u64 {
         state.last_sent_time_of_entry_ms = time_of_entry_ms;
     }
 
-    let field = handle_get_brcb_field(&engine, &path, RcbField::Unknown("TimeofEntry".to_string()));
+    let field = handle_get_brcb_field(&engine, &path, RcbField::TimeOfEntry);
     let wire = match field {
         Some(AccessResult::Success(MmsData::BinaryTime(b))) => b,
         other => panic!("expected a BinaryTime for TimeofEntry, got {other:?}"),
