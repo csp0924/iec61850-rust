@@ -238,19 +238,16 @@ fn handle_get_var_access_attrs_merged(
 
 /// Finds a named child of a structure type specification.
 ///
-/// An array descends into its element type; a leaf has no children and yields
-/// `None`.
+/// The elements of an array have no names, so a flattened name ends at the
+/// array (IEC 61850-8-1 §7.3.1) and an element is reached through an
+/// alternate access instead; an array, like a leaf, yields `None`.
 fn find_child_by_name<'a>(ts: &'a MmsTypeSpec, name: &str) -> Option<&'a MmsTypeSpec> {
     match ts {
         MmsTypeSpec::Structure(children) => children
             .iter()
             .find(|c| c.name == name)
             .map(|c| &c.type_spec),
-        MmsTypeSpec::Array { inner, .. } => {
-            // A named field of an array is a field of its element type.
-            find_child_by_name(inner, name)
-        }
-        MmsTypeSpec::Leaf(_) => None,
+        _ => None,
     }
 }
 

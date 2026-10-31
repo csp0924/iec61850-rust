@@ -105,6 +105,12 @@ use crate::reporting::{NullReportSink, ReportingEngine};
 use get_name_list::{handle_get_name_list_with_extras, GetNameListResult};
 use get_var_access_attrs::GetVarAccessAttrsResult;
 use read::pdu_budget_for_access_results;
+#[cfg(any(
+    feature = "reporting",
+    feature = "control",
+    feature = "setting-groups",
+    feature = "goose-mapping"
+))]
 use write::handle_single_write;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1851,16 +1857,23 @@ fn dispatch_write(
         .iter()
         .zip(req.list_of_data.iter())
         .map(|(entry, data)| {
-            // Writes targeting an individual array element are not supported
-            // yet: the data model does not materialize per-element storage,
-            // so silently overwriting the shared template would corrupt
-            // every other element.
-            if entry.alt_access.is_some() {
-                tracing::warn!(
-                    "Write with AlternateAccess targets per-element storage which is not yet \
-                     materialized; rejecting with ObjectAccessUnsupported"
+            // Leading components name the same variable as the flattened name;
+            // what remains selects an array element of the model data.
+            let (entry_name, entry_alt_access) =
+                fold_leading_components(&entry.name, entry.alt_access.as_ref());
+            if let Some(alt) = entry_alt_access {
+                return crate::service::write::handle_single_write_with_access(
+                    ied_model,
+                    mms_model,
+                    policies,
+                    Some(handler_registry),
+                    #[cfg(feature = "setting-groups")]
+                    Some(setting_groups),
+                    conn_id,
+                    &entry_name,
+                    Some(alt),
+                    data,
                 );
-                return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
             }
             handle_write_with_routing(
                 ied_model,
@@ -1876,7 +1889,7 @@ fn dispatch_write(
                 #[cfg(feature = "goose-mapping")]
                 gocb_registry,
                 conn_id,
-                &entry.name,
+                &entry_name,
                 data,
             )
         })
@@ -1936,16 +1949,16 @@ fn dispatch_write(
         .iter()
         .zip(req.list_of_data.iter())
         .map(|(entry, data)| {
-            if entry.alt_access.is_some() {
-                return WriteOutcome::Failure(DataAccessError::ObjectAccessUnsupported);
-            }
-            handle_single_write(
+            let (entry_name, entry_alt_access) =
+                fold_leading_components(&entry.name, entry.alt_access.as_ref());
+            crate::service::write::handle_single_write_with_access(
                 ied_model,
                 mms_model,
                 policies,
                 Some(handler_registry),
                 conn_id,
-                &entry.name,
+                &entry_name,
+                entry_alt_access,
                 data,
             )
         })

@@ -42,6 +42,11 @@
 //! node beneath it, in model order, down to the leaves, else the read answers
 //! type-inconsistent; a bit string that does not fit its declared size answers
 //! object-value-invalid. The value is charged to the PDU budget as it is sent.
+//!
+//! An array, of data attributes or of sub-data-objects, reads as an MMS array
+//! of its elements (IEC 61850-8-1 §8.1.2.7). Its elements have no names, so a
+//! flattened name ends at the array, and an alternate access selects an
+//! element, optionally followed by the components of a structured element.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -57,9 +62,7 @@ use crate::mapping::{bit_string_fits, declared_bit_string_size, MmsDeviceModel};
 use iec61850_mms::mms::pdu::common::{
     AccessResult, AlternateAccess, AlternateAccessSelector, DataAccessError, MmsData, ObjectName,
 };
-use iec61850_model::{
-    DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, LogicalNode, MmsValue, FC,
-};
+use iec61850_model::{DataAttribute, DataObject, DoChild, IedModel, LogicalNode, MmsValue, FC};
 
 use crate::service::convert::{mms_data_to_mms_value, mms_value_to_mms_data};
 
@@ -88,9 +91,45 @@ impl<'a> Node<'a> {
     pub(crate) fn is_leaf(self) -> bool {
         match self {
             Node::Object(_) => false,
-            Node::Attribute(da) => {
-                da.ty != DataAttributeType::Constructed && da.children.is_empty()
+            Node::Attribute(da) => da.is_leaf() && da.children.is_empty(),
+        }
+    }
+
+    /// Reports whether the node is an array, whose children are its elements.
+    pub(crate) fn is_array(self) -> bool {
+        match self {
+            Node::Object(obj) => obj.is_array(),
+            Node::Attribute(da) => da.is_array(),
+        }
+    }
+
+    /// Element `index` of an array node, `None` for another node or an index
+    /// out of range.
+    pub(crate) fn element(self, index: u32) -> Option<Node<'a>> {
+        match self {
+            Node::Object(obj) => obj.element(index).map(Node::Object),
+            Node::Attribute(da) => da.element(index).map(Node::Attribute),
+        }
+    }
+
+    /// The value of the node made of the values of the nodes beneath it: an
+    /// array for an array node, a structure otherwise.
+    pub(crate) fn compose(self, members: Vec<MmsValue>) -> MmsValue {
+        if self.is_array() {
+            MmsValue::Array(members)
+        } else {
+            MmsValue::Structure(members)
+        }
+    }
+
+    /// The member values of `value` when it has the outer shape of the node:
+    /// an array for an array node, a structure otherwise.
+    pub(crate) fn members(self, value: &MmsValue) -> Option<&[MmsValue]> {
+        match (self.is_array(), value) {
+            (true, MmsValue::Array(members)) | (false, MmsValue::Structure(members)) => {
+                Some(members)
             }
+            _ => None,
         }
     }
 
@@ -116,8 +155,11 @@ impl<'a> Node<'a> {
 
     /// The node named `step` directly beneath this one on a path under `fc`:
     /// a sub-object of that name, an attribute of that name carrying `fc`, or
-    /// a sub-attribute of that name.
+    /// a sub-attribute of that name. The elements of an array have no names.
     pub(crate) fn child(self, fc: FC, step: &str) -> Option<Node<'a>> {
+        if self.is_array() {
+            return None;
+        }
         match self {
             Node::Object(obj) => obj.children.iter().find_map(|c| match c {
                 DoChild::SubDo(sub) if sub.name == step => Some(Node::Object(sub)),
@@ -132,9 +174,7 @@ impl<'a> Node<'a> {
     pub(crate) fn snapshot(self, fc: FC) -> MmsValue {
         match self {
             Node::Attribute(da) => da.snapshot(),
-            Node::Object(_) => {
-                MmsValue::Structure(self.children(fc).map(|c| c.snapshot(fc)).collect())
-            }
+            Node::Object(_) => self.compose(self.children(fc).map(|c| c.snapshot(fc)).collect()),
         }
     }
 }
@@ -379,7 +419,8 @@ fn handler_value(
     Ok(mms_value_to_mms_data(&value))
 }
 
-/// Checks a handler value against the shape of `node` under `fc`.
+/// Checks a handler value against the shape of `node` under `fc`; an array
+/// node takes an array of its elements.
 fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), DataAccessError> {
     if node.is_leaf() {
         if let (Node::Attribute(da), MmsValue::BitString { padding, data }) = (node, value) {
@@ -391,7 +432,7 @@ fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), D
         }
         return Ok(());
     }
-    let MmsValue::Structure(members) = value else {
+    let Some(members) = node.members(value) else {
         return Err(DataAccessError::TypeInconsistent);
     };
     let mut children = node.children(fc);
@@ -612,7 +653,11 @@ fn expand_do_for_fc(
     if children.is_empty() {
         return Ok(None);
     }
-    let st = MmsData::Structure(children);
+    let st = if do_node.is_array() {
+        MmsData::Array(children)
+    } else {
+        MmsData::Structure(children)
+    };
     // The children are already charged; only the wrapping tag and length of
     // the structure itself remain.
     let outer = st.estimated_encoded_size() - children_inner_size_sum(&st);
@@ -856,10 +901,15 @@ fn lookup_domain_specific_value(
     let mut ancestors: Vec<Node<'_>> = vec![Node::Object(do_node)];
     while next < parts.len() {
         let step = parts[next];
-        let child = current_do.children.iter().find(|c| match c {
-            DoChild::SubDo(sub) => sub.name == step,
-            DoChild::Da(da) => da.name == step && da.fc == target_fc,
-        });
+        // The elements of an array sub-object have no names.
+        let child = current_do
+            .children
+            .iter()
+            .filter(|_| !current_do.is_array())
+            .find(|c| match c {
+                DoChild::SubDo(sub) => sub.name == step,
+                DoChild::Da(da) => da.name == step && da.fc == target_fc,
+            });
         match child {
             Some(DoChild::SubDo(sub)) => {
                 current_do = sub;
@@ -892,19 +942,39 @@ fn lookup_domain_specific_value(
         Some(da) => da,
         None => {
             // The path stops on a sub-data-object, which expands under the
-            // constraint exactly as a data object does. It carries no array
-            // shape, so alternate access cannot apply to it.
-            if alt_access.is_some() {
-                tracing::warn!(
-                    domain = domain,
-                    item_id = item_id,
-                    "alternate-access on a path that expands a sub-data-object, answering type-inconsistent"
-                );
-                return LookupResult::Result(AccessResult::Failure(
-                    DataAccessError::TypeInconsistent,
-                ));
-            }
+            // constraint exactly as a data object does. Only an array of
+            // sub-data-objects has elements an alternate access can select.
             let target = Node::Object(current_do);
+            if let Some(alt) = alt_access {
+                if !current_do.is_array() {
+                    tracing::warn!(
+                        domain = domain,
+                        item_id = item_id,
+                        "alternate-access on a path that expands a sub-data-object, answering type-inconsistent"
+                    );
+                    return LookupResult::Result(AccessResult::Failure(
+                        DataAccessError::TypeInconsistent,
+                    ));
+                }
+                let decided = scope
+                    .decide_from_above(target_fc, item_id, &ancestors, target)
+                    .unwrap_or_else(|| {
+                        let value = mms_value_to_mms_data(&target.snapshot(target_fc));
+                        scope.apply(target, target_fc, item_id, value)
+                    });
+                let access = match decided {
+                    Err(e) => AccessResult::Failure(e),
+                    Ok(data) => {
+                        select_element(target, target_fc, &mms_data_to_mms_value(&data), alt)
+                    }
+                };
+                if let AccessResult::Success(ref data) = access {
+                    if !budget.consume(data.estimated_encoded_size()) {
+                        return LookupResult::OverBudget;
+                    }
+                }
+                return LookupResult::Result(access);
+            }
             if let Some(decided) = scope.decide_from_above(target_fc, item_id, &ancestors, target) {
                 return charged_verdict(decided, 0, budget);
             }
@@ -1269,123 +1339,79 @@ fn select_array_index(data: MmsData, index: u32) -> Result<MmsData, DataAccessEr
 }
 
 /// Apply an `AlternateAccess` selector against the model-typed `DataAttribute`
-/// reached by the read lookup, using the DA's child template to map component
-/// names to ordinal positions inside the per-element `MmsValue::Structure`.
+/// reached by the read lookup, whose value is `value`.
 ///
-/// Contract:
-/// - `value` must be a snapshot of `da.value` taken under the same RwLock
-///   guard the caller has already released; passing both avoids taking the
-///   lock a second time.
-/// - If `value` is not `MmsValue::Array`, AlternateAccess is rejected with
-///   `TypeInconsistent`, so a client sees one consistent outcome for element
-///   access on a non-array.
-/// - `IndexComponent { component }` requires the selected element to be a
-///   `MmsValue::Structure` whose ordinal layout matches `da.children`. Each
-///   `$`-separated segment is looked up by name in the current template
-///   slice; a match descends into the corresponding field of the value tree,
-///   and into that child's `children` for the next segment.
-///
-/// Failure mapping:
-/// - Index out of range → `TypeInconsistent` (consistent with
-///   `apply_alt_access`).
-/// - Component descends into a non-Structure → `ObjectAccessUnsupported`.
-/// - Component name not in the template → `ObjectNonExistent`.
-/// - Template/value ordinal mismatch (corrupt model) → `TypeInconsistent`.
+/// `da` must be an array and `value` an `MmsValue::Array`, else the access
+/// answers `TypeInconsistent`. An index selects one element; components after
+/// it are looked up by name among the sub-attributes of the element and
+/// select the matching member of its structure. An index out of range
+/// answers `TypeInconsistent`, a component the element does not hold
+/// `ObjectNonExistent`, and a selector other than an index, with or without
+/// components, `ObjectAccessUnsupported`.
 pub fn apply_alt_access_typed(
     da: &DataAttribute,
     value: &MmsValue,
     alt: &AlternateAccess,
 ) -> AccessResult {
-    let elems = match value {
-        MmsValue::Array(items) => items.as_slice(),
-        other => {
-            tracing::warn!(
-                da = %da.name,
-                got = other.type_name(),
-                "alternate-access: the target data attribute is not an array"
-            );
-            return AccessResult::Failure(DataAccessError::TypeInconsistent);
-        }
-    };
-    let (index, component_opt) = match &alt.selector {
+    select_element(Node::Attribute(da), da.fc, value, alt)
+}
+
+/// Selects, in `value`, the value of an array node `node` under `fc`, the
+/// element an alternate access names and then the member its components name
+/// below the element.
+///
+/// An index out of range, an access on a node that is not an array or a value
+/// of another shape answers `TypeInconsistent`; a component the element does
+/// not hold, or one past an array, which has no named members,
+/// `ObjectNonExistent`; a selector other than an index, with or without
+/// components, `ObjectAccessUnsupported`.
+pub(crate) fn select_element(
+    node: Node<'_>,
+    fc: FC,
+    value: &MmsValue,
+    alt: &AlternateAccess,
+) -> AccessResult {
+    let (index, component) = match &alt.selector {
         AlternateAccessSelector::Index(i) => (*i, None),
         AlternateAccessSelector::IndexComponent { index, component } => {
             (*index, Some(component.as_str()))
         }
         _ => {
             tracing::warn!(
-                da = %da.name,
+                node = node.name(),
                 "alternate-access: only an index selection applies here; leading components are resolved by name before the read"
             );
             return AccessResult::Failure(DataAccessError::ObjectAccessUnsupported);
         }
     };
-    let i = index as usize;
-    if i >= elems.len() {
+    let (Some(element), Some(members)) = (node.element(index), node.members(value)) else {
         tracing::warn!(
-            da = %da.name,
+            node = node.name(),
             index,
-            array_len = elems.len(),
-            "alternate-access: index out of range"
+            "alternate-access: the target is not an array or holds no such element"
         );
         return AccessResult::Failure(DataAccessError::TypeInconsistent);
-    }
-    let element = &elems[i];
-    let leaf = match component_opt {
-        None => element.clone(),
-        Some(component) => match walk_component_path(da.children.as_slice(), element, component) {
-            Ok(v) => v,
-            Err(e) => return AccessResult::Failure(e),
-        },
     };
-    AccessResult::Success(mms_value_to_mms_data(&leaf))
-}
-
-/// Walk a `$`-separated component path against a value tree, using a parallel
-/// template slice to resolve names to ordinal positions inside the value's
-/// `MmsValue::Structure`. Returns the leaf value at the end of the path.
-fn walk_component_path(
-    template: &[DataAttribute],
-    value: &MmsValue,
-    component: &str,
-) -> Result<MmsValue, DataAccessError> {
-    let mut current_value: &MmsValue = value;
-    let mut current_template: &[DataAttribute] = template;
-    for seg in component.split('$') {
-        let fields = match current_value {
-            MmsValue::Structure(items) => items.as_slice(),
-            other => {
-                tracing::warn!(
-                    seg = %seg,
-                    got = other.type_name(),
-                    "alternate-access component: cannot descend into a non-structure value"
-                );
-                return Err(DataAccessError::ObjectAccessUnsupported);
-            }
+    let Some(mut selected) = usize::try_from(index).ok().and_then(|i| members.get(i)) else {
+        return AccessResult::Failure(DataAccessError::TypeInconsistent);
+    };
+    let mut current = element;
+    for seg in component.into_iter().flat_map(|c| c.split('$')) {
+        let found = current
+            .children(fc)
+            .enumerate()
+            .find(|(_, child)| !current.is_array() && child.name() == seg);
+        let Some((ord, child)) = found else {
+            tracing::warn!(seg, "alternate-access component: no member of that name");
+            return AccessResult::Failure(DataAccessError::ObjectNonExistent);
         };
-        let ord = match current_template.iter().position(|c| c.name == seg) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    seg = %seg,
-                    "alternate-access component: name not found in the template"
-                );
-                return Err(DataAccessError::ObjectNonExistent);
-            }
+        let Some(member) = current.members(selected).and_then(|m| m.get(ord)) else {
+            return AccessResult::Failure(DataAccessError::TypeInconsistent);
         };
-        if ord >= fields.len() {
-            tracing::warn!(
-                seg = %seg,
-                ord,
-                fields_len = fields.len(),
-                "alternate-access component: template and value disagree on ordinal layout"
-            );
-            return Err(DataAccessError::TypeInconsistent);
-        }
-        current_value = &fields[ord];
-        current_template = current_template[ord].children.as_slice();
+        selected = member;
+        current = child;
     }
-    Ok(current_value.clone())
+    AccessResult::Success(mms_value_to_mms_data(selected))
 }
 
 fn select_component_path(data: MmsData, component_path: &str) -> Result<MmsData, DataAccessError> {

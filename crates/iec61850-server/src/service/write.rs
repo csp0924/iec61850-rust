@@ -55,6 +55,13 @@
 //! constraint in which the target is replaced by the written value: a refusal
 //! refuses the write, and taking the value over leaves the cache alone,
 //! exactly as for a write of the ancestor itself.
+//!
+//! An array, of data attributes or of sub-data-objects, takes an MMS array of
+//! exactly its element count (IEC 61850-8-1 §8.1.2.7), another count or shape
+//! answering `TypeInconsistent`. One element is written through an alternate
+//! access that selects it by index, optionally followed by the components of
+//! a structured element; the elements of an array have no names, so the
+//! handlers on the array and above it decide such a write.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -75,7 +82,9 @@ use crate::service::read::{leading_segments, object_has_fc, Node};
 // Writing under FC SE belongs to the setting-group subsystem.
 #[cfg(feature = "setting-groups")]
 use crate::setting_groups::SettingGroupRegistry;
-use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName, WriteOutcome};
+use iec61850_mms::mms::pdu::common::{
+    AlternateAccess, AlternateAccessSelector, DataAccessError, MmsData, ObjectName, WriteOutcome,
+};
 use iec61850_model::{DataAttribute, IedModel, FC};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +157,37 @@ pub fn handle_single_write(
     #[cfg(feature = "setting-groups")] setting_groups: Option<&SettingGroupRegistry>,
     conn_id: u64,
     name: &ObjectName,
+    data: &MmsData,
+) -> WriteOutcome {
+    handle_single_write_with_access(
+        ied_model,
+        mms_model,
+        policies,
+        handler_registry,
+        #[cfg(feature = "setting-groups")]
+        setting_groups,
+        conn_id,
+        name,
+        None,
+        data,
+    )
+}
+
+/// Writes one value to one object name, or to the array element `alt_access`
+/// selects below it, as [`handle_single_write`] does.
+///
+/// `alt_access`, when present, starts with an index: the components that may
+/// lead an alternate access are folded into the name beforehand.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_single_write_with_access(
+    ied_model: &IedModel,
+    mms_model: &MmsDeviceModel,
+    policies: &WriteAccessPolicies,
+    handler_registry: Option<&HandlerRegistry>,
+    #[cfg(feature = "setting-groups")] setting_groups: Option<&SettingGroupRegistry>,
+    conn_id: u64,
+    name: &ObjectName,
+    alt_access: Option<&AlternateAccess>,
     data: &MmsData,
 ) -> WriteOutcome {
     let (domain, item_id) = match name {
@@ -230,6 +270,7 @@ pub fn handle_single_write(
                 ln_name,
                 fc,
                 object_path,
+                alt_access,
                 data,
                 handler_registry,
                 conn_id,
@@ -288,6 +329,7 @@ pub fn handle_single_write(
                 ln_name,
                 FC::Se,
                 object_path,
+                alt_access,
                 data,
                 handler_registry,
                 conn_id,
@@ -307,6 +349,7 @@ fn write_to_target(
     ln_name: &str,
     fc: FC,
     object_path: &[&str],
+    alt_access: Option<&AlternateAccess>,
     data: &MmsData,
     handler_registry: Option<&HandlerRegistry>,
     conn_id: u64,
@@ -391,6 +434,28 @@ fn write_to_target(
         return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
     };
 
+    // The steps below the data object to the target, as handlers see them:
+    // the names of the path, then the element and components an alternate
+    // access selects. Only the nodes the path names have a handler path.
+    let named = object_path.len();
+    let mut steps: Vec<Step<'_>> = object_path[1..].iter().map(|s| Step::Name(s)).collect();
+    let (target, spec) = match alt_access {
+        None => (target, spec),
+        Some(alt) => match select_element_target(target, fc, spec, alt, &mut ancestors, &mut steps)
+        {
+            Ok(selected) => selected,
+            Err(e) => {
+                tracing::warn!(
+                    domain = domain,
+                    item_id = item_id,
+                    ?e,
+                    "write: the alternate access selects no element of an array"
+                );
+                return WriteOutcome::Failure(e);
+            }
+        },
+    };
+
     // Every leaf is checked, and its value fixed, before any handler runs.
     let new_value = match check_value(target, fc, spec, data) {
         Ok(v) => v,
@@ -413,12 +478,12 @@ fn write_to_target(
     // write of the whole ancestor: it sees the ancestor's current value with
     // the target replaced by the written one, outermost ancestor first.
     if !handlers.is_empty() {
-        for (depth, ancestor) in ancestors.iter().enumerate() {
+        for (depth, ancestor) in ancestors.iter().enumerate().take(named) {
             let path = leading_segments(item_id, depth + 3);
             let Some(handler) = handler_at(&handlers, path) else {
                 continue;
             };
-            let merged = merged_value(*ancestor, fc, &object_path[depth + 1..], new_value.clone());
+            let merged = merged_value(*ancestor, fc, &steps[depth..], new_value.clone());
             match consult_write_handler(handler, path, item_id, fc, conn_id, &merged) {
                 HandlerWriteOutcome::Reject(e) => return WriteOutcome::Failure(e),
                 // The handler takes the whole ancestor over, so no cached value
@@ -433,7 +498,7 @@ fn write_to_target(
     // node beneath it down to the leaves. Paths are needed only to find
     // handlers.
     let mut nodes: Vec<NodeWrite<'_, '_>> = Vec::new();
-    let target_path = (!handlers.is_empty()).then(|| item_id.to_string());
+    let target_path = (!handlers.is_empty() && alt_access.is_none()).then(|| item_id.to_string());
     collect_node_writes(target, fc, &new_value, target_path, &mut nodes);
 
     // The handlers run only after the policy and value checks have passed, and
@@ -502,23 +567,88 @@ fn write_to_target(
     WriteOutcome::Success
 }
 
-/// Returns the current value of `node` with the node `steps` names below it
-/// replaced by `new_value`.
+/// One step down from a node: to the member of that name, or to an element of
+/// an array.
+#[derive(Debug, Clone, Copy)]
+enum Step<'s> {
+    Name(&'s str),
+    Index(u32),
+}
+
+/// Narrows the target of a write to the element of the array `node` that
+/// `alt` selects by index, and to the member its components name below the
+/// element, extending `ancestors` and `steps` down to it. Returns the new
+/// target with its declared type.
+///
+/// An index on a node that is not an array, or out of range, answers
+/// `TypeInconsistent`, a component the element does not hold
+/// `ObjectNonExistent`, and a selector that does not start with an index
+/// `ObjectAccessUnsupported`.
+fn select_element_target<'a, 'm, 's>(
+    node: Node<'a>,
+    fc: FC,
+    spec: &'m MmsTypeSpec,
+    alt: &'s AlternateAccess,
+    ancestors: &mut Vec<Node<'a>>,
+    steps: &mut Vec<Step<'s>>,
+) -> Result<(Node<'a>, &'m MmsTypeSpec), DataAccessError> {
+    let (index, component) = match &alt.selector {
+        AlternateAccessSelector::Index(i) => (*i, None),
+        AlternateAccessSelector::IndexComponent { index, component } => {
+            (*index, Some(component.as_str()))
+        }
+        _ => return Err(DataAccessError::ObjectAccessUnsupported),
+    };
+    let (Some(element), MmsTypeSpec::Array { inner, .. }) = (node.element(index), spec) else {
+        return Err(DataAccessError::TypeInconsistent);
+    };
+    ancestors.push(node);
+    steps.push(Step::Index(index));
+    let mut current = element;
+    let mut spec: &MmsTypeSpec = inner;
+    for seg in component.into_iter().flat_map(|c| c.split('$')) {
+        let child = current
+            .child(fc, seg)
+            .ok_or(DataAccessError::ObjectNonExistent)?;
+        let MmsTypeSpec::Structure(members) = spec else {
+            return Err(DataAccessError::ObjectNonExistent);
+        };
+        spec = &members
+            .iter()
+            .find(|m| m.name == seg)
+            .ok_or(DataAccessError::ObjectNonExistent)?
+            .type_spec;
+        ancestors.push(current);
+        steps.push(Step::Name(seg));
+        current = child;
+    }
+    Ok((current, spec))
+}
+
+/// Returns the current value of `node` with the node `steps` leads to below
+/// it replaced by `new_value`.
 fn merged_value(
     node: Node<'_>,
     fc: FC,
-    steps: &[&str],
+    steps: &[Step<'_>],
     new_value: iec61850_model::MmsValue,
 ) -> iec61850_model::MmsValue {
     let Some((step, rest)) = steps.split_first() else {
         return new_value;
     };
     let mut new_value = Some(new_value);
-    iec61850_model::MmsValue::Structure(
+    node.compose(
         node.children(fc)
-            .map(|child| match new_value.take_if(|_| child.name() == *step) {
-                Some(v) => merged_value(child, fc, rest, v),
-                None => child.snapshot(fc),
+            .enumerate()
+            .map(|(i, child)| {
+                let hit = match step {
+                    Step::Name(name) => !node.is_array() && child.name() == *name,
+                    Step::Index(index) => node.is_array() && u32::try_from(i) == Ok(*index),
+                };
+                match new_value.take_if(|_| hit) {
+                    Some(v) => merged_value(child, fc, rest, v),
+                    None => child.snapshot(fc),
+                }
             })
             .collect(),
     )
@@ -556,9 +686,14 @@ fn collect_node_writes<'a, 'v>(
         end: index + 1,
     });
     if !node.is_leaf() {
-        if let iec61850_model::MmsValue::Structure(members) = value {
+        if let Some(members) = node.members(value) {
+            // The elements of an array have no names, so no handler path.
+            let named = !node.is_array();
             for (child, member) in node.children(fc).zip(members) {
-                let child_path = path.as_ref().map(|p| format!("{p}${}", child.name()));
+                let child_path = path
+                    .as_ref()
+                    .filter(|_| named)
+                    .map(|p| format!("{p}${}", child.name()));
                 collect_node_writes(child, fc, member, child_path, out);
             }
         }
@@ -572,15 +707,33 @@ fn collect_node_writes<'a, 'v>(
 /// A data object takes a structure with one member per node it holds under
 /// `fc`, and a constructed attribute one member per sub-attribute; another
 /// member count, or a scalar for a data object, is type-inconsistent, a scalar
-/// for a constructed attribute object-value-invalid. A leaf takes a value of
-/// the variant it holds, else object-value-invalid, then
-/// [`check_declared_type`] applies.
+/// for a constructed attribute object-value-invalid. An array takes an array
+/// of exactly its element count, else type-inconsistent, each element checked
+/// against the element type. A leaf takes a value of the variant it holds,
+/// else object-value-invalid, then [`check_declared_type`] applies.
 fn check_value(
     node: Node<'_>,
     fc: FC,
     spec: &MmsTypeSpec,
     data: &MmsData,
 ) -> Result<iec61850_model::MmsValue, DataAccessError> {
+    if node.is_array() {
+        let (MmsData::Array(members), MmsTypeSpec::Array { count, inner }) = (data, spec) else {
+            return Err(DataAccessError::TypeInconsistent);
+        };
+        if u32::try_from(members.len()) != Ok(*count) {
+            return Err(DataAccessError::TypeInconsistent);
+        }
+        let values = node
+            .children(fc)
+            .zip(members)
+            .map(|(element, member)| check_value(element, fc, inner, member))
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.len() != members.len() {
+            return Err(DataAccessError::TypeInconsistent);
+        }
+        return Ok(iec61850_model::MmsValue::Array(values));
+    }
     if let Node::Attribute(da) = node {
         if node.is_leaf() {
             if !same_data_variant(data, &da.snapshot()) {
@@ -596,8 +749,7 @@ fn check_value(
         });
     };
     let MmsTypeSpec::Structure(member_specs) = spec else {
-        // An array of data objects is not written through this path.
-        return Err(DataAccessError::ObjectAccessUnsupported);
+        return Err(DataAccessError::TypeInconsistent);
     };
     if members.len() != member_specs.len() {
         return Err(DataAccessError::TypeInconsistent);

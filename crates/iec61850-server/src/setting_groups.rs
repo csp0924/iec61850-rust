@@ -48,9 +48,7 @@ use crate::connection::ConnectionId;
 use iec61850_mms::mms::pdu::common::{
     AccessResult, DataAccessError, MmsData, ObjectName, WriteOutcome,
 };
-use iec61850_model::{
-    DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, MmsValue, FC,
-};
+use iec61850_model::{DataAttribute, DataObject, DoChild, IedModel, MmsValue, FC};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -912,21 +910,23 @@ impl SettingGroupRegistry {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Collects the leaf settings below `dobj`, pairing each FC=SG attribute with
-/// the FC=SE attribute of the same name and type.
+/// the FC=SE attribute of the same name, type and element count.
 fn collect_settings(dobj: &DataObject, num_of_sg: u8, out: &mut Vec<SettingLeaf>) {
+    let same_shape =
+        |a: &DataAttribute, b: &DataAttribute| a.ty == b.ty && a.array_count == b.array_count;
     for child in &dobj.children {
         match child {
             DoChild::SubDo(sub) => collect_settings(sub, num_of_sg, out),
             DoChild::Da(sg) if sg.fc == FC::Sg => {
                 let se = dobj
                     .children_with_fc(FC::Se)
-                    .find(|se| se.name == sg.name && se.ty == sg.ty);
+                    .find(|se| se.name == sg.name && same_shape(se, sg));
                 collect_leaves(Some(sg), se, num_of_sg, out);
             }
             DoChild::Da(se) if se.fc == FC::Se => {
                 let paired = dobj
                     .children_with_fc(FC::Sg)
-                    .any(|sg| sg.name == se.name && sg.ty == se.ty);
+                    .any(|sg| sg.name == se.name && same_shape(sg, se));
                 if !paired {
                     collect_leaves(None, Some(se), num_of_sg, out);
                 }
@@ -937,7 +937,8 @@ fn collect_settings(dobj: &DataObject, num_of_sg: u8, out: &mut Vec<SettingLeaf>
 }
 
 /// Collects the leaves of one setting attribute, walking the FC=SG and the
-/// FC=SE tree side by side.
+/// FC=SE tree side by side: the elements of an array by index, the
+/// sub-attributes of a constructed attribute by name.
 fn collect_leaves(
     active: Option<&DataAttribute>,
     edit: Option<&DataAttribute>,
@@ -947,12 +948,22 @@ fn collect_leaves(
     let Some(first) = active.or(edit) else {
         return;
     };
-    if first.ty == DataAttributeType::Constructed {
+    if first.is_array() {
+        for index in (0..first.children.len()).filter_map(|i| u32::try_from(i).ok()) {
+            let a = active.and_then(|a| a.element(index));
+            let e = edit
+                .and_then(|e| e.element(index))
+                .filter(|e| a.is_none_or(|a| a.ty == e.ty));
+            collect_leaves(a, e, num_of_sg, out);
+        }
+        return;
+    }
+    if !first.is_leaf() {
         for c in &first.children {
             let a = active.and_then(|a| a.child_by_name(&c.name));
             let e = edit
                 .and_then(|e| e.child_by_name(&c.name))
-                .filter(|e| a.is_none_or(|a| a.ty == e.ty));
+                .filter(|e| a.is_none_or(|a| a.ty == e.ty && a.array_count == e.array_count));
             collect_leaves(a, e, num_of_sg, out);
         }
         return;
@@ -1211,6 +1222,7 @@ fn unsigned_to_u8(data: &MmsData) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iec61850_model::DataAttributeType;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     fn rt_three_sg() -> SettingGroupRuntime {

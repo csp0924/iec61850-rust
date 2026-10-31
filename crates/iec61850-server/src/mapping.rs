@@ -118,7 +118,8 @@ pub enum MmsTypeSpec {
     Leaf(MmsLeafType),
     /// A structure whose members keep the order the model declares.
     Structure(Vec<NamedVariableSpec>),
-    /// An array, produced by a data attribute with an element count.
+    /// An array, produced by a data attribute or sub-data-object with an
+    /// element count (IEC 61850-8-1 §8.1.2.7).
     Array {
         /// Number of elements.
         count: u32,
@@ -464,16 +465,15 @@ fn do_has_fc(d: &DataObject, fc: FC) -> bool {
 }
 
 /// Builds the structure of a data object, keeping only the attributes and
-/// sub-objects that carry one functional constraint.
+/// sub-objects that carry one functional constraint; an array of
+/// sub-data-objects is an array of that structure.
 fn build_do_type_spec(d: &DataObject, fc: FC) -> Result<MmsTypeSpec> {
-    let inner = build_do_struct_for_fc(d, fc)?;
-    if let Some(count) = d.array_count {
-        Ok(MmsTypeSpec::Array {
+    match (d.array_count, d.element(0)) {
+        (Some(count), Some(element)) => Ok(MmsTypeSpec::Array {
             count,
-            inner: Box::new(inner),
-        })
-    } else {
-        Ok(inner)
+            inner: Box::new(build_do_struct_for_fc(element, fc)?),
+        }),
+        _ => build_do_struct_for_fc(d, fc),
     }
 }
 
@@ -501,8 +501,15 @@ fn build_do_struct_for_fc(d: &DataObject, fc: FC) -> Result<MmsTypeSpec> {
     Ok(MmsTypeSpec::Structure(children))
 }
 
-/// Maps a data attribute onto a type specification, per IEC 61850-8-1 §5.2.
+/// Maps a data attribute onto a type specification, per IEC 61850-8-1 §5.2;
+/// an array maps onto an MMS array of its element type (§8.1.2.7).
 fn build_da_type_spec(da: &DataAttribute) -> Result<MmsTypeSpec> {
+    if let (Some(count), Some(element)) = (da.array_count, da.element(0)) {
+        return Ok(MmsTypeSpec::Array {
+            count,
+            inner: Box::new(build_da_type_spec(element)?),
+        });
+    }
     if da.ty == DataAttributeType::Constructed {
         // Sub-attributes keep the order the model declares; a client depends on it.
         let children = da
@@ -1071,15 +1078,57 @@ mod tests {
             TrgOps::default(),
             MmsValue::Boolean(false),
         );
-        let mut do_node = DataObject::new("Ind".to_string(), vec![DoChild::Da(inner_da)]);
-        do_node.array_count = Some(3);
+        let element = DataObject::new("Ind".to_string(), vec![DoChild::Da(inner_da)]);
+        let do_node = DataObject::array(element, 3).unwrap();
         let spec = build_do_type_spec(&do_node, FC::St).unwrap();
         match spec {
             MmsTypeSpec::Array { count, inner } => {
                 assert_eq!(count, 3);
-                assert!(matches!(*inner, MmsTypeSpec::Structure(_)));
+                assert!(matches!(*inner, MmsTypeSpec::Structure(ref m) if m.len() == 1));
             }
             other => panic!("an array data object must map to an array, got {:?}", other),
+        }
+    }
+
+    /// An array data attribute maps onto an MMS array of its element type,
+    /// basic or constructed (IEC 61850-8-1 §8.1.2.7).
+    #[test]
+    fn array_da_wraps_its_element_type() {
+        let leaf = DataAttribute::new(
+            "vals",
+            FC::Sp,
+            DataAttributeType::Int32,
+            TrgOps::default(),
+            MmsValue::Integer(0),
+        );
+        let spec = build_da_type_spec(&DataAttribute::array(leaf, 4).unwrap()).unwrap();
+        assert_eq!(
+            spec,
+            MmsTypeSpec::Array {
+                count: 4,
+                inner: Box::new(MmsTypeSpec::Leaf(MmsLeafType::Integer(32))),
+            }
+        );
+        let point = DataAttribute::constructed(
+            "pts",
+            FC::Sp,
+            vec![DataAttribute::new(
+                "x",
+                FC::Sp,
+                DataAttributeType::Float32,
+                TrgOps::default(),
+                MmsValue::Float32(0.0),
+            )],
+        );
+        match build_da_type_spec(&DataAttribute::array(point, 2).unwrap()).unwrap() {
+            MmsTypeSpec::Array { count: 2, inner } => match *inner {
+                MmsTypeSpec::Structure(members) => {
+                    assert_eq!(members.len(), 1);
+                    assert_eq!(members[0].name, "x");
+                }
+                other => panic!("the element must be a structure, got {other:?}"),
+            },
+            other => panic!("an array attribute must map to an array, got {other:?}"),
         }
     }
 
