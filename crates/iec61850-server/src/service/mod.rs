@@ -1172,6 +1172,8 @@ fn dispatch_read(
 
     let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
     for entry in &entries {
+        let (entry_name, entry_alt_access) =
+            fold_leading_components(&entry.name, entry.alt_access.as_ref());
         #[cfg(any(
             feature = "reporting",
             feature = "logging",
@@ -1190,8 +1192,8 @@ fn dispatch_read(
             gocb_registry,
             #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
             &route,
-            &entry.name,
-            entry.alt_access.as_ref(),
+            &entry_name,
+            entry_alt_access,
             remaining_budget,
         );
         #[cfg(not(any(
@@ -1203,7 +1205,7 @@ fn dispatch_read(
         let ln_read: Option<ReadRoutingOutcome> = None;
         let outcome = match ln_read {
             Some(outcome) => outcome,
-            None => route(&entry.name, entry.alt_access.as_ref(), remaining_budget),
+            None => route(&entry_name, entry_alt_access, remaining_budget),
         };
         match outcome {
             ReadRoutingOutcome::Result(r) => {
@@ -1401,11 +1403,13 @@ fn dispatch_read(
     let mut remaining = read_results_budget(&req, negotiated_max_pdu_size);
     let mut results: Vec<AccessResult> = Vec::with_capacity(entries.len());
     for entry in &entries {
+        let (entry_name, entry_alt_access) =
+            fold_leading_components(&entry.name, entry.alt_access.as_ref());
         match handle_single_read_with_budget(
             ied_model,
             mms_model,
-            &entry.name,
-            entry.alt_access.as_ref(),
+            &entry_name,
+            entry_alt_access,
             remaining,
         ) {
             LookupResult::Result(r) => {
@@ -1448,13 +1452,54 @@ enum ReadRoutingOutcome {
     OverBudget,
 }
 
+/// Folds the component selections that lead an alternate access into the
+/// object name, so that `X` read with the components `c1`, `c2` becomes `X$c1$c2`,
+/// which names the same variable (IEC 61850-8-1 §7.3.1). The alternate access
+/// that remains after them, one that starts with an array index, is returned
+/// with the name; `None` when the access was a component chain alone.
+fn fold_leading_components<'a>(
+    name: &'a iec61850_mms::mms::pdu::common::ObjectName,
+    alt_access: Option<&'a iec61850_mms::mms::pdu::common::AlternateAccess>,
+) -> (
+    alloc::borrow::Cow<'a, iec61850_mms::mms::pdu::common::ObjectName>,
+    Option<&'a iec61850_mms::mms::pdu::common::AlternateAccess>,
+) {
+    use alloc::borrow::Cow;
+    use iec61850_mms::mms::pdu::common::ObjectName;
+    let Some(access) = alt_access else {
+        return (Cow::Borrowed(name), None);
+    };
+    let (components, rest) = access.leading_components();
+    if components.is_empty() {
+        return (Cow::Borrowed(name), alt_access);
+    }
+    let extend = |base: &str| {
+        let mut flat = String::from(base);
+        for component in &components {
+            flat.push('$');
+            flat.push_str(component);
+        }
+        flat
+    };
+    let folded = match name {
+        ObjectName::DomainSpecific { domain_id, item_id } => ObjectName::DomainSpecific {
+            domain_id: domain_id.clone(),
+            item_id: extend(item_id),
+        },
+        ObjectName::VmdSpecific(item) => ObjectName::VmdSpecific(extend(item)),
+        ObjectName::AaSpecific(item) => ObjectName::AaSpecific(extend(item)),
+    };
+    (Cow::Owned(folded), rest)
+}
+
 /// Reads an object name as a GOOSE control block path.
 ///
-/// `Some(Success(data))` means the `GO$` path resolved to a known attribute.
-/// `Some(Failure(ObjectNonExistent))` means the path is shaped like a control
-/// block path but names no block or no known attribute.
-/// `Some(Failure(TypeInconsistent))` means AlternateAccess was requested, which
-/// a control block does not support. `None` means the name is not a control
+/// `Some(Success(data))` means the `GO$` path resolved to a known component or
+/// a member below one. `Some(Failure(ObjectNonExistent))` means the path is
+/// shaped like a control block path but names no block or no known component.
+/// `Some(Failure(TypeInconsistent))` means an array index was requested, which
+/// no component of a control block accepts; component selections reach this
+/// route already folded into the name. `None` means the name is not a control
 /// block path and the caller continues with its other routes.
 ///
 /// The read path tries this before the setting group and reporting routes.
@@ -1475,7 +1520,7 @@ fn try_read_gocb(
         tracing::warn!(
             domain,
             item,
-            "read of a GOOSE control block with alternate-access: control blocks are not arrays, rejecting"
+            "read of a GOOSE control block with an array index: no component is an array, rejecting"
         );
         return Some(AccessResult::Failure(DataAccessError::TypeInconsistent));
     }

@@ -9,14 +9,24 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use iec61850_goose::frame::{VlanPriority, VlanTag};
 use iec61850_goose::publisher::CommParameters;
 use iec61850_goose::GoosePublisher;
-use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder, MmsConnection};
+use iec61850_mms::mms::pdu::common::{
+    AccessResult, AlternateAccess, DataAccessError, ListOfVariableEntry, ObjectName,
+    VariableAccessSpecification,
+};
 use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
+use iec61850_mms::mms::pdu::read::{encode_confirmed_read_request, ReadRequest, ReadResponse};
 use iec61850_mms::mms::pdu::type_specification::TypeSpecification;
+use iec61850_mms::mms::pdu::MmsPdu;
 use iec61850_mms::mms::MmsData;
-use iec61850_model::{IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
+use iec61850_model::{
+    DataAttribute, DataAttributeType, DataObjectBuilder, IedModel, IedModelBuilder,
+    LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
+};
 use iec61850_server::goose_mapping::GoCBHandle;
 use iec61850_server::lifecycle::ServerHandle;
 use iec61850_server::{IedServer, IedServerConfig};
@@ -24,8 +34,23 @@ use iec61850_server::{IedServer, IedServerConfig};
 const DOMAIN: &str = "TESTLD0";
 const GOCB_ITEM: &str = "LLN0$GO$gcb01";
 
+/// LD0 with LLN0 holding `Mod.stVal`.
 fn build_model() -> Arc<IedModel> {
-    let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
+    let lln0 = LogicalNodeBuilder::lln0()
+        .add_do(
+            DataObjectBuilder::scalar("Mod")
+                .add_da_node(DataAttribute::new(
+                    "stVal",
+                    FC::St,
+                    DataAttributeType::Enumerated,
+                    TrgOps::default(),
+                    MmsValue::Integer(1),
+                ))
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
     let ld = LogicalDeviceBuilder::new("LD0")
         .add_ln(lln0)
         .build()
@@ -515,7 +540,6 @@ async fn dat_set_write_increments_conf_rev_even_when_unchanged() {
     use iec61850_client::connection::IedConnection;
     use iec61850_client::gocb::GoCBValuesWrite;
     use iec61850_client::ClientError;
-    use iec61850_mms::mms::pdu::DataAccessError;
 
     let (handle, publisher) = start_server(IedServerConfig::default()).await;
     let conn = IedConnection::new();
@@ -577,7 +601,6 @@ async fn dat_set_write_increments_conf_rev_even_when_unchanged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ed2_1_server_refuses_go_id_and_dat_set_writes() {
     use iec61850_mms::mms::client::error::ClientError;
-    use iec61850_mms::mms::pdu::DataAccessError;
     use iec61850_server::Edition;
 
     let mut config = IedServerConfig::default();
@@ -648,5 +671,138 @@ async fn ed2_server_accepts_go_id_writes_while_disabled() {
     assert_eq!(publisher.lock().unwrap().go_id(), Some("changed"));
 
     client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+// ── Alternate access ────────────────────────────────────────────────────
+
+/// Sends one Read of `item` under `access` over a bare MMS association and
+/// returns its single access result.
+async fn read_with_access(
+    conn: &mut MmsConnection,
+    invoke_id: u32,
+    item: &str,
+    access: AlternateAccess,
+) -> AccessResult {
+    let req = ReadRequest {
+        specification_with_result: false,
+        variable_access_spec: VariableAccessSpecification::ListOfVariable(vec![
+            ListOfVariableEntry::with_alt_access(
+                ObjectName::DomainSpecific {
+                    domain_id: DOMAIN.to_string(),
+                    item_id: item.to_string(),
+                },
+                access,
+            ),
+        ]),
+    };
+    let mut full = BytesMut::new();
+    encode_confirmed_read_request(invoke_id, &req, &mut full);
+    let content = Bytes::from(tlv_content(&full).to_vec());
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        conn.send_mms_pdu(&MmsPdu::ConfirmedRequest(content)),
+    )
+    .await
+    .expect("timeout")
+    .expect("send");
+    let pdu = tokio::time::timeout(Duration::from_secs(5), conn.recv_mms_pdu_confirmed())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    let MmsPdu::ConfirmedResponse(body) = pdu else {
+        panic!("a confirmed response, got {pdu:?}");
+    };
+    // The body is the invoke id followed by the ReadResponse.
+    let (header, len) = tlv_header(&body);
+    let mut resp = ReadResponse::decode(&body[header + len..]).expect("decode ReadResponse");
+    assert_eq!(resp.list_of_access_result.len(), 1);
+    resp.list_of_access_result.remove(0)
+}
+
+fn tlv_content(tlv: &[u8]) -> &[u8] {
+    let (header, len) = tlv_header(tlv);
+    &tlv[header..header + len]
+}
+
+fn tlv_header(tlv: &[u8]) -> (usize, usize) {
+    let first = tlv[1];
+    if first < 0x80 {
+        return (2, usize::from(first));
+    }
+    let n = usize::from(first & 0x7f);
+    let len = tlv[2..2 + n]
+        .iter()
+        .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
+    (2 + n, len)
+}
+
+/// A component selection reads the same value as the flattened name it
+/// stands for (IEC 61850-8-1 §7.3.1), for a GoCB component, for a chain that
+/// starts at the logical node, and for model data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_alternate_access_reads_like_the_flattened_name() {
+    let (handle, _publisher) = start_server(IedServerConfig::default()).await;
+    let mut conn = MmsConnection::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        conn.connect("127.0.0.1", handle.bound_addr.port()),
+    )
+    .await
+    .expect("timeout")
+    .expect("connect");
+
+    let go_ena = read_with_access(
+        &mut conn,
+        1,
+        GOCB_ITEM,
+        AlternateAccess::component("GoEna").unwrap(),
+    )
+    .await;
+    assert_eq!(go_ena, AccessResult::Success(MmsData::Boolean(false)));
+
+    let app_id = read_with_access(
+        &mut conn,
+        2,
+        "LLN0",
+        AlternateAccess::component("GO$gcb01$DstAddress$APPID").unwrap(),
+    )
+    .await;
+    assert_eq!(app_id, AccessResult::Success(MmsData::Unsigned(0x1000)));
+
+    let st_val = read_with_access(
+        &mut conn,
+        3,
+        "LLN0$ST",
+        AlternateAccess::component("Mod$stVal").unwrap(),
+    )
+    .await;
+    assert_eq!(st_val, AccessResult::Success(MmsData::Integer(1)));
+
+    let unknown = read_with_access(
+        &mut conn,
+        4,
+        GOCB_ITEM,
+        AlternateAccess::component("NoSuch").unwrap(),
+    )
+    .await;
+    assert_eq!(
+        unknown,
+        AccessResult::Failure(DataAccessError::ObjectNonExistent)
+    );
+
+    // No GoCB component is an array.
+    let indexed = read_with_access(
+        &mut conn,
+        5,
+        GOCB_ITEM,
+        AlternateAccess::component_then("GoEna", AlternateAccess::index(0)).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        indexed,
+        AccessResult::Failure(DataAccessError::TypeInconsistent)
+    );
+
     handle.stop().await;
 }
