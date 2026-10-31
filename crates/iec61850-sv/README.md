@@ -52,12 +52,6 @@ The [workspace repository](https://github.com/csp0924/iec61850-rust) ties
 them together; a Python binding is published on PyPI as
 [iec61850](https://pypi.org/project/iec61850/).
 
-## Feature flags
-
-- `tokio-runtime` - tokio-based helpers, a convenience for development and
-  tests. The publisher hot path does not depend on a runtime; it runs on a
-  dedicated thread.
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://github.com/csp0924/iec61850-rust/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/csp0924/iec61850-rust/blob/main/LICENSE-MIT) at your option.

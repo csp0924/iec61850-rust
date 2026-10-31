@@ -682,7 +682,6 @@ dependencies = [
  "iec61850-model",
  "libc",
  "thiserror",
- "tokio",
  "tracing",
 ]
 
