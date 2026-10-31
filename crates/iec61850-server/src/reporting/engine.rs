@@ -1819,8 +1819,11 @@ impl ReportingEngine {
                     return sent_count;
                 }
                 match push_segments(ch_sink, conn_id, pdus.into()) {
-                    Delivery::Complete { .. } => {}
-                    Delivery::Blocked { rest, .. } => {
+                    Delivery::Complete { .. } => self.overflow_reported(brcb),
+                    Delivery::Blocked { sent, rest } => {
+                        if sent > 0 {
+                            self.overflow_reported(brcb);
+                        }
                         self.keep_partial(
                             &brcb.mms_path,
                             conn_id,
@@ -1841,7 +1844,7 @@ impl ReportingEngine {
                     }
                 }
             } else {
-                for pdu in pdus {
+                for (n, pdu) in pdus.into_iter().enumerate() {
                     if !self.sink.send_pdu(conn_id, pdu) {
                         tracing::warn!(
                             conn_id,
@@ -1850,6 +1853,9 @@ impl ReportingEngine {
                         );
                         self.on_connection_dropped(conn_id);
                         return sent_count;
+                    }
+                    if n == 0 {
+                        self.overflow_reported(brcb);
                     }
                 }
             }
@@ -1864,7 +1870,11 @@ impl ReportingEngine {
     }
 
     /// Records that every segment of the BRCB entry `entry_id` was accepted:
-    /// advances the transmit anchor and SqNum and clears the overflow flag.
+    /// advances the transmit anchor, SqNum and the last sent entry.
+    ///
+    /// The overflow flag is not touched here: it was cleared when the first
+    /// segment of the entry went out, so an overflow while later segments wait
+    /// is reported by the next entry.
     fn brcb_entry_sent(
         &self,
         brcb: &BufferedReportControl,
@@ -1886,6 +1896,12 @@ impl ReportingEngine {
             state.last_sent_entry_id = entry_id;
             state.last_sent_time_of_entry_ms = time_of_entry_ms;
         }
+    }
+
+    /// Clears the overflow flag of a BRCB once the first segment of an entry,
+    /// which carries the BufOvfl value, has been accepted (IEC 61850-7-2
+    /// §17.2.3.2.2.8).
+    fn overflow_reported(&self, brcb: &BufferedReportControl) {
         if let Ok(mut buf) = brcb.lock_buffer() {
             buf.clear_overflow();
         }
@@ -4677,5 +4693,86 @@ mod tests {
             brcb_arc.state.lock().unwrap().transmit_anchor,
             TransmitAnchor::AfterEntryId(entries[4].entry_id)
         );
+    }
+
+    /// BufOvfl of an unsegmented BRCB report with SqNum and BufOvfl set.
+    fn buf_ovfl(pdu: &[u8]) -> bool {
+        use iec61850_mms::mms::pdu::common::MmsData;
+        use iec61850_mms::mms::pdu::information_report::decode_information_report;
+        let (len, hdr) = iec61850_asn1::decode_length(&pdu[1..]).expect("outer length");
+        let report = decode_information_report(&pdu[1 + hdr..1 + hdr + len]).expect("decode");
+        match &report.list_of_access_result[3] {
+            MmsData::Boolean(b) => *b,
+            other => panic!("BufOvfl expected, got {other:?}"),
+        }
+    }
+
+    /// An entry dropped from a full buffer while a long entry is still being
+    /// sent is reported by the next entry sent after it (IEC 61850-7-2
+    /// §17.2.3.2.2.8, figure 31).
+    #[test]
+    fn overflow_while_an_entry_is_resumed_is_reported_by_the_next_entry() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::GI | TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::BUFFER_OVERFLOW | OptFlds::DATA_REFERENCE)
+            .with_buffer_capacity(2);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(150))
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 200);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let small = |v: i64| {
+            let mut one = EnqueuedSnapshot::new(150);
+            one.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+            one.values[0] = Some(MmsValue::Integer(v));
+            one
+        };
+        let gi = eng.snapshot_full_dataset(path).unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(1_000, false, true, gi)
+            .unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(2_000, false, false, small(2))
+            .unwrap();
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+
+        // The long entry starts; its first segment reports the buffer start.
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        assert!(eng.has_partial(path));
+        assert!(!brcb_arc.lock_buffer().unwrap().is_overflow());
+        // Two more entries: the first evicts the long entry, already formatted,
+        // and the second evicts the entry after it, which was never sent.
+        brcb_arc
+            .enqueue_entry_with_snapshot(3_000, false, false, small(3))
+            .unwrap();
+        brcb_arc
+            .enqueue_entry_with_snapshot(4_000, false, false, small(4))
+            .unwrap();
+        assert!(brcb_arc.lock_buffer().unwrap().is_overflow());
+
+        let mut pdus = Vec::new();
+        let mut sent = 0;
+        for _ in 0..20 {
+            drain(&mut rx, &mut pdus);
+            sent += eng.flush_brcb_pending(&brcb_arc, 5);
+            if sent == 3 {
+                break;
+            }
+        }
+        drain(&mut rx, &mut pdus);
+        assert_eq!(sent, 3, "the long entry and the two that remain");
+        let after = pdus.split_off(pdus.len() - 2);
+        assert!(buf_ovfl(&after[0]), "the next entry reports the overflow");
+        assert!(!buf_ovfl(&after[1]), "the one after it does not");
     }
 }
