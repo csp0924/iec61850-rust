@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
+  <Header id="settings"/>
+  <IED name="Settings">
+    <AccessPoint name="AP1">
+      <Server>
+        <Authentication/>
+        <LDevice inst="LD0">
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+            <DataSet name="dsSettings">
+              <FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="OpDlTmms" daName="setVal" fc="SG"/>
+              <FCDA ldInst="LD0" lnClass="PTOC" lnInst="1" doName="MinOpTmms" daName="setVal" fc="SE"/>
+            </DataSet>
+            <SettingControl numOfSGs="2" actSG="1"/>
+          </LN0>
+          <LN lnClass="PTOC" inst="1" lnType="PTOC_T">
+            <DOI name="OpDlTmms">
+              <DAI name="setVal"><Val>250</Val></DAI>
+            </DOI>
+            <DOI name="TmSet">
+              <SDI name="tm">
+                <DAI name="setVal"><Val>9</Val></DAI>
+              </SDI>
+            </DOI>
+            <DOI name="StrVal">
+              <SDI name="setMag">
+                <DAI name="f"><Val>1.5</Val></DAI>
+              </SDI>
+            </DOI>
+          </LN>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <LNodeType id="PTOC_T" lnClass="PTOC">
+      <DO name="OpDlTmms" type="ING_SE_T"/>
+      <DO name="StrVal" type="ASG_SE_T"/>
+      <DO name="TmMult" type="ING_SG_T"/>
+      <DO name="MinOpTmms" type="ING_BOTH_T"/>
+      <DO name="TmSet" type="TMSET_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+    </DOType>
+    <DOType id="ING_SE_T" cdc="ING">
+      <DA name="setVal" fc="SE" bType="INT32"><Val>100</Val></DA>
+      <DA name="minVal" fc="CF" bType="INT32"/>
+    </DOType>
+    <DOType id="ASG_SE_T" cdc="ASG">
+      <DA name="setMag" fc="SE" bType="Struct" type="AnVal_T"/>
+    </DOType>
+    <DOType id="TMSET_T" cdc="ING">
+      <SDO name="tm" type="ING_SE_T"/>
+    </DOType>
+    <DOType id="ING_SG_T" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"><Val>7</Val></DA>
+    </DOType>
+    <DOType id="ING_BOTH_T" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"><Val>3</Val></DA>
+      <DA name="setVal" fc="SE" bType="INT32"><Val>4</Val></DA>
+    </DOType>
+    <DAType id="AnVal_T">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+  </DataTypeTemplates>
+</SCL>

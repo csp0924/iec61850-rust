@@ -11,4 +11,11 @@ fn main() {
         .ied_name("Demo")
         .compile()
         .expect("iec61850-scl-build: compile demo.icd failed");
+
+    // The integration tests compare this generated model with the one the
+    // runtime path builds from the same file.
+    iec61850_scl_build::compile_icd("scl/settings.icd")
+        .out_file("settings_model.rs")
+        .compile()
+        .expect("iec61850-scl-build: compile settings.icd failed");
 }

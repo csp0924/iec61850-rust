@@ -28,9 +28,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    attribute_type, fcda_do_path, gse_control_go_id, ld_domain_name, parse_fc,
-    parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance, template_initial_value,
-    warn_count_not_modeled, MmsValue,
+    attribute_type, derives_setting_view, fcda_do_path, gse_control_go_id, ld_domain_name,
+    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, skip_indexed_instance,
+    template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -341,11 +341,25 @@ fn emit_do_type_expansion(
 ) -> Result<TokenStream, CompileError> {
     let name_lit = name;
 
-    let da_exprs = dot
+    // An FC=SE attribute is followed by its FC=SG view, as on the runtime path.
+    let da_stmts = dot
         .das
         .iter()
-        .map(|da| emit_da_expr(da, dtt))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|da| {
+            let expr = emit_da_expr(da, dtt)?;
+            Ok(if derives_setting_view(da, dot) {
+                quote! {
+                    {
+                        let __se = #expr;
+                        let __sg = ::iec61850_scl::__rt::setting_view(&__se);
+                        __do = __do.add_da_node(__se).add_da_node(__sg);
+                    }
+                }
+            } else {
+                quote! { __do = __do.add_da_node(#expr); }
+            })
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
 
     let sdo_exprs = dot
         .sdos
@@ -356,7 +370,7 @@ fn emit_do_type_expansion(
     Ok(quote! {
         {
             let mut __do = DataObjectBuilder::scalar(#name_lit);
-            #( __do = __do.add_da_node(#da_exprs); )*
+            #( #da_stmts )*
             #( __do = __do.add_sub_do(#sdo_exprs); )*
             __do.build().expect("codegen: DataObjectBuilder::build failed")
         }
@@ -722,6 +736,8 @@ fn emit_sgcb_expr(
 struct DaiOverride {
     path: Vec<String>,
     value: MmsValue,
+    /// Whether the value also goes to the FC=SG view of the attribute.
+    setting_view: bool,
 }
 
 /// Emits the statements that apply every DAI value under `RawLogicalNode.doi`
@@ -750,18 +766,28 @@ fn emit_dai_override(o: &DaiOverride) -> TokenStream {
         Some((first, rest)) => (first.as_str(), rest),
         None => ("", &[][..]),
     };
-    let names = rest.iter().map(|s| s.as_str());
+    let names: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     let value_tok = emit_mms_value(&o.value);
-    quote! {
-        if let ::std::option::Option::Some(__da) =
-            ::iec61850_scl::__rt::instance_target(&__ln, #do_name, &[ #( #names ),* ])
-        {
-            *__da
-                .value
-                .write()
-                .expect("codegen: MmsValue lock poisoned during DAI override")
-                = #value_tok;
+    let assign = |lookup: TokenStream| {
+        quote! {
+            if let ::std::option::Option::Some(__da) =
+                ::iec61850_scl::__rt::#lookup(&__ln, #do_name, &[ #( #names ),* ])
+            {
+                *__da
+                    .value
+                    .write()
+                    .expect("codegen: MmsValue lock poisoned during DAI override")
+                    = #value_tok;
+            }
         }
+    };
+    let primary = assign(quote! { instance_target });
+    let view = o
+        .setting_view
+        .then(|| assign(quote! { setting_view_target }));
+    quote! {
+        #primary
+        #view
     }
 }
 
@@ -859,6 +885,7 @@ fn emit_instances_at_do(
                 };
                 let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
                 base_path.push(dai.name.clone());
+                let first = out.len();
                 emit_dai_assignment(
                     dai,
                     da_def.b_type.as_str(),
@@ -868,11 +895,21 @@ fn emit_instances_at_do(
                     base_path,
                     out,
                 )?;
+                if derives_setting_view(da_def, dot) {
+                    mark_setting_view(&mut out[first..]);
+                }
                 base_path.pop();
             }
         }
     }
     Ok(())
+}
+
+/// Marks overrides that also apply to the FC=SG view of their attribute.
+fn mark_setting_view(overrides: &mut [DaiOverride]) {
+    for o in overrides {
+        o.setting_view = true;
+    }
 }
 
 fn handle_sdi_at_do(
@@ -919,7 +956,11 @@ fn handle_sdi_at_do(
         })?;
         let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
         base_path.push(sdi.name.clone());
+        let first = out.len();
         emit_instances_at_da(&sdi.children, dat, dtt, &path, base_path, out)?;
+        if derives_setting_view(da_def, dot) {
+            mark_setting_view(&mut out[first..]);
+        }
         base_path.pop();
     } else {
         tracing::warn!(
@@ -1051,6 +1092,7 @@ fn emit_dai_assignment(
     out.push(DaiOverride {
         path: base_path.to_vec(),
         value: parsed,
+        setting_view: false,
     });
     Ok(())
 }
