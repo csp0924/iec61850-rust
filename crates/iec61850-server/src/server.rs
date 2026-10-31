@@ -992,12 +992,13 @@ impl IedServer {
             .unwrap_or(0)
     }
 
-    /// Registers a log control block under the domain and item a ReadJournal
-    /// request names it by.
+    /// Registers a log control block under its MMS domain, such as
+    /// `"IED1LD0"`, and its path within the domain, such as
+    /// `"MMXU1$LG$lcb01"`.
     ///
-    /// The usual key is the MMS domain, such as `"IED1LD0"`, together with the
-    /// path of the control block within it, such as `"MMXU1$LG$lcb01"`; a log
-    /// instance name such as `"MMXU1$EventLog"` works equally well.
+    /// A ReadJournal request names the journal by the LogRef of the control
+    /// block, such as `"IED1LD0/MMXU1$GeneralLog"`, never by the key it is
+    /// registered under.
     pub fn register_log_control(
         &self,
         domain: impl Into<String>,

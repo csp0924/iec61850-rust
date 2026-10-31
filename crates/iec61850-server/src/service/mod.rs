@@ -3136,27 +3136,21 @@ fn ber_encode_u32(val: u32) -> Vec<u8> {
 /// Resolves the journal a ReadJournal request names to the log control block
 /// whose log it reads.
 ///
-/// A registry key equal to `(domain, item)` wins, so a control block registered
-/// under its own path, or under a log instance name, answers to that name.
-/// Otherwise the journal is the log a control block's LogRef names: a LogRef
-/// `<domain>/<item>` maps to the MMS journal `item` of domain `domain`. When
-/// several control blocks name the same log, the first by registry key that
-/// has a storage backend bound is chosen, or the first by key when none has.
+/// A journal is named only by the LogRef of a control block: a LogRef
+/// `<domain>/<item>` maps to the MMS journal `item` of domain `domain`, and the
+/// key a control block is registered under names no journal. When several
+/// control blocks name the same log, the first by registry key that has a
+/// storage backend bound is chosen, or the first by key when none has.
 #[cfg(feature = "logging")]
 fn resolve_journal(
     registry: &std::collections::HashMap<(String, String), Arc<LogControl>>,
     domain: &str,
     item: &str,
 ) -> Option<Arc<LogControl>> {
-    if let Some(lc) = registry.get(&(domain.to_string(), item.to_string())) {
-        return Some(Arc::clone(lc));
-    }
     let wanted = format!("{domain}/{item}");
     let mut named: Vec<(&(String, String), &Arc<LogControl>)> = registry
         .iter()
-        .filter(|((d, it), lc)| {
-            is_lcb_path(it) && log_ref_of(lc, d, it).as_deref() == Some(wanted.as_str())
-        })
+        .filter(|((d, it), lc)| log_ref_of(lc, d, it).as_deref() == Some(wanted.as_str()))
         .collect();
     named.sort_by(|a, b| a.0.cmp(b.0));
     named
@@ -3179,8 +3173,8 @@ fn log_ref_of(lc: &LogControl, domain: &str, item: &str) -> Option<String> {
 
 /// Names of the journals of `domain`, as GetNameList reports them for the
 /// Journal object class: the log each control block's LogRef names within
-/// the domain, and each registry key that is a log instance name rather than
-/// a control block path. Sorted, without duplicates.
+/// the domain, the same set [`resolve_journal`] resolves. Sorted, without
+/// duplicates.
 ///
 /// A poisoned registry lock yields no name.
 #[cfg(feature = "logging")]
@@ -3195,13 +3189,9 @@ fn journal_names_in_domain(log_controls: &LogControlRegistry, domain: &str) -> V
     let mut names: Vec<String> = registry
         .iter()
         .filter_map(|((d, item), lc)| {
-            if is_lcb_path(item) {
-                let log_ref = log_ref_of(lc, d, item)?;
-                let (log_domain, log_item) = log_ref.split_once('/')?;
-                (log_domain == domain && !log_item.is_empty()).then(|| log_item.to_string())
-            } else {
-                (d == domain).then(|| item.clone())
-            }
+            let log_ref = log_ref_of(lc, d, item)?;
+            let (log_domain, log_item) = log_ref.split_once('/')?;
+            (log_domain == domain && !log_item.is_empty()).then(|| log_item.to_string())
         })
         .collect();
     names.sort();

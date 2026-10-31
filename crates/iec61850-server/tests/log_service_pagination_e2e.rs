@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 const DOMAIN: &str = "IED1LD0";
 const ITEM: &str = "MMXU1$LG$lcb01";
+/// The journal the LogRef of the control block names.
+const JOURNAL: &str = "MMXU1$GeneralLog";
 const BASE_TIME_MS: u64 = 1_700_000_000_000;
 const TIME_STEP_MS: u64 = 10;
 const TOTAL_ENTRIES: usize = 10_000;
@@ -137,7 +139,7 @@ fn probe_entry_wire_size() {
     let conn = make_conn();
     let req = ReadJournalRequest::time_range(
         DOMAIN,
-        ITEM,
+        JOURNAL,
         BASE_TIME_MS,
         BASE_TIME_MS + (n as u64) * TIME_STEP_MS,
     );
@@ -178,7 +180,7 @@ fn read_journal_full_time_range_returns_all_entries_within_pdu_cap() {
     let conn = make_conn();
 
     let end_time = BASE_TIME_MS + (N as u64) * TIME_STEP_MS;
-    let req = ReadJournalRequest::time_range(DOMAIN, ITEM, BASE_TIME_MS, end_time);
+    let req = ReadJournalRequest::time_range(DOMAIN, JOURNAL, BASE_TIME_MS, end_time);
 
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(7, &req, &mut full);
@@ -248,7 +250,7 @@ fn read_journal_time_window_pagination_iterates_all_10000() {
         // The time range includes both bounds, so the next window starts one
         // millisecond later to avoid repeating an entry.
         let t_window_end = (t_cursor + window_ms).min(t_end_global);
-        let req = ReadJournalRequest::time_range(DOMAIN, ITEM, t_cursor, t_window_end);
+        let req = ReadJournalRequest::time_range(DOMAIN, JOURNAL, t_cursor, t_window_end);
 
         let mut full = BytesMut::new();
         let invoke_id = 100u32 + rounds as u32;

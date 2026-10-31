@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 const DOMAIN: &str = "IED1LD0";
 const ITEM: &str = "MMXU1$LG$lcb01";
+/// The journal the LogRef of the control block names.
+const JOURNAL: &str = "MMXU1$GeneralLog";
 
 fn build_min_model() -> iec61850_model::IedModel {
     let lln0 = LogicalNodeBuilder::lln0().build().unwrap();
@@ -116,7 +118,7 @@ fn read_journal_time_range_returns_all_entries() {
 
     let req = ReadJournalRequest::time_range(
         DOMAIN,
-        ITEM,
+        JOURNAL,
         // BinaryTime6 counts from 1984, so the test values are past that epoch.
         1_700_000_000_000,
         1_700_000_010_000,
@@ -170,7 +172,7 @@ fn read_journal_start_after_skips_first_entry() {
     let first_id = visitor.entries[0].entry_id;
 
     let req =
-        ReadJournalRequest::start_after(DOMAIN, ITEM, 1_700_000_000_000, first_id.to_be_bytes());
+        ReadJournalRequest::start_after(DOMAIN, JOURNAL, 1_700_000_000_000, first_id.to_be_bytes());
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(8, &req, &mut full);
     let body = extract_service_body(&full);
@@ -269,7 +271,7 @@ fn read_journal_empty_storage_returns_empty_list() {
     let (dispatcher, _storage) = build_dispatcher_with_lcb(0);
     let conn = make_conn();
 
-    let req = ReadJournalRequest::time_range(DOMAIN, ITEM, 1_700_000_000_000, 1_700_000_009_000);
+    let req = ReadJournalRequest::time_range(DOMAIN, JOURNAL, 1_700_000_000_000, 1_700_000_009_000);
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(13, &req, &mut full);
     let body = extract_service_body(&full);
@@ -301,7 +303,7 @@ fn read_journal_round_trip_carries_timestamp_and_value() {
     let (dispatcher, _storage) = build_dispatcher_with_lcb(2);
     let conn = make_conn();
 
-    let req = ReadJournalRequest::time_range(DOMAIN, ITEM, 1_700_000_000_000, 1_700_000_010_000);
+    let req = ReadJournalRequest::time_range(DOMAIN, JOURNAL, 1_700_000_000_000, 1_700_000_010_000);
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(15, &req, &mut full);
     let body = extract_service_body(&full);

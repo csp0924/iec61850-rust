@@ -166,7 +166,7 @@ async fn enabled_lcb_logs_each_data_change_of_a_data_set_member() {
     assert_eq!(storage.count(), 2);
 
     let mut c = client(h.bound_addr.port()).await;
-    let resp = read_all(&mut c, LCB_ITEM).await;
+    let resp = read_all(&mut c, EVENT_LOG).await;
     assert_eq!(resp.entries.len(), 2);
     let values: Vec<_> = resp
         .entries
@@ -206,7 +206,7 @@ async fn quality_change_is_logged_with_its_reason_code() {
     srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
 
     let mut c = client(h.bound_addr.port()).await;
-    let resp = read_all(&mut c, LCB_ITEM).await;
+    let resp = read_all(&mut c, EVENT_LOG).await;
     assert_eq!(resp.entries.len(), 1);
     assert_eq!(resp.entries[0].variables[0].data_ref, Q_REF);
     assert_eq!(
@@ -326,7 +326,7 @@ async fn whole_lcb_read_carries_the_nine_components() {
 
     srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
     srv.update_boolean(ggio_da(&m, 0, 0), false).unwrap();
-    let journal = read_all(&mut c, LCB_ITEM).await;
+    let journal = read_all(&mut c, EVENT_LOG).await;
     let (oldest, newest) = (&journal.entries[0], &journal.entries[1]);
 
     let full = members(c.read(DOM, LCB_ITEM).await.expect("read LCB"));
@@ -397,8 +397,14 @@ async fn the_journal_a_logref_names_is_readable() {
     let by_log_ref = read_all(&mut c, EVENT_LOG).await;
     assert_eq!(by_log_ref.entries.len(), 1);
     assert_eq!(by_log_ref.entries[0].variables[0].data_ref, ST_VAL_REF);
-    // The control block path still names the same journal.
-    assert_eq!(read_all(&mut c, LCB_ITEM).await, by_log_ref);
+    // The control block path names no journal.
+    let by_path = c
+        .read_journal(&ReadJournalRequest::time_range(DOM, LCB_ITEM, 0, 1))
+        .await;
+    assert!(
+        by_path.is_err(),
+        "a control block path is not a journal name"
+    );
     assert!(read_all(&mut c, "GGIO1$GeneralLog")
         .await
         .entries
@@ -563,7 +569,7 @@ async fn a_journal_page_stops_visiting_once_the_pdu_is_full() {
         h.bound_addr.port(),
     )
     .await;
-    let page = read_all(&mut c, LCB_ITEM).await;
+    let page = read_all(&mut c, EVENT_LOG).await;
     assert_eq!(page.more_follows, Some(true));
     assert!(!page.entries.is_empty());
     let visited = storage.visited.load(Ordering::Relaxed);

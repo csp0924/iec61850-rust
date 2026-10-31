@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 const DOMAIN: &str = "IED1LD0";
 const ITEM: &str = "MMXU1$LG$lcb01";
+/// The journal the LogRef of the control block names.
+const JOURNAL: &str = "MMXU1$GeneralLog";
 const BASE_TIME_MS: u64 = 1_700_000_000_000;
 const TIME_STEP_MS: u64 = 10;
 const TOTAL_ENTRIES: usize = 2_000;
@@ -128,7 +130,7 @@ fn read_journal_unnegotiated_conn_uses_hard_cap_and_sets_more_follows() {
     let mut c = MmsServerConnection::new();
     c.set_connection_id(1);
 
-    let req = ReadJournalRequest::start_after(DOMAIN, ITEM, 0, [0u8; 8]);
+    let req = ReadJournalRequest::start_after(DOMAIN, JOURNAL, 0, [0u8; 8]);
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(7, &req, &mut full);
     let body = extract_service_body(&full);
@@ -182,7 +184,7 @@ fn read_journal_server_segmentation_cursor_iterates_all_entries() {
         if rounds >= max_rounds {
             panic!("paging did not converge within {max_rounds} rounds");
         }
-        let req = ReadJournalRequest::start_after(DOMAIN, ITEM, cursor_time, cursor_id);
+        let req = ReadJournalRequest::start_after(DOMAIN, JOURNAL, cursor_time, cursor_id);
         let mut full = BytesMut::new();
         let invoke_id = 200u32 + rounds as u32;
         encode_confirmed_read_journal_request(invoke_id, &req, &mut full);
@@ -267,7 +269,7 @@ fn read_journal_fits_in_budget_returns_more_follows_false() {
     let (dispatcher, _storage) = build_dispatcher_with_prefilled_lcb(30);
     let conn = make_negotiated_conn(65_000);
 
-    let req = ReadJournalRequest::start_after(DOMAIN, ITEM, 0, [0u8; 8]);
+    let req = ReadJournalRequest::start_after(DOMAIN, JOURNAL, 0, [0u8; 8]);
     let mut full = BytesMut::new();
     encode_confirmed_read_journal_request(11, &req, &mut full);
     let body = extract_service_body(&full);
