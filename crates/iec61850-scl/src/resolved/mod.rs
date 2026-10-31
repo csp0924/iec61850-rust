@@ -13,8 +13,35 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::{ErrorKind, SclParseError, TypeKind};
-use crate::raw::{RawBda, RawScl};
+use crate::error::{ErrorKind, SclParseError, SourceSpan, TypeKind};
+use crate::raw::{DataTypeTemplates, RawBda, RawDoTypeChild, RawScl};
+
+/// The default of [`ResolveOptions::max_expanded_nodes`].
+pub const DEFAULT_MAX_EXPANDED_NODES: u64 = 1_000_000;
+
+/// Limits that stage 2 applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolveOptions {
+    /// The most model nodes, logical nodes, data objects and data attributes
+    /// at every nesting level, that one IED, or one type of the
+    /// DataTypeTemplates, may expand to.
+    ///
+    /// A type referenced several times is expanded once per reference, so a
+    /// few hundred lines of nested types can describe an exponential number of
+    /// nodes; the limit turns such a file into an error instead of time and
+    /// memory spent on the model build. Defaults to
+    /// [`DEFAULT_MAX_EXPANDED_NODES`].
+    pub max_expanded_nodes: u64,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        Self {
+            max_expanded_nodes: DEFAULT_MAX_EXPANDED_NODES,
+        }
+    }
+}
 
 /// An SCL model whose type references have all been resolved.
 ///
@@ -45,6 +72,16 @@ impl ResolvedScl {
         &self.raw
     }
 
+    /// Runs stage 2 with the default [`ResolveOptions`]; see
+    /// [`from_raw_with`](Self::from_raw_with).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_raw_with`](Self::from_raw_with).
+    pub fn from_raw(raw: RawScl) -> Result<Self, SclParseError> {
+        Self::from_raw_with(raw, &ResolveOptions::default())
+    }
+
     /// Runs stage 2, resolving every type reference.
     ///
     /// The checks are: a logical node's `ln_type_ref` exists in
@@ -60,8 +97,10 @@ impl ResolvedScl {
     /// resolve; the element path names the full logical node, data object and
     /// data attribute path of the reference, and the span is that of the
     /// referencing element. [`ErrorKind::SemanticConflict`] when structure or
-    /// sub-object references form a cycle, or nest deeper than 32 levels.
-    pub fn from_raw(raw: RawScl) -> Result<Self, SclParseError> {
+    /// sub-object references form a cycle, nest deeper than 32 levels, or
+    /// expand an IED or a type to more than
+    /// [`ResolveOptions::max_expanded_nodes`] nodes.
+    pub fn from_raw_with(raw: RawScl, options: &ResolveOptions) -> Result<Self, SclParseError> {
         // The four tables are already in raw.data_type_templates, and stage 1
         // has rejected any duplicate identifier.
         let dtt = &raw.data_type_templates;
@@ -157,11 +196,17 @@ impl ResolvedScl {
         //
         // `visited` is a stack of DAType identifiers: one is pushed on entry
         // and popped on the way out, so a reference back into the stack is a
-        // cycle and is rejected before the recursion can run away.
+        // cycle and is rejected before the recursion can run away. `heights`
+        // records each DAType checked in full, so a shared type is walked once.
+        let mut heights: BTreeMap<String, usize> = BTreeMap::new();
         for (dat_id, dat) in &dtt.da_types {
+            if heights.contains_key(dat_id) {
+                continue;
+            }
+            let mut visited: Vec<String> = vec![dat_id.clone()];
+            let mut below = 0;
             for bda in &dat.bdas {
-                let mut visited: Vec<String> = vec![dat_id.clone()];
-                check_bda_recursive(
+                below = below.max(check_bda_recursive(
                     bda,
                     &format!(
                         "SCL/DataTypeTemplates/DAType[id=\"{}\"]/BDA[name=\"{}\"]",
@@ -169,9 +214,14 @@ impl ResolvedScl {
                     ),
                     dtt,
                     &mut visited,
-                )?;
+                    &mut heights,
+                )?);
             }
+            heights.insert(dat_id.clone(), below + 1);
         }
+
+        // With every chain acyclic and bounded, the expansion sizes are finite.
+        check_expanded_nodes(&raw, options.max_expanded_nodes)?;
 
         // Every ln_type_ref has been checked above, so the index is the key set.
         let ln_type_index = dtt
@@ -356,13 +406,16 @@ fn check_attr_type_ref(
 }
 
 /// Recursively checks the `type_ref` of a nested attribute, and detects a cycle
-/// between structure types.
+/// between structure types. Returns the number of DAType levels below the
+/// attribute.
 ///
 /// `visited` is a stack of DAType identifiers: one is pushed each time a
 /// `bType=Struct` reference is followed, and popped on the way out. A reference
-/// to an identifier already on the stack is a cycle, and a stack reaching
+/// to an identifier already on the stack is a cycle, and a chain longer than
 /// [`MAX_TYPE_NESTING`] is too deep; either yields
-/// [`ErrorKind::SemanticConflict`].
+/// [`ErrorKind::SemanticConflict`]. `heights` holds the level count of every
+/// DAType already checked in full, so a type reached again is not walked
+/// again.
 ///
 /// The recursion follows the same path the model builder takes, so a cycle or
 /// a runaway nesting is caught here, within the bound, and cannot overflow the
@@ -370,11 +423,26 @@ fn check_attr_type_ref(
 fn check_bda_recursive(
     bda: &RawBda,
     path: &str,
-    dtt: &crate::raw::DataTypeTemplates,
+    dtt: &DataTypeTemplates,
     visited: &mut Vec<String>,
-) -> Result<(), SclParseError> {
+    heights: &mut BTreeMap<String, usize>,
+) -> Result<usize, SclParseError> {
     check_attr_type_ref(&bda.b_type, bda.type_ref.as_deref(), bda.span, path, dtt)?;
 
+    let too_deep = |type_id: &str, visited: &[String]| {
+        SclParseError::at(
+            bda.span,
+            path,
+            ErrorKind::SemanticConflict {
+                detail: format!(
+                    "the DAType nesting below `{}` is deeper than {MAX_TYPE_NESTING} levels",
+                    visited.first().map_or(type_id, |s| s.as_str())
+                ),
+            },
+        )
+    };
+
+    let mut below = 0;
     // A bType of Struct follows type_ref into a DAType, exactly as the model
     // builder does, so the cycle check runs before descending.
     if bda.b_type == "Struct" {
@@ -391,27 +459,34 @@ fn check_bda_recursive(
                     },
                 ));
             }
-            if visited.len() >= MAX_TYPE_NESTING {
-                return Err(SclParseError::at(
-                    bda.span,
-                    path,
-                    ErrorKind::SemanticConflict {
-                        detail: format!(
-                            "the DAType nesting below `{}` is deeper than {MAX_TYPE_NESTING} levels",
-                            visited.first().map_or(type_id, |s| s.as_str())
-                        ),
-                    },
-                ));
-            }
-            // Stage 2 has already checked that type_ref exists in da_types, so
-            // this lookup always succeeds.
-            if let Some(dat) = dtt.da_types.get(type_id) {
-                visited.push(type_id.to_string());
-                for child_bda in &dat.bdas {
-                    let child_path = format!("{path}/BDA[name=\"{}\"]", child_bda.name);
-                    check_bda_recursive(child_bda, &child_path, dtt, visited)?;
+            if let Some(&height) = heights.get(type_id) {
+                if visited.len() + height > MAX_TYPE_NESTING {
+                    return Err(too_deep(type_id, visited));
                 }
-                visited.pop();
+                below = height;
+            } else {
+                if visited.len() >= MAX_TYPE_NESTING {
+                    return Err(too_deep(type_id, visited));
+                }
+                // Stage 2 has already checked that type_ref exists in
+                // da_types, so this lookup always succeeds.
+                if let Some(dat) = dtt.da_types.get(type_id) {
+                    visited.push(type_id.to_string());
+                    let mut deepest = 0;
+                    for child_bda in &dat.bdas {
+                        let child_path = format!("{path}/BDA[name=\"{}\"]", child_bda.name);
+                        deepest = deepest.max(check_bda_recursive(
+                            child_bda,
+                            &child_path,
+                            dtt,
+                            visited,
+                            heights,
+                        )?);
+                    }
+                    visited.pop();
+                    heights.insert(type_id.to_string(), deepest + 1);
+                    below = deepest + 1;
+                }
             }
         }
     }
@@ -420,9 +495,177 @@ fn check_bda_recursive(
     // reaches a DAType through type_ref instead.
     for child in &bda.bda {
         let child_path = format!("{}/BDA[name=\"{}\"]", path, child.name);
-        check_bda_recursive(child, &child_path, dtt, visited)?;
+        below = below.max(check_bda_recursive(
+            child,
+            &child_path,
+            dtt,
+            visited,
+            heights,
+        )?);
+    }
+    Ok(below)
+}
+
+/// Rejects an IED, or a type of the DataTypeTemplates, whose model expansion
+/// holds more than `max` nodes.
+///
+/// Counts every logical node, data object, sub-object, data attribute and
+/// nested attribute the model builder would create, a type being counted once
+/// per reference to it. Each type's count is computed once and shared, so the
+/// check is linear in the size of the templates. Every chain must already be
+/// known to be acyclic.
+fn check_expanded_nodes(raw: &RawScl, max: u64) -> Result<(), SclParseError> {
+    let dtt = &raw.data_type_templates;
+    let mut counts = ExpansionCounts::default();
+    let over = |kind: &str, id: &str, count: u64, span: SourceSpan, path: String| {
+        SclParseError::at(
+            span,
+            path,
+            ErrorKind::SemanticConflict {
+                detail: format!(
+                    "{kind} `{id}` expands to {count} model nodes, more than the limit of {max}"
+                ),
+            },
+        )
+    };
+    for (id, dat) in &dtt.da_types {
+        let count = counts.da_type(dtt, id);
+        if count > max {
+            return Err(over(
+                "DAType",
+                id,
+                count,
+                dat.span,
+                format!("SCL/DataTypeTemplates/DAType[id=\"{id}\"]"),
+            ));
+        }
+    }
+    for (id, dot) in &dtt.do_types {
+        let count = counts.do_type(dtt, id);
+        if count > max {
+            return Err(over(
+                "DOType",
+                id,
+                count,
+                dot.span,
+                format!("SCL/DataTypeTemplates/DOType[id=\"{id}\"]"),
+            ));
+        }
+    }
+    for (id, lnt) in &dtt.ln_node_types {
+        let count = counts.ln_node_type(dtt, id);
+        if count > max {
+            return Err(over(
+                "LNodeType",
+                id,
+                count,
+                lnt.span,
+                format!("SCL/DataTypeTemplates/LNodeType[id=\"{id}\"]"),
+            ));
+        }
+    }
+    for ied in &raw.ieds {
+        let mut total: u64 = 0;
+        for ap in &ied.access_points {
+            let Some(server) = ap.server.as_ref() else {
+                continue;
+            };
+            for ld in &server.logical_devices {
+                for ln in &ld.logical_nodes {
+                    let ln_count = 1 + counts.ln_node_type(dtt, &ln.ln_type_ref);
+                    total = total.saturating_add(ln_count);
+                }
+            }
+        }
+        if total > max {
+            return Err(over(
+                "IED",
+                &ied.name,
+                total,
+                ied.span,
+                format!("SCL/IED[name=\"{}\"]", ied.name),
+            ));
+        }
     }
     Ok(())
+}
+
+/// The number of model nodes each type expands to, computed on demand and
+/// remembered.
+#[derive(Default)]
+struct ExpansionCounts {
+    da_types: BTreeMap<String, u64>,
+    do_types: BTreeMap<String, u64>,
+    ln_node_types: BTreeMap<String, u64>,
+}
+
+impl ExpansionCounts {
+    fn da_type(&mut self, dtt: &DataTypeTemplates, id: &str) -> u64 {
+        if let Some(&n) = self.da_types.get(id) {
+            return n;
+        }
+        let n = match dtt.da_types.get(id) {
+            Some(dat) => dat
+                .bdas
+                .iter()
+                .fold(0u64, |acc, bda| acc.saturating_add(self.bda(dtt, bda))),
+            None => 0,
+        };
+        self.da_types.insert(id.to_string(), n);
+        n
+    }
+
+    fn bda(&mut self, dtt: &DataTypeTemplates, bda: &RawBda) -> u64 {
+        let mut n: u64 = 1;
+        if bda.b_type == "Struct" {
+            if let Some(id) = bda.type_ref.as_deref() {
+                n = n.saturating_add(self.da_type(dtt, id));
+            }
+        }
+        for child in &bda.bda {
+            n = n.saturating_add(self.bda(dtt, child));
+        }
+        n
+    }
+
+    fn do_type(&mut self, dtt: &DataTypeTemplates, id: &str) -> u64 {
+        if let Some(&n) = self.do_types.get(id) {
+            return n;
+        }
+        let mut n: u64 = 0;
+        if let Some(dot) = dtt.do_types.get(id) {
+            for child in &dot.children {
+                let child_count = match child {
+                    RawDoTypeChild::Da(da) => match (da.b_type.as_str(), da.type_ref.as_deref()) {
+                        ("Struct", Some(type_id)) => {
+                            1u64.saturating_add(self.da_type(dtt, type_id))
+                        }
+                        _ => 1,
+                    },
+                    RawDoTypeChild::Sdo(sdo) => {
+                        1u64.saturating_add(self.do_type(dtt, &sdo.do_type_ref))
+                    }
+                };
+                n = n.saturating_add(child_count);
+            }
+        }
+        self.do_types.insert(id.to_string(), n);
+        n
+    }
+
+    fn ln_node_type(&mut self, dtt: &DataTypeTemplates, id: &str) -> u64 {
+        if let Some(&n) = self.ln_node_types.get(id) {
+            return n;
+        }
+        let mut n: u64 = 0;
+        if let Some(lnt) = dtt.ln_node_types.get(id) {
+            for do_def in &lnt.dos {
+                n = n.saturating_add(1u64.saturating_add(self.do_type(dtt, &do_def.do_type_ref)));
+            }
+        }
+        self.ln_node_types.insert(id.to_string(), n);
+        n
+    }
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ pub mod summarize;
 
 pub use error::{ErrorKind, SclParseError, SourceSpan, TypeKind};
 pub use raw::RawScl;
-pub use resolved::ResolvedScl;
+pub use resolved::{ResolveOptions, ResolvedScl};
 
 /// Parses an SCL XML string into the stage 1 raw AST.
 ///
@@ -53,6 +53,16 @@ impl RawScl {
     /// consistency rule is violated.
     pub fn resolve(self) -> Result<ResolvedScl, SclParseError> {
         ResolvedScl::from_raw(self)
+    }
+
+    /// Runs stage 2 as [`resolve`](Self::resolve) does, under the limits of
+    /// `options`.
+    ///
+    /// # Errors
+    ///
+    /// As [`resolve`](Self::resolve); see [`ResolvedScl::from_raw_with`].
+    pub fn resolve_with(self, options: &ResolveOptions) -> Result<ResolvedScl, SclParseError> {
+        ResolvedScl::from_raw_with(self, options)
     }
 }
 

@@ -65,6 +65,7 @@ pub fn compile_icd<P: AsRef<Path>>(path: P) -> CompileBuilder {
         out_file: "model.rs".to_string(),
         ied_name: None,
         deterministic: true,
+        resolve_options: iec61850_scl::ResolveOptions::default(),
     }
 }
 
@@ -75,6 +76,7 @@ pub struct CompileBuilder {
     out_file: String,
     ied_name: Option<String>,
     deterministic: bool,
+    resolve_options: iec61850_scl::ResolveOptions,
 }
 
 impl CompileBuilder {
@@ -96,6 +98,14 @@ impl CompileBuilder {
     /// warm. Defaults to `true`.
     pub fn deterministic(mut self, yes: bool) -> Self {
         self.deterministic = yes;
+        self
+    }
+
+    /// Sets the most model nodes one IED or one type may expand to; see
+    /// [`iec61850_scl::ResolveOptions::max_expanded_nodes`]. Defaults to
+    /// [`iec61850_scl::resolved::DEFAULT_MAX_EXPANDED_NODES`].
+    pub fn max_expanded_nodes(mut self, max: u64) -> Self {
+        self.resolve_options.max_expanded_nodes = max;
         self
     }
 
@@ -135,7 +145,9 @@ impl CompileBuilder {
     /// run-time model build, and returns the formatted source.
     fn generate(&self, xml: &str) -> Result<String, CompileError> {
         let raw = iec61850_scl::parse_scl(xml).map_err(CompileError::ParseScl)?;
-        let resolved = raw.resolve().map_err(CompileError::ResolveScl)?;
+        let resolved = raw
+            .resolve_with(&self.resolve_options)
+            .map_err(CompileError::ResolveScl)?;
 
         let tokens = emit::emit_file(&resolved, self)?;
 
@@ -307,6 +319,17 @@ mod tests {
             .expect("an IED that is not generated is not checked");
         assert!(pretty.contains("build_Good_model"), "{pretty}");
         assert!(!pretty.contains("build_Bad_model"), "{pretty}");
+    }
+
+    #[test]
+    fn expansion_limit_is_configurable() {
+        let xml = scl(&[ied("IED1", "TotW")]);
+        let err = compile_icd("unused.icd")
+            .max_expanded_nodes(3)
+            .generate(&xml)
+            .expect_err("the IED expands to more than three nodes");
+        assert!(matches!(err, CompileError::ResolveScl(_)), "{err:?}");
+        assert!(compile_icd("unused.icd").generate(&xml).is_ok());
     }
 
     #[test]
