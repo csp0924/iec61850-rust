@@ -1567,7 +1567,7 @@ pub(super) fn ber_len_size(len: usize) -> usize {
 }
 
 /// Decodes a signed big-endian integer of 1 to 8 bytes.
-fn decode_signed_int(data: &[u8]) -> Result<i64, MmsError> {
+pub(crate) fn decode_signed_int(data: &[u8]) -> Result<i64, MmsError> {
     if data.is_empty() || data.len() > 8 {
         return Err(MmsError::InvalidLength);
     }
@@ -1635,7 +1635,7 @@ pub(crate) fn encode_unsigned_int_minimal(val: u64) -> Vec<u8> {
 ///
 /// `InvalidLength` when the content lacks the padding-count byte, and
 /// `InvalidPdu` when the padding count is above 7 or is non-zero with no data.
-fn decode_bit_string(tag: u8, val: &[u8]) -> Result<(u8, Vec<u8>), MmsError> {
+pub(crate) fn decode_bit_string(tag: u8, val: &[u8]) -> Result<(u8, Vec<u8>), MmsError> {
     let Some((&padding, data)) = val.split_first() else {
         tracing::warn!("bit string tag 0x{:02X} has no padding-count byte", tag);
         return Err(MmsError::InvalidLength);

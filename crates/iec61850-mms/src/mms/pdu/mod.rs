@@ -38,6 +38,7 @@ pub mod read;
 pub mod read_journal;
 pub mod reject;
 pub mod service_error;
+pub mod status;
 pub mod type_specification;
 pub mod write;
 
@@ -114,6 +115,12 @@ pub use reject::{
 pub use service_error::{
     decode_confirmed_error_inner, decode_confirmed_error_pdu, encode_confirmed_error_pdu,
     ErrorClass, ServiceError,
+};
+pub use status::{
+    decode_confirmed_status_request, decode_confirmed_status_response, decode_status_request,
+    encode_confirmed_status_request, encode_confirmed_status_response, StatusResponse,
+    VmdLogicalStatus, VmdPhysicalStatus, MAX_LOCAL_DETAIL_BITS, SERVICE_TAG_STATUS_REQUEST,
+    SERVICE_TAG_STATUS_RESPONSE,
 };
 pub use type_specification::{StructComponent, TypeSpecification, MAX_TYPE_SPEC_DEPTH};
 pub use write::{
