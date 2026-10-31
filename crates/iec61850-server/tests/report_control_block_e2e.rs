@@ -14,7 +14,7 @@ use iec61850_client::report::parse::{parse_report, ParsedReport, ReasonForInclus
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName};
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
-use iec61850_mms::mms::pdu::service_error::{subcode, ErrorClass};
+use iec61850_mms::mms::pdu::service_error::{subcode, ErrorClass, ServiceSpecificInfo};
 use iec61850_mms::mms::pdu::DefineNamedVariableEntry;
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{
@@ -706,7 +706,8 @@ async fn dynamic_data_set_in_use_reports_and_cannot_be_deleted() {
         matches!(
             deleted,
             Err(ClientError::ServiceError {
-                error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT)
+                error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
+                service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(0)),
             })
         ),
         "{deleted:?}"
@@ -781,7 +782,8 @@ async fn dynamic_data_set_used_by_a_brcb_cannot_be_deleted() {
         matches!(
             deleted,
             Err(ClientError::ServiceError {
-                error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT)
+                error_class: ErrorClass::Service(subcode::service::OBJECT_CONSTRAINT_CONFLICT),
+                service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(0)),
             })
         ),
         "{deleted:?}"

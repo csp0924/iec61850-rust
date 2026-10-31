@@ -461,6 +461,7 @@ fn invoke_id_exhausted_error_can_be_constructed() {
 fn service_error_can_be_constructed() {
     let err = ClientError::ServiceError {
         error_class: ErrorClass::Access(0),
+        service_specific: None,
     };
     let msg = format!("{err}");
     assert!(!msg.is_empty());

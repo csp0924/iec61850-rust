@@ -702,7 +702,8 @@ async fn data_set_values_of_an_unknown_data_set_fail_the_service() {
         matches!(
             unknown,
             Err(ClientError::ServiceError {
-                error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT)
+                error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+                ..
             })
         ),
         "{unknown:?}"

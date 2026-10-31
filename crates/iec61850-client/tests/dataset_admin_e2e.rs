@@ -5,22 +5,25 @@
 //! under a name already taken, which the server refuses; naming a member that
 //! does not exist, which the server refuses; deleting a data set, after which
 //! reading it reports `ObjectNonExistent`; deleting one that was never created,
-//! which reports that nothing was deleted rather than an error; and deleting a
-//! static data set, which is not deletable.
+//! which reports that nothing was deleted rather than an error; deleting a
+//! static data set, which is not deletable; and deleting a data set a report
+//! control block refers to, which the server refuses while reporting how many
+//! data sets it deleted.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use iec61850_client::dataset_admin::DataSetMember;
-use iec61850_client::IedConnection;
+use iec61850_client::{ClientError, ErrorClass, IedConnection, ServiceSpecificInfo};
 use iec61850_mms::mms::client::MmsClientBuilder;
+use iec61850_mms::mms::pdu::service_error::subcode::service;
 use iec61850_mms::AccessResult;
 use iec61850_model::{
     DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, IedModelBuilder,
     LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue, TrgOps, FC,
 };
-use iec61850_server::{Dataset, DatasetEntry, IedServer, IedServerConfig};
+use iec61850_server::{Dataset, DatasetEntry, IedServer, IedServerConfig, Rcb, ReportControl};
 
 const DOMAIN: &str = "IED1LD0";
 
@@ -277,4 +280,90 @@ async fn delete_static_dataset_rejected_returns_false() {
 
     let _ = conn.disconnect().await;
     let _ = handle.stop().await;
+}
+
+/// A data set a report control block refers to is not deleted: the server
+/// answers the DeleteNamedVariableList with object-constraint-conflict and
+/// reports, as its serviceSpecificInformation, that it deleted none
+/// (ISO 9506-2). Once the control block refers to another data set, the same
+/// delete succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_data_set_in_use_reports_how_many_were_deleted() {
+    let server = build_server();
+    let bool_da = DataAttribute::new(
+        "stVal",
+        FC::St,
+        DataAttributeType::Boolean,
+        TrgOps::DCHG,
+        MmsValue::Boolean(true),
+    );
+    let mut ds = Dataset::new("GGIO1$ds_urcb");
+    ds.push(DatasetEntry::new(
+        "IED1LD0/GGIO1$ST$Ind1$stVal".to_string(),
+        Arc::clone(&bool_da.value),
+    ));
+    let rc = ReportControl::new(
+        "IED1LD0/GGIO1$RP$urcb01",
+        Rcb::new("urcb01", "GGIO1$ds_urcb"),
+    );
+    server.register_urcb(rc, ds).expect("register_urcb");
+    let handle = server.start().await.expect("server start");
+    let conn = fresh_client(handle.bound_addr.port()).await;
+
+    within(conn.create_data_set("IED1LD0/GGIO1.ds_dyn1", &members_two()))
+        .await
+        .expect("create OK");
+    within(conn.write_boolean("IED1LD0/GGIO1.urcb01.Resv", FC::Rp, true))
+        .await
+        .expect("the client reserves the URCB");
+    within(conn.write_visible_string(
+        "IED1LD0/GGIO1.urcb01.DatSet",
+        FC::Rp,
+        "IED1LD0/GGIO1$ds_dyn1",
+    ))
+    .await
+    .expect("the URCB takes the new data set");
+
+    let refused = within(conn.delete_data_set("IED1LD0/GGIO1.ds_dyn1")).await;
+    match refused {
+        Err(ClientError::Service {
+            error_class,
+            service_specific,
+            ..
+        }) => {
+            assert_eq!(
+                error_class,
+                ErrorClass::Service(service::OBJECT_CONSTRAINT_CONFLICT)
+            );
+            assert_eq!(
+                service_specific,
+                Some(ServiceSpecificInfo::DeleteNamedVariableList(0)),
+                "the refusal reports that no data set was deleted"
+            );
+        }
+        other => panic!("expected a service error, got {other:?}"),
+    }
+    assert_eq!(server.dynamic_dataset_count(), 1, "the data set survives");
+
+    within(conn.write_visible_string(
+        "IED1LD0/GGIO1.urcb01.DatSet",
+        FC::Rp,
+        "IED1LD0/GGIO1$ds_urcb",
+    ))
+    .await
+    .expect("the URCB takes its own data set back");
+    let deleted = within(conn.delete_data_set("IED1LD0/GGIO1.ds_dyn1"))
+        .await
+        .expect("a data set no control block refers to is deleted");
+    assert!(deleted);
+
+    let _ = conn.disconnect().await;
+    let _ = handle.stop().await;
+}
+
+/// Awaits `f` for at most five seconds.
+async fn within<F: std::future::Future>(f: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(5), f)
+        .await
+        .expect("the call finishes within five seconds")
 }

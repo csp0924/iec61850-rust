@@ -7,7 +7,7 @@
 use alloc::string::{String, ToString};
 
 use iec61850_hal::transport::TransportError;
-use iec61850_mms::mms::pdu::{ErrorClass, RejectReason};
+use iec61850_mms::mms::pdu::{ErrorClass, RejectReason, ServiceSpecificInfo};
 use thiserror::Error;
 
 #[cfg(feature = "reporting")]
@@ -176,6 +176,10 @@ pub enum ClientError {
     Service {
         /// errorClass of the ServiceError.
         error_class: ErrorClass,
+        /// serviceSpecificInformation of the ServiceError, such as how many
+        /// data sets a failed DeleteDataSet did delete; `None` when the server
+        /// sent none.
+        service_specific: Option<ServiceSpecificInfo>,
     },
 
     /// The server answered with a RejectPDU (ISO 9506-2).
@@ -277,7 +281,13 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::Transport(cause) => ClientError::Transport(cause),
             #[cfg(feature = "std")]
             M::Io(io) => ClientError::Transport(TransportError::from(io)),
-            M::ServiceError { error_class } => ClientError::Service { error_class },
+            M::ServiceError {
+                error_class,
+                service_specific,
+            } => ClientError::Service {
+                error_class,
+                service_specific,
+            },
             M::RejectError { reason } => ClientError::Reject { reason },
             M::ConcludeRejected => ClientError::ConcludeRejected,
             M::AssociateFailed => ClientError::AssociateFailed,
@@ -359,11 +369,28 @@ mod tests {
     fn a_confirmed_error_keeps_its_class_and_code() {
         match map(M::ServiceError {
             error_class: ErrorClass::Access(3),
+            service_specific: None,
         }) {
             ClientError::Service { error_class, .. } => {
                 assert_eq!(error_class.context_tag(), 7);
                 assert_eq!(error_class.code(), 3);
             }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_error_keeps_its_service_specific_information() {
+        match map(M::ServiceError {
+            error_class: ErrorClass::Service(6),
+            service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(2)),
+        }) {
+            ClientError::Service {
+                service_specific, ..
+            } => assert_eq!(
+                service_specific,
+                Some(ServiceSpecificInfo::DeleteNamedVariableList(2))
+            ),
             other => panic!("got {other:?}"),
         }
     }

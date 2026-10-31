@@ -22,7 +22,7 @@
 use crate::compat::prelude::*;
 use crate::iso::presentation::provider_reason_name;
 use crate::iso::session::refuse_reason_name;
-use crate::mms::pdu::{DataAccessError, ErrorClass, RejectReason};
+use crate::mms::pdu::{DataAccessError, ErrorClass, RejectReason, ServiceSpecificInfo};
 use iec61850_hal::transport::TransportError;
 use thiserror::Error;
 
@@ -136,6 +136,10 @@ pub enum ClientError {
     ServiceError {
         /// errorClass carried by the confirmed error PDU.
         error_class: ErrorClass,
+        /// serviceSpecificInformation of the ServiceError, such as the
+        /// numberDeleted of a failed DeleteNamedVariableList; `None` when the
+        /// peer sent none or an alternative this crate does not model.
+        service_specific: Option<ServiceSpecificInfo>,
     },
 
     /// The peer answered with a Reject PDU.

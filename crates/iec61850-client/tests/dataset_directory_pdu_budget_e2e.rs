@@ -210,7 +210,7 @@ async fn the_refusal_arrives_as_a_typed_service_error() {
     .expect("timeout");
 
     match result {
-        Err(ClientError::ServiceError { error_class }) => assert_eq!(
+        Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
             error_class,
             ErrorClass::Resource(resource::OTHER),
             "an oversized directory must answer resource other"
@@ -284,7 +284,7 @@ async fn the_values_refusal_arrives_as_a_typed_service_error() {
     .expect("timeout");
 
     match result {
-        Err(ClientError::ServiceError { error_class }) => assert_eq!(
+        Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
             error_class,
             ErrorClass::Resource(resource::OTHER),
             "oversized data set values must answer resource other"

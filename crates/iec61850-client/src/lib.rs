@@ -131,7 +131,7 @@ pub use iec61850_mms::mms::pdu::{VmdLogicalStatus, VmdPhysicalStatus};
 // Re-exported so that the causes `ClientError` carries can be named without
 // depending on `iec61850-mms` or `iec61850-hal` directly.
 pub use iec61850_hal::transport::{IoErrorKind, TransportError};
-pub use iec61850_mms::mms::pdu::{ErrorClass, RejectReason};
+pub use iec61850_mms::mms::pdu::{ErrorClass, RejectReason, ServiceSpecificInfo};
 pub use object_io::{
     parse_data_set_ref, parse_iec_object_path, ArrayElement, DataSetRef, IecObjectPath,
 };

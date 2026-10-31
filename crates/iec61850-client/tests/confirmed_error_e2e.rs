@@ -97,7 +97,7 @@ async fn unknown_data_set_yields_a_typed_service_error() {
     .expect("timeout");
 
     match result {
-        Err(ClientError::ServiceError { error_class }) => assert_eq!(
+        Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
             error_class,
             ErrorClass::Access(access::OBJECT_NON_EXISTENT),
             "an unknown data set must answer object-non-existent"
@@ -134,7 +134,7 @@ async fn duplicate_data_set_name_yields_the_definition_error_class() {
     .expect("timeout");
 
     match result {
-        Err(ClientError::ServiceError { error_class }) => assert_eq!(
+        Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
             error_class,
             ErrorClass::Definition(definition::OBJECT_EXISTS),
             "a duplicate data set name must answer definition object-exists"
@@ -164,7 +164,7 @@ async fn unknown_member_yields_a_typed_service_error() {
     .expect("timeout");
 
     match result {
-        Err(ClientError::ServiceError { error_class }) => assert_eq!(
+        Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
             error_class,
             ErrorClass::Definition(definition::OBJECT_UNDEFINED),
             "an unresolvable member must answer object-undefined"
@@ -236,6 +236,7 @@ async fn get_data_set_directory_of_an_unknown_set_reports_the_error_class() {
     }
     let mms_text = ClientError::ServiceError {
         error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+        service_specific: None,
     }
     .to_string();
     assert_eq!(err.to_string(), format!("mms layer error: {mms_text}"));

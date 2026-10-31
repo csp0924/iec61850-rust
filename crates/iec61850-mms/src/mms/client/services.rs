@@ -907,7 +907,8 @@ fn dispatch_get_var_access_attrs_response(pdu: MmsPdu) -> Result<TypeSpecificati
 /// ```
 ///
 /// The invokeID has already been matched against the request by
-/// `recv_confirmed_response`, so only the errorClass is carried out.
+/// `recv_confirmed_response`, so only the errorClass and the
+/// serviceSpecificInformation are carried out.
 fn handle_confirmed_error(inner: &[u8]) -> ClientError {
     match decode_confirmed_error_inner(inner) {
         Ok((invoke_id, se)) => {
@@ -917,6 +918,7 @@ fn handle_confirmed_error(inner: &[u8]) -> ClientError {
             );
             ClientError::ServiceError {
                 error_class: se.error_class,
+                service_specific: se.service_specific,
             }
         }
         Err(e) => {
@@ -1050,7 +1052,8 @@ mod tests {
             matches!(
                 err,
                 ClientError::ServiceError {
-                    error_class: ErrorClass::Service(1)
+                    error_class: ErrorClass::Service(1),
+                    ..
                 }
             ),
             "got {err:?}"
@@ -1108,7 +1111,8 @@ mod tests {
             matches!(
                 err,
                 ClientError::ServiceError {
-                    error_class: ErrorClass::Service(1)
+                    error_class: ErrorClass::Service(1),
+                    ..
                 }
             ),
             "got {err:?}"

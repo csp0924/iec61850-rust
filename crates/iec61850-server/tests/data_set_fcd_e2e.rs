@@ -586,7 +586,7 @@ async fn an_undefined_member_answers_object_undefined() {
             .define_named_variable_list(DOM, "LLN0$dynBad", vec![entry])
             .await
         {
-            Err(ClientError::ServiceError { error_class }) => assert_eq!(
+            Err(ClientError::ServiceError { error_class, .. }) => assert_eq!(
                 error_class,
                 ErrorClass::Definition(definition::OBJECT_UNDEFINED),
                 "{item}"
@@ -602,7 +602,7 @@ async fn an_undefined_member_answers_object_undefined() {
         )
         .await
     {
-        Err(ClientError::ServiceError { error_class }) => {
+        Err(ClientError::ServiceError { error_class, .. }) => {
             assert_eq!(error_class, ErrorClass::Access(access::OBJECT_NON_EXISTENT))
         }
         other => panic!("{other:?}"),
