@@ -25,7 +25,7 @@ use core::sync::atomic::AtomicBool;
 
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
-use iec61850_mms::mms::client::MmsClient;
+use iec61850_mms::mms::client::{ConnectionState, MmsClient};
 
 use crate::error::ClientError;
 use crate::prelude::Arc;
@@ -151,6 +151,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// Closes the association: MMS Conclude, then the ACSE release, then the
     /// transport is closed.
     ///
+    /// The cached device model is dropped once the association has ended, and
+    /// kept while it stays established.
+    ///
     /// # Errors
     ///
     /// `ConcludeRejected` when the server refuses the Conclude; the
@@ -159,12 +162,18 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.is_connected
             .store(false, core::sync::atomic::Ordering::Release);
+        let mut client = self.mms_client.lock().await;
+        let result = client.disconnect().await;
+        let still_associated = client.state() == ConnectionState::Connected;
+        drop(client);
         // A later connection may reach a different server; a stale model would
         // make the directory API compare against the wrong logical devices.
-        *self.device_model.lock().await = None;
-        let mut client = self.mms_client.lock().await;
-        client.disconnect().await?;
-        Ok(())
+        // While a refused Conclude leaves the association open, the model
+        // still describes the server.
+        if !still_associated {
+            *self.device_model.lock().await = None;
+        }
+        result.map_err(ClientError::from)
     }
 
     /// Aborts the association without the Conclude exchange: an ACSE ABRT is

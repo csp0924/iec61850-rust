@@ -9,7 +9,7 @@ mod support;
 
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use iec61850_client::directory::DEFAULT_MAX_NAME_LIST_NAMES;
 use iec61850_client::{AcsiClass, ClientError, IedConnection};
 use iec61850_mms::mms::pdu::get_name_list::{
@@ -208,4 +208,51 @@ async fn name_list_walk_within_a_configured_limit_completes() {
         .await
         .expect("ld directory");
     assert_eq!(lns, vec!["GGIO1".to_string(), "LLN0".to_string()]);
+}
+
+/// Answers a Conclude with a Conclude-ErrorPDU and every other request as the
+/// `MODEL` script does.
+fn refusing_conclude() -> Arc<support::Script> {
+    let model = script_for("MODEL");
+    Arc::new(move |mms: &[u8], seq: u32| {
+        if mms == [0x8b, 0x00] {
+            // [13] IMPLICIT ServiceError: errorClass conclude [9],
+            // further-communication-required(1)
+            return Some(Plan::reply(Bytes::from_static(&[
+                0xad, 0x05, 0xa0, 0x03, 0x89, 0x01, 0x01,
+            ])));
+        }
+        model(mms, seq)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_conclude_keeps_the_device_model() {
+    let port = support::start(refusing_conclude()).await;
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    conn.get_server_directory(false).await.expect("directory");
+
+    assert_eq!(conn.disconnect().await, Err(ClientError::ConcludeRejected));
+    assert!(conn.is_connected());
+    assert!(
+        conn.cached_device_model().await.is_some(),
+        "the association is still open, so its model is kept"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_disconnect_drops_the_device_model() {
+    let conn = connect("MODEL").await;
+    conn.get_server_directory(false).await.expect("directory");
+    assert!(conn.cached_device_model().await.is_some());
+
+    conn.disconnect().await.expect("disconnect");
+    assert!(!conn.is_connected());
+    assert!(conn.cached_device_model().await.is_none());
 }
