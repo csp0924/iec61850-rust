@@ -14,8 +14,12 @@
 //!
 //! The type check compares the variant of the decoded wire value against the
 //! variant currently held in the model and answers `ObjectValueInvalid` on a
-//! mismatch; a bit string whose length does not fit the declared size of the
-//! attribute answers `TypeInconsistent`. A path is served down to a data
+//! mismatch. The value must then lie within the type the attribute declares in
+//! GetVariableAccessAttributes (IEC 61850-8-1 §8.1.1, table 15): an integer
+//! outside the range of its width, and a visible, Unicode or octet string longer
+//! than its maximum length, or of another length than a fixed one, answer
+//! `ObjectValueInvalid` (§8.1.2.1). A bit string whose length does not fit the
+//! declared size of the attribute answers `TypeInconsistent`. A path is served down to a data
 //! attribute or any sub-attribute beneath it, `LN$FC$DO[$SDO...]$DA[$SDA...]`,
 //! crossing any depth of sub-data-objects on the way. A path that stops on a
 //! data object answers `ObjectAccessUnsupported`.
@@ -43,7 +47,9 @@ use alloc::{
 use crate::handler::{
     canonicalize_attr_path, HandlerRegistry, WriteContext, WriteOutcome as HandlerWriteOutcome,
 };
-use crate::mapping::{bit_string_fits, declared_bit_string_size, MmsDeviceModel};
+use crate::mapping::{
+    bit_string_fits, declared_bit_string_size, MmsDeviceModel, MmsLeafType, MmsTypeSpec, StringSize,
+};
 use crate::policy::WriteAccessPolicies;
 use crate::service::convert::{mms_data_to_mms_value, same_data_variant};
 // Writing under FC SE belongs to the setting-group subsystem.
@@ -117,7 +123,7 @@ fn classify_fc(fc_str: &str) -> Option<FcWriteRoute> {
 #[allow(clippy::too_many_arguments)]
 pub fn handle_single_write(
     ied_model: &IedModel,
-    _mms_model: &MmsDeviceModel,
+    mms_model: &MmsDeviceModel,
     policies: &WriteAccessPolicies,
     handler_registry: Option<&HandlerRegistry>,
     #[cfg(feature = "setting-groups")] setting_groups: Option<&SettingGroupRegistry>,
@@ -200,6 +206,7 @@ pub fn handle_single_write(
             }
             write_to_da(
                 ied_model,
+                mms_model,
                 domain,
                 ln_name,
                 fc,
@@ -255,6 +262,7 @@ pub fn handle_single_write(
             }
             write_to_da(
                 ied_model,
+                mms_model,
                 domain,
                 ln_name,
                 FC::Se,
@@ -273,6 +281,7 @@ pub fn handle_single_write(
 #[allow(clippy::too_many_arguments)]
 fn write_to_da(
     ied_model: &IedModel,
+    mms_model: &MmsDeviceModel,
     domain: &str,
     ln_name: &str,
     fc: FC,
@@ -388,10 +397,22 @@ fn write_to_da(
         };
     }
 
+    // The declared type of the target, as GetVariableAccessAttributes reports
+    // it; the model and its MMS view are built together, so a resolved target
+    // always has one.
+    let Some(spec) = mms_model.spec_at(domain, item_id) else {
+        tracing::warn!(
+            domain = domain,
+            item_id = item_id,
+            "write: the data attribute has no type description"
+        );
+        return WriteOutcome::Failure(DataAccessError::ObjectNonExistent);
+    };
+
     // Every node the write reaches, in pre-order: the target first, then, for a
     // constructed target, each sub-attribute down to the leaves.
     let mut nodes: Vec<NodeWrite<'_>> = Vec::new();
-    if let Err(e) = collect_node_writes(target, data, item_id.to_string(), &mut nodes) {
+    if let Err(e) = collect_node_writes(target, spec, data, item_id.to_string(), &mut nodes) {
         tracing::warn!(
             domain = domain,
             item_id = item_id,
@@ -504,10 +525,12 @@ struct NodeWrite<'a> {
 ///
 /// A constructed attribute takes a structure with one member per sub-attribute;
 /// a different member count is type-inconsistent. A leaf takes a value of the
-/// variant it holds, else object-value-invalid, and a bit string must fit its
-/// declared size, else type-inconsistent.
+/// variant it holds, else object-value-invalid, within the range or length of
+/// its declared type `spec`, else object-value-invalid, and a bit string must fit
+/// its declared size, else type-inconsistent.
 fn collect_node_writes<'a>(
     da: &'a DataAttribute,
+    spec: &MmsTypeSpec,
     data: &'a MmsData,
     path: String,
     out: &mut Vec<NodeWrite<'a>>,
@@ -516,7 +539,10 @@ fn collect_node_writes<'a>(
         let MmsData::Structure(members) = data else {
             return Err(DataAccessError::ObjectValueInvalid);
         };
-        if members.len() != da.children.len() {
+        let MmsTypeSpec::Structure(member_specs) = spec else {
+            return Err(DataAccessError::TypeInconsistent);
+        };
+        if members.len() != da.children.len() || member_specs.len() != da.children.len() {
             return Err(DataAccessError::TypeInconsistent);
         }
         out.push(NodeWrite {
@@ -525,8 +551,14 @@ fn collect_node_writes<'a>(
             path: path.clone(),
             is_leaf: false,
         });
-        for (child, member) in da.children.iter().zip(members) {
-            collect_node_writes(child, member, format!("{path}${}", child.name), out)?;
+        for ((child, member_spec), member) in da.children.iter().zip(member_specs).zip(members) {
+            collect_node_writes(
+                child,
+                &member_spec.type_spec,
+                member,
+                format!("{path}${}", child.name),
+                out,
+            )?;
         }
         return Ok(());
     }
@@ -534,6 +566,7 @@ fn collect_node_writes<'a>(
     if !same_data_variant(data, &da.snapshot()) {
         return Err(DataAccessError::ObjectValueInvalid);
     }
+    check_declared_type(spec, data)?;
     // A bit string whose length does not fit the declared size of the
     // attribute, such as 13 bits for a two-bit Dbpos, is refused and the
     // attribute keeps its value.
@@ -551,6 +584,85 @@ fn collect_node_writes<'a>(
         is_leaf: true,
     });
     Ok(())
+}
+
+/// Checks a value of the right variant against the type its attribute declares:
+/// the range of an integer width, the length of a visible, Unicode or octet
+/// string, the octet count of a binary time, and, member by member, a structure
+/// that a scalar attribute such as PhyComAddr declares. Anything outside the
+/// declared type is object-value-invalid (IEC 61850-8-1 §8.1.2.1); a structure
+/// of another member count is type-inconsistent.
+///
+/// The length of a Unicode string counts characters, as IEC 61850-8-1
+/// §8.1.2.6 sizes an MMSString. Bit strings are checked by the caller.
+fn check_declared_type(spec: &MmsTypeSpec, data: &MmsData) -> Result<(), DataAccessError> {
+    let fits = match (spec, data) {
+        (MmsTypeSpec::Leaf(MmsLeafType::Integer(bits)), MmsData::Integer(v)) => {
+            fits_width(i128::from(*v), *bits, true)
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::Integer(bits)), MmsData::Unsigned(v)) => {
+            fits_width(i128::from(*v), *bits, true)
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::Unsigned(bits)), MmsData::Integer(v)) => {
+            fits_width(i128::from(*v), *bits, false)
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::Unsigned(bits)), MmsData::Unsigned(v)) => {
+            fits_width(i128::from(*v), *bits, false)
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::OctetString(size)), MmsData::OctetString(v)) => {
+            fits_length(*size, v.len())
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::VisibleString(size)), MmsData::VisibleString(v)) => {
+            fits_length(*size, v.len())
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::UnicodeString(size)), MmsData::MmsString(v)) => {
+            fits_length(*size, v.chars().count())
+        }
+        (MmsTypeSpec::Leaf(MmsLeafType::BinaryTime { size }), MmsData::BinaryTime(v)) => {
+            v.len() == usize::from(*size)
+        }
+        (MmsTypeSpec::Structure(member_specs), MmsData::Structure(members)) => {
+            if member_specs.len() != members.len() {
+                return Err(DataAccessError::TypeInconsistent);
+            }
+            for (member_spec, member) in member_specs.iter().zip(members) {
+                check_declared_type(&member_spec.type_spec, member)?;
+            }
+            true
+        }
+        _ => true,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(DataAccessError::ObjectValueInvalid)
+    }
+}
+
+/// Reports whether `v` lies within an integer of `bits` bits, signed or not
+/// (IEC 61850-8-1 §8.1.1, table 15). A width of 64 bits or more admits every
+/// value the wire decoder yields.
+fn fits_width(v: i128, bits: u16, signed: bool) -> bool {
+    if bits >= 64 {
+        return signed || v >= 0;
+    }
+    let bits = u32::from(bits);
+    if signed {
+        let half = 1i128 << (bits - 1);
+        (-half..half).contains(&v)
+    } else {
+        (0..1i128 << bits).contains(&v)
+    }
+}
+
+/// Reports whether a string of `len` units fits a declared size: at most N for
+/// `Max(N)`, exactly N for `Fixed(N)`, anything for `Generic`.
+fn fits_length(size: StringSize, len: usize) -> bool {
+    match size {
+        StringSize::Max(n) => len <= usize::from(n),
+        StringSize::Fixed(n) => len == usize::from(n),
+        StringSize::Generic => true,
+    }
 }
 
 /// Gives the write handler installed on `item_id`, if any, its say on
@@ -1712,6 +1824,184 @@ mod tests {
                 padding: 6,
                 data: vec![0x80],
             }
+        );
+    }
+
+    // ── The declared range and length of a basic type ──────────────────
+
+    /// `GGIO1.Lim` holds one SP attribute per basic type whose range or length
+    /// the write path checks.
+    fn build_limits_model() -> (iec61850_model::IedModel, MmsDeviceModel) {
+        let attrs = vec![
+            ("i8", DataAttributeType::Int8, MmsValue::Integer(0)),
+            ("u8", DataAttributeType::Int8U, MmsValue::Unsigned(0)),
+            ("i16", DataAttributeType::Int16, MmsValue::Integer(0)),
+            ("u16", DataAttributeType::Int16U, MmsValue::Unsigned(0)),
+            ("i32", DataAttributeType::Int32, MmsValue::Integer(0)),
+            ("u32", DataAttributeType::Int32U, MmsValue::Unsigned(0)),
+            ("i64", DataAttributeType::Int64, MmsValue::Integer(0)),
+            ("en", DataAttributeType::Enumerated, MmsValue::Integer(0)),
+            (
+                "vis",
+                DataAttributeType::VisibleString(4),
+                MmsValue::VisibleString(String::new()),
+            ),
+            (
+                "oct",
+                DataAttributeType::OctetString(4),
+                MmsValue::OctetString(Vec::new()),
+            ),
+            (
+                "oct8",
+                DataAttributeType::OctetString(8),
+                MmsValue::OctetString(vec![0; 8]),
+            ),
+            (
+                "uni",
+                DataAttributeType::UnicodeString255,
+                MmsValue::MmsString(String::new()),
+            ),
+            // A model may hold an unsigned type in a signed value.
+            ("u8i", DataAttributeType::Int8U, MmsValue::Integer(0)),
+        ];
+        let lim = DataObject::new(
+            "Lim",
+            attrs
+                .into_iter()
+                .map(|(name, ty, v)| {
+                    DoChild::Da(DataAttribute::new(name, FC::Sp, ty, TrgOps::default(), v))
+                })
+                .collect(),
+        );
+        let ggio_ln = LogicalNodeBuilder::new("", "GGIO", "1")
+            .add_do(lim)
+            .build()
+            .unwrap();
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio_ln)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
+        (model, mms_model)
+    }
+
+    fn write_limit(
+        model: &iec61850_model::IedModel,
+        mms_model: &MmsDeviceModel,
+        attr: &str,
+        data: MmsData,
+    ) -> WriteOutcome {
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: format!("GGIO1$SP$Lim${attr}"),
+        };
+        let policies = WriteAccessPolicies::default();
+        handle_single_write(model, mms_model, &policies, None, None, 0, &name, &data)
+    }
+
+    /// Every integer width admits its bounds and refuses the value one past
+    /// each, with object-value-invalid, leaving the attribute as it was.
+    #[test]
+    fn write_integer_outside_its_width_is_object_value_invalid() {
+        let (model, mms_model) = build_limits_model();
+        let accepted = [
+            ("i8", MmsData::Integer(-128)),
+            ("i8", MmsData::Integer(127)),
+            ("u8", MmsData::Unsigned(255)),
+            ("i16", MmsData::Integer(-32768)),
+            ("i16", MmsData::Integer(32767)),
+            ("u16", MmsData::Unsigned(65535)),
+            ("i32", MmsData::Integer(i64::from(i32::MIN))),
+            ("i32", MmsData::Integer(i64::from(i32::MAX))),
+            ("u32", MmsData::Unsigned(u64::from(u32::MAX))),
+            ("i64", MmsData::Integer(i64::MIN)),
+            ("en", MmsData::Integer(127)),
+            ("u8i", MmsData::Integer(255)),
+        ];
+        for (attr, data) in accepted {
+            assert_eq!(
+                write_limit(&model, &mms_model, attr, data.clone()),
+                WriteOutcome::Success,
+                "{attr} = {data:?}"
+            );
+        }
+        let refused = [
+            ("i8", MmsData::Integer(-129)),
+            ("i8", MmsData::Integer(128)),
+            ("u8", MmsData::Unsigned(256)),
+            ("i16", MmsData::Integer(-32769)),
+            ("i16", MmsData::Integer(32768)),
+            ("u16", MmsData::Unsigned(65536)),
+            ("i32", MmsData::Integer(i64::from(i32::MIN) - 1)),
+            ("i32", MmsData::Integer(i64::from(i32::MAX) + 1)),
+            ("u32", MmsData::Unsigned(u64::from(u32::MAX) + 1)),
+            ("en", MmsData::Integer(128)),
+            ("u8i", MmsData::Integer(-1)),
+            ("u8i", MmsData::Integer(256)),
+        ];
+        for (attr, data) in refused {
+            assert_eq!(
+                write_limit(&model, &mms_model, attr, data.clone()),
+                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid),
+                "{attr} = {data:?}"
+            );
+        }
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$Lim$i8"),
+            MmsValue::Integer(127)
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$Lim$u8"),
+            MmsValue::Unsigned(255)
+        );
+    }
+
+    /// A string or octet string longer than its maximum length, or of another
+    /// length than a fixed one, is object-value-invalid; a Unicode string is
+    /// measured in characters, not octets.
+    #[test]
+    fn write_string_longer_than_its_maximum_is_object_value_invalid() {
+        let (model, mms_model) = build_limits_model();
+        let accepted = [
+            ("vis", MmsData::VisibleString("abcd".into())),
+            ("oct", MmsData::OctetString(vec![1, 2, 3, 4])),
+            ("oct", MmsData::OctetString(Vec::new())),
+            ("oct8", MmsData::OctetString(vec![9; 8])),
+            ("uni", MmsData::MmsString("\u{00e9}".repeat(255))),
+        ];
+        for (attr, data) in accepted {
+            assert_eq!(
+                write_limit(&model, &mms_model, attr, data.clone()),
+                WriteOutcome::Success,
+                "{attr} = {data:?}"
+            );
+        }
+        let refused = [
+            ("vis", MmsData::VisibleString("abcde".into())),
+            ("oct", MmsData::OctetString(vec![1, 2, 3, 4, 5])),
+            ("oct8", MmsData::OctetString(vec![9; 7])),
+            ("uni", MmsData::MmsString("a".repeat(256))),
+        ];
+        for (attr, data) in refused {
+            assert_eq!(
+                write_limit(&model, &mms_model, attr, data.clone()),
+                WriteOutcome::Failure(DataAccessError::ObjectValueInvalid),
+                "{attr} = {data:?}"
+            );
+        }
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$Lim$vis"),
+            MmsValue::VisibleString("abcd".into())
+        );
+        assert_eq!(
+            leaf_value(&model, "IED1LD0/GGIO1$SP$Lim$oct8"),
+            MmsValue::OctetString(vec![9; 8])
         );
     }
 }

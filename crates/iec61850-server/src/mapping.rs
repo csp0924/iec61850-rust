@@ -239,13 +239,6 @@ impl MmsDeviceModel {
     ///
     /// `None` means the domain or a step does not exist, or a step passes
     /// through something other than a structure.
-    #[cfg(any(
-        feature = "reporting",
-        feature = "control",
-        feature = "setting-groups",
-        feature = "goose-mapping",
-        feature = "logging"
-    ))]
     pub(crate) fn spec_at(&self, domain: &str, item_id: &str) -> Option<&MmsTypeSpec> {
         let mut steps = item_id.split('$');
         let mut spec = self.get_variable_spec(domain, steps.next()?)?;
