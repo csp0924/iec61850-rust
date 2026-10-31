@@ -666,8 +666,8 @@ async fn pdu_at_the_negotiated_size_is_sent_and_one_above_is_refused() {
 // Release and abort
 
 /// The client releases with an RLRQ in a Session FN and the server answers
-/// with an RLRE in a Session DN, which the client has received by the time
-/// the release returns.
+/// with an RLRE in a Session DN. The proxy records the DN when it reads it
+/// from the server, whether or not the client is still waiting for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_is_a_finish_answered_by_a_disconnect() {
     let handle = start_server("127.0.0.1:0").await;
@@ -684,11 +684,12 @@ async fn release_is_a_finish_answered_by_a_disconnect() {
         sent.iter().any(|s| is_finish_with_rlrq(s)),
         "no session finish with an rlrq among {sent:02x?}"
     );
-    let answers = proxy.spdus_to_client();
-    assert!(
-        answers.iter().any(|s| is_disconnect_with_rlre(s)),
-        "no session disconnect with an rlre among {answers:02x?}"
-    );
+    settle(&proxy, |p| {
+        p.spdus_to_client()
+            .iter()
+            .any(|s| is_disconnect_with_rlre(s))
+    })
+    .await;
     handle.stop().await;
 }
 
