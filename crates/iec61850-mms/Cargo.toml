@@ -49,9 +49,9 @@ embedded = [
     "dep:ahash",
 ]
 
-# TLS over MMS (secure MMS port 3782). Implies std, since tokio-rustls needs a
+# TLS over MMS (secure MMS port 3782). Implies std, since the TLS stream needs a
 # tokio runtime.
-tls = ["std", "dep:iec61850-tls", "dep:tokio-rustls", "dep:rustls"]
+tls = ["std", "dep:iec61850-tls", "dep:rustls"]
 
 [dependencies]
 # The hal `transport` and `transport-tokio` features are enabled conditionally
@@ -76,7 +76,6 @@ hashbrown      = { version = "0.14", default-features = false, features = ["ahas
 ahash          = { version = "0.8",  default-features = false, features = ["compile-time-rng"], optional = true }
 # tokio is enabled only by `std`; an embedded build does not pull it in.
 tokio          = { workspace = true, features = ["io-util", "net", "rt", "macros", "time", "sync"], optional = true }
-tokio-rustls   = { workspace = true, optional = true }
 rustls         = { workspace = true, optional = true }
 
 [dev-dependencies]

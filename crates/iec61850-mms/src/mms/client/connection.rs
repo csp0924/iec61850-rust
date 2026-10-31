@@ -70,11 +70,9 @@ use iec61850_hal::time::TokioTimer;
 use tokio::net::TcpStream;
 
 #[cfg(feature = "tls")]
-use iec61850_tls::{TlsConnector, TlsError};
+use iec61850_tls::{TlsConnector, TlsError, TlsStream};
 #[cfg(feature = "tls")]
 use rustls::pki_types::ServerName;
-#[cfg(feature = "tls")]
-use tokio_rustls::client::TlsStream;
 
 // Constants
 

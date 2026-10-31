@@ -591,7 +591,6 @@ dependencies = [
  "rustls",
  "thiserror",
  "tokio",
- "tokio-rustls",
  "tracing",
 ]
 

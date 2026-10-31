@@ -213,7 +213,8 @@ struct ServerSide {
 #[derive(Debug)]
 struct ClientSide {
     resumed: bool,
-    version: Option<rustls::ProtocolVersion>,
+    version: Option<TlsVersion>,
+    suite: Option<rustls::CipherSuite>,
 }
 
 /// Runs one handshake over loopback TCP, presenting `name` to the server, and
@@ -228,7 +229,7 @@ async fn handshake_as(
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut stream = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
-        let peer_cert_presented = stream.get_ref().1.peer_certificates().is_some();
+        let peer_cert_presented = stream.peer_certificates().is_some();
         let mut byte = [0u8; 1];
         stream
             .read_exact(&mut byte)
@@ -244,9 +245,9 @@ async fn handshake_as(
     let name = ServerName::try_from(name.to_string()).unwrap();
     let client = match connector.connect(name, tcp).await {
         Ok(mut stream) => {
-            let conn = stream.get_ref().1;
-            let resumed = conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
-            let version = conn.protocol_version();
+            let resumed = stream.is_resumed();
+            let version = stream.protocol_version();
+            let suite = stream.negotiated_cipher_suite();
             async {
                 stream.write_all(&[7]).await?;
                 let mut byte = [0u8; 1];
@@ -254,7 +255,11 @@ async fn handshake_as(
                 Ok::<_, std::io::Error>(())
             }
             .await
-            .map(|_| ClientSide { resumed, version })
+            .map(|_| ClientSide {
+                resumed,
+                version,
+                suite,
+            })
             .map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
@@ -308,9 +313,18 @@ async fn ecdsa_certificate_negotiates_tls12() {
     let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
 
     assert!(srv.is_ok(), "server side: {srv:?}");
-    assert_eq!(
-        cli.expect("client side").version,
-        Some(rustls::ProtocolVersion::TLSv1_2)
+    let cli = cli.expect("client side");
+    assert_eq!(cli.version, Some(TlsVersion::Tls12));
+    assert!(
+        matches!(
+            cli.suite,
+            Some(
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                    | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            )
+        ),
+        "suite: {:?}",
+        cli.suite
     );
 }
 
@@ -330,10 +344,7 @@ async fn rsa_certificate_negotiates_tls12() {
     let (srv, cli) = handshake(TlsAcceptor::new(server), &TlsConnector::new(client)).await;
 
     assert!(srv.is_ok(), "server side: {srv:?}");
-    assert_eq!(
-        cli.expect("client side").version,
-        Some(rustls::ProtocolVersion::TLSv1_2)
-    );
+    assert_eq!(cli.expect("client side").version, Some(TlsVersion::Tls12));
 }
 
 // -----------------------------------------------------------------------------
@@ -874,7 +885,7 @@ async fn tls13_tickets_received(server: impl Fn(&Leaf) -> TlsConfigBuilder) -> u
     let (srv, cli) = handshake(acceptor, &TlsConnector::from_rustls(Arc::new(client))).await;
     assert!(srv.is_ok(), "server={srv:?}");
     let cli = cli.expect("client side");
-    assert_eq!(cli.version, Some(rustls::ProtocolVersion::TLSv1_3));
+    assert_eq!(cli.version, Some(TlsVersion::Tls13));
     store.tls13_tickets()
 }
 

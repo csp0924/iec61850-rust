@@ -86,7 +86,7 @@ async fn handshake(acceptor: TlsAcceptor, connector: &TlsConnector) -> bool {
     let tcp = TcpStream::connect(addr).await.unwrap();
     let name = ServerName::try_from("server.test").unwrap().to_owned();
     let mut stream = connector.connect(name, tcp).await.unwrap();
-    let resumed = stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
+    let resumed = stream.is_resumed();
     stream.write_all(&[7]).await.unwrap();
     let mut byte = [0u8; 1];
     stream.read_exact(&mut byte).await.unwrap();

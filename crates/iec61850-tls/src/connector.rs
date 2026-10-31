@@ -4,19 +4,19 @@ use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
-use tokio_rustls::{client::TlsStream, TlsConnector as RustlsTlsConnector};
+use tokio_rustls::TlsConnector as RustlsTlsConnector;
 
 use crate::config::TlsClientConfig;
 use crate::error::TlsError;
 use crate::event::{
     report_established, report_handshake_failure, DefaultTracingHandler, TlsEventHandler,
 };
+use crate::stream::TlsStream;
 
 /// TLS connector for the client side.
 ///
-/// A thin wrapper over `tokio_rustls::TlsConnector`; cloning is cheap, because
-/// the configuration sits behind an `Arc`. The returned
-/// `tokio_rustls::client::TlsStream<TcpStream>` implements
+/// Cloning is cheap, because the configuration sits behind an `Arc`. The
+/// returned [`TlsStream<TcpStream>`] implements
 /// `AsyncRead + AsyncWrite + Unpin`, so it can be handed to
 /// `CotpConnection::new()` with no change inside COTP.
 ///
@@ -72,7 +72,8 @@ impl TlsConnector {
     ) -> Result<TlsStream<TcpStream>, TlsError> {
         match self.inner.connect(server_name, tcp).await {
             Ok(stream) => {
-                report_established(self.event_handler.as_ref(), "client", stream.get_ref().1);
+                let stream = TlsStream::new(stream);
+                report_established(self.event_handler.as_ref(), "client", stream.state());
                 Ok(stream)
             }
             Err(e) => {

@@ -2,9 +2,9 @@
 //!
 //! [`TlsConfigBuilder`] produces client and server configurations with the
 //! profile's constraints already applied: TLS 1.2 as the floor and a fixed
-//! cipher suite whitelist. [`TlsConnector`] and [`TlsAcceptor`] wrap
-//! `tokio-rustls` and hand back a `TlsStream<TcpStream>` that plugs straight
-//! into the COTP connection type.
+//! cipher suite whitelist. [`TlsConnector`] and [`TlsAcceptor`] run the
+//! handshake and hand back a [`TlsStream<TcpStream>`] that plugs straight into
+//! the COTP connection type.
 //!
 //! The verifier wrappers add the profile's stricter certificate rules.
 //! [`AllowOnlyKnownCertsServerVerifier`] and its client counterpart reject a
@@ -28,6 +28,7 @@ pub mod connector;
 pub mod error;
 pub mod event;
 mod session;
+mod stream;
 pub mod verifier;
 
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub use error::TlsError;
 pub use event::{
     DefaultTracingHandler, NullEventHandler, TlsEventCode, TlsEventHandler, TlsEventLevel,
 };
+pub use stream::TlsStream;
 pub use verifier::{
     AllowOnlyKnownCertsClientVerifier, AllowOnlyKnownCertsServerVerifier,
     IgnoreValidityTimeClientVerifier, IgnoreValidityTimeServerVerifier,

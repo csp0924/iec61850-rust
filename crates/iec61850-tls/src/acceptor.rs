@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
-use tokio_rustls::{server::TlsStream, TlsAcceptor as RustlsTlsAcceptor};
+use tokio_rustls::TlsAcceptor as RustlsTlsAcceptor;
 
 use crate::config::TlsServerConfig;
 use crate::error::TlsError;
@@ -11,12 +11,12 @@ use crate::event::{
     report_established, report_handshake_failure, DefaultTracingHandler, TlsEventCode,
     TlsEventHandler, TlsEventLevel,
 };
+use crate::stream::TlsStream;
 
 /// TLS acceptor for the server side.
 ///
-/// A thin wrapper over `tokio_rustls::TlsAcceptor`; cloning is cheap, because
-/// the configuration sits behind an `Arc`. The returned
-/// `tokio_rustls::server::TlsStream<TcpStream>` implements
+/// Cloning is cheap, because the configuration sits behind an `Arc`. The
+/// returned [`TlsStream<TcpStream>`] implements
 /// `AsyncRead + AsyncWrite + Unpin`, so it can be handed to
 /// `CotpConnection::new()` with no change inside COTP.
 ///
@@ -72,7 +72,8 @@ impl TlsAcceptor {
     pub async fn accept(&self, tcp: TcpStream) -> Result<TlsStream<TcpStream>, TlsError> {
         match self.inner.accept(tcp).await {
             Ok(stream) => {
-                let conn = stream.get_ref().1;
+                let stream = TlsStream::new(stream);
+                let conn = stream.state();
                 report_established(self.event_handler.as_ref(), "server", conn);
                 if self.client_auth_optional && conn.peer_certificates().is_none() {
                     let msg = "client presented no certificate; client authentication is optional";
