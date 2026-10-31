@@ -17,7 +17,10 @@
 //!
 //! TODO: add a macOS and BSD BPF backend.
 
-use std::time::Duration;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::time::Duration;
 
 #[cfg(all(feature = "ethernet-linux-afpacket", target_os = "linux"))]
 #[cfg_attr(

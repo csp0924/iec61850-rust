@@ -141,6 +141,7 @@ jobs:
           cargo check -p iec61850-asn1   --target thumbv7em-none-eabihf --no-default-features --features alloc
           cargo check -p iec61850-model  --target thumbv7em-none-eabihf --no-default-features --features embedded
           cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features alloc,transport
+          cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features alloc,ethernet
           cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features transport-embassy
           cargo check -p iec61850-mms    --target thumbv7em-none-eabihf --no-default-features --features embedded
           cargo check -p iec61850-client --target thumbv7em-none-eabihf --no-default-features --features minimal,embedded
