@@ -73,7 +73,7 @@ pub enum ControlAddCause {
     BlockedByInterlocking = 10,
     /// `Blocked-by-synchrocheck` (11): the synchrocheck condition blocks the
     /// command.
-    BlockedBySynchroCheck = 11,
+    BlockedBySynchrocheck = 11,
     /// `Command-already-in-execution` (12): another command on the object is
     /// still in execution.
     CommandAlreadyInExecution = 12,
@@ -106,9 +106,9 @@ pub enum ControlAddCause {
     /// `Abortion-by-communication-loss` (23): the operation was aborted when
     /// communication was lost.
     AbortionByCommunicationLoss = 23,
-    /// `Blocked-by-command` (24): a command blocks this one. The variant name
-    /// differs from the standard name.
-    AbortionByCommand = 24,
+    /// `Blocked-by-command` (24): the command is blocked by a command block,
+    /// `CmdBlk.stVal` being TRUE.
+    BlockedByCommand = 24,
     /// `None` (25): the command failed without an additional cause.
     None = 25,
     /// `Inconsistent-parameters` (26): the parameters of the command do not
@@ -132,7 +132,7 @@ impl ControlAddCause {
             8 => Self::BlockedByMode,
             9 => Self::BlockedByProcess,
             10 => Self::BlockedByInterlocking,
-            11 => Self::BlockedBySynchroCheck,
+            11 => Self::BlockedBySynchrocheck,
             12 => Self::CommandAlreadyInExecution,
             13 => Self::BlockedByHealth,
             14 => Self::OneOfNControl,
@@ -145,7 +145,7 @@ impl ControlAddCause {
             21 => Self::EndedWithOvershoot,
             22 => Self::AbortionDueToDeviation,
             23 => Self::AbortionByCommunicationLoss,
-            24 => Self::AbortionByCommand,
+            24 => Self::BlockedByCommand,
             25 => Self::None,
             26 => Self::InconsistentParameters,
             27 => Self::LockedByOtherClient,
@@ -168,12 +168,12 @@ pub enum ControlLastApplError {
     /// state machine could refuse the command; a value the standard does not
     /// define also maps here.
     Unknown = 1,
-    /// `Timeout Test Not OK` (2): a time-activated command failed its test.
-    /// The variant name differs from the standard name.
-    TimeoutTest = 2,
-    /// `Operator Test Not OK` (3): an Operate command failed its test. The
-    /// variant name differs from the standard name.
-    OperationFailed = 3,
+    /// `Timeout Test Not OK` (2): a time-activated command issued with Test
+    /// set failed.
+    TimeoutTestNotOk = 2,
+    /// `Operator Test Not OK` (3): an Operate command issued with Test set
+    /// failed.
+    OperatorTestNotOk = 3,
 }
 
 impl ControlLastApplError {
@@ -181,8 +181,8 @@ impl ControlLastApplError {
     pub fn from_i32(v: i32) -> Self {
         match v {
             0 => Self::NoError,
-            2 => Self::TimeoutTest,
-            3 => Self::OperationFailed,
+            2 => Self::TimeoutTestNotOk,
+            3 => Self::OperatorTestNotOk,
             _ => Self::Unknown,
         }
     }
@@ -281,6 +281,19 @@ mod tests {
     }
 
     #[test]
+    fn add_cause_names_follow_the_standard() {
+        assert_eq!(
+            ControlAddCause::from_i32(11),
+            ControlAddCause::BlockedBySynchrocheck
+        );
+        assert_eq!(
+            ControlAddCause::from_i32(24),
+            ControlAddCause::BlockedByCommand
+        );
+        assert_eq!(ControlAddCause::BlockedByCommand as i32, 24);
+    }
+
+    #[test]
     fn last_appl_error_from_i32() {
         assert_eq!(
             ControlLastApplError::from_i32(0),
@@ -288,7 +301,11 @@ mod tests {
         );
         assert_eq!(
             ControlLastApplError::from_i32(3),
-            ControlLastApplError::OperationFailed
+            ControlLastApplError::OperatorTestNotOk
+        );
+        assert_eq!(
+            ControlLastApplError::from_i32(2),
+            ControlLastApplError::TimeoutTestNotOk
         );
         assert_eq!(
             ControlLastApplError::from_i32(99),
