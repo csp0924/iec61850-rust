@@ -89,7 +89,6 @@ use crate::control::ControlObjectsRegistry;
 #[allow(unused_imports)]
 use crate::goose_mapping::{
     apply_gocb_write, encode_gocb_da, encode_gocb_structure, parse_go_item_id, GoCBRegistry,
-    GOCB_DA_NAMES,
 };
 use crate::handler::HandlerRegistry;
 // These helpers serve the read and write routing paths, so they are available
@@ -1451,21 +1450,16 @@ fn try_read_gocb(
         return Some(AccessResult::Failure(DataAccessError::TypeInconsistent));
     }
     match registry.find_by_item_base(domain, base) {
-        Some(handle) => match da {
-            None => Some(AccessResult::Success(encode_gocb_structure(&handle))),
-            Some(da_name) => {
-                if !GOCB_DA_NAMES.contains(&da_name) {
-                    tracing::warn!(
-                        domain,
-                        item,
-                        da = da_name,
-                        "read: unknown GOOSE control block attribute"
-                    );
-                    return Some(AccessResult::Failure(DataAccessError::ObjectNonExistent));
-                }
-                Some(AccessResult::Success(encode_gocb_da(&handle, da_name)))
-            }
-        },
+        Some(handle) => {
+            let value = match da {
+                None => encode_gocb_structure(&handle),
+                Some(da_name) => encode_gocb_da(&handle, da_name),
+            };
+            Some(match value {
+                Ok(data) => AccessResult::Success(data),
+                Err(e) => AccessResult::Failure(e),
+            })
+        }
         None => {
             tracing::warn!(
                 domain,

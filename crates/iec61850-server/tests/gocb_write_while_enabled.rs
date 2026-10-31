@@ -45,7 +45,7 @@ async fn start() -> (ServerHandle, MmsClient, Arc<Mutex<GoosePublisher>>) {
         .with_src_mac([0x00, 0x50, 0xc2, 0x12, 0x34, 0x56]);
     let publisher = Arc::new(Mutex::new(
         GoosePublisher::new(
-            comm.clone(),
+            comm,
             "TESTLD0/LLN0$GO$gcb01",
             Some("before".into()),
             "TESTLD0/LLN0$ds1",
@@ -58,13 +58,6 @@ async fn start() -> (ServerHandle, MmsClient, Arc<Mutex<GoosePublisher>>) {
         "LLN0",
         "gcb01",
         publisher.clone(),
-        7,
-        "TESTLD0/LLN0$ds1",
-        Some("before".into()),
-        false,
-        comm,
-        None,
-        None,
     )));
     let h = server.start().await.expect("start");
     let mut client = MmsClientBuilder::new()

@@ -47,11 +47,15 @@ fn comm() -> CommParameters {
 }
 
 fn build_publisher() -> Arc<Mutex<GoosePublisher>> {
+    build_publisher_with_data_set("TESTLD0/LLN0$ds1")
+}
+
+fn build_publisher_with_data_set(data_set_ref: &str) -> Arc<Mutex<GoosePublisher>> {
     let p = GoosePublisher::new(
         comm(),
         "TESTLD0/LLN0$GO$gcb01",
         Some("goid01".into()),
-        "TESTLD0/LLN0$ds1",
+        data_set_ref,
         7,
     )
     .unwrap();
@@ -59,29 +63,23 @@ fn build_publisher() -> Arc<Mutex<GoosePublisher>> {
 }
 
 fn build_handle(publisher: Arc<Mutex<GoosePublisher>>) -> Arc<GoCBHandle> {
-    Arc::new(GoCBHandle::new(
-        DOMAIN,
-        "LLN0",
-        "gcb01",
-        publisher,
-        7,
-        "TESTLD0/LLN0$ds1",
-        Some("goid01".into()),
-        false,
-        comm(),
-        Some(4),
-        Some(1000),
-    ))
+    Arc::new(GoCBHandle::new(DOMAIN, "LLN0", "gcb01", publisher))
 }
 
 async fn start_server(config: IedServerConfig) -> (ServerHandle, Arc<Mutex<GoosePublisher>>) {
+    start_server_with(config, build_publisher()).await
+}
+
+async fn start_server_with(
+    config: IedServerConfig,
+    publisher: Arc<Mutex<GoosePublisher>>,
+) -> (ServerHandle, Arc<Mutex<GoosePublisher>>) {
     let server = IedServer::builder()
         .model(build_model())
         .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .config(config)
         .build()
         .expect("build server");
-    let publisher = build_publisher();
     server.register_gocb(build_handle(publisher.clone()));
     (server.start().await.expect("start"), publisher)
 }
@@ -192,5 +190,77 @@ async fn client_get_gocb_values_decodes_table_83() {
     assert_eq!(v.fixed_offs, Some(false));
 
     conn.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+/// A change the application makes on the publisher after the GoCB is
+/// registered is what a client reads next: the publication and the GoCB carry
+/// the same goID, datSet, confRev and ndsCom (IEC 61850-8-1 §18.1.2.5.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_follow_changes_made_on_the_publisher() {
+    use iec61850_goose::publisher::RetransIntervals;
+
+    let (handle, publisher) = start_server(IedServerConfig::default()).await;
+    let mut client = connect(&handle).await;
+    {
+        let mut p = publisher.lock().unwrap();
+        p.set_conf_rev(8);
+        p.set_needs_commission(true);
+        p.set_go_id(Some("goid02".into()));
+        let mut intervals = RetransIntervals::default();
+        intervals.t1 = Duration::from_millis(2);
+        intervals.tmax = Duration::from_millis(3000);
+        p.set_retrans_intervals(intervals);
+        p.set_enabled(true);
+    }
+
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$ConfRev").await,
+        MmsData::Unsigned(8)
+    );
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$NdsCom").await,
+        MmsData::Boolean(true)
+    );
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$GoID").await,
+        MmsData::VisibleString("goid02".into())
+    );
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$GoEna").await,
+        MmsData::Boolean(true)
+    );
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$MinTime").await,
+        MmsData::Unsigned(2)
+    );
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$MaxTime").await,
+        MmsData::Unsigned(3000)
+    );
+
+    client.disconnect().await.expect("disconnect");
+    handle.stop().await;
+}
+
+/// DatSet reads as a complete reference, `<LD>/LLN0$<dsName>`, even when the
+/// publisher was configured with the data set name relative to its domain
+/// (IEC 61850-8-1 §8.1.3.2.2); the publication carries the same reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dat_set_reads_with_its_domain() {
+    let (handle, publisher) = start_server_with(
+        IedServerConfig::default(),
+        build_publisher_with_data_set("LLN0$ds1"),
+    )
+    .await;
+    let mut client = connect(&handle).await;
+
+    assert_eq!(
+        read(&mut client, "LLN0$GO$gcb01$DatSet").await,
+        MmsData::VisibleString("TESTLD0/LLN0$ds1".into())
+    );
+    assert_eq!(publisher.lock().unwrap().data_set_ref(), "TESTLD0/LLN0$ds1");
+
+    client.disconnect().await.expect("disconnect");
     handle.stop().await;
 }

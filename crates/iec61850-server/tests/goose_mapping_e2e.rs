@@ -57,21 +57,9 @@ fn build_server_with_gocb() -> IedServer {
             priority: VlanPriority::new(4).unwrap(),
             vlan_id: 100,
         });
-    let publisher = build_publisher(comm.clone());
+    let publisher = build_publisher(comm);
 
-    let handle = Arc::new(GoCBHandle::new(
-        "TESTLD0",
-        "LLN0",
-        "gcb01",
-        publisher,
-        7,
-        "TESTLD0/LLN0$ds1",
-        None,
-        false,
-        comm,
-        Some(10),
-        Some(2000),
-    ));
+    let handle = Arc::new(GoCBHandle::new("TESTLD0", "LLN0", "gcb01", publisher));
     server.register_gocb(handle);
     server
 }
@@ -358,8 +346,8 @@ async fn client_get_gocb_values_round_trip() {
     assert_eq!(v.dst_address.priority, 4);
     assert_eq!(v.dst_address.vlan_id, 100);
     assert_eq!(v.dst_address.app_id, 0x1000);
-    assert_eq!(v.min_time_ms, Some(10));
-    assert_eq!(v.max_time_ms, Some(2000));
+    assert_eq!(v.min_time_ms, Some(4));
+    assert_eq!(v.max_time_ms, Some(1000));
     assert_eq!(v.fixed_offs, Some(false));
 
     conn.disconnect().await.expect("disconnect");
