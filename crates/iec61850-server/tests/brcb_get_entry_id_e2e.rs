@@ -296,12 +296,12 @@ fn dbpos(n: u8) -> MmsValue {
     }
 }
 
-/// While enabled, the BRCB exposes the last entry it sent even when that entry
-/// is no longer the newest in the buffer: after the buffer is purged and the
-/// BRCB enabled again, and before anything new is sent, the entry sent last is
-/// exposed rather than the all-zero EntryID of the empty buffer.
+/// A purge discards the entries already sent along with the others: after the
+/// buffer is purged and the BRCB enabled again, and before anything new is
+/// sent, the all-zero EntryID of the empty buffer is exposed rather than the
+/// entry sent before the purge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn enabled_brcb_exposes_the_last_entry_sent_after_a_purge() {
+async fn enabled_brcb_exposes_no_entry_after_a_purge() {
     let f = start().await;
     let mut mms = f.connect().await;
     write_brcb(&mut mms, "RptEna", MmsData::Boolean(true)).await;
@@ -312,5 +312,10 @@ async fn enabled_brcb_exposes_the_last_entry_sent_after_a_purge() {
     assert_eq!(read_exposed(&mut mms).await, (vec![0; 8], EPOCH_1984_MS));
 
     write_brcb(&mut mms, "RptEna", MmsData::Boolean(true)).await;
-    assert_eq!(read_exposed(&mut mms).await, carried(&sent));
+    assert_eq!(read_exposed(&mut mms).await, (vec![0; 8], EPOCH_1984_MS));
+
+    f.set_st_val(1);
+    let next = next_report(&mut mms).await;
+    assert_ne!(carried(&next), carried(&sent));
+    assert_eq!(read_exposed(&mut mms).await, carried(&next));
 }

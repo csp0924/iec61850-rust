@@ -819,10 +819,12 @@ fn brcb_field_value(
 /// Returns the EntryID a GetBRCBValues response exposes, with its TimeOfEntry
 /// in milliseconds, per IEC 61850-7-2.
 ///
-/// With RptEna true it is the last entry formatted and queued for transmission.
-/// With RptEna false it is the newest entry in the buffer, or the all-zero
-/// EntryID with a zero timestamp when the buffer is empty. A client write of
-/// EntryID moves the transmit anchor only and does not change this value.
+/// With RptEna true it is the last entry formatted and queued for transmission,
+/// or the all-zero EntryID when nothing has been sent since the buffer was last
+/// purged. With RptEna false it is the newest entry in the buffer, or the
+/// all-zero EntryID with a zero timestamp when the buffer is empty. A client
+/// write of EntryID moves the transmit anchor only and does not change this
+/// value.
 ///
 /// Returns `None` when a mutex is poisoned.
 fn exposed_entry(brcb: &super::brcb::BufferedReportControl) -> Option<(EntryId, u64)> {

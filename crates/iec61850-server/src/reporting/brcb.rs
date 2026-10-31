@@ -355,8 +355,10 @@ pub struct BrcbState {
     /// writing false has no effect.
     pub purge_buf_pending: bool,
     /// EntryID of the entry sent most recently, eight bytes big-endian; BRCB only.
+    /// All zeros until an entry is sent, and again after a purge.
     pub last_sent_entry_id: EntryId,
-    /// Millisecond timestamp of the entry sent most recently; BRCB only.
+    /// Millisecond timestamp of the entry sent most recently, zero alongside an
+    /// all-zero `last_sent_entry_id`; BRCB only.
     pub last_sent_time_of_entry_ms: u64,
     /// ResvTms, introduced in Edition 2.
     pub resv_tms: ResvTmsState,
@@ -785,10 +787,7 @@ impl BufferedReportControl {
         // held at the same time.
         drop(state);
 
-        let purged = {
-            let mut buf = self.lock_buffer()?;
-            buf.purge()
-        };
+        let purged = self.run_purge_buf_procedure()?;
 
         // The purge is reported rather than performed silently.
         tracing::warn!(
@@ -829,15 +828,27 @@ impl BufferedReportControl {
             // Writing false is not an error; nothing is purged.
             return Ok(0);
         }
-        let purged = {
-            let mut buf = self.lock_buffer()?;
-            buf.purge()
-        };
+        let purged = self.run_purge_buf_procedure()?;
         tracing::warn!(
             mms_path = %self.mms_path,
             purged_entries = purged,
             "client wrote PurgeBuf=true, report buffer purged"
         );
+        Ok(purged)
+    }
+
+    /// Runs the PurgeBuf procedure of IEC 61850-7-2: discards every buffered
+    /// entry, sent or not, and with them the record of the entry sent last, so
+    /// a GetBRCBValues that follows exposes the all-zero EntryID of the empty
+    /// buffer. Returns the number of entries removed.
+    ///
+    /// The caller holds neither lock; the buffer lock and the state lock are
+    /// taken one after the other.
+    fn run_purge_buf_procedure(&self) -> Result<usize, crate::error::ServerError> {
+        let purged = self.lock_buffer()?.purge();
+        let mut state = self.lock_state()?;
+        state.last_sent_entry_id = EntryId::ZERO;
+        state.last_sent_time_of_entry_ms = 0;
         Ok(purged)
     }
 
@@ -1320,6 +1331,39 @@ mod tests {
         assert!(rc.handle_purge_buf_write(true).is_err());
         assert!(rc.handle_purge_buf_write(false).is_err());
         assert_eq!(rc.lock_buffer().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn purges_forget_the_last_entry_sent() {
+        // A PurgeBuf write and a purging configuration change both discard the
+        // record of the entry sent last, so nothing purged is exposed.
+        for purge in [
+            (|rc: &BufferedReportControl| {
+                rc.handle_purge_buf_write(true).unwrap();
+            }) as fn(&BufferedReportControl),
+            |rc| {
+                rc.set_config_field(BrcbConfigField::BufTmMs(250)).unwrap();
+            },
+        ] {
+            let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", make_brcb());
+            let (id, _) = rc
+                .enqueue_entry(1000, false, false, Bytes::from_static(b"a"))
+                .unwrap();
+            {
+                let mut state = rc.lock_state().unwrap();
+                state.last_sent_entry_id = id;
+                state.last_sent_time_of_entry_ms = 1000;
+            }
+            purge(&rc);
+            let state = rc.lock_state().unwrap();
+            assert_eq!(state.last_sent_entry_id, EntryId::ZERO);
+            assert_eq!(state.last_sent_time_of_entry_ms, 0);
+        }
+        // Writing PurgeBuf = false purges nothing and keeps the record.
+        let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", make_brcb());
+        rc.lock_state().unwrap().last_sent_time_of_entry_ms = 7;
+        rc.handle_purge_buf_write(false).unwrap();
+        assert_eq!(rc.lock_state().unwrap().last_sent_time_of_entry_ms, 7);
     }
 
     // ─── enqueue_entry ───────────────────────────────────────────────────────
