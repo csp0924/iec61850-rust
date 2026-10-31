@@ -10,7 +10,6 @@
 //! than through `set_rcb_values`, so that a test exercises the report path
 //! alone.
 
-use bytes::Bytes;
 use iec61850_client::report::{ClientReport, ReportCallback};
 use iec61850_client::IedConnection;
 use iec61850_mms::mms::client::MmsClientBuilder;
@@ -253,10 +252,6 @@ async fn wait_for_first_conn_id(server: &IedServer, timeout: Duration) -> u64 {
 fn first_connected_id(_server: &IedServer) -> Option<u64> {
     Some(1)
 }
-
-// Keeps the `Bytes` import from reading as unused.
-#[allow(dead_code)]
-fn _force_use(_: Bytes) {}
 
 // A general interrogation returns a complete snapshot of the data set.
 //

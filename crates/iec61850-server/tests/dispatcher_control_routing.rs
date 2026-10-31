@@ -7,9 +7,9 @@
 //! where the control model requires it.
 
 use bytes::{Bytes, BytesMut};
-use iec61850_mms::mms::pdu::common::{MmsData, ObjectName};
+use iec61850_mms::mms::pdu::common::MmsData;
 use iec61850_mms::mms::pdu::read::{encode_confirmed_read_request, ReadRequest, ReadResponse};
-use iec61850_mms::mms::pdu::write::{encode_confirmed_write_request, WriteRequest, WriteResponse};
+use iec61850_mms::mms::pdu::write::{encode_confirmed_write_request, WriteRequest};
 use iec61850_mms::mms::server::dispatcher::{
     ConfirmedRequest, ConfirmedResponse, MmsServiceDispatcher,
 };
@@ -452,11 +452,4 @@ async fn dispatcher_unregistered_co_returns_non_existent() {
 
 fn decode_confirmed_read_response(data: &[u8]) -> (u32, ReadResponse) {
     iec61850_mms::mms::pdu::read::decode_confirmed_read_response(data).unwrap()
-}
-
-// Keeps otherwise unused helpers from tripping the dead-code lint.
-#[allow(dead_code)]
-fn _silence_unused() {
-    let _: ObjectName = ObjectName::VmdSpecific(String::new());
-    let _: WriteResponse = WriteResponse { outcomes: vec![] };
 }

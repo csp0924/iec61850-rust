@@ -79,15 +79,15 @@ pub struct IedConnection<T, Tm> {
 
 impl<T, Tm> IedConnection<T, Tm> {
     /// Shares the connection flag with the control module.
-    #[allow(dead_code)]
+    #[cfg(feature = "control")]
     pub(crate) fn is_connected_arc(&self) -> &Arc<AtomicBool> {
         &self.is_connected
     }
 
     /// Shares the MMS client handle with the GoCB module, whose methods are
     /// defined in another file and would otherwise reach into the field.
-    #[allow(dead_code)]
-    pub(crate) fn mms_client_arc_inner(&self) -> Arc<Mutex<MmsClient<T, Tm>>> {
+    #[cfg(feature = "reporting")]
+    pub(crate) fn mms_client_arc(&self) -> Arc<Mutex<MmsClient<T, Tm>>> {
         self.mms_client.clone()
     }
 

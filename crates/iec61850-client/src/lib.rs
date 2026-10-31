@@ -39,10 +39,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 // Keeps `vec!` and the other alloc macros visible to every submodule in a
-// no_std build, matching what the std prelude provides otherwise. No
-// submodule of the `minimal` feature set uses one, hence the allow.
+// no_std build, matching what the std prelude provides otherwise. Only the
+// `reporting` and `control` submodules use one.
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
+#[cfg_attr(
+    not(any(feature = "reporting", feature = "control")),
+    allow(unused_imports)
+)]
 #[macro_use]
 extern crate alloc;
 

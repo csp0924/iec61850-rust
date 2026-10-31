@@ -15,8 +15,6 @@
 //! IEC 61850-7-2 §18.2.1 Table 42; a server answers a write to any other
 //! attribute with `ObjectAccessDenied`.
 
-use core::sync::atomic::Ordering;
-
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
 use iec61850_mms::mms::pdu::common::MmsData;
@@ -25,8 +23,7 @@ use iec61850_model::value::MmsValue;
 use crate::connection::IedConnection;
 use crate::error::ClientError;
 use crate::mms_compat::mms_value_to_mms_data;
-use crate::prelude::{format, Arc, String, ToString};
-use crate::sync::Mutex;
+use crate::prelude::{format, String, ToString};
 
 /// A snapshot of the attributes of a GOOSE control block.
 ///
@@ -391,22 +388,6 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         }
         Ok(())
     }
-}
-
-// The `mms_client` field is private to the crate and this file defines its
-// methods in a separate extension impl, so it reaches the field through the
-// accessor on the connection.
-impl<T, Tm> IedConnection<T, Tm> {
-    pub(crate) fn mms_client_arc(&self) -> Arc<Mutex<iec61850_mms::mms::client::MmsClient<T, Tm>>> {
-        self.mms_client_arc_inner()
-    }
-}
-
-// Keeps the `Ordering` import from reading as unused: the connected flag is
-// read through `is_connected` rather than directly here.
-#[allow(dead_code)]
-fn _force_use_atomic_ordering() {
-    let _ = Ordering::Acquire;
 }
 
 #[cfg(test)]

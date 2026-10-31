@@ -58,7 +58,6 @@ struct IedServerInner {
     mms_view: Option<Arc<MmsDeviceModel>>,
     /// Start-up settings, including the association limit the accept loop
     /// enforces.
-    #[allow(dead_code)]
     config: IedServerConfig,
     bind_addr: SocketAddr,
 
@@ -68,7 +67,6 @@ struct IedServerInner {
     /// they have finished associating; `max_mms_connections` bounds it.
     open_sockets: AtomicUsize,
     /// Source of the next connection id.
-    #[allow(dead_code)]
     next_connection_id: AtomicU64,
 
     /// Which functional constraints accept a remote Write; changeable at run
@@ -1019,7 +1017,6 @@ impl IedServer {
     }
 
     /// Registers an association once it is established.
-    #[allow(dead_code)]
     pub(crate) fn add_connection(&self, conn: ClientConnection) {
         if let Ok(mut g) = self.inner.connections.write() {
             g.insert(conn.id(), conn);
@@ -1027,7 +1024,6 @@ impl IedServer {
     }
 
     /// Removes an association when it closes.
-    #[allow(dead_code)]
     pub(crate) fn remove_connection(&self, id: ConnectionId) -> Option<ClientConnection> {
         let conn = self.inner.connections.write().ok()?.remove(&id)?;
         conn.invalidate();
@@ -1045,7 +1041,6 @@ impl IedServer {
     }
 
     /// Allocates the next connection id.
-    #[allow(dead_code)]
     pub(crate) fn next_connection_id(&self) -> ConnectionId {
         self.inner.next_connection_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -1315,7 +1310,6 @@ impl IedServer {
     ///
     /// The dispatcher holds the same registry, so the Read and Write services
     /// resolve a data set through it rather than through this method.
-    #[allow(dead_code)]
     pub(crate) fn dataset_registry(&self) -> crate::reporting::DatasetRegistry {
         Arc::clone(&self.inner.dataset_registry)
     }
@@ -1375,7 +1369,6 @@ impl IedServer {
     }
 
     /// Sets the running flag, which the accept loop does when it starts.
-    #[allow(dead_code)]
     pub(crate) fn set_running(&self, on: bool) {
         self.inner.running.store(on, Ordering::SeqCst);
     }

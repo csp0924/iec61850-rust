@@ -11,15 +11,9 @@
 //! cleared.
 
 // These names are in the std prelude, so the import is only needed in a no_std
-// build. Which subset is used depends on the enabled features, hence the blanket
-// allow rather than one cfg per name.
+// build.
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::mapping::{MmsLeafType, MmsTypeSpec, NamedVariableSpec, StringSize};
 use iec61850_mms::mms::pdu::{

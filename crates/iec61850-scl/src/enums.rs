@@ -12,7 +12,6 @@
 
 use quick_xml::events::attributes::Attributes;
 
-use crate::attrs::{optional, parse_optional_or};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
     GseControlType, OptionFieldsBits, SampledValueSmpMod, SmvOptsBits, TriggerOptionsBits,
@@ -343,13 +342,6 @@ impl SmvOptsBits {
     pub fn default_when_missing() -> Self {
         Self::default()
     }
-}
-
-// Not used outside this module yet; reserved for the remaining element handlers.
-#[allow(dead_code)]
-fn _drop_unused_imports() {
-    let _ = optional;
-    let _ = parse_optional_or::<u32>;
 }
 
 #[cfg(test)]

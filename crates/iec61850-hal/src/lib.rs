@@ -28,11 +28,10 @@ extern crate alloc;
 
 /// Facade shared by the std and no_std builds, so a module imports the
 /// `alloc` types it needs from one place.
-#[allow(unused_imports, dead_code)]
+#[cfg(feature = "transport")]
 pub(crate) mod compat {
     pub mod prelude {
         pub use alloc::string::{String, ToString};
-        pub use alloc::vec::Vec;
     }
 }
 

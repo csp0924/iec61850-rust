@@ -5,14 +5,9 @@
 //! association while a request is in flight must not leave another task reading
 //! an invalidated handle; taking the option out under the mutex makes the
 //! invalidation and the access mutually exclusive.
-//!
-//! Background work counts itself with `pending_tasks` through the `TaskGuard`
-//! returned by `ClientConnection::task_guard`, which decrements on drop, so
-//! that a release waits for the count to reach zero before invalidating.
 
 use iec61850_mms::mms::server::MmsServerConnection;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -37,12 +32,6 @@ struct ClientConnectionInner {
     /// Per-association MMS state, available once the association is
     /// established. `None` means the connection task has invalidated it.
     mms: Mutex<Option<MmsServerConnection>>,
-    /// Background tasks still running on this association.
-    ///
-    /// Only the task guard touches the counter, so the field is never read
-    /// directly.
-    #[allow(dead_code)]
-    pending_tasks: AtomicU32,
     /// Set when the server decides to abort the association.
     ///
     /// The connection task checks it once per loop iteration and, when set,
@@ -53,14 +42,13 @@ struct ClientConnectionInner {
 
 impl ClientConnection {
     /// Creates the handle once the association is established.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
     pub(crate) fn new(id: ConnectionId, peer: SocketAddr, mms: MmsServerConnection) -> Self {
         Self {
             inner: Arc::new(ClientConnectionInner {
                 id,
                 peer,
                 mms: Mutex::new(Some(mms)),
-                pending_tasks: AtomicU32::new(0),
                 abort_requested: std::sync::atomic::AtomicBool::new(false),
             }),
         }
@@ -113,7 +101,6 @@ impl ClientConnection {
     /// when the association is invalidated.
     ///
     /// The callback runs while the mutex is held, so it must not await.
-    #[allow(dead_code)]
     pub(crate) fn with_mms_mut<R>(
         &self,
         f: impl FnOnce(&mut MmsServerConnection) -> R,
@@ -124,7 +111,6 @@ impl ClientConnection {
 
     /// Gives the callback read access to the MMS state, or returns `None` when
     /// the association is invalidated.
-    #[allow(dead_code)]
     pub(crate) fn with_mms<R>(&self, f: impl FnOnce(&MmsServerConnection) -> R) -> Option<R> {
         let g = self.inner.mms.lock().ok()?;
         g.as_ref().map(f)
@@ -160,42 +146,6 @@ impl ClientConnection {
             .abort_requested
             .load(std::sync::atomic::Ordering::SeqCst)
     }
-
-    /// Registers a background task on this association.
-    ///
-    /// The returned guard decrements the count when it is dropped.
-    #[allow(dead_code)]
-    pub(crate) fn task_guard(&self) -> TaskGuard {
-        self.inner.pending_tasks.fetch_add(1, Ordering::AcqRel);
-        TaskGuard {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-
-    /// Returns the number of background tasks registered on this association.
-    #[cfg(test)]
-    pub(crate) fn pending_tasks(&self) -> u32 {
-        self.inner.pending_tasks.load(Ordering::SeqCst)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Background task guard
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Counts one background task against its association for as long as it lives.
-///
-/// When every guard has been dropped the count reaches zero, which is the
-/// signal that the association can be invalidated safely.
-#[allow(dead_code)]
-pub(crate) struct TaskGuard {
-    inner: Arc<ClientConnectionInner>,
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        self.inner.pending_tasks.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 #[cfg(test)]
@@ -212,7 +162,6 @@ mod tests {
         assert!(conn.is_active());
         assert_eq!(conn.id(), 1);
         assert_eq!(conn.peer_address(), dummy_addr());
-        assert_eq!(conn.pending_tasks(), 0);
     }
 
     #[test]
@@ -273,20 +222,5 @@ mod tests {
         });
         let conn = ClientConnection::new(1, dummy_addr(), mms);
         assert_eq!(conn.negotiated_max_pdu_size(), Some(4096));
-    }
-
-    /// A task guard increments on creation and decrements on drop.
-    #[test]
-    fn task_guard_inc_dec_on_drop() {
-        let conn = ClientConnection::new(1, dummy_addr(), MmsServerConnection::new());
-        assert_eq!(conn.pending_tasks(), 0);
-        {
-            let _g = conn.task_guard();
-            assert_eq!(conn.pending_tasks(), 1);
-            let _g2 = conn.task_guard();
-            assert_eq!(conn.pending_tasks(), 2);
-        }
-        // Dropping both guards returns the count to zero.
-        assert_eq!(conn.pending_tasks(), 0);
     }
 }

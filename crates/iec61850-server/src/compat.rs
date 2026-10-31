@@ -29,23 +29,19 @@ pub use std::sync::{Mutex, RwLock};
 // bare guard under spin. Both helpers normalize to `Option<Guard>` (`None` =
 // poisoned, never produced by spin); both guard types `Deref<Target = T>`.
 #[cfg(feature = "std")]
-#[allow(dead_code)]
 pub(crate) fn rwlock_read<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
     lock.read().ok()
 }
 #[cfg(all(not(feature = "std"), feature = "embedded"))]
-#[allow(dead_code)]
 pub(crate) fn rwlock_read<T>(lock: &RwLock<T>) -> Option<spin::RwLockReadGuard<'_, T>> {
     Some(lock.read())
 }
 
 #[cfg(feature = "std")]
-#[allow(dead_code)]
 pub(crate) fn rwlock_write<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> {
     lock.write().ok()
 }
 #[cfg(all(not(feature = "std"), feature = "embedded"))]
-#[allow(dead_code)]
 pub(crate) fn rwlock_write<T>(lock: &RwLock<T>) -> Option<spin::RwLockWriteGuard<'_, T>> {
     Some(lock.write())
 }

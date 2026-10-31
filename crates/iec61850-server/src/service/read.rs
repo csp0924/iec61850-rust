@@ -49,7 +49,6 @@
 //! element, optionally followed by the components of a structured element.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
 use alloc::{
     format,
     string::{String, ToString},

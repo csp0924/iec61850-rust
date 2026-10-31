@@ -8,8 +8,6 @@
 //! The two meta-tests in `main.rs` keep the table usable: the row count matches
 //! `TOTAL_ITEMS`, and no description is blank.
 
-#![allow(dead_code)]
-
 pub const TOTAL_ITEMS: usize = 607;
 
 /// Conformance cases as `(id, section, description)`.

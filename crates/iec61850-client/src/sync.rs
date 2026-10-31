@@ -16,16 +16,16 @@
 #![allow(clippy::module_name_repetitions)]
 
 #[cfg(feature = "std")]
-#[allow(unused_imports)]
-pub use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use tokio::sync::Mutex;
+#[cfg(all(feature = "std", feature = "reporting"))]
+pub use tokio::sync::RwLock;
 
-// The embedded subsystems that take these locks are not yet wired up, so a
-// `minimal,embedded` build has no caller for the facade.
 #[cfg(not(feature = "std"))]
-#[allow(dead_code)]
 mod embedded_locks {
     use core::ops::{Deref, DerefMut};
-    use spin::{Mutex as SpinMutex, MutexGuard as SpinMutexGuard, RwLock as SpinRwLock};
+    #[cfg(feature = "reporting")]
+    use spin::RwLock as SpinRwLock;
+    use spin::{Mutex as SpinMutex, MutexGuard as SpinMutexGuard};
 
     /// Mutex with the call shape of `tokio::sync::Mutex`, backed by `spin`.
     pub struct Mutex<T> {
@@ -70,10 +70,12 @@ mod embedded_locks {
     }
 
     /// Read-write lock with an async `read` and `write`, backed by `spin`.
+    #[cfg(feature = "reporting")]
     pub struct RwLock<T> {
         inner: SpinRwLock<T>,
     }
 
+    #[cfg(feature = "reporting")]
     impl<T> RwLock<T> {
         /// Wraps a value in an unlocked read-write lock.
         pub const fn new(t: T) -> Self {
@@ -100,10 +102,12 @@ mod embedded_locks {
     }
 
     /// Guard returned by `RwLock::read`, releasing the lock when dropped.
+    #[cfg(feature = "reporting")]
     pub struct RwLockReadGuard<'a, T> {
         inner: spin::RwLockReadGuard<'a, T>,
     }
 
+    #[cfg(feature = "reporting")]
     impl<T> Deref for RwLockReadGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -112,10 +116,12 @@ mod embedded_locks {
     }
 
     /// Guard returned by `RwLock::write`, releasing the lock when dropped.
+    #[cfg(feature = "reporting")]
     pub struct RwLockWriteGuard<'a, T> {
         inner: spin::RwLockWriteGuard<'a, T>,
     }
 
+    #[cfg(feature = "reporting")]
     impl<T> Deref for RwLockWriteGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -123,6 +129,7 @@ mod embedded_locks {
         }
     }
 
+    #[cfg(feature = "reporting")]
     impl<T> DerefMut for RwLockWriteGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             self.inner.deref_mut()
@@ -131,5 +138,6 @@ mod embedded_locks {
 }
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-pub use embedded_locks::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use embedded_locks::Mutex;
+#[cfg(all(not(feature = "std"), feature = "reporting"))]
+pub use embedded_locks::RwLock;

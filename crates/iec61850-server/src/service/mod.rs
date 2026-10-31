@@ -36,12 +36,7 @@ use crate::compat::Arc;
 use crate::compat::{HashMap, Mutex};
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{format, string::String, vec::Vec};
 
 use bytes::{Bytes, BytesMut};
 
@@ -87,7 +82,6 @@ use crate::control::ControlObjectsRegistry;
 // Only `GoCBRegistry` is named by a field; the helpers are reached from the
 // read and write routing paths, which carry their own gates.
 #[cfg(feature = "goose-mapping")]
-#[allow(unused_imports)]
 use crate::goose_mapping::{
     apply_gocb_write, encode_gocb_da, encode_gocb_structure, parse_go_item_id, GoCBRegistry,
 };
@@ -3537,13 +3531,6 @@ fn dispatch_write_journal_unsupported(invoke_id: u32) -> ConfirmedResponse {
         ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
     )
 }
-
-/// Silences a dead-code warning: `LogControl` and `LogStorageError` are reached
-/// only indirectly, through the journal query calls and through type inference
-/// against the storage trait.
-#[cfg(feature = "logging")]
-#[allow(dead_code)]
-fn _silence_log_imports(_lc: &LogControl, _e: LogStorageError) {}
 
 /// Builds a complete ConfirmedErrorPdu, outer `0xa2 <len>` included.
 ///

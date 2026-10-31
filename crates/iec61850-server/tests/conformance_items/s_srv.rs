@@ -7,7 +7,7 @@
 //! The cases the server does not implement yet carry no test function here;
 //! `catalog.rs` lists them.
 
-#![allow(non_snake_case, dead_code)]
+#![allow(non_snake_case)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

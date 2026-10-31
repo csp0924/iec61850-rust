@@ -10,11 +10,7 @@
 //! left to the conversion layer.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::vec::Vec;
 
 #[cfg(any(feature = "reporting", feature = "logging", feature = "goose-mapping"))]
 use crate::mapping::ln_spec_with_control_blocks;

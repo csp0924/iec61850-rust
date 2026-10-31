@@ -7,10 +7,7 @@
 //! trigger into the BRCB buffer. Without that wiring a BRCB would never flush
 //! on its own.
 
-use iec61850_model::{
-    DataAttribute, DataAttributeType, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
-    MmsValue, TrgOps, FC,
-};
+use iec61850_model::{IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue};
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{Dataset, DatasetEntry, IedServer, InclusionFlag, TriggerOptions};
 use std::net::SocketAddr;
@@ -120,17 +117,4 @@ async fn lifecycle_tick_loop_runs_reservation_tick_without_panic() {
     })
     .await
     .expect("lifecycle_tick_loop_runs_reservation_tick_without_panic 3s timeout");
-}
-
-// Keeps the model imports used; they are reserved for tests that bind a BRCB
-// to a real model data set.
-#[allow(dead_code)]
-fn _silence_unused() {
-    let _ = DataAttribute::new(
-        "x",
-        FC::St,
-        DataAttributeType::Boolean,
-        TrgOps::DCHG,
-        MmsValue::Boolean(false),
-    );
 }

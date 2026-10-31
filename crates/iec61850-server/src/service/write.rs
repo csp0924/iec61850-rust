@@ -64,7 +64,6 @@
 //! handlers on the array and above it decide such a write.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
 use alloc::{
     format,
     string::{String, ToString},

@@ -14,7 +14,7 @@
 //!
 //! Run with `cargo test -p iec61850-server --test conformance_items`.
 
-#![allow(non_snake_case, dead_code)]
+#![allow(non_snake_case)]
 
 mod catalog;
 mod s_srv;

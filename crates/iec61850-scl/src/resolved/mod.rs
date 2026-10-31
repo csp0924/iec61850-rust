@@ -52,16 +52,9 @@ impl Default for ResolveOptions {
 /// [`iec61850_model::IedModel`].
 #[derive(Debug)]
 pub struct ResolvedScl {
-    /// The raw AST, kept because `build_model` reads it together with the
-    /// index below.
-    #[allow(dead_code)]
+    /// The raw AST, whose every `lnType` reference is confirmed to exist in
+    /// `data_type_templates.ln_node_types`; `build_model` reads it.
     pub(crate) raw: RawScl,
-    /// The `ln_type_ref` identifiers confirmed to exist in `ln_node_types`.
-    ///
-    /// Only existence is recorded here; `build_model` looks the type itself up
-    /// in `raw.data_type_templates.ln_node_types`.
-    #[allow(dead_code)]
-    pub(crate) ln_type_index: BTreeMap<String, ()>,
     /// The node limit stage 2 applied, which the model builder applies to an
     /// array whose element count an instance gives.
     pub(crate) max_expanded_nodes: u64,
@@ -240,16 +233,8 @@ impl ResolvedScl {
         // With every chain acyclic and bounded, the expansion sizes are finite.
         check_expanded_nodes(&raw, options.max_expanded_nodes)?;
 
-        // Every ln_type_ref has been checked above, so the index is the key set.
-        let ln_type_index = dtt
-            .ln_node_types
-            .keys()
-            .map(|k| (k.clone(), ()))
-            .collect::<BTreeMap<_, _>>();
-
         Ok(Self {
             raw,
-            ln_type_index,
             max_expanded_nodes: options.max_expanded_nodes,
         })
     }
@@ -1049,7 +1034,11 @@ mod tests {
 </SCL>"#;
         let raw = must_parse(xml);
         let resolved = ResolvedScl::from_raw(raw).expect("must resolve");
-        assert!(resolved.ln_type_index.contains_key("LLN0_T"));
+        assert!(resolved
+            .raw
+            .data_type_templates
+            .ln_node_types
+            .contains_key("LLN0_T"));
     }
 
     /// A logical node referencing a missing lnType yields

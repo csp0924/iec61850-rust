@@ -71,13 +71,11 @@ pub(crate) mod compat {
     /// exists for the server's write path.
     #[cfg(feature = "std")]
     #[inline]
-    #[allow(dead_code)]
     pub fn rwlock_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         lock.write().expect("RwLock poisoned")
     }
     #[cfg(not(feature = "std"))]
     #[inline]
-    #[allow(dead_code)]
     pub fn rwlock_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         lock.write()
     }

@@ -62,7 +62,7 @@
 
 use super::super::binary_time::{binary_time6_from_epoch_ms, epoch_ms_from_binary_time6};
 use super::super::error::MmsError;
-use super::common::{decode_signed_int, encode_signed_int_minimal, DataAccessError, MmsData};
+use super::common::{decode_signed_int, encode_signed_int_minimal, MmsData};
 use super::initiate::{decode_length, encode_length};
 use crate::compat::prelude::*;
 use bytes::BytesMut;
@@ -1105,11 +1105,6 @@ fn decode_confirmed_pdu_inner(data: &[u8], outer_tag: u8) -> Result<(u32, &[u8])
     let service_start = id_start + id_len;
     Ok((id, &inner[service_start..]))
 }
-
-// DataAccessError is not used on the ReadJournal path yet; the import is kept for
-// the dispatcher error path.
-#[allow(dead_code)]
-fn _silence_unused(_e: DataAccessError) {}
 
 // Unit tests
 
