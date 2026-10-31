@@ -22,6 +22,7 @@ use crate::error::SourceSpan;
 /// The parser does not read `<Header>` and never constructs this type; see
 /// [`RawScl::header`](crate::raw::RawScl::header).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Header {
     /// The `id` attribute, which names the project.
     pub id: String,
@@ -39,6 +40,7 @@ pub struct Header {
 
 /// An `<IED>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawIed {
     /// The `name` attribute.
     pub name: String,
@@ -56,6 +58,7 @@ pub struct RawIed {
 
 /// An `<AccessPoint>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawAccessPoint {
     /// The `name` attribute.
     pub name: String,
@@ -67,6 +70,7 @@ pub struct RawAccessPoint {
 
 /// A `<Server>` element.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RawServer {
     /// The `<Authentication>` child, if present.
     pub authentication: Option<Authentication>,
@@ -76,6 +80,7 @@ pub struct RawServer {
 
 /// An `<LDevice>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawLogicalDevice {
     /// The `inst` attribute.
     pub inst: String,
@@ -91,6 +96,7 @@ pub struct RawLogicalDevice {
 
 /// An `<LN>` or `<LN0>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawLogicalNode {
     /// The `prefix` attribute.
     pub prefix: Option<String>,
@@ -128,6 +134,7 @@ pub struct RawLogicalNode {
 /// A `<DOI>` element: a data object instance carrying overrides and default
 /// values.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDoi {
     /// The `name` attribute.
     pub name: String,
@@ -151,6 +158,7 @@ pub enum RawDataInstance {
 
 /// An `<SDI>` element, a structured sub-instance.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawSdi {
     /// The `name` attribute.
     pub name: String,
@@ -165,6 +173,7 @@ pub struct RawSdi {
 
 /// A `<DAI>` element, a data attribute instance and a leaf.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDai {
     /// The `name` attribute.
     pub name: String,
@@ -184,6 +193,7 @@ pub struct RawDai {
 
 /// A `<Val>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawVal {
     /// The `sGroup` attribute; `None` means the value applies to every setting
     /// group.
@@ -200,6 +210,7 @@ pub struct RawVal {
 
 /// A `<DataSet>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDataSet {
     /// The `name` attribute.
     pub name: String,
@@ -213,6 +224,7 @@ pub struct RawDataSet {
 
 /// An `<FCDA>` element, one data set member.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawFcda {
     /// The `ldInst` attribute, either a logical device instance or a full domain name.
     pub ld_inst: String,
@@ -236,6 +248,7 @@ pub struct RawFcda {
 
 /// A `<ReportControl>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawReportControlBlock {
     /// The `name` attribute.
     pub name: String,
@@ -263,6 +276,7 @@ pub struct RawReportControlBlock {
 
 /// A `<LogControl>` element.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawLogControl {
     /// The `name` attribute.
     pub name: String,
@@ -286,6 +300,7 @@ pub struct RawLogControl {
 
 /// A `<GSEControl>` element, valid only on an `<LN0>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawGseControl {
     /// The `name` attribute.
     pub name: String,
@@ -314,6 +329,7 @@ pub enum GseControlType {
 
 /// A `<SampledValueControl>` element, valid only on an `<LN0>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawSampledValueControl {
     /// The `name` attribute.
     pub name: String,
@@ -350,6 +366,7 @@ pub enum SampledValueSmpMod {
 
 /// A `<SettingControl>` element, valid only on an `<LN0>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawSettingControl {
     /// The `numOfSGs` attribute.
     pub num_of_sgs: u32,
@@ -405,6 +422,7 @@ pub struct OptionFieldsBits {
 
 /// The boolean attributes of an `<SmvOpts>` element.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct SmvOptsBits {
     /// The `refreshTime` attribute.
     pub refresh_time: bool,
@@ -445,6 +463,7 @@ pub struct Authentication {
 
 /// The `<DataTypeTemplates>` section, as four tables keyed by identifier.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DataTypeTemplates {
     /// The `<LNodeType>` declarations.
     pub ln_node_types: BTreeMap<String, RawLNodeType>,
@@ -458,6 +477,7 @@ pub struct DataTypeTemplates {
 
 /// An `<LNodeType>` declaration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawLNodeType {
     /// The `id` attribute.
     pub id: String,
@@ -473,6 +493,7 @@ pub struct RawLNodeType {
 
 /// A `<DO>` declaration inside an `<LNodeType>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDoDef {
     /// The `name` attribute.
     pub name: String,
@@ -488,6 +509,7 @@ pub struct RawDoDef {
 
 /// A `<DOType>` declaration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDoType {
     /// The `id` attribute.
     pub id: String,
@@ -503,6 +525,7 @@ pub struct RawDoType {
 
 /// An `<SDO>` declaration inside a `<DOType>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawSdoDef {
     /// The `name` attribute.
     pub name: String,
@@ -514,6 +537,7 @@ pub struct RawSdoDef {
 
 /// A `<DA>` declaration inside a `<DOType>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDaDef {
     /// The `name` attribute.
     pub name: String,
@@ -543,6 +567,7 @@ pub struct RawDaDef {
 /// Shaped like a `<DA>`, but it carries no functional constraint of its own
 /// and inherits the one of its parent.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawBda {
     /// The `name` attribute.
     pub name: String,
@@ -562,6 +587,7 @@ pub struct RawBda {
 
 /// A `<DAType>` declaration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawDaType {
     /// The `id` attribute.
     pub id: String,
@@ -573,6 +599,7 @@ pub struct RawDaType {
 
 /// An `<EnumType>` declaration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawEnumType {
     /// The `id` attribute.
     pub id: String,
@@ -584,6 +611,7 @@ pub struct RawEnumType {
 
 /// An `<EnumVal>` declaration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawEnumValue {
     /// The `ord` attribute, the ordinal the wire carries.
     pub ord: i32,

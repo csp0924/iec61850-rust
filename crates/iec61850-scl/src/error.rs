@@ -15,6 +15,7 @@ use std::fmt;
 /// 160-odd bytes on the success path. The public API still exposes it as
 /// `&ErrorKind`.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub struct SclParseError {
     /// The semantic category of the failure.
     pub kind: Box<ErrorKind>,
@@ -60,6 +61,7 @@ impl fmt::Display for SourceSpan {
 /// Every variant carries enough information to say what was seen and what was
 /// expected, so no failure is reported as a bare "parse error".
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// The XML itself is malformed, as reported by the reader. Wrapped so the
     /// message can also carry the element path.
@@ -157,6 +159,7 @@ pub enum ErrorKind {
 
 /// The four kinds of SCL type identifier, one per DataTypeTemplates section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeKind {
     /// A `<LNodeType>` identifier.
     LNodeType,

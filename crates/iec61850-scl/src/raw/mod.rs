@@ -17,6 +17,7 @@ pub use elements::*;
 ///
 /// Call [`Self::resolve`] to continue into stage 2.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RawScl {
     /// The `<Header>` element. The parser skips `<Header>`, so this is
     /// always `None`.
