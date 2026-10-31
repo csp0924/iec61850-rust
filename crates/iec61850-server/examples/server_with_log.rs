@@ -109,15 +109,16 @@ fn register_seeded_lcb(
         .with_dataset("LLN0$evlogds")
         .with_log_ref(lcb_path)
         .with_trg_ops(TriggerOptions::DATA_CHANGED);
-    let lc = LogControl::new(lcb_path, block).with_storage(storage);
+    let lc = LogControl::new(lcb_path, block).with_storage(storage.clone());
     lc.set_log_ena(true)
         .map_err(|e| format!("set_log_ena failed: {e}"))?;
 
     let data_ref = format!("{domain}/GGIO1$ST$Ind1$stVal");
     for i in 0..ENTRY_COUNT {
         let time_ms = BASE_TIME_MS + (i as u64) * TIME_STEP_MS;
-        lc.log_single_value(
-            time_ms,
+        let id = storage.add_entry(time_ms)?;
+        storage.add_entry_data(
+            id,
             &data_ref,
             MmsValue::Boolean(i % 2 == 0),
             REASON_DATA_CHANGE,

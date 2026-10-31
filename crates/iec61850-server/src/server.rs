@@ -715,7 +715,7 @@ impl IedServer {
                     .unwrap_or_default()
                     .as_millis() as u64
             });
-            if let Err(e) = lc.log_single_value(time_ms, &data_ref, value.clone(), reason_code) {
+            if let Err(e) = lc.write_entry(time_ms, &[(data_ref, value.clone())], reason_code) {
                 tracing::warn!(
                     mms_path = %lc.mms_path,
                     error = %e,

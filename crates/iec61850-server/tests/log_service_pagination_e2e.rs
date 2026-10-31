@@ -80,9 +80,10 @@ fn build_dispatcher_with_prefilled_lcb(
 
     for i in 0..prefill {
         let time_ms = BASE_TIME_MS + (i as u64) * TIME_STEP_MS;
-        // The reason code is the trigger option shifted left by one, so a data
-        // change becomes 0x02.
-        lc.log_single_value(time_ms, DATA_REF, MmsValue::Float32(i as f32), 0x02)
+        // Reason code 0x02 is data-change.
+        let id = storage.add_entry(time_ms).unwrap();
+        storage
+            .add_entry_data(id, DATA_REF, MmsValue::Float32(i as f32), 0x02)
             .unwrap();
     }
 

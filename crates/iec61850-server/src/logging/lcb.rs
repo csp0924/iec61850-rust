@@ -21,7 +21,6 @@
 
 use super::storage::{EntryId, LogEntryVisitor, LogStorage, LogStorageError};
 use crate::flags::TriggerOptions;
-use iec61850_model::MmsValue;
 use std::sync::{Arc, Mutex};
 
 /// The LogEna attribute of a log control block.
@@ -223,7 +222,8 @@ impl LogControl {
             .unwrap_or(false)
     }
 
-    /// Writes one entry, called from the data-change trigger path.
+    /// Writes one entry holding `data`, each value with `reason_code`; the
+    /// trigger paths of the server are its only callers.
     ///
     /// A disabled control block writes nothing and returns `Ok(None)`. A control
     /// block with no storage bound logs a warning and returns `Ok(None)` rather
@@ -233,11 +233,11 @@ impl LogControl {
     /// # Errors
     ///
     /// Returns the `LogStorageError` the backend reports.
-    pub fn log_single_value(
+    #[cfg(any(feature = "full-server", test))]
+    pub(crate) fn write_entry(
         &self,
         time_ms: u64,
-        data_ref: &str,
-        value: MmsValue,
+        data: &[(String, iec61850_model::MmsValue)],
         reason_code: u8,
     ) -> Result<Option<EntryId>, LogStorageError> {
         if !self.is_enabled() {
@@ -251,7 +251,9 @@ impl LogControl {
             return Ok(None);
         };
         let id = storage.add_entry(time_ms)?;
-        storage.add_entry_data(id, data_ref, value, reason_code)?;
+        for (data_ref, value) in data {
+            storage.add_entry_data(id, data_ref, value.clone(), reason_code)?;
+        }
         Ok(Some(id))
     }
 
@@ -303,6 +305,7 @@ impl LogControl {
 mod tests {
     use super::*;
     use crate::logging::storage::{CollectingVisitor, InMemoryLogStorage};
+    use iec61850_model::MmsValue;
 
     fn make_lcb_with_storage() -> LogControl {
         let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
@@ -311,6 +314,36 @@ mod tests {
             .with_log_ref("IED1LD0/MMXU1$GeneralLog")
             .with_trg_ops(TriggerOptions::DATA_CHANGED);
         LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb).with_storage(storage)
+    }
+
+    fn write_one(lc: &LogControl, time_ms: u64, value: MmsValue) -> Option<EntryId> {
+        lc.write_entry(time_ms, &[("ref1".to_string(), value)], 0x02)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_entry_holds_every_value_given() {
+        let lc = make_lcb_with_storage();
+        lc.set_log_ena(true).unwrap();
+        lc.write_entry(
+            10,
+            &[
+                ("a".to_string(), MmsValue::Boolean(true)),
+                ("b".to_string(), MmsValue::Integer(7)),
+            ],
+            0x10,
+        )
+        .unwrap()
+        .expect("an entry");
+        let mut v = CollectingVisitor::new();
+        lc.query_by_time(0, 9999, &mut v).unwrap();
+        assert_eq!(v.entries.len(), 1);
+        let refs: Vec<_> = v.entries[0]
+            .variables
+            .iter()
+            .map(|d| (d.data_ref.as_str(), d.reason_code))
+            .collect();
+        assert_eq!(refs, vec![("a", 0x10), ("b", 0x10)]);
     }
 
     #[test]
@@ -355,9 +388,7 @@ mod tests {
     fn log_value_when_disabled_returns_none() {
         let lc = make_lcb_with_storage();
         // The control block starts disabled.
-        let r = lc
-            .log_single_value(1000, "ref1", MmsValue::Boolean(true), 0x02)
-            .unwrap();
+        let r = write_one(&lc, 1000, MmsValue::Boolean(true));
         assert!(
             r.is_none(),
             "a disabled control block must not write an entry"
@@ -368,9 +399,7 @@ mod tests {
     fn log_value_when_enabled_writes_entry() {
         let lc = make_lcb_with_storage();
         lc.set_log_ena(true).unwrap();
-        let id = lc
-            .log_single_value(1000, "ref1", MmsValue::Boolean(true), 0x02)
-            .unwrap();
+        let id = write_one(&lc, 1000, MmsValue::Boolean(true));
         assert!(id.is_some());
 
         let mut v = CollectingVisitor::new();
@@ -383,18 +412,9 @@ mod tests {
     fn query_after_round_trip() {
         let lc = make_lcb_with_storage();
         lc.set_log_ena(true).unwrap();
-        let id1 = lc
-            .log_single_value(100, "ref1", MmsValue::Integer(1), 0x02)
-            .unwrap()
-            .unwrap();
-        let id2 = lc
-            .log_single_value(200, "ref1", MmsValue::Integer(2), 0x02)
-            .unwrap()
-            .unwrap();
-        let id3 = lc
-            .log_single_value(300, "ref1", MmsValue::Integer(3), 0x02)
-            .unwrap()
-            .unwrap();
+        let id1 = write_one(&lc, 100, MmsValue::Integer(1)).unwrap();
+        let id2 = write_one(&lc, 200, MmsValue::Integer(2)).unwrap();
+        let id3 = write_one(&lc, 300, MmsValue::Integer(3)).unwrap();
         let _ = (id2, id3);
 
         // Everything after id1, which is id2 and id3.
@@ -458,7 +478,7 @@ mod tests {
         let lcb = LogControlBlock::new("lcb01").with_dataset("MMXU1$ds1");
         let lc = LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb).with_storage(storage);
         lc.set_log_ena(true).unwrap();
-        let r = lc.log_single_value(1000, "ref1", MmsValue::Boolean(true), 0x02);
+        let r = lc.write_entry(1000, &[("ref1".to_string(), MmsValue::Boolean(true))], 0x02);
         assert!(
             r.is_err(),
             "a storage failure must be propagated, with no partial state"

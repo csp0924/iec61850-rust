@@ -553,13 +553,10 @@ async fn a_journal_page_stops_visiting_once_the_pdu_is_full() {
     .with_storage(storage.clone());
     lc.set_log_ena(true).unwrap();
     for i in 0..1_000u64 {
-        lc.log_single_value(
-            1_700_000_000_000 + i,
-            ST_VAL_REF,
-            MmsValue::Boolean(i % 2 == 0),
-            0x02,
-        )
-        .unwrap();
+        let id = storage.add_entry(1_700_000_000_000 + i).unwrap();
+        storage
+            .add_entry_data(id, ST_VAL_REF, MmsValue::Boolean(i % 2 == 0), 0x02)
+            .unwrap();
     }
     srv.register_log_control(DOM, LCB_ITEM, Arc::new(lc));
     let h = srv.start().await.unwrap();

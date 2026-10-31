@@ -60,15 +60,16 @@ fn build_dispatcher_with_lcb(prefill_entries: usize) -> (MmsModelDispatcher, Arc
     // Prefill entries through the storage handle the trigger path also uses.
     for i in 0..prefill_entries {
         let time_ms = 1_700_000_000_000u64 + (i as u64) * 1_000;
-        // The reason code is the trigger option shifted left by one, so a data
-        // change becomes 0x02.
-        lc.log_single_value(
-            time_ms,
-            "LD0/MMXU1$MX$A$mag$f",
-            MmsValue::Float32(1.0 + i as f32),
-            0x02,
-        )
-        .unwrap();
+        // Reason code 0x02 is data-change.
+        let id = storage.add_entry(time_ms).unwrap();
+        storage
+            .add_entry_data(
+                id,
+                "LD0/MMXU1$MX$A$mag$f",
+                MmsValue::Float32(1.0 + i as f32),
+                0x02,
+            )
+            .unwrap();
     }
 
     let registry = iec61850_server::logging::new_log_control_registry();
