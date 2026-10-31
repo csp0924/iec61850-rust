@@ -265,6 +265,10 @@ struct ControlObjectInner {
     /// Whether the connection holding the selection closed while a command
     /// executed, which ends the selection once the command finishes.
     owner_lost: bool,
+
+    /// The timer task of the current ready period, aborted when the period
+    /// ends, so at most one timer per object is alive.
+    timer: Option<tokio::task::AbortHandle>,
 }
 
 impl ControlObjectInner {
@@ -277,12 +281,21 @@ impl ControlObjectInner {
             select_time: None,
             ready_period: 0,
             owner_lost: false,
+            timer: None,
+        }
+    }
+
+    /// Aborts the timer of the ready period that is ending.
+    fn stop_timer(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
         }
     }
 
     /// Enters the ready state for `conn_id` under `settings` and returns the
     /// new ready period.
     fn enter_ready(&mut self, conn_id: u64, settings: ControlSettings) -> u64 {
+        self.stop_timer();
         self.state = ControlState::Ready;
         self.owner_conn_id = conn_id;
         self.active = Some(settings);
@@ -294,6 +307,7 @@ impl ControlObjectInner {
     /// Returns to the unselected state and returns the connection that held the
     /// object.
     fn clear(&mut self) -> u64 {
+        self.stop_timer();
         let owner = self.owner_conn_id;
         self.state = ControlState::Unselected;
         self.owner_conn_id = 0;
@@ -485,7 +499,7 @@ impl ControlObject {
                     conn_id,
                     "select accepted, object is now ready"
                 );
-                self.arm_select_timer(period, settings.sbo_timeout_ms);
+                // Reported before the timer exists, so a Timeout cannot precede it.
                 self.notify(SelectionChange {
                     conn_id,
                     is_selected: true,
@@ -494,6 +508,7 @@ impl ControlObject {
                     origin: OriginValue::default(),
                     ctl_num: 0,
                 });
+                self.arm_select_timer(period, settings.sbo_timeout_ms);
                 Ok(true)
             }
             ControlState::Ready => {
@@ -581,7 +596,8 @@ impl ControlObject {
     }
 
     /// Starts the timer that ends the ready period `period` after `timeout_ms`,
-    /// when it is not 0 and a tokio runtime is available.
+    /// when it is not 0, a tokio runtime is available, and the period has not
+    /// ended already. The timer is aborted when the period ends otherwise.
     fn arm_select_timer(&self, period: u64, timeout_ms: u32) {
         if timeout_ms == 0 {
             return;
@@ -589,11 +605,19 @@ impl ControlObject {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if g.state != ControlState::Ready || g.ready_period != period {
+            return;
+        }
         let obj = self.clone();
-        runtime.spawn(async move {
+        let task = runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
             obj.expire_selection(period);
         });
+        g.stop_timer();
+        g.timer = Some(task.abort_handle());
     }
 
     /// Deselects the object when it is still in the ready period `period`, the
@@ -724,6 +748,7 @@ impl ControlObject {
                 )));
             }
         }
+        g.stop_timer();
         g.state = ControlState::WaitForExecution;
         g.last_oper_params = Some(params.clone());
         Ok(Some(OperateBeginResult::Accepted))
@@ -852,7 +877,7 @@ impl ControlObject {
         g.last_oper_params = Some(params.clone());
         drop(g);
         tracing::debug!(name = %self.config.name, conn_id, "select-with-value accepted");
-        self.arm_select_timer(period, settings.sbo_timeout_ms);
+        // Reported before the timer exists, so a Timeout cannot precede it.
         self.notify(SelectionChange {
             conn_id,
             is_selected: true,
@@ -861,6 +886,7 @@ impl ControlObject {
             origin: params.origin.clone(),
             ctl_num: params.ctl_num,
         });
+        self.arm_select_timer(period, settings.sbo_timeout_ms);
         Ok(Ok(()))
     }
 
@@ -1327,6 +1353,40 @@ mod tests {
             Some((SelectStateChangedReason::Timeout, 1, 0))
         );
         assert_eq!(started.elapsed(), Duration::from_millis(160));
+    }
+
+    /// Yields until the runtime has polled every task it has queued.
+    async fn reap() {
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_timers_do_not_outlive_their_selection() {
+        let mut config = make_config(ControlModel::SboNormal);
+        config.sbo_timeout_ms = 30_000;
+        let obj = ControlObject::new(config);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let params = make_oper_params(MmsValue::Boolean(true));
+        for _ in 0..50 {
+            assert!(obj.try_select(1).unwrap());
+            assert_eq!(obj.try_cancel(1), CancelResult::Accepted);
+            assert!(obj.try_select(1).unwrap());
+            obj.begin_operate(1, &params).unwrap();
+            obj.finish_operate();
+        }
+        assert!(obj.try_select(1).unwrap());
+        // Aborted tasks are reaped once the runtime polls them.
+        reap().await;
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            1,
+            "only the timer of the current selection is alive"
+        );
+        assert_eq!(obj.try_cancel(1), CancelResult::Accepted);
+        reap().await;
+        assert_eq!(metrics.num_alive_tasks(), 0);
     }
 
     #[tokio::test]
