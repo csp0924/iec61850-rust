@@ -223,7 +223,8 @@ pub enum SeekResult {
 /// - `push()` on a full buffer applies the configured `OverflowStrategy`. It
 ///   sets `is_overflow`, so the next report carries `BufOvfl = true`, whenever
 ///   it loses an entry that was never formatted for transmission: the rejected
-///   new entry, or an evicted entry after the one `mark_formatted` last named.
+///   new entry, or an evicted entry after the newest one formatted in the
+///   current transmission (`mark_formatted`, `set_formatted_through`).
 ///   Evicting an entry already formatted loses nothing the client was not sent
 ///   and leaves `is_overflow` alone (IEC 61850-7-2 §17.2.3.2.2.8, figures 30
 ///   and 31).
@@ -287,10 +288,21 @@ pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
 
     /// Records that every entry up to and including `id` has been formatted
     /// for transmission, so evicting one of them later does not set
-    /// `is_overflow`.
+    /// `is_overflow`. A mark never moves back; see `set_formatted_through`.
     ///
     /// The default does nothing, which makes every eviction set `is_overflow`.
     fn mark_formatted(&mut self, _id: &EntryId) {}
+
+    /// Sets the newest entry formatted in the current transmission to `id`,
+    /// or to none, moving the mark back as well as forward.
+    ///
+    /// Called when transmission restarts from an earlier point, such as an
+    /// EntryID write, a purge, or a partly sent entry that is given up: the
+    /// entries after `id` are formatted again before the client receives them,
+    /// so evicting one of them first sets `is_overflow`.
+    ///
+    /// The default does nothing.
+    fn set_formatted_through(&mut self, _id: Option<&EntryId>) {}
 
     /// Returns every stored entry in insertion order.
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>>;
@@ -536,6 +548,10 @@ impl ReportBufferBackend for InMemoryReportBuffer {
 
     fn mark_formatted(&mut self, id: &EntryId) {
         self.formatted_through = self.formatted_through.max(id.as_u64());
+    }
+
+    fn set_formatted_through(&mut self, id: Option<&EntryId>) {
+        self.formatted_through = id.map_or(0, EntryId::as_u64);
     }
 
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>> {

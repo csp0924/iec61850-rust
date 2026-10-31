@@ -655,6 +655,12 @@ impl ReportBufferBackend for SqliteReportBuffer {
         }
     }
 
+    fn set_formatted_through(&mut self, id: Option<&EntryId>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.formatted_through = id.map_or(0, EntryId::as_u64);
+        }
+    }
+
     fn iter_entries(&self) -> Vec<Arc<ReportEntry>> {
         let Ok(g) = self.inner.lock() else {
             return Vec::new();

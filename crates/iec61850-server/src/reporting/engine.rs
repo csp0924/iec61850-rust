@@ -1257,8 +1257,24 @@ impl ReportingEngine {
     /// with a positive ResvTms stays reserved for its owner for ResvTms seconds
     /// from now; an unreserved one forgets its owner.
     pub fn on_connection_dropped(&self, conn_id: ConnectionId) {
-        if let Ok(mut m) = self.partial_reports.lock() {
-            m.retain(|_, p| p.conn_id != conn_id);
+        let forgotten: Vec<String> = match self.partial_reports.lock() {
+            Ok(mut m) => {
+                let keys: Vec<String> = m
+                    .iter()
+                    .filter(|(_, p)| p.conn_id == conn_id)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in &keys {
+                    m.remove(k);
+                }
+                keys
+            }
+            Err(_) => Vec::new(),
+        };
+        for path in forgotten {
+            if let Some(brcb) = self.brcbs.get(&path) {
+                rewind_formatted(brcb);
+            }
         }
         for rc_arc in self.rcbs.values() {
             let Ok(rc_guard) = rc_arc.lock() else {
@@ -1515,9 +1531,19 @@ impl ReportingEngine {
     }
 
     /// Forgets the partly sent report of the control block at `mms_path`.
+    ///
+    /// For a BRCB the entry is sent again from its first segment, so the
+    /// formatted mark of its buffer moves back to the transmit anchor.
     pub(crate) fn forget_partial(&self, mms_path: &str) {
-        if let Ok(mut m) = self.partial_reports.lock() {
-            m.remove(mms_path);
+        let removed = self
+            .partial_reports
+            .lock()
+            .map(|mut m| m.remove(mms_path).is_some())
+            .unwrap_or(false);
+        if removed {
+            if let Some(brcb) = self.brcbs.get(mms_path) {
+                rewind_formatted(brcb);
+            }
         }
     }
 
@@ -2472,6 +2498,22 @@ fn dataset_key(rcb_mms_path: &str, dat_set: &str) -> Option<(String, String)> {
         None => rcb_mms_path
             .split_once('/')
             .map(|(domain, _)| (domain.to_string(), dat_set.to_string())),
+    }
+}
+
+/// Moves the formatted mark of a BRCB buffer back to its transmit anchor, for
+/// an entry that will be formatted again from its first segment.
+fn rewind_formatted(brcb: &BufferedReportControl) {
+    let through = match brcb.state.lock() {
+        Ok(s) => match &s.transmit_anchor {
+            TransmitAnchor::AfterEntryId(id) => Some(*id),
+            TransmitAnchor::WaitingForNext => Some(s.last_committed_entry_id),
+            TransmitAnchor::None | TransmitAnchor::FromHead => None,
+        },
+        Err(_) => return,
+    };
+    if let Ok(mut buf) = brcb.lock_buffer() {
+        buf.set_formatted_through(through.as_ref());
     }
 }
 
@@ -4876,5 +4918,100 @@ mod tests {
         let after = pdus.split_off(pdus.len() - 2);
         assert!(!buf_ovfl(&after[0]), "nothing unsent was lost");
         assert!(!buf_ovfl(&after[1]));
+    }
+
+    /// Sends three entries, resynchronizes on the first, and buffers two more,
+    /// which evict the first and then the second. Returns the overflow flag
+    /// after each of the two evictions.
+    fn overflow_after_resync_on_an_earlier_entry(
+        brcb: crate::reporting::brcb::BufferedReportControl,
+    ) -> (bool, bool) {
+        use crate::reporting::brcb::TransmitAnchor;
+        let sink = Arc::new(CollectReportSink::default());
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+        let path = brcb.mms_path.clone();
+        eng.register_brcb_with_dataset(brcb, make_ds(vec![(attr.as_str(), MmsValue::Integer(0))]))
+            .unwrap();
+        let brcb_arc = eng.get_brcb(&path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let flag = InclusionFlag::VALUE_CHANGED;
+        for v in 1..=3 {
+            eng.on_brcb_value_updated(&attr, MmsValue::Integer(v), flag, v as u64);
+        }
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 3);
+        let e1 = brcb_arc.lock_buffer().unwrap().iter_entries()[0].entry_id;
+
+        // The association is lost; the client resynchronizes on E1, so E2 and
+        // E3 are to be sent again.
+        eng.on_connection_dropped(5);
+        brcb_arc.apply_entry_id_write(e1).unwrap().unwrap();
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(4), flag, 4);
+        let after_e1 = brcb_arc.lock_buffer().unwrap().is_overflow();
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(5), flag, 5);
+        let after_e2 = brcb_arc.lock_buffer().unwrap().is_overflow();
+        (after_e1, after_e2)
+    }
+
+    #[test]
+    fn entry_evicted_before_it_is_sent_again_after_a_resync_sets_overflow() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl};
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_buffer_capacity(3);
+        let (after_e1, after_e2) = overflow_after_resync_on_an_earlier_entry(
+            BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb),
+        );
+        assert!(!after_e1, "E1 is the resync point the client already has");
+        assert!(after_e2, "E2 was lost before it was sent again");
+    }
+
+    #[cfg(feature = "sqlite-backend")]
+    #[test]
+    fn sqlite_entry_evicted_before_it_is_sent_again_after_a_resync_sets_overflow() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl};
+        use crate::reporting::buffer::OverflowStrategy;
+        use crate::reporting::sqlite_buffer::SqliteReportBuffer;
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_trg_ops(TriggerOptions::DATA_CHANGED);
+        let backend =
+            SqliteReportBuffer::open_memory("brcb01", 3, OverflowStrategy::DropOldest).unwrap();
+        let (after_e1, after_e2) = overflow_after_resync_on_an_earlier_entry(
+            BufferedReportControl::with_backend("IED1LD0/GGIO1$BR$brcb01", brcb, Box::new(backend)),
+        );
+        assert!(!after_e1, "E1 is the resync point the client already has");
+        assert!(after_e2, "E2 was lost before it was sent again");
+    }
+
+    /// A partly sent entry that is given up is formatted again from its first
+    /// segment, so evicting it before then sets the overflow flag.
+    #[test]
+    fn a_given_up_partial_entry_counts_as_not_yet_formatted() {
+        let LongBrcbEntry {
+            eng,
+            brcb_arc,
+            rx: _rx,
+            ..
+        } = long_brcb_entry_engine();
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5), 0);
+        assert!(!brcb_arc.lock_buffer().unwrap().is_overflow());
+        eng.on_connection_dropped(5);
+        // The buffer holds 64 entries and has two: 63 more evict the long
+        // entry and nothing else.
+        for t in 0..63 {
+            let mut one = EnqueuedSnapshot::new(150);
+            one.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+            one.values[0] = Some(MmsValue::Integer(t));
+            brcb_arc
+                .enqueue_entry_with_snapshot(3_000 + t as u64, false, false, one)
+                .unwrap();
+        }
+        let buf = brcb_arc.lock_buffer().unwrap();
+        assert_eq!(buf.len(), 64);
+        assert!(buf.is_overflow(), "the long entry was never sent in full");
     }
 }

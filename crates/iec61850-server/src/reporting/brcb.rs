@@ -866,7 +866,11 @@ impl BufferedReportControl {
     /// The caller holds neither lock; the buffer lock and the state lock are
     /// taken one after the other.
     fn run_purge_buf_procedure(&self) -> Result<usize, crate::error::ServerError> {
-        let purged = self.lock_buffer()?.purge();
+        let purged = {
+            let mut buf = self.lock_buffer()?;
+            buf.set_formatted_through(None);
+            buf.purge()
+        };
         let mut state = self.lock_state()?;
         state.last_sent_entry_id = EntryId::ZERO;
         state.last_sent_time_of_entry_ms = 0;
@@ -1031,6 +1035,13 @@ impl BufferedReportControl {
                 Err(ApplyEntryIdError::InvalidEntryId)
             }
         };
+        drop(state);
+        if outcome.is_ok() {
+            // Transmission restarts after `id`, or from the head for the all-zero
+            // EntryID, so the entries after it count as not yet formatted.
+            let through = (!id.is_zero()).then_some(&id);
+            self.lock_buffer()?.set_formatted_through(through);
+        }
         Ok(outcome)
     }
 
