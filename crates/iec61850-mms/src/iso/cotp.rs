@@ -900,8 +900,14 @@ pub fn encode_options(opts: &CotpOptions) -> Vec<u8> {
 /// Reading goes through the bounds-checked [`TpduReader`]: each option reads its
 /// type and then its length, and a truncated option returns an error instead of
 /// advancing past the end of the buffer.
+///
+/// A TPDU without the TPDU size parameter proposes 128 octets, the default of
+/// ISO 8073, so the returned `tpdu_size` is 128 when the parameter is absent.
 pub fn parse_options(buf: &[u8]) -> Result<CotpOptions, CotpError> {
-    let mut opts = CotpOptions::default();
+    let mut opts = CotpOptions {
+        tpdu_size: TpduSize(COTP_MIN_TPDU_SIZE_ENCODED),
+        ..CotpOptions::default()
+    };
     let mut r = TpduReader::new(buf);
 
     while r.has_remaining() {
@@ -1212,6 +1218,55 @@ mod tests {
             matches!(err, CotpError::UnsupportedProtocolClass { class: 0x40 }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn options_without_tpdu_size_propose_128_octets() {
+        assert_eq!(parse_options(&[]).unwrap().tpdu_size.bytes(), 128);
+        // a calling TSAP alone still leaves the default
+        let opts = parse_options(&[OPT_CALLING_TSAP, 0x02, 0x00, 0x01]).unwrap();
+        assert_eq!(opts.tpdu_size.bytes(), 128);
+    }
+
+    /// A CR without the TPDU size parameter is confirmed at 128 octets, and data
+    /// is then segmented at that size; a CR proposing 1024 is confirmed at 1024.
+    #[tokio::test]
+    async fn cr_without_tpdu_size_is_confirmed_at_128_octets() {
+        for (cr, confirmed) in [
+            (
+                &[
+                    0x03, 0x00, 0x00, 0x0b, 0x06, 0xe0, 0x00, 0x00, 0x00, 0x01, 0x00,
+                ][..],
+                0x07u8,
+            ),
+            (
+                &[
+                    0x03, 0x00, 0x00, 0x0e, 0x09, 0xe0, 0x00, 0x00, 0x00, 0x01, 0x00, 0xc0, 0x01,
+                    0x0a,
+                ][..],
+                0x0a,
+            ),
+        ] {
+            let (mut client, server_stream) = duplex(4096);
+            let server = tokio::spawn(async move {
+                CotpConnection::accept(server_stream, CotpOptions::default())
+                    .await
+                    .unwrap()
+            });
+            client.write_all(cr).await.unwrap();
+            let mut hdr = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut hdr)
+                .await
+                .unwrap();
+            let mut body = vec![0u8; u16::from_be_bytes([hdr[2], hdr[3]]) as usize - 4];
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut body)
+                .await
+                .unwrap();
+            let (_, size) = parse_cc(&body).unwrap();
+            assert_eq!(size.encoded(), confirmed, "cc {body:02x?}");
+            let conn = server.await.unwrap();
+            assert_eq!(conn.tpdu_size(), 1u16 << confirmed);
+        }
     }
 
     // CC encode and decode round trip
