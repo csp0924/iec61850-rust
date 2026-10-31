@@ -52,8 +52,10 @@
 //! handlers runs twice: first without the lock, asking the handlers and
 //! recording their outcomes, then, unless that run ended without a value,
 //! under the lock, taking the values and answering each consultation from the
-//! record. Each handler is asked once per read, and a handler may call the
-//! server, `update_*` and `lock_data_model` included.
+//! record. The first run also reads the model values, outside the lock; they
+//! are kept only for a result without a value, a refusal or a value over the
+//! budget, and otherwise discarded. Each handler is asked once per read, and
+//! a handler may call the server, `update_*` and `lock_data_model` included.
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -514,10 +516,12 @@ fn check_handler_shape(node: Node<'_>, fc: FC, value: &MmsValue) -> Result<(), D
 /// Runs `run` so that no read handler is asked while the value lock is held.
 ///
 /// Without handlers in `scope`, `run` runs once under the lock. With them, a
-/// first run without the lock asks the handlers and records their outcomes;
-/// a result `has_value` rejects, a refusal or a value over the budget, stands
-/// as it is, as neither carries a value; otherwise `run` runs again under the
-/// lock, taking the values and answered the recorded outcomes.
+/// first run without the lock asks the handlers and records their outcomes,
+/// reading the model values as it goes; a result `has_value` rejects, a
+/// refusal or a value over the budget, stands as it is, as neither carries a
+/// value; otherwise the values of the first run are discarded and `run` runs
+/// again under the lock, taking the values and answered the recorded
+/// outcomes.
 fn with_handlers_outside_the_value_lock<R>(
     mms_model: &MmsDeviceModel,
     scope: ReadHandlerScope,
@@ -2781,5 +2785,97 @@ mod tests {
             LookupResult::Result(AccessResult::Success(_))
         ));
         assert!(mms_model.value_lock().try_write().is_ok());
+    }
+
+    /// Signals when it is asked, then waits to be released and declines.
+    #[derive(Debug)]
+    struct Gate {
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ReadHandler for Gate {
+        fn read(&self, _ctx: &ReadContext<'_>) -> ReadOutcome {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self
+                .go
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30));
+            ReadOutcome::CacheMiss
+        }
+    }
+
+    /// A read that consults a handler still takes the values it answers with
+    /// under the value lock. Once the handler has been asked, a leaf the read
+    /// already took outside the lock is held: the read then waits on it while
+    /// holding the value lock, so it cannot finish first, and a read that
+    /// answered with the values it took outside the lock would.
+    #[test]
+    fn a_read_with_a_handler_takes_its_values_under_the_value_lock() {
+        for item_id in ["MMXU1$MX$A", "MMXU1$MX"] {
+            let model = Arc::new(build_handler_model());
+            let mms_model = Arc::new(MmsDeviceModel::from_ied_model(&model).unwrap());
+            let registry = Arc::new(HandlerRegistry::new());
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            registry
+                .install_read_handler(
+                    "MMXU1$MX$A$phsA$cVal",
+                    Arc::new(Gate {
+                        entered: std::sync::Mutex::new(entered_tx),
+                        go: std::sync::Mutex::new(go_rx),
+                    }),
+                )
+                .unwrap();
+            let r = iec61850_model::ObjectRef::parse_mms("IED1LD0/MMXU1$MX$A$q").unwrap();
+            let Some(iec61850_model::NodeRef::Da(q)) = model.node_by_object_ref(&r) else {
+                panic!("q is a data attribute");
+            };
+            let q = Arc::clone(&q.value);
+
+            let reader = std::thread::spawn({
+                let (model, mms_model, registry) = (
+                    Arc::clone(&model),
+                    Arc::clone(&mms_model),
+                    Arc::clone(&registry),
+                );
+                move || {
+                    let name = ObjectName::DomainSpecific {
+                        domain_id: "IED1LD0".to_string(),
+                        item_id: item_id.to_string(),
+                    };
+                    let services = ReadServices {
+                        mms_model: &mms_model,
+                        handlers: Some((&registry, 7)),
+                    };
+                    read_with_handlers(&model, &name, None, None, services)
+                }
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the read asks its handler");
+            let hold = q.write().unwrap();
+            go_tx.send(()).unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while mms_model.value_lock().try_write().is_ok() && !reader.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{item_id}: deadlocked"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                !reader.is_finished(),
+                "{item_id}: the read finished without taking the held leaf under the value lock"
+            );
+            drop(hold);
+            assert!(matches!(
+                reader.join().unwrap(),
+                LookupResult::Result(AccessResult::Success(_))
+            ));
+            assert!(mms_model.value_lock().try_write().is_ok());
+        }
     }
 }

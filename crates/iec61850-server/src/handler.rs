@@ -175,8 +175,10 @@ pub trait ReadHandler: Send + Sync + core::fmt::Debug {
     /// under the lock that keeps it from seeing part of a concurrent write.
     /// The handler may therefore call the server, `update_*` and
     /// `lock_data_model` included. Each handler a read consults is asked once
-    /// for that read; the model values the read answers with are taken after
-    /// every handler has answered.
+    /// for that read; the model values the read answers with are taken under
+    /// that lock after every handler has answered. The values the read takes
+    /// while it asks the handlers, outside the lock, decide only a read that
+    /// is refused for its size.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
 }
 

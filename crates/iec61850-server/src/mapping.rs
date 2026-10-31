@@ -176,7 +176,8 @@ pub struct MmsDeviceModel {
     ///
     /// The reporting engine takes it under the engine lock, so whoever holds
     /// it must not take the engine lock; no read handler runs while it is
-    /// held.
+    /// held. A read that consults handlers also reads values outside it while
+    /// it asks them, and those values decide only a read refused for its size.
     value_lock: Arc<RwLock<()>>,
     /// Where a write hands the leaves it stored, to raise their report and log
     /// triggers; unset for a view no server owns.
