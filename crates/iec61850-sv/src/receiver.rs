@@ -26,7 +26,7 @@ use std::time::Duration;
 use iec61850_hal::ethernet::{EthernetError, EthernetSource};
 
 use crate::error::SvError;
-use crate::frame::{SvFrame, SV_ETHER_TYPE};
+use crate::frame::SvFrame;
 use crate::pdu::decode_sav_pdu;
 use crate::subscriber::{SvSubscriber, SvSubscriberAsdu};
 
@@ -76,13 +76,8 @@ impl Drop for SvReceiverHandle {
 struct SvReceiverInner {
     /// Subscriptions, each dispatched independently.
     subscribers: Vec<Arc<SvSubscriber>>,
-    /// Whether the receiver validates the destination MAC before dispatch.
-    ///
-    /// Off by default, which preserves the on-wire behavior of a receiver that
-    /// does not filter on the destination address. Per-subscription filtering
-    /// is separate.
-    ///
-    /// TODO: implement the receiver-level check this flag selects.
+    /// Whether a frame must be addressed to a destination MAC that some
+    /// subscription names; see `SvReceiver::set_dest_addr_check`.
     dest_addr_check: bool,
 }
 
@@ -113,6 +108,15 @@ impl SvReceiver<Idle> {
 
     /// Enables the receiver-level destination MAC check, which is off by
     /// default.
+    ///
+    /// When enabled, a frame is decoded and dispatched only if its
+    /// destination MAC equals the
+    /// [`dst_mac`](crate::subscriber::SvSubscriberBuilder::dst_mac) filter of
+    /// at least one subscription; any other frame is dropped before
+    /// its PDU is decoded, for every subscription, including those without a
+    /// destination MAC filter. With no subscription naming an address, every
+    /// frame is dropped. The per-subscription filters still apply to the
+    /// frames that pass.
     pub fn set_dest_addr_check(&mut self, enable: bool) {
         self.inner.dest_addr_check = enable;
     }
@@ -208,8 +212,19 @@ impl SvReceiver<Running> {
         let dst_mac = sv_frame.header.dst_mac;
         let simulate = sv_frame.header.simulate;
 
-        // A decoded frame always carries the SV EtherType.
-        let _ = SV_ETHER_TYPE;
+        if self.inner.dest_addr_check
+            && !self
+                .inner
+                .subscribers
+                .iter()
+                .any(|s| s.dst_mac_filter() == Some(dst_mac))
+        {
+            tracing::trace!(
+                "sv frame to {:02x?} dropped, no subscription names that address",
+                dst_mac
+            );
+            return Ok(0);
+        }
 
         let sav_pdu = match decode_sav_pdu(&sv_frame.pdu_bytes) {
             Ok(p) => p,
@@ -434,6 +449,117 @@ mod tests {
             1,
             "a non-matching dst mac is not dispatched"
         );
+    }
+
+    /// Builds a counting subscriber, with a destination MAC filter when
+    /// `mac` is given.
+    fn counting_subscriber(mac: Option<[u8; 6]>) -> (Arc<SvSubscriber>, Arc<Mutex<u32>>) {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let c = counter.clone();
+        let mut b = SvSubscriberBuilder::new().listener(move |_| {
+            *c.lock().unwrap() += 1;
+        });
+        if let Some(m) = mac {
+            b = b.dst_mac(m);
+        }
+        (Arc::new(b.build()), counter)
+    }
+
+    #[test]
+    fn dest_addr_check_drops_frames_to_unnamed_addresses() {
+        let named = [0x01, 0x0C, 0xCD, 0x04, 0x00, 0x01];
+        let other = [0x01, 0x0C, 0xCD, 0x04, 0x00, 0x02];
+        let (with_mac, with_count) = counting_subscriber(Some(named));
+        let (without_mac, without_count) = counting_subscriber(None);
+        let mut rx = SvReceiver::<Idle>::new();
+        rx.add_subscriber(with_mac);
+        rx.add_subscriber(without_mac);
+        rx.set_dest_addr_check(true);
+        let mut running = rx.into_threadless();
+
+        let pdu = SavPdu {
+            asdus: vec![make_asdu("sv1", 0, 8)],
+        };
+        assert_eq!(
+            running.tick(&encode_frame(&pdu, SV_DEFAULT_APPID, named)),
+            Ok(2)
+        );
+        assert_eq!(
+            running.tick(&encode_frame(&pdu, SV_DEFAULT_APPID, other)),
+            Ok(0)
+        );
+        assert_eq!(*with_count.lock().unwrap(), 1);
+        assert_eq!(
+            *without_count.lock().unwrap(),
+            1,
+            "the unfiltered subscription only sees the named address"
+        );
+    }
+
+    #[test]
+    fn dest_addr_check_off_dispatches_any_address() {
+        let named = [0x01, 0x0C, 0xCD, 0x04, 0x00, 0x01];
+        let other = [0x01, 0x0C, 0xCD, 0x04, 0x00, 0x02];
+        let (with_mac, with_count) = counting_subscriber(Some(named));
+        let (without_mac, without_count) = counting_subscriber(None);
+        let mut rx = SvReceiver::<Idle>::new();
+        rx.add_subscriber(with_mac);
+        rx.add_subscriber(without_mac);
+        let mut running = rx.into_threadless();
+
+        let pdu = SavPdu {
+            asdus: vec![make_asdu("sv1", 0, 8)],
+        };
+        running
+            .tick(&encode_frame(&pdu, SV_DEFAULT_APPID, named))
+            .unwrap();
+        assert_eq!(
+            running.tick(&encode_frame(&pdu, SV_DEFAULT_APPID, other)),
+            Ok(1)
+        );
+        assert_eq!(*with_count.lock().unwrap(), 1);
+        assert_eq!(*without_count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn dest_addr_check_without_named_addresses_drops_everything() {
+        let (sub, count) = counting_subscriber(None);
+        let mut rx = SvReceiver::<Idle>::new();
+        rx.add_subscriber(sub);
+        rx.set_dest_addr_check(true);
+        let mut running = rx.into_threadless();
+        let pdu = SavPdu {
+            asdus: vec![make_asdu("sv1", 0, 8)],
+        };
+        assert_eq!(
+            running.tick(&encode_frame(
+                &pdu,
+                SV_DEFAULT_APPID,
+                crate::frame::SV_DEFAULT_DST_MAC
+            )),
+            Ok(0)
+        );
+        assert_eq!(*count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn dest_addr_check_drops_before_decoding_the_pdu() {
+        let (sub, _) = counting_subscriber(Some([0x01, 0x0C, 0xCD, 0x04, 0x00, 0x01]));
+        let mut rx = SvReceiver::<Idle>::new();
+        rx.add_subscriber(sub);
+        rx.set_dest_addr_check(true);
+        let mut running = rx.into_threadless();
+        let frame = SvFrame {
+            header: SvFrameHeader::new(
+                [0x01, 0x0C, 0xCD, 0x04, 0x00, 0x09],
+                [0u8; 6],
+                SV_DEFAULT_APPID,
+            ),
+            pdu_bytes: vec![0x61, 0x00],
+        };
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        assert_eq!(running.tick(&buf), Ok(0), "a bad pdu to an unnamed address");
     }
 
     #[test]
