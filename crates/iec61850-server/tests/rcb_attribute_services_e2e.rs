@@ -8,12 +8,17 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
+use iec61850_client::mms_compat::mms_data_to_mms_value;
+use iec61850_client::report::parse::{parse_report, ParsedReport};
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
-use iec61850_mms::mms::pdu::common::DataAccessError;
+use iec61850_mms::mms::pdu::common::{DataAccessError, ObjectName};
+use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
 use iec61850_mms::mms::MmsData;
 use iec61850_model::{
     cdc, DataAttribute, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
-    NodeRef, ObjectRef,
+    MmsValue, NodeRef, ObjectRef,
 };
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{
@@ -118,7 +123,6 @@ impl Fixture {
         mms
     }
 
-    #[allow(dead_code)]
     fn set_st_val(&self, n: u32) {
         self.server
             .update_bit_string_from_int(&self.st_val, n)
@@ -148,6 +152,36 @@ async fn read_brcb(mms: &mut MmsClient, field: &str) -> MmsData {
     mms.read(DOMAIN, &format!("{BRCB_ITEM}${field}"))
         .await
         .unwrap_or_else(|e| panic!("read {field}: {e:?}"))
+}
+
+/// Receives the next report; fails after four seconds.
+async fn next_report(mms: &mut MmsClient) -> ParsedReport {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "no report arrived");
+        let Some(inner) = mms
+            .recv_unconfirmed_pdu_with_timeout(remaining)
+            .await
+            .expect("receive")
+        else {
+            continue;
+        };
+        let report = decode_information_report(&inner).expect("decode information report");
+        let is_rpt = matches!(
+            &report.variable_access_spec,
+            VariableAccessSpec::VariableListName(ObjectName::VmdSpecific(s)) if s == "RPT"
+        );
+        if !is_rpt {
+            continue;
+        }
+        let elements: Vec<MmsValue> = report
+            .list_of_access_result
+            .iter()
+            .map(mms_data_to_mms_value)
+            .collect();
+        return parse_report(&MmsValue::Array(elements)).expect("parse report");
+    }
 }
 
 fn assert_refused_with(result: Result<(), ClientError>, expected: DataAccessError) {
@@ -195,4 +229,63 @@ async fn urcb_disable_keeps_the_reservation() {
     write_urcb(&mut other, "Resv", MmsData::Boolean(true))
         .await
         .expect("another client reserves a released URCB");
+}
+
+/// RptEna = TRUE on an unreserved URCB reserves it for the writer, which then
+/// receives its reports; another client is refused until the reservation ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn urcb_enable_reserves_implicitly() {
+    let f = start().await;
+    let mut holder = f.connect().await;
+    let mut other = f.connect().await;
+
+    write_urcb(&mut holder, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable without reserving first");
+    assert_eq!(read_urcb(&mut other, "Resv").await, MmsData::Boolean(true));
+    f.set_st_val(2);
+    assert_eq!(next_report(&mut holder).await.rpt_id, URCB_PATH);
+
+    assert_refused_with(
+        write_urcb(&mut other, "RptEna", MmsData::Boolean(true)).await,
+        DataAccessError::ObjectAccessDenied,
+    );
+    assert_refused_with(
+        write_urcb(&mut other, "Resv", MmsData::Boolean(true)).await,
+        DataAccessError::TemporarilyUnavailable,
+    );
+
+    write_urcb(&mut holder, "RptEna", MmsData::Boolean(false))
+        .await
+        .expect("disable");
+    assert_eq!(read_urcb(&mut other, "Resv").await, MmsData::Boolean(true));
+    assert_refused_with(
+        write_urcb(&mut other, "RptEna", MmsData::Boolean(true)).await,
+        DataAccessError::ObjectAccessDenied,
+    );
+}
+
+/// On an unreserved URCB, a write of any attribute other than RptEna = TRUE is
+/// still refused and does not reserve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn urcb_other_writes_do_not_reserve() {
+    let f = start().await;
+    let mut mms = f.connect().await;
+    assert_refused_with(
+        write_urcb(
+            &mut mms,
+            "TrgOps",
+            MmsData::BitString {
+                padding: 2,
+                data: vec![0x40],
+            },
+        )
+        .await,
+        DataAccessError::ObjectAccessDenied,
+    );
+    assert_refused_with(
+        write_urcb(&mut mms, "RptEna", MmsData::Boolean(false)).await,
+        DataAccessError::ObjectAccessDenied,
+    );
+    assert_eq!(read_urcb(&mut mms, "Resv").await, MmsData::Boolean(false));
 }

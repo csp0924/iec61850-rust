@@ -9,7 +9,7 @@
 //! |---|---|
 //! | Resv | any client, moving the block from idle to reserved |
 //! | RptID, DatSet, OptFlds, BufTm, TrgOps, IntgPd | reserved, and the writer owns the reservation |
-//! | RptEna = true | reserved, and the writer owns the reservation |
+//! | RptEna = true | reserved by the writer, or unreserved, in which case the write reserves it for the writer |
 //! | RptEna = false | enabled, and the writer owns the reservation; the reservation is kept |
 //! | GI = true | enabled, the writer owns the reservation, and trgOps includes GI |
 //! | ConfRev, SqNum, Owner, TimeOfEntry | never writable; answered with ObjectAccessDenied |
@@ -227,9 +227,17 @@ pub fn handle_set_rcb_field(
         return Ok(());
     }
 
-    // Edition 2.1: a client that does not hold the reservation may not write any
+    // RptEna = true on an unreserved control block reserves it for the writer,
+    // per the Resv semantics of IEC 61850-7-2; the reservation is taken below,
+    // only once the enable succeeds.
+    let implicit_reservation = !state.resv
+        && state.client_conn_id.is_none()
+        && field == RcbField::RptEna
+        && matches!(value, RcbWriteValue::Bool(true));
+
+    // Otherwise a client that does not hold the reservation may not write any
     // other field, per the RCB write conditions of IEC 61850-7-2.
-    if !state.resv || state.client_conn_id != Some(conn_id) {
+    if !implicit_reservation && (!state.resv || state.client_conn_id != Some(conn_id)) {
         tracing::warn!(
             mms_path,
             conn_id,
@@ -254,6 +262,10 @@ pub fn handle_set_rcb_field(
             if state.rpt_ena {
                 // Already enabled.
                 return Ok(());
+            }
+            if implicit_reservation {
+                state.resv = true;
+                state.client_conn_id = Some(conn_id);
             }
             state.rpt_ena = true;
             state.sq_num = 0;
@@ -1692,6 +1704,64 @@ mod tests {
 
         // The holder releases it with Resv = false.
         set(RcbField::Resv, RcbWriteValue::Bool(false), 1).unwrap();
+        assert_eq!(urcb_resv(&engine, &path), (false, None));
+    }
+
+    /// RptEna = TRUE on an unreserved URCB reserves it for the writer, which
+    /// another client then cannot take or write.
+    #[test]
+    fn urcb_rpt_ena_true_reserves_an_unreserved_urcb() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        let set = |field: RcbField, value: RcbWriteValue, conn_id: ConnectionId| {
+            handle_set_rcb_field(&engine, &path, field, value, conn_id)
+        };
+        assert_eq!(set(RcbField::RptEna, RcbWriteValue::Bool(true), 1), Ok(()));
+        assert_eq!(urcb_resv(&engine, &path), (true, Some(1)));
+        assert_eq!(
+            set(RcbField::RptEna, RcbWriteValue::Bool(true), 2),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            set(RcbField::Resv, RcbWriteValue::Bool(true), 2),
+            Err(DataAccessError::TemporarilyUnavailable)
+        );
+        assert_eq!(set(RcbField::RptEna, RcbWriteValue::Bool(false), 1), Ok(()));
+        assert_eq!(urcb_resv(&engine, &path), (true, Some(1)));
+    }
+
+    /// Only RptEna = TRUE reserves implicitly: RptEna = FALSE and every other
+    /// attribute are still refused on an unreserved URCB, and an enable that
+    /// fails leaves the URCB unreserved.
+    #[test]
+    fn urcb_without_resv_only_an_enable_reserves() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        for (field, value) in [
+            (RcbField::RptEna, RcbWriteValue::Bool(false)),
+            (RcbField::BufTm, RcbWriteValue::Unsigned(250)),
+            (RcbField::Gi, RcbWriteValue::Bool(true)),
+        ] {
+            assert_eq!(
+                handle_set_rcb_field(&engine, &path, field, value, 1),
+                Err(DataAccessError::ObjectAccessDenied)
+            );
+        }
+        assert_eq!(urcb_resv(&engine, &path), (false, None));
+
+        {
+            let rc_arc = engine.lock().unwrap().get_rcb(&path).unwrap();
+            let rc = rc_arc.lock().unwrap();
+            rc.state.lock().unwrap().dat_set = String::new();
+        }
+        assert_eq!(
+            handle_set_rcb_field(
+                &engine,
+                &path,
+                RcbField::RptEna,
+                RcbWriteValue::Bool(true),
+                1
+            ),
+            Err(DataAccessError::TemporarilyUnavailable)
+        );
         assert_eq!(urcb_resv(&engine, &path), (false, None));
     }
 
