@@ -22,6 +22,11 @@ use crate::frame::{GooseFrame, GooseFrameHeader, VlanPriority, VlanTag, RESERVED
 use crate::pdu::GoosePdu;
 
 /// Maximum size of a GOOSE frame including the Ethernet header.
+///
+/// The limit is that of an IEEE 802.3 frame carrying an 802.1Q tag, without
+/// the frame check sequence. An untagged frame is limited to 1514 bytes; the
+/// publisher does not check that tighter bound, and a larger untagged frame is
+/// refused by the network interface when it is sent.
 pub const GOOSE_MAX_FRAME_SIZE: usize = 1518;
 
 /// Communication parameters of a GOOSE publication: APPID, destination MAC,
