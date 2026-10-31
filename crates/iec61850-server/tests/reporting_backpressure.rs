@@ -2,14 +2,13 @@
 //! metrics.
 //!
 //! A bounded channel sink whose receiver never reads stands in for a slow
-//! client: once the channel is full further reports raise the socket-full drop
-//! counter, and after enough consecutive would-block results the engine treats
-//! the connection as gone and clears RptEna. The metrics tests drive each
-//! counter path by hand and read the values back from the snapshot.
+//! client: once the channel is full further reports are dropped and raise the
+//! socket-full drop counter, while RptEna and Resv stay as they are. The
+//! metrics tests drive each counter path by hand and read the values back from
+//! the snapshot.
 
 use bytes::Bytes;
 use iec61850_model::MmsValue;
-use iec61850_server::reporting::engine::BACKPRESSURE_CLOSE_THRESHOLD;
 use iec61850_server::{
     ChannelReportSink, Dataset, DatasetEntry, InclusionFlag, NullReportSink, Rcb,
     RcbMetricsSnapshot, ReportControl, ReportingEngine, SendOutcome, TriggerOptions,
@@ -119,13 +118,13 @@ async fn backpressure_normal_receiver_no_drops() {
     );
 }
 
-// A slow receiver raises the drop counter and eventually loses the connection.
+// A slow receiver raises the drop counter and keeps its control block.
 
 // The body is synchronous, so it runs on its own thread with a receive timeout:
 // a reentrant-lock regression inside the engine would otherwise hang the whole
 // test binary instead of failing this one test.
 #[test]
-fn backpressure_slow_receiver_dropped_counter_and_conn_dropped() {
+fn backpressure_slow_receiver_drops_reports_and_keeps_rpt_ena() {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         let ch_sink = Arc::new(ChannelReportSink::new());
@@ -162,21 +161,16 @@ fn backpressure_slow_receiver_dropped_counter_and_conn_dropped() {
             "a send into a full channel must report would-block"
         );
 
-        // Each tick flushes once and hits would-block once, so enough ticks
-        // cross the threshold at which the connection is dropped.
+        // Each tick flushes once and hits would-block once.
         use iec61850_server::reporting::rcb::PendingReport;
 
-        for i in 0..(BACKPRESSURE_CLOSE_THRESHOLD + 5) {
+        for i in 0..20u64 {
             // Put a pending report in place and expire its deadline.
             {
                 let rc_l = rc_arc.lock().unwrap();
                 let mut s = rc_l.state.lock().unwrap();
-                // Stop once the connection has been dropped.
-                if !s.rpt_ena {
-                    break;
-                }
                 let ds_len = s.dataset.as_ref().map(|d| d.len()).unwrap_or(1);
-                let mut pending = PendingReport::new_empty(ds_len, 1_000_000 + i as u64);
+                let mut pending = PendingReport::new_empty(ds_len, 1_000_000 + i);
                 pending.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
                 pending.snapshot[0] = Some(MmsValue::Boolean(true));
                 s.pending = Some(pending);
@@ -186,21 +180,19 @@ fn backpressure_slow_receiver_dropped_counter_and_conn_dropped() {
             engine.tick();
         }
 
-        // Reports were dropped.
+        // Every report was dropped.
         let rc_l = rc_arc.lock().unwrap();
         let snap = rc_l.metrics_snapshot();
-        assert!(
-            snap.dropped_socket_full > 0,
-            "a slow receiver must drop reports, got {}",
-            snap.dropped_socket_full
+        assert_eq!(
+            snap.dropped_socket_full, 20,
+            "a slow receiver must drop every report"
         );
 
-        // The connection was dropped, which clears RptEna.
+        // The association is still there, so the control block stays enabled
+        // and reserved.
         let state = rc_l.state.lock().unwrap();
-        assert!(
-            !state.rpt_ena,
-            "repeated would-block must drop the connection and clear RptEna"
-        );
+        assert!(state.rpt_ena, "a full channel must not clear RptEna");
+        assert!(state.resv, "a full channel must not clear Resv");
 
         let _ = done_tx.send(());
     });

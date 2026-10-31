@@ -8,12 +8,15 @@
 //! channel therefore approximates socket backpressure without touching the socket.
 //!
 //! The sink knows nothing about metrics: the engine decides what a `WouldBlock`
-//! means, counts it, logs it, and closes the connection after enough of them in a
-//! row.
+//! means. A full channel drops the rest of a URCB report and keeps a BRCB entry
+//! buffered for a later attempt; the engine counts and logs the drops but leaves
+//! RptEna and Resv alone, because only the loss of the association disables a
+//! control block. An association that stops reading altogether is closed by the
+//! idle and send timeouts of the connection lifecycle, and its control blocks
+//! are released then.
 //!
 //! `REPORT_CHANNEL_CAP` is 32. At a 5 ms buffer time and roughly 200 reports per
-//! second, that is about one entry every 5 ms, so 32 slots hold about 160 ms of
-//! traffic. A client that consumes nothing for 160 ms is treated as stalled.
+//! second, 32 slots hold about 160 ms of traffic.
 
 use crate::connection::ConnectionId;
 use crate::reporting::ReportSink;
@@ -36,8 +39,8 @@ pub const REPORT_CHANNEL_CAP: usize = 32;
 
 /// Outcome of one `ChannelReportSink` send attempt.
 ///
-/// The engine reads this to decide whether to count a drop, log a warning, or
-/// close the connection.
+/// The engine reads this to decide whether to count a drop or to release the
+/// control blocks of a connection whose task has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SendOutcome {

@@ -24,22 +24,11 @@ use crate::flags::{InclusionFlag, TriggerOptions};
 use bytes::Bytes;
 use iec61850_mms::mms::server::connection::SERVER_MAX_PDU_SIZE;
 use iec61850_model::MmsValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Backpressure constants
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Number of consecutive `WouldBlock` results after which a connection counts as
-/// stalled and `on_connection_dropped` is called.
-///
-/// The value is 10: raise it when bursty traffic causes false positives, lower it
-/// to close unresponsive connections sooner.
-pub const BACKPRESSURE_CLOSE_THRESHOLD: u32 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ReportSink: the caller implements this trait to deliver PDU bytes to a client
@@ -95,8 +84,9 @@ impl ReportSink for CollectReportSink {
 /// - `sink`: report PDU delivery, injected by the connection lifecycle layer
 /// - `channel_sink`: optional backpressure-aware sink
 ///
-/// The consecutive-`WouldBlock` count lives per control block in
-/// `rc.metrics.consecutive_socket_full`, so `flush_pending` needs only `&self`.
+/// The number of report PDUs a URCB has dropped since its channel last took one
+/// lives per control block in `rc.metrics.consecutive_socket_full`, so
+/// `flush_pending` needs only `&self`.
 ///
 /// `Arc<dyn ReportSink>` is not `Debug`, so `Debug` is implemented by hand.
 pub struct ReportingEngine {
@@ -122,6 +112,9 @@ pub struct ReportingEngine {
     sink: Arc<dyn ReportSink>,
     /// Backpressure-aware sink. When present, `flush_pending` uses `try_send_pdu`.
     channel_sink: Option<Arc<ChannelReportSink>>,
+    /// MMS paths of the BRCBs whose last send found the channel full; a BRCB
+    /// logs when it enters and when it leaves this set, not on every retry.
+    brcb_blocked: Mutex<HashSet<String>>,
     /// Engine-level metrics. `dropped_buffer_full` is incremented by the buffer
     /// backends themselves when an entry has to be discarded.
     metrics: Arc<ReportingEngineMetrics>,
@@ -284,6 +277,7 @@ impl ReportingEngine {
             brcb_next_intg: Mutex::new(HashMap::new()),
             sink,
             channel_sink: None,
+            brcb_blocked: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: None,
@@ -293,10 +287,10 @@ impl ReportingEngine {
 
     /// Creates an engine backed by a backpressure-aware `ChannelReportSink`.
     ///
-    /// `flush_pending` then sends through `try_send_pdu`, evaluates the
-    /// `SendOutcome`, and asks for the connection to be closed after
-    /// `BACKPRESSURE_CLOSE_THRESHOLD` consecutive failures. The consecutive count
-    /// is kept per control block in `rc.metrics.consecutive_socket_full`.
+    /// Reports are then sent through `try_send_pdu`. A full channel drops the
+    /// rest of a URCB report and keeps a BRCB entry buffered for the next tick;
+    /// neither changes RptEna or Resv. Only a channel whose receiver is gone
+    /// releases the control blocks of the connection.
     pub fn new_with_channel_sink(sink: Arc<ChannelReportSink>) -> Self {
         let trait_sink = sink.clone() as Arc<dyn ReportSink>;
         Self {
@@ -309,6 +303,7 @@ impl ReportingEngine {
             brcb_next_intg: Mutex::new(HashMap::new()),
             sink: trait_sink,
             channel_sink: Some(sink),
+            brcb_blocked: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
             dataset_registry: None,
@@ -1155,6 +1150,10 @@ impl ReportingEngine {
             // A lost connection always clears Resv.
             state.resv = false;
             state.gi = false;
+            rc_guard
+                .metrics
+                .consecutive_socket_full
+                .store(0, Ordering::Relaxed);
         }
         for brcb in self.brcbs.values() {
             let Ok(mut state) = brcb.state.lock() else {
@@ -1171,6 +1170,7 @@ impl ReportingEngine {
             state.rpt_ena = false;
             state.client_conn_id = None;
             state.gi = false;
+            self.set_brcb_blocked(&brcb.mms_path, false);
             match state.resv_tms {
                 ResvTmsState::WithTimeout(secs) => {
                     state.reservation_timeout =
@@ -1191,13 +1191,18 @@ impl ReportingEngine {
     /// With a `ChannelReportSink` injected, each PDU goes through `try_send_pdu` and
     /// the `SendOutcome` decides what happens:
     ///
-    /// - `Sent`: the `sent` counter is incremented and the consecutive-failure count
-    ///   is reset to zero
-    /// - `WouldBlock`: `dropped_socket_full` is incremented, a warning is logged, and
-    ///   the consecutive count grows; on reaching `BACKPRESSURE_CLOSE_THRESHOLD` the
-    ///   function returns `Some(conn_id)`
+    /// - `Sent`: the `sent` counter is incremented
+    /// - `WouldBlock`: this PDU and the remaining segments of the report are
+    ///   dropped and counted in `dropped_socket_full`; RptEna and Resv are left as
+    ///   they are, since only the loss of the association disables a URCB
+    ///   (IEC 61850-7-2 §17.2.4.4, §17.2.4.5)
     /// - `ReceiverDropped` or `NotFound`: the connection is treated as gone and
     ///   `Some(conn_id)` is returned
+    ///
+    /// A run of drops logs one warning when it starts and one, with the number
+    /// of PDUs dropped, when the channel takes a PDU again. An association that
+    /// stops reading altogether is closed by the idle and send timeouts of the
+    /// connection lifecycle.
     ///
     /// With any other sink the plain boolean path is used and no counter moves.
     ///
@@ -1272,46 +1277,42 @@ impl ReportingEngine {
 
         if let Some(ref ch_sink) = self.channel_sink {
             // Backpressure-aware path.
-            for pdu in pdus {
+            let segments = pdus.len();
+            for (n, pdu) in pdus.into_iter().enumerate() {
                 let outcome = ch_sink.try_send_pdu(conn_id, pdu);
                 match outcome {
                     SendOutcome::Sent => {
                         rc.metrics.sent.fetch_add(1, Ordering::Relaxed);
-                        rc.metrics
-                            .consecutive_socket_full
-                            .store(0, Ordering::Relaxed);
-                    }
-                    SendOutcome::WouldBlock => {
-                        rc.metrics
-                            .dropped_socket_full
-                            .fetch_add(1, Ordering::Relaxed);
-                        let consec = rc
+                        let dropped = rc
                             .metrics
                             .consecutive_socket_full
-                            .fetch_add(1, Ordering::Relaxed)
-                            + 1;
-                        tracing::warn!(
-                            conn_id,
-                            mms_path = %rc.mms_path,
-                            consecutive = consec,
-                            threshold = BACKPRESSURE_CLOSE_THRESHOLD,
-                            "report pdu dropped: channel full"
-                        );
-                        if consec >= BACKPRESSURE_CLOSE_THRESHOLD {
+                            .swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
                             tracing::warn!(
                                 conn_id,
                                 mms_path = %rc.mms_path,
-                                consecutive = consec,
-                                "consecutive would-block threshold reached, connection treated as stalled"
+                                dropped,
+                                "report delivery resumed after the report channel was full"
                             );
-                            // Reset for the next connection.
-                            rc.metrics
-                                .consecutive_socket_full
-                                .store(0, Ordering::Relaxed);
-                            return Some(conn_id);
                         }
-                        // Below the threshold: the rest of this report is dropped and
-                        // the connection stays open.
+                    }
+                    SendOutcome::WouldBlock => {
+                        // This segment and the ones after it are dropped.
+                        let dropped = (segments - n) as u64;
+                        rc.metrics
+                            .dropped_socket_full
+                            .fetch_add(dropped, Ordering::Relaxed);
+                        let before = rc.metrics.consecutive_socket_full.fetch_add(
+                            u32::try_from(dropped).unwrap_or(u32::MAX),
+                            Ordering::Relaxed,
+                        );
+                        if before == 0 {
+                            tracing::warn!(
+                                conn_id,
+                                mms_path = %rc.mms_path,
+                                "report channel full, dropping urcb reports until it drains; RptEna and Resv are kept"
+                            );
+                        }
                         return None;
                     }
                     SendOutcome::ReceiverDropped | SendOutcome::NotFound => {
@@ -1484,12 +1485,14 @@ impl ReportingEngine {
                     match outcome {
                         SendOutcome::Sent => {}
                         SendOutcome::WouldBlock => {
-                            tracing::warn!(
-                                conn_id,
-                                mms_path = %brcb.mms_path,
-                                entry_id = entry.entry_id.as_u64(),
-                                "brcb report pdu dropped: channel full, anchor left in place for the next tick"
-                            );
+                            if self.set_brcb_blocked(&brcb.mms_path, true) {
+                                tracing::warn!(
+                                    conn_id,
+                                    mms_path = %brcb.mms_path,
+                                    entry_id = entry.entry_id.as_u64(),
+                                    "report channel full, brcb entries stay buffered until it drains"
+                                );
+                            }
                             all_segments_sent = false;
                             break;
                         }
@@ -1526,6 +1529,13 @@ impl ReportingEngine {
             }
 
             // Every segment was accepted: advance the anchor and sqNum, clear overflow.
+            if self.set_brcb_blocked(&brcb.mms_path, false) {
+                tracing::debug!(
+                    conn_id,
+                    mms_path = %brcb.mms_path,
+                    "report channel drained, brcb transmission resumed"
+                );
+            }
             if let Ok(mut state) = brcb.state.lock() {
                 state.sq_num = state.sq_num.wrapping_add(1);
                 state.transmit_anchor = TransmitAnchor::AfterEntryId(entry.entry_id);
@@ -1541,6 +1551,19 @@ impl ReportingEngine {
         }
 
         sent_count
+    }
+
+    /// Marks the BRCB at `mms_path` as blocked by a full channel, or as no
+    /// longer blocked, and reports whether that changed its state.
+    fn set_brcb_blocked(&self, mms_path: &str, blocked: bool) -> bool {
+        let Ok(mut set) = self.brcb_blocked.lock() else {
+            return blocked;
+        };
+        if blocked {
+            set.insert(mms_path.to_string())
+        } else {
+            set.remove(mms_path)
+        }
     }
 
     /// Flushes every BRCB that is enabled and has a client connection.
@@ -2527,15 +2550,64 @@ mod tests {
         assert_eq!(sent[0].1[0], 0xa3, "the outer pdu tag must be 0xa3");
     }
 
-    // ── WouldBlock increments dropped_socket_full and drops the connection ────
+    // ── WouldBlock drops the report and keeps the control block ───────────────
+
+    /// Counts the warning and error events emitted on the current thread.
+    #[derive(Clone, Default)]
+    struct LogCount {
+        warn: Arc<std::sync::atomic::AtomicUsize>,
+        error: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for LogCount {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let counter = match *event.metadata().level() {
+                tracing::Level::WARN => &self.warn,
+                tracing::Level::ERROR => &self.error,
+                _ => return,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl LogCount {
+        fn warns(&self) -> usize {
+            self.warn.load(Ordering::Relaxed)
+        }
+        fn errors(&self) -> usize {
+            self.error.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Stages a due data-change report on the single member of a URCB.
+    fn stage_due_report(rc_arc: &Arc<Mutex<ReportControl>>, now_ms: u64) {
+        let rc_l = rc_arc.lock().unwrap();
+        let mut state = rc_l.state.lock().unwrap();
+        let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(1);
+        let mut pending = PendingReport::new_empty(ds_len, now_ms);
+        pending.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+        pending.snapshot[0] = Some(MmsValue::Boolean(true));
+        state.pending = Some(pending);
+        state.triggered = true;
+        state.report_due = Some(Instant::now() - Duration::from_millis(10));
+    }
 
     #[test]
-    fn flush_pending_would_block_increments_dropped_and_drops_conn() {
-        use crate::reporting::sink::ChannelReportSink;
+    fn full_report_channel_drops_reports_and_keeps_the_urcb_enabled() {
+        use crate::reporting::sink::{ChannelReportSink, REPORT_CHANNEL_CAP};
 
         let ch_sink = Arc::new(ChannelReportSink::new());
         let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
-
         let (rc, ds) = make_rcb_and_ds(
             "urcb01",
             "IED1LD0/GGIO1$ST$Ind1$stVal",
@@ -2546,53 +2618,122 @@ mod tests {
         let rc_arc = engine.get_rcb(&path).unwrap();
         enable_rcb(&rc_arc, 7);
 
-        // Register a channel whose receiver never reads, simulating a slow client.
-        let (tx, _rx) = ChannelReportSink::create_channel();
+        // A receiver that reads nothing until the channel is full.
+        let (tx, mut rx) = ChannelReportSink::create_channel();
         ch_sink.register(7, tx);
+        let filler = bytes::Bytes::from_static(b"\xa3\x00");
+        for _ in 0..REPORT_CHANNEL_CAP {
+            ch_sink.try_send_pdu(7, filler.clone());
+        }
 
-        // Fill the channel.
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            for i in 0..40 {
+                stage_due_report(&rc_arc, 1_000_000 + i);
+                engine.tick();
+            }
+        });
         {
-            let pdu = bytes::Bytes::from_static(b"\xa3\x00");
-            use crate::reporting::sink::REPORT_CHANNEL_CAP;
-            for _ in 0..REPORT_CHANNEL_CAP {
-                ch_sink.try_send_pdu(7, pdu.clone());
-            }
+            let rc_l = rc_arc.lock().unwrap();
+            assert_eq!(rc_l.metrics_snapshot().dropped_socket_full, 40);
+            let state = rc_l.state.lock().unwrap();
+            assert!(state.rpt_ena, "RptEna stays TRUE");
+            assert!(state.resv, "Resv stays TRUE");
+            assert_eq!(state.client_conn_id, Some(7));
         }
+        assert_eq!(logs.warns(), 1, "one warning for the whole run of drops");
 
-        // Tick past the threshold, staging a pending report each time.
-        for i in 0..(BACKPRESSURE_CLOSE_THRESHOLD as usize + 2) {
-            {
-                let rc_l = rc_arc.lock().unwrap();
-                let mut state = rc_l.state.lock().unwrap();
-                if !state.rpt_ena {
-                    break;
-                }
-                let ds_len = state.dataset.as_ref().map(|d| d.len()).unwrap_or(1);
-                let mut pending = PendingReport::new_empty(ds_len, 1_000_000 + i as u64);
-                pending.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
-                pending.snapshot[0] = Some(MmsValue::Boolean(true));
-                state.pending = Some(pending);
-                state.triggered = true;
-                state.report_due = Some(Instant::now() - Duration::from_millis(10));
-            }
+        // The client reads again: the next report is delivered.
+        while rx.try_recv().is_ok() {}
+        tracing::subscriber::with_default(logs.clone(), || {
+            stage_due_report(&rc_arc, 2_000_000);
             engine.tick();
-        }
-
+        });
+        let delivered = rx.try_recv().expect("the next report is delivered");
+        assert_eq!(delivered[0], 0xa3);
+        assert_eq!(logs.warns(), 2, "one more warning when delivery resumes");
+        assert_eq!(logs.errors(), 0);
         let rc_l = rc_arc.lock().unwrap();
-        let snap = rc_l.metrics_snapshot();
-        assert!(
-            snap.dropped_socket_full >= BACKPRESSURE_CLOSE_THRESHOLD as u64,
-            "dropped_socket_full must be at least {}, was {}",
-            BACKPRESSURE_CLOSE_THRESHOLD,
-            snap.dropped_socket_full
+        assert_eq!(rc_l.metrics_snapshot().sent, 1);
+        assert!(rc_l.state.lock().unwrap().rpt_ena);
+    }
+
+    /// Control: a receiver that is gone still releases the URCB.
+    #[test]
+    fn dropped_report_receiver_releases_the_urcb() {
+        use crate::reporting::sink::ChannelReportSink;
+
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let (rc, ds) = make_rcb_and_ds(
+            "urcb01",
+            "IED1LD0/GGIO1$ST$Ind1$stVal",
+            TriggerOptions::DATA_CHANGED,
+        );
+        let path = rc.mms_path.clone();
+        engine.register_rcb(rc, ds).unwrap();
+        let rc_arc = engine.get_rcb(&path).unwrap();
+        enable_rcb(&rc_arc, 7);
+        let (tx, rx) = ChannelReportSink::create_channel();
+        ch_sink.register(7, tx);
+        drop(rx);
+        stage_due_report(&rc_arc, 1_000_000);
+        engine.tick();
+        let rc_l = rc_arc.lock().unwrap();
+        let state = rc_l.state.lock().unwrap();
+        assert!(!state.rpt_ena);
+        assert!(!state.resv);
+    }
+
+    #[test]
+    fn full_report_channel_keeps_brcb_entries_and_logs_once() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        use crate::reporting::sink::{ChannelReportSink, REPORT_CHANNEL_CAP};
+
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(
+            BufferedReportControl::new(path, brcb),
+            make_ds(vec![(attr, MmsValue::Integer(0))]),
+        )
+        .unwrap();
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+        let filler = bytes::Bytes::from_static(b"\xa3\x00");
+        for _ in 0..REPORT_CHANNEL_CAP {
+            ch_sink.try_send_pdu(5, filler.clone());
+        }
+        eng.on_brcb_value_updated(
+            &attr.to_string(),
+            MmsValue::Integer(1),
+            InclusionFlag::VALUE_CHANGED,
+            1_000,
         );
 
-        let state = rc_l.state.lock().unwrap();
-        assert!(
-            !state.rpt_ena,
-            "rpt_ena must be false after {} consecutive would-block results",
-            BACKPRESSURE_CLOSE_THRESHOLD
-        );
+        let logs = LogCount::default();
+        tracing::subscriber::with_default(logs.clone(), || {
+            for _ in 0..40 {
+                assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5, 2_000), 0);
+            }
+        });
+        assert_eq!(logs.warns(), 1, "one warning while the channel stays full");
+        assert!(brcb_arc.state.lock().unwrap().rpt_ena);
+
+        while rx.try_recv().is_ok() {}
+        assert_eq!(eng.flush_brcb_pending(&brcb_arc, 5, 3_000), 1);
+        assert!(rx.try_recv().is_ok(), "the buffered entry is delivered");
     }
 
     // ── refresh_integrity_period ──────────────────────────────────────────────

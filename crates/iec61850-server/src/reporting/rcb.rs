@@ -125,7 +125,7 @@ impl Rcb {
 /// | `sent` | `flush_pending` successfully sends a PDU segment |
 /// | `dropped_socket_full` | a send hits a full channel, that is, backpressure |
 /// | `dropped_buffer_full` | a BRCB report buffer is full; a URCB never increments it |
-/// | `coalesced_buftm` | `on_value_updated` merges a second trigger on the same entry inside the buffer time |
+/// | `coalesced_buftm` | a member already in the pending report triggers again inside the buffer time, and the pending report is sent at once |
 /// | `skipped_trgops` | `on_value_updated` returns early because trgOps does not cover the trigger |
 ///
 /// A URCB has a single pending slot, and IEC 61850-7-2 answers a second trigger
@@ -135,10 +135,10 @@ impl Rcb {
 /// The counter exists so a BRCB can reuse this type unchanged.
 ///
 /// `consecutive_socket_full` is internal state, not a published metric, and does
-/// not appear in `RcbMetricsSnapshot`. It tracks how many `WouldBlock` results a
-/// flush has seen in a row, for the `BACKPRESSURE_CLOSE_THRESHOLD` decision. It is
-/// an `AtomicU32` so `flush_pending` needs only `&self`; a successful send stores
-/// zero and a `WouldBlock` increments it.
+/// not appear in `RcbMetricsSnapshot`. It counts the report PDUs dropped since
+/// the channel last accepted one, so a run of drops is logged once when it
+/// starts and once when it ends. It is an `AtomicU32` so `flush_pending` needs
+/// only `&self`; a drop adds to it and a successful send stores zero.
 #[derive(Debug, Default)]
 pub struct RcbMetrics {
     /// PDU segments sent successfully, segmented reports included.
@@ -147,11 +147,12 @@ pub struct RcbMetrics {
     pub dropped_socket_full: AtomicU64,
     /// Reports dropped because a BRCB buffer was full; never incremented for a URCB.
     pub dropped_buffer_full: AtomicU64,
-    /// Times a second trigger on the same entry was merged inside the buffer time.
+    /// Times a member retriggered inside the buffer time sent the pending report
+    /// at once.
     pub coalesced_buftm: AtomicU64,
     /// Triggers skipped because trgOps did not cover them.
     pub skipped_trgops: AtomicU64,
-    /// Consecutive `WouldBlock` results; internal backpressure state.
+    /// Report PDUs dropped since the channel last accepted one.
     pub(crate) consecutive_socket_full: AtomicU32,
 }
 
@@ -184,7 +185,7 @@ pub struct RcbMetricsSnapshot {
     pub dropped_socket_full: u64,
     /// Reports dropped because a BRCB buffer was full; always zero for a URCB.
     pub dropped_buffer_full: u64,
-    /// Entries merged inside the buffer time.
+    /// Times a retriggered member sent the pending report at once.
     pub coalesced_buftm: u64,
     /// Triggers skipped because trgOps did not cover them.
     pub skipped_trgops: u64,
