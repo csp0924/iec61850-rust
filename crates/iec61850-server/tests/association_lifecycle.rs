@@ -7,7 +7,8 @@
 //! which count against the connection limit from accept and are closed once
 //! the association setup timeout runs out; and the data sets an association
 //! creates, which are limited per association and outlive it. The idle and
-//! send timeouts are covered on a paused clock in the `lifecycle` unit tests.
+//! send timeouts, and the setup deadline at each stage of the setup, are
+//! covered on a paused clock in the `lifecycle` unit tests.
 //!
 //! Every test binds 127.0.0.1:0 so concurrent tests cannot collide on a port.
 
@@ -329,8 +330,9 @@ async fn unassociated_socket_counts_against_the_limit() {
     let handle = server.start().await.expect("start");
     let port = handle.bound_addr.port();
 
+    // The listener accepts in connection order, so the idle socket takes the
+    // slot before the client that follows it.
     let idle = TcpStream::connect(handle.bound_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !try_connect(port).await,
         "the only slot is held by the unassociated socket"
@@ -347,10 +349,10 @@ async fn unassociated_socket_counts_against_the_limit() {
     handle.stop().await;
 }
 
-/// A socket that stops before associating, either before the COTP connection
-/// request or between the COTP handshake and the Session connect, is closed
-/// once `association_setup_timeout_ms` has elapsed since accept, and its slot
-/// is freed.
+/// A socket that sends nothing after accept is closed once
+/// `association_setup_timeout_ms` has elapsed, and its slot is freed. The
+/// socket needs no step of its own within the timeout, so the outcome does
+/// not depend on how fast the host runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_setup_is_closed_after_the_setup_timeout() {
     let (model, _vendor) = model_with_writable_vendor();
@@ -364,15 +366,9 @@ async fn stalled_setup_is_closed_after_the_setup_timeout() {
     let port = handle.bound_addr.port();
 
     let mut silent = TcpStream::connect(handle.bound_addr).await.unwrap();
-    expect_raw_closed(&mut silent, Duration::from_secs(3)).await;
+    expect_raw_closed(&mut silent, Duration::from_secs(30)).await;
 
-    let stream = TcpStream::connect(handle.bound_addr).await.unwrap();
-    let mut cotp = CotpConnection::connect(stream, CotpOptions::default())
-        .await
-        .expect("COTP handshake");
-    expect_closed(&mut cotp).await;
-
-    let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+    let reconnected = tokio::time::timeout(Duration::from_secs(30), async {
         while !try_connect(port).await {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

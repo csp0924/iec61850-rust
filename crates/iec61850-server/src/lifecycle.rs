@@ -1422,10 +1422,18 @@ mod tests {
     /// Runs one connection task, holding a connection slot as the accept loop
     /// does, over an in-memory stream that buffers `buf` bytes per direction.
     fn spawn_connection(server: &IedServer, buf: usize) -> (DuplexStream, JoinHandle<()>) {
+        spawn_connection_until(server, buf, Instant::now() + Duration::from_secs(10))
+    }
+
+    /// As [`spawn_connection`], with the association setup due by `deadline`.
+    fn spawn_connection_until(
+        server: &IedServer,
+        buf: usize,
+        deadline: Instant,
+    ) -> (DuplexStream, JoinHandle<()>) {
         let (client, server_end) = tokio::io::duplex(buf);
         let slot = server.try_acquire_connection_slot().expect("a free slot");
         let server = server.clone();
-        let deadline = Instant::now() + Duration::from_secs(10);
         let task = tokio::spawn(async move {
             let _slot = slot;
             handle_connection_inner(
@@ -1575,6 +1583,53 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_secs(300));
         assert_eq!(server.connection_count(), 0);
+    }
+
+    /// A connection that sends nothing is closed at its setup deadline, and not
+    /// before; its slot is freed.
+    #[tokio::test(start_paused = true)]
+    async fn silent_connection_is_closed_at_the_setup_deadline() {
+        let server = build_server(IedServerConfig::default());
+        let start = Instant::now();
+        let (mut client, task) =
+            spawn_connection_until(&server, 4096, start + Duration::from_millis(300));
+
+        tokio::time::timeout(Duration::from_millis(301), task)
+            .await
+            .expect("a silent connection must be closed at the setup deadline")
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert_eq!(server.connection_count(), 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut client, &mut buf)
+                .await
+                .unwrap(),
+            0,
+            "the server side is closed"
+        );
+    }
+
+    /// A connection that completes the COTP handshake and then stops before
+    /// the Session connect is closed at its setup deadline, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn setup_stalled_after_the_cotp_handshake_is_closed_at_the_deadline() {
+        let server = build_server(IedServerConfig::default());
+        let start = Instant::now();
+        let (client, task) =
+            spawn_connection_until(&server, 4096, start + Duration::from_millis(300));
+        let mut cotp = CotpConnection::connect(client, CotpOptions::default())
+            .await
+            .expect("the COTP handshake completes before the deadline");
+        assert!(start.elapsed() < Duration::from_millis(300));
+
+        tokio::time::timeout(Duration::from_millis(301), task)
+            .await
+            .expect("a stalled setup must be closed at the setup deadline")
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert_eq!(server.connection_count(), 0);
+        assert!(cotp.recv_data().await.is_err(), "the server side is closed");
     }
 
     /// Returns the abort-source of the ACSE ABRT inside a session ABORT.
