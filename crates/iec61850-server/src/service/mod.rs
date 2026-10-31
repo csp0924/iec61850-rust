@@ -93,15 +93,6 @@ use crate::goose_mapping::{
 };
 use crate::handler::HandlerRegistry;
 // These helpers serve the read and write routing paths, so they are available
-// whenever any routed subsystem is enabled.
-#[cfg(any(
-    feature = "reporting",
-    feature = "control",
-    feature = "setting-groups",
-    feature = "goose-mapping",
-    feature = "logging"
-))]
-use crate::handler::{canonicalize_attr_path, fc_from_canonical_path, ReadContext, ReadOutcome};
 #[cfg(feature = "logging")]
 use crate::logging::{
     new_log_control_registry, LogControl, LogControlRegistry, LogEntryId, LogStorageError,
@@ -1113,11 +1104,12 @@ fn dispatch_read(
                     None => AccessResult::Failure(DataAccessError::HardwareFault),
                 };
                 let result = match get_named_variable_list_attrs::split_attr_ref(&entry.attr_ref) {
-                    Some((domain_id, item_id)) => apply_read_handler(
+                    Some((domain_id, item_id)) => crate::service::read::apply_read_handlers(
+                        ied_model,
                         handler_registry,
-                        mms_model,
                         conn_id,
-                        &iec61850_mms::ObjectName::DomainSpecific { domain_id, item_id },
+                        &domain_id,
+                        &item_id,
                         baseline,
                     ),
                     None => baseline,
@@ -1414,13 +1406,13 @@ fn dispatch_read(
     invoke_id: u32,
     body: &Bytes,
     ied_model: &IedModel,
-    mms_model: &MmsDeviceModel,
-    _handler_registry: &HandlerRegistry,
-    _conn_id: u64,
+    _mms_model: &MmsDeviceModel,
+    handler_registry: &HandlerRegistry,
+    conn_id: u64,
     negotiated_max_pdu_size: Option<u32>,
     negotiated_nesting_level: Option<u8>,
 ) -> ConfirmedResponse {
-    use crate::service::read::{handle_single_read_with_budget, LookupResult};
+    use crate::service::read::{read_with_handlers, LookupResult};
     let req = match ReadRequest::decode_with_negotiated_cap(body, negotiated_nesting_level) {
         Ok(r) => r,
         Err(e) => {
@@ -1448,12 +1440,12 @@ fn dispatch_read(
     for entry in &entries {
         let (entry_name, entry_alt_access) =
             fold_leading_components(&entry.name, entry.alt_access.as_ref());
-        match handle_single_read_with_budget(
+        match read_with_handlers(
             ied_model,
-            mms_model,
             &entry_name,
             entry_alt_access,
             remaining,
+            Some((handler_registry, conn_id)),
         ) {
             LookupResult::Result(r) => {
                 if let Some(b) = remaining.as_mut() {
@@ -2773,12 +2765,10 @@ fn extract_co_target(
 ///
 /// On the standard path the model is consulted first. A path that does not
 /// exist answers `ObjectNonExistent` immediately, so that a registered handler
-/// can never make an absent object appear to exist. Otherwise the read handler
-/// registry decides: an error replaces the outcome, a cached value replaces the
-/// model snapshot, and a miss or an absent handler keeps the snapshot.
-///
-/// With `ignore_read_access` set, the registry is skipped and the model
-/// snapshot is returned as is.
+/// can never make an absent object appear to exist. Otherwise the read handlers
+/// on the path, above it and below it decide, as the
+/// [`read`](crate::service::read) module describes. With `ignore_read_access`
+/// set, the registry is skipped and the model answers.
 ///
 /// The standard path reads under the shared PDU budget and answers
 /// [`ReadRoutingOutcome::OverBudget`] when expansion no longer fits, which the
@@ -2793,7 +2783,7 @@ fn extract_co_target(
 #[allow(clippy::too_many_arguments)]
 fn handle_read_with_co_routing(
     ied_model: &IedModel,
-    mms_model: &MmsDeviceModel,
+    _mms_model: &MmsDeviceModel,
     #[cfg(feature = "control")] control_objects: &ControlObjectsRegistry,
     handler_registry: &HandlerRegistry,
     conn_id: u64,
@@ -2801,7 +2791,7 @@ fn handle_read_with_co_routing(
     alt_access: Option<&iec61850_mms::mms::pdu::common::AlternateAccess>,
     remaining_budget: Option<usize>,
 ) -> ReadRoutingOutcome {
-    use crate::service::read::{handle_single_read_with_budget, LookupResult};
+    use crate::service::read::{read_with_handlers, LookupResult};
 
     #[cfg(feature = "control")]
     {
@@ -2882,162 +2872,16 @@ fn handle_read_with_co_routing(
         }
     }
 
-    let baseline = match handle_single_read_with_budget(
+    match read_with_handlers(
         ied_model,
-        mms_model,
         name,
         alt_access,
         remaining_budget,
+        Some((handler_registry, conn_id)),
     ) {
-        LookupResult::Result(r) => r,
-        LookupResult::OverBudget => return ReadRoutingOutcome::OverBudget,
-    };
-
-    // A path that does not exist wins over any handler, so that a handler can
-    // never make an absent object appear to exist.
-    if matches!(
-        baseline,
-        AccessResult::Failure(DataAccessError::ObjectNonExistent)
-    ) {
-        return ReadRoutingOutcome::Result(baseline);
+        LookupResult::Result(r) => ReadRoutingOutcome::Result(r),
+        LookupResult::OverBudget => ReadRoutingOutcome::OverBudget,
     }
-
-    // An alternate-access read bypasses the handler registry: a handler returns
-    // a whole-attribute value without the model template, leaving no way to
-    // apply a component path to its output. The baseline above already resolved
-    // the selector against the model-typed attribute, so it is used directly.
-    if alt_access.is_some() {
-        return ReadRoutingOutcome::Result(baseline);
-    }
-
-    ReadRoutingOutcome::Result(apply_read_handler(
-        handler_registry,
-        mms_model,
-        conn_id,
-        name,
-        baseline,
-    ))
-}
-
-/// Passes the model value read for `name` through the read handler installed
-/// on its attribute path, if any.
-///
-/// A cache hit replaces `baseline`, a miss keeps it, and an error replaces it
-/// with that error. With `ignore_read_access` set, or for a name that is not a
-/// handler path, `baseline` is returned unchanged. Every service that returns
-/// the value of a data attribute goes through this, so an access decision a
-/// handler makes holds whichever service names the attribute.
-#[cfg(any(
-    feature = "reporting",
-    feature = "control",
-    feature = "setting-groups",
-    feature = "goose-mapping",
-    feature = "logging"
-))]
-fn apply_read_handler(
-    handler_registry: &HandlerRegistry,
-    mms_model: &MmsDeviceModel,
-    conn_id: u64,
-    name: &iec61850_mms::mms::pdu::common::ObjectName,
-    baseline: AccessResult,
-) -> AccessResult {
-    if handler_registry.ignore_read_access() {
-        return baseline;
-    }
-    let canonical_path = match read_path_canonical_from_object_name(name) {
-        Some(p) => p,
-        // Not a canonicalizable domain-specific path, so out of registry scope.
-        None => return baseline,
-    };
-    let handler = match handler_registry.lookup_read(&canonical_path) {
-        Some(h) => h,
-        None => return baseline,
-    };
-    let fc = match fc_from_canonical_path(&canonical_path) {
-        Some(f) => f,
-        None => return baseline,
-    };
-    let ctx = ReadContext {
-        path: &canonical_path,
-        fc,
-        conn_id,
-    };
-    match handler.read(&ctx) {
-        ReadOutcome::CacheHit(value) => {
-            if handler_bit_string_fits(mms_model, name, &value) {
-                AccessResult::Success(crate::service::convert::mms_value_to_mms_data(&value))
-            } else {
-                tracing::warn!(
-                    path = %canonical_path,
-                    "read: the read handler returned a bit string that does not fit the data attribute, answering object-value-invalid"
-                );
-                AccessResult::Failure(DataAccessError::ObjectValueInvalid)
-            }
-        }
-        ReadOutcome::CacheMiss => baseline,
-        ReadOutcome::Error(e) => {
-            tracing::warn!(
-                path = %canonical_path,
-                ?e,
-                "read: the read handler replaced the model value with an error"
-            );
-            AccessResult::Failure(e)
-        }
-    }
-}
-
-/// Reports whether a value a read handler supplies may be sent for `name`: a
-/// bit string must fit the declared size of a bit-string attribute, and any
-/// other value passes.
-#[cfg(any(
-    feature = "reporting",
-    feature = "control",
-    feature = "setting-groups",
-    feature = "goose-mapping",
-    feature = "logging"
-))]
-fn handler_bit_string_fits(
-    mms_model: &MmsDeviceModel,
-    name: &iec61850_mms::mms::pdu::common::ObjectName,
-    value: &iec61850_model::MmsValue,
-) -> bool {
-    use crate::mapping::{bit_string_fits, MmsLeafType, MmsTypeSpec};
-    use iec61850_mms::mms::pdu::common::ObjectName;
-    let iec61850_model::MmsValue::BitString { padding, data } = value else {
-        return true;
-    };
-    let ObjectName::DomainSpecific { domain_id, item_id } = name else {
-        return true;
-    };
-    match mms_model.spec_at(domain_id, item_id) {
-        Some(MmsTypeSpec::Leaf(MmsLeafType::BitString(size))) => {
-            bit_string_fits(*size, data.len(), *padding)
-        }
-        _ => true,
-    }
-}
-
-/// Canonicalizes a domain-specific object name into the attribute path the
-/// handler registry is keyed by.
-///
-/// `None` means the name is not domain-specific or its item id is malformed,
-/// which the caller treats as out of registry scope.
-#[cfg(any(
-    feature = "reporting",
-    feature = "control",
-    feature = "setting-groups",
-    feature = "goose-mapping",
-    feature = "logging"
-))]
-fn read_path_canonical_from_object_name(
-    name: &iec61850_mms::mms::pdu::common::ObjectName,
-) -> Option<String> {
-    use iec61850_mms::mms::pdu::common::ObjectName;
-    let item_id = match name {
-        ObjectName::DomainSpecific { item_id, .. } => item_id.as_str(),
-        _ => return None,
-    };
-    canonicalize_attr_path(item_id).ok()
 }
 
 /// Routes a write: functional constraint CO to the control service, everything

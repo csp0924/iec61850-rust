@@ -9,22 +9,26 @@
 //!
 //! A read of the setting group edit buffer, FC SE, answers
 //! temporarily-unavailable until a setting group is selected for editing.
+//!
+//! A read handler decides every read that covers its node, from above or from
+//! below, and a refused read carries no part of the value.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::define_named_variable_list::DefineNamedVariableEntry;
 use iec61850_mms::mms::MmsData;
-use iec61850_mms::DataAccessError;
+use iec61850_mms::{AccessResult, DataAccessError};
 use iec61850_model::{
     DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, IedModelBuilder,
     LogicalDeviceBuilder, LogicalNode, LogicalNodeBuilder, MmsValue, SettingGroupControlBlock,
     TrgOps, FC,
 };
 use iec61850_server::{
-    AttributeAccessHandler, HandlerWriteOutcome, IedServer, IedServerConfig, ServerHandle,
-    WriteContext,
+    AttributeAccessHandler, HandlerWriteOutcome, IedServer, IedServerConfig, ReadContext,
+    ReadHandler, ReadOutcome, ServerHandle, WriteContext,
 };
 
 const DOMAIN: &str = "IED1LD0";
@@ -127,7 +131,24 @@ fn build_model() -> Arc<IedModel> {
             ),
         ],
     );
-    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt, set]);
+    let ind = DataObject::new(
+        "Ind",
+        vec![
+            da(
+                "stVal",
+                FC::St,
+                DataAttributeType::Boolean,
+                MmsValue::Boolean(true),
+            ),
+            da(
+                "q",
+                FC::St,
+                DataAttributeType::Quality,
+                MmsValue::default_for(DataAttributeType::Quality),
+            ),
+        ],
+    );
+    let ggio = LogicalNode::new(String::new(), "GGIO", "1", vec![lim, pt, set, ind]);
     let lln0 = LogicalNodeBuilder::lln0()
         .set_sgcb({
             let mut sgcb = SettingGroupControlBlock::default();
@@ -472,6 +493,127 @@ async fn edit_buffer_reads_wait_for_a_selected_edit_group() {
         assert_eq!(
             client.read(DOMAIN, "GGIO1$SE$Set$setVal").await.unwrap(),
             MmsData::Integer(5)
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// Answers every read with one outcome and counts how often it is asked.
+#[derive(Debug)]
+struct FixedRead {
+    outcome: ReadOutcome,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl FixedRead {
+    fn new(outcome: ReadOutcome) -> Arc<Self> {
+        Arc::new(Self {
+            outcome,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ReadHandler for FixedRead {
+    fn read(&self, _ctx: &ReadContext<'_>) -> ReadOutcome {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcome.clone()
+    }
+}
+
+/// A handler on a leaf is asked by a read of the whole data object: its value
+/// replaces the leaf, and its refusal refuses the read with no value in the
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaf_read_handler_decides_a_read_of_its_data_object() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        let quality = MmsData::BitString {
+            padding: 3,
+            data: vec![0, 0],
+        };
+
+        let hit = FixedRead::new(ReadOutcome::CacheHit(MmsValue::Boolean(false)));
+        server
+            .handler_registry()
+            .install_read_handler("GGIO1$ST$Ind$stVal", hit.clone())
+            .unwrap();
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$ST$Ind").await.unwrap(),
+            MmsData::Structure(vec![MmsData::Boolean(false), quality.clone()])
+        );
+        assert_eq!(hit.asked(), 1);
+
+        server
+            .handler_registry()
+            .install_read_handler(
+                "GGIO1$ST$Ind$stVal",
+                FixedRead::new(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+        assert_eq!(
+            access_error(client.read(DOMAIN, "GGIO1$ST$Ind").await),
+            DataAccessError::ObjectAccessDenied
+        );
+        assert_eq!(
+            client.read(DOMAIN, "GGIO1$ST$Ind$q").await.unwrap(),
+            quality
+        );
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A handler on a data object decides a read of an attribute beneath it, on
+/// its own and as a data set member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_object_read_handler_decides_reads_beneath_it() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (server, handle) = start().await;
+        let mut client = connect(&handle).await;
+        server
+            .handler_registry()
+            .install_read_handler(
+                "GGIO1$ST$Ind",
+                FixedRead::new(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            access_error(client.read(DOMAIN, "GGIO1$ST$Ind$stVal").await),
+            DataAccessError::ObjectAccessDenied
+        );
+
+        client
+            .define_named_variable_list(
+                DOMAIN,
+                "GGIO1$dsInd",
+                vec![
+                    DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$ST$Ind$stVal"),
+                    DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$SP$Lim$u8"),
+                ],
+            )
+            .await
+            .expect("CreateDataSet");
+        assert_eq!(
+            client
+                .read_named_variable_list_values(DOMAIN, "GGIO1$dsInd")
+                .await
+                .expect("GetDataSetValues"),
+            vec![
+                AccessResult::Failure(DataAccessError::ObjectAccessDenied),
+                AccessResult::Success(MmsData::Unsigned(0)),
+            ]
         );
 
         handle.stop().await;

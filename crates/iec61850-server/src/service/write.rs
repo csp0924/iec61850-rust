@@ -66,11 +66,12 @@ use crate::handler::{
 use crate::mapping::{bit_string_fits, MmsDeviceModel, MmsLeafType, MmsTypeSpec, StringSize};
 use crate::policy::WriteAccessPolicies;
 use crate::service::convert::{bit_string_bytes, mms_data_to_mms_value, same_data_variant};
+use crate::service::read::{leading_segments, object_has_fc, Node};
 // Writing under FC SE belongs to the setting-group subsystem.
 #[cfg(feature = "setting-groups")]
 use crate::setting_groups::SettingGroupRegistry;
 use iec61850_mms::mms::pdu::common::{DataAccessError, MmsData, ObjectName, WriteOutcome};
-use iec61850_model::{DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, FC};
+use iec61850_model::{DataAttribute, IedModel, FC};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Functional-constraint routing
@@ -347,15 +348,7 @@ fn write_to_target(
     let mut ancestors: Vec<Node<'_>> = Vec::with_capacity(object_path.len());
     let mut target = Node::Object(do_node);
     for step in &object_path[1..] {
-        let child = match target {
-            Node::Object(obj) => obj.children.iter().find_map(|c| match c {
-                DoChild::SubDo(sub) if sub.name == *step => Some(Node::Object(sub)),
-                DoChild::Da(da) if da.name == *step && da.fc == fc => Some(Node::Attribute(da)),
-                _ => None,
-            }),
-            Node::Attribute(da) => da.child_by_name(step).map(Node::Attribute),
-        };
-        let Some(child) = child else {
+        let Some(child) = target.child(fc, step) else {
             tracing::warn!(
                 domain = domain,
                 item_id = item_id,
@@ -485,81 +478,6 @@ fn write_to_target(
         "write: value updated"
     );
     WriteOutcome::Success
-}
-
-/// A node of the model a write reaches: a data object or sub-data-object,
-/// seen under the functional constraint of the write, or a data attribute.
-#[derive(Debug, Clone, Copy)]
-enum Node<'a> {
-    Object(&'a DataObject),
-    Attribute(&'a DataAttribute),
-}
-
-impl<'a> Node<'a> {
-    fn name(self) -> &'a str {
-        match self {
-            Node::Object(obj) => &obj.name,
-            Node::Attribute(da) => &da.name,
-        }
-    }
-
-    /// Reports whether the node holds its value itself rather than in the
-    /// nodes beneath it.
-    fn is_leaf(self) -> bool {
-        match self {
-            Node::Object(_) => false,
-            Node::Attribute(da) => {
-                da.ty != DataAttributeType::Constructed && da.children.is_empty()
-            }
-        }
-    }
-
-    /// The nodes beneath this one under `fc`, in model order, which is the
-    /// member order of its MMS structure: for an object, its attributes of
-    /// `fc` and its sub-objects that hold one; for an attribute, its
-    /// sub-attributes.
-    fn children(self, fc: FC) -> impl Iterator<Item = Node<'a>> {
-        let (object_children, attribute_children): (&'a [DoChild], &'a [DataAttribute]) = match self
-        {
-            Node::Object(obj) => (&obj.children, &[]),
-            Node::Attribute(da) => (&[], &da.children),
-        };
-        object_children
-            .iter()
-            .filter_map(move |c| match c {
-                DoChild::Da(da) if da.fc == fc => Some(Node::Attribute(da)),
-                DoChild::SubDo(sub) if object_has_fc(sub, fc) => Some(Node::Object(sub)),
-                _ => None,
-            })
-            .chain(attribute_children.iter().map(Node::Attribute))
-    }
-
-    /// The current value of the node under `fc`.
-    fn snapshot(self, fc: FC) -> iec61850_model::MmsValue {
-        match self {
-            Node::Attribute(da) => da.snapshot(),
-            Node::Object(_) => iec61850_model::MmsValue::Structure(
-                self.children(fc).map(|c| c.snapshot(fc)).collect(),
-            ),
-        }
-    }
-}
-
-/// Reports whether a data object carries an attribute of `fc`, directly or in
-/// a sub-object.
-fn object_has_fc(obj: &DataObject, fc: FC) -> bool {
-    obj.children.iter().any(|c| match c {
-        DoChild::Da(da) => da.fc == fc,
-        DoChild::SubDo(sub) => object_has_fc(sub, fc),
-    })
-}
-
-/// Returns the first `n` `$`-separated segments of `path`.
-fn leading_segments(path: &str, n: usize) -> &str {
-    match path.match_indices('$').nth(n.saturating_sub(1)) {
-        Some((end, _)) if n > 0 => &path[..end],
-        _ => path,
-    }
 }
 
 /// Returns the current value of `node` with the node `steps` names below it

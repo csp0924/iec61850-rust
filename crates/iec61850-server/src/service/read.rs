@@ -19,6 +19,24 @@
 //!
 //! A path that does not resolve yields `AccessResult::Failure(ObjectNonExistent)`.
 //! Read places no restriction on the functional constraint; only Write does.
+//!
+//! A read of a node is also a read of every node it contains, and a read of a
+//! part of every node above it, so the read handlers of all of them have their
+//! say, as long as the path resolves:
+//!
+//! - A handler above the target, on its data object, a sub-data-object or a
+//!   constructed attribute, is asked first, outermost first. An error refuses
+//!   the read; a value answers it with the part of that value the target
+//!   occupies; a miss passes the read on.
+//! - Then the handler on the target itself, with the same three outcomes.
+//! - Then the handlers below the target, in model order. A value replaces the
+//!   part of the answer its node occupies and the handlers below that node are
+//!   not asked; an error refuses the whole read, since one access result cannot
+//!   carry a failure for a part of its value.
+//!
+//! A read of a logical node or a functional-constraint group asks the handlers
+//! of every data object in it the same way. A refused read carries the error
+//! and no part of the value.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -28,13 +46,351 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::mapping::MmsDeviceModel;
+use crate::compat::Arc;
+use crate::handler::{is_below, HandlerRegistry, ReadContext, ReadHandler, ReadOutcome};
+use crate::mapping::{bit_string_fits, declared_bit_string_size, MmsDeviceModel};
 use iec61850_mms::mms::pdu::common::{
     AccessResult, AlternateAccess, AlternateAccessSelector, DataAccessError, MmsData, ObjectName,
 };
-use iec61850_model::{DataAttribute, DoChild, IedModel, LogicalNode, MmsValue, FC};
+use iec61850_model::{
+    DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, LogicalNode, MmsValue, FC,
+};
 
-use crate::service::convert::mms_value_to_mms_data;
+use crate::service::convert::{mms_data_to_mms_value, mms_value_to_mms_data};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model nodes under a functional constraint
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A node of the model below a logical node: a data object or
+/// sub-data-object, seen under one functional constraint, or a data attribute.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Node<'a> {
+    Object(&'a DataObject),
+    Attribute(&'a DataAttribute),
+}
+
+impl<'a> Node<'a> {
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Node::Object(obj) => &obj.name,
+            Node::Attribute(da) => &da.name,
+        }
+    }
+
+    /// Reports whether the node holds its value itself rather than in the
+    /// nodes beneath it.
+    pub(crate) fn is_leaf(self) -> bool {
+        match self {
+            Node::Object(_) => false,
+            Node::Attribute(da) => {
+                da.ty != DataAttributeType::Constructed && da.children.is_empty()
+            }
+        }
+    }
+
+    /// The nodes beneath this one under `fc`, in model order, which is the
+    /// member order of its MMS structure: for an object, its attributes of
+    /// `fc` and its sub-objects that hold one; for an attribute, its
+    /// sub-attributes.
+    pub(crate) fn children(self, fc: FC) -> impl Iterator<Item = Node<'a>> {
+        let (object_children, attribute_children): (&'a [DoChild], &'a [DataAttribute]) = match self
+        {
+            Node::Object(obj) => (&obj.children, &[]),
+            Node::Attribute(da) => (&[], &da.children),
+        };
+        object_children
+            .iter()
+            .filter_map(move |c| match c {
+                DoChild::Da(da) if da.fc == fc => Some(Node::Attribute(da)),
+                DoChild::SubDo(sub) if object_has_fc(sub, fc) => Some(Node::Object(sub)),
+                _ => None,
+            })
+            .chain(attribute_children.iter().map(Node::Attribute))
+    }
+
+    /// The node named `step` directly beneath this one on a path under `fc`:
+    /// a sub-object of that name, an attribute of that name carrying `fc`, or
+    /// a sub-attribute of that name.
+    pub(crate) fn child(self, fc: FC, step: &str) -> Option<Node<'a>> {
+        match self {
+            Node::Object(obj) => obj.children.iter().find_map(|c| match c {
+                DoChild::SubDo(sub) if sub.name == step => Some(Node::Object(sub)),
+                DoChild::Da(da) if da.name == step && da.fc == fc => Some(Node::Attribute(da)),
+                _ => None,
+            }),
+            Node::Attribute(da) => da.child_by_name(step).map(Node::Attribute),
+        }
+    }
+
+    /// The current value of the node under `fc`.
+    pub(crate) fn snapshot(self, fc: FC) -> MmsValue {
+        match self {
+            Node::Attribute(da) => da.snapshot(),
+            Node::Object(_) => {
+                MmsValue::Structure(self.children(fc).map(|c| c.snapshot(fc)).collect())
+            }
+        }
+    }
+}
+
+/// Reports whether a data object carries an attribute of `fc`, directly or in
+/// a sub-object.
+pub(crate) fn object_has_fc(obj: &DataObject, fc: FC) -> bool {
+    obj.children.iter().any(|c| match c {
+        DoChild::Da(da) => da.fc == fc,
+        DoChild::SubDo(sub) => object_has_fc(sub, fc),
+    })
+}
+
+/// Returns the first `n` `$`-separated segments of `path`.
+pub(crate) fn leading_segments(path: &str, n: usize) -> &str {
+    match path.match_indices('$').nth(n.saturating_sub(1)) {
+        Some((end, _)) if n > 0 => &path[..end],
+        _ => path,
+    }
+}
+
+/// Resolves `LN$FC$DO[$...]` in `domain` to its functional constraint and the
+/// nodes along the path, the data object first and the target last.
+#[cfg(feature = "reporting")]
+pub(crate) fn resolve_node_path<'m>(
+    ied_model: &'m IedModel,
+    domain: &str,
+    item_id: &str,
+) -> Option<(FC, Vec<Node<'m>>)> {
+    let mut parts = item_id.split('$');
+    let ln = ied_model.ld_by_domain(domain)?.ln_by_name(parts.next()?)?;
+    let fc = FC::parse(parts.next()?).ok()?;
+    let mut node = Node::Object(ln.do_by_name(parts.next()?)?);
+    let mut nodes = vec![node];
+    for step in parts {
+        node = node.child(fc, step)?;
+        nodes.push(node);
+    }
+    Some((fc, nodes))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The read handlers one read consults, looked up once: those on the path
+/// read, on the nodes above it and on the nodes below it.
+pub(crate) struct ReadHandlerScope {
+    handlers: Vec<(String, Arc<dyn ReadHandler>)>,
+    conn_id: u64,
+}
+
+impl ReadHandlerScope {
+    /// A scope that consults no handler.
+    pub(crate) fn none() -> Self {
+        Self {
+            handlers: Vec::new(),
+            conn_id: 0,
+        }
+    }
+
+    /// The handlers of `registry` that bear on a read of `item_id` on the
+    /// association `conn_id`; none while the registry ignores read access.
+    pub(crate) fn around(registry: &HandlerRegistry, item_id: &str, conn_id: u64) -> Self {
+        if registry.ignore_read_access() {
+            return Self::none();
+        }
+        Self {
+            handlers: registry.read_handlers_around(item_id),
+            conn_id,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+
+    /// Reports whether a handler sits on `path` or below it.
+    fn reaches(&self, path: &str) -> bool {
+        self.handlers
+            .iter()
+            .any(|(key, _)| key == path || is_below(key, path))
+    }
+
+    /// Reports whether a handler sits below `path`.
+    fn reaches_below(&self, path: &str) -> bool {
+        self.handlers.iter().any(|(key, _)| is_below(key, path))
+    }
+
+    /// Asks the handler on `path`, if there is one.
+    fn consult(&self, path: &str, fc: FC) -> Option<ReadOutcome> {
+        let (_, handler) = self.handlers.iter().find(|(key, _)| key == path)?;
+        Some(handler.read(&ReadContext::new(path, fc, self.conn_id)))
+    }
+
+    /// Asks the handlers above the target, `ancestors[i]` naming the first
+    /// `i + 3` segments of `item_id`, outermost first. `Some` carries the
+    /// verdict of the first one that answers with a value or an error: the
+    /// part of the value `target` occupies, or the error.
+    fn decide_from_above(
+        &self,
+        fc: FC,
+        item_id: &str,
+        ancestors: &[Node<'_>],
+        target: Node<'_>,
+    ) -> Option<Result<MmsData, DataAccessError>> {
+        let steps: Vec<&str> = item_id.split('$').skip(3).collect();
+        for (depth, ancestor) in ancestors.iter().enumerate() {
+            let path = leading_segments(item_id, depth + 3);
+            let Some(outcome) = self.consult(path, fc) else {
+                continue;
+            };
+            match outcome {
+                ReadOutcome::CacheMiss => continue,
+                ReadOutcome::Error(e) => {
+                    tracing::warn!(
+                        path,
+                        ?e,
+                        "read: a read handler above the target refused the read"
+                    );
+                    return Some(Err(e));
+                }
+                ReadOutcome::CacheHit(value) => {
+                    let part = select_below(*ancestor, fc, &steps[depth..], value)
+                        .and_then(|part| handler_value(target, item_id, part));
+                    return Some(part);
+                }
+            }
+        }
+        None
+    }
+
+    /// Applies the handlers on `node`, whose path is `path`, and below it to
+    /// `value`, the model value of the node.
+    fn apply(
+        &self,
+        node: Node<'_>,
+        fc: FC,
+        path: &str,
+        value: MmsData,
+    ) -> Result<MmsData, DataAccessError> {
+        match self.consult(path, fc) {
+            Some(ReadOutcome::CacheHit(v)) => return handler_value(node, path, v),
+            Some(ReadOutcome::Error(e)) => {
+                tracing::warn!(path, ?e, "read: a read handler refused the read");
+                return Err(e);
+            }
+            Some(ReadOutcome::CacheMiss) | None => {}
+        }
+        if node.is_leaf() || !self.reaches_below(path) {
+            return Ok(value);
+        }
+        let MmsData::Structure(mut members) = value else {
+            return Ok(value);
+        };
+        for (child, member) in node.children(fc).zip(members.iter_mut()) {
+            let child_path = format!("{path}${}", child.name());
+            if self.reaches(&child_path) {
+                let current = core::mem::replace(member, MmsData::Boolean(false));
+                *member = self.apply(child, fc, &child_path, current)?;
+            }
+        }
+        Ok(MmsData::Structure(members))
+    }
+}
+
+/// Selects, in `value`, the value of `node`, the part the node `steps` names
+/// below `node` occupies. A value of another shape than the model is
+/// object-value-invalid.
+fn select_below(
+    mut node: Node<'_>,
+    fc: FC,
+    steps: &[&str],
+    mut value: MmsValue,
+) -> Result<MmsValue, DataAccessError> {
+    for step in steps {
+        let found = node
+            .children(fc)
+            .enumerate()
+            .find(|(_, child)| child.name() == *step);
+        let (Some((index, child)), MmsValue::Structure(mut members)) = (found, value) else {
+            return Err(DataAccessError::ObjectValueInvalid);
+        };
+        if index >= members.len() {
+            return Err(DataAccessError::ObjectValueInvalid);
+        }
+        value = members.swap_remove(index);
+        node = child;
+    }
+    Ok(value)
+}
+
+/// Turns a value a read handler supplies for `node` into wire data. A bit
+/// string that does not fit the declared size of a bit-string attribute is not
+/// sent; the read answers object-value-invalid.
+fn handler_value(node: Node<'_>, path: &str, value: MmsValue) -> Result<MmsData, DataAccessError> {
+    if let (Node::Attribute(da), MmsValue::BitString { padding, data }) = (node, &value) {
+        if let Some(size) = declared_bit_string_size(da.ty) {
+            if !bit_string_fits(size, data.len(), *padding) {
+                tracing::warn!(
+                    path,
+                    "read: the read handler returned a bit string that does not fit the data attribute, answering object-value-invalid"
+                );
+                return Err(DataAccessError::ObjectValueInvalid);
+            }
+        }
+    }
+    Ok(mms_value_to_mms_data(&value))
+}
+
+/// Passes `baseline`, the model value of the data attribute or data object
+/// `item_id` names in `domain`, through the read handlers of `registry`, as a
+/// read of that path would. A failure, and a path that does not resolve, pass
+/// unchanged.
+#[cfg(feature = "reporting")]
+pub(crate) fn apply_read_handlers(
+    ied_model: &IedModel,
+    registry: &HandlerRegistry,
+    conn_id: u64,
+    domain: &str,
+    item_id: &str,
+    baseline: AccessResult,
+) -> AccessResult {
+    let AccessResult::Success(value) = baseline else {
+        return baseline;
+    };
+    let scope = ReadHandlerScope::around(registry, item_id, conn_id);
+    if scope.is_empty() {
+        return AccessResult::Success(value);
+    }
+    let Some((fc, nodes)) = resolve_node_path(ied_model, domain, item_id) else {
+        return AccessResult::Success(value);
+    };
+    let Some((&target, ancestors)) = nodes.split_last() else {
+        return AccessResult::Success(value);
+    };
+    let decided = scope
+        .decide_from_above(fc, item_id, ancestors, target)
+        .unwrap_or_else(|| scope.apply(target, fc, item_id, value));
+    match decided {
+        Ok(v) => AccessResult::Success(v),
+        Err(e) => AccessResult::Failure(e),
+    }
+}
+
+/// Why an expansion stopped short.
+enum Halt {
+    /// The response no longer fits the negotiated PDU size.
+    OverBudget,
+    /// A read handler refused a part of the value.
+    Refused(DataAccessError),
+}
+
+impl Halt {
+    fn into_lookup(self) -> LookupResult {
+        match self {
+            Halt::OverBudget => LookupResult::OverBudget,
+            Halt::Refused(e) => LookupResult::Result(AccessResult::Failure(e)),
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Budget tracking
@@ -200,7 +556,8 @@ fn children_inner_size_sum(data: &MmsData) -> usize {
 }
 
 /// Expands every data object of a logical node under one functional constraint
-/// into a structure, after the `lead` members.
+/// into a structure, after the `lead` members, passing each data object through
+/// the read handlers of `scope`.
 ///
 /// Per IEC 61850-8-1 each functional-constraint group is a structure whose
 /// members are themselves structures, one per data object; a control block of
@@ -210,13 +567,25 @@ fn expand_ln_for_fc(
     ln: &LogicalNode,
     fc: FC,
     lead: Vec<MmsData>,
+    scope: &ReadHandlerScope,
     budget: &mut BudgetGuard,
-) -> Result<Option<MmsData>, ()> {
+) -> Result<Option<MmsData>, Halt> {
+    let group_path = (!scope.is_empty()).then(|| format!("{}${}", ln.full_name(), fc.as_str()));
     let mut do_groups = lead;
     for d in &ln.dos {
-        if let Some(do_struct) = expand_do_for_fc(d, fc, budget)? {
-            do_groups.push(do_struct);
+        let Some(mut do_struct) = expand_do_for_fc(d, fc, budget).map_err(|()| Halt::OverBudget)?
+        else {
+            continue;
+        };
+        if let Some(group_path) = &group_path {
+            let do_path = format!("{group_path}${}", d.name);
+            if scope.reaches(&do_path) {
+                do_struct = scope
+                    .apply(Node::Object(d), fc, &do_path, do_struct)
+                    .map_err(Halt::Refused)?;
+            }
         }
+        do_groups.push(do_struct);
     }
     if do_groups.is_empty() {
         return Ok(None);
@@ -224,24 +593,28 @@ fn expand_ln_for_fc(
     let st = MmsData::Structure(do_groups);
     let outer = st.estimated_encoded_size() - children_inner_size_sum(&st);
     if !budget.consume(outer) {
-        return Err(());
+        return Err(Halt::OverBudget);
     }
     Ok(Some(st))
 }
 
 /// Expands a whole logical node into a structure of its functional-constraint
 /// groups, as IEC 61850-8-1 maps a logical node onto an MMS structure.
-fn expand_whole_ln(ln: &LogicalNode, budget: &mut BudgetGuard) -> Result<MmsData, ()> {
+fn expand_whole_ln(
+    ln: &LogicalNode,
+    scope: &ReadHandlerScope,
+    budget: &mut BudgetGuard,
+) -> Result<MmsData, Halt> {
     let mut fc_groups = Vec::new();
     for fc in FC::WIRE_ORDER {
-        if let Some(group) = expand_ln_for_fc(ln, fc, Vec::new(), budget)? {
+        if let Some(group) = expand_ln_for_fc(ln, fc, Vec::new(), scope, budget)? {
             fc_groups.push(group);
         }
     }
     let st = MmsData::Structure(fc_groups);
     let outer = st.estimated_encoded_size() - children_inner_size_sum(&st);
     if !budget.consume(outer) {
-        return Err(());
+        return Err(Halt::OverBudget);
     }
     Ok(st)
 }
@@ -258,11 +631,13 @@ fn expand_whole_ln(ln: &LogicalNode, budget: &mut BudgetGuard) -> Result<MmsData
 /// segments through sub-data-objects and then data attributes: the path may
 /// stop on a sub-data-object, which expands under the constraint like a data
 /// object, or reach a data attribute or sub-attribute, which yields its value.
+/// Once the path resolves, the read handlers of `scope` have their say.
 fn lookup_domain_specific_value(
     ied_model: &IedModel,
     domain: &str,
     item_id: &str,
     alt_access: Option<&AlternateAccess>,
+    scope: &ReadHandlerScope,
     budget: &mut BudgetGuard,
 ) -> LookupResult {
     let parts: Vec<&str> = item_id.split('$').collect();
@@ -307,12 +682,9 @@ fn lookup_domain_specific_value(
 
     // ── One segment: the whole logical node ─────────────────────────
     if parts.len() == 1 {
-        return match expand_whole_ln(ln, budget) {
+        return match expand_whole_ln(ln, scope, budget) {
             Ok(st) => LookupResult::Result(AccessResult::Success(st)),
-            Err(()) => {
-                debug_assert!(budget.is_over());
-                LookupResult::OverBudget
-            }
+            Err(halt) => halt.into_lookup(),
         };
     }
 
@@ -332,7 +704,7 @@ fn lookup_domain_specific_value(
 
     // ── Two segments: one functional-constraint group ───────────────
     if parts.len() == 2 {
-        return match expand_ln_for_fc(ln, target_fc, Vec::new(), budget) {
+        return match expand_ln_for_fc(ln, target_fc, Vec::new(), scope, budget) {
             Ok(Some(st)) => LookupResult::Result(AccessResult::Success(st)),
             Ok(None) => {
                 tracing::warn!(
@@ -343,10 +715,7 @@ fn lookup_domain_specific_value(
                 );
                 LookupResult::Result(AccessResult::Failure(DataAccessError::ObjectNonExistent))
             }
-            Err(()) => {
-                debug_assert!(budget.is_over());
-                LookupResult::OverBudget
-            }
+            Err(halt) => halt.into_lookup(),
         };
     }
 
@@ -368,7 +737,7 @@ fn lookup_domain_specific_value(
     // ── Three segments: one data object, sub-objects included ───────
     if parts.len() == 3 {
         return match expand_do_for_fc(do_node, target_fc, budget) {
-            Ok(Some(st)) => LookupResult::Result(AccessResult::Success(st)),
+            Ok(Some(st)) => handled(scope.apply(Node::Object(do_node), target_fc, item_id, st)),
             Ok(None) => {
                 tracing::warn!(
                     domain = domain,
@@ -394,6 +763,8 @@ fn lookup_domain_specific_value(
     let mut current_do = do_node;
     let mut next = 3;
     let mut reached_da: Option<&DataAttribute> = None;
+    // The nodes above the target, the data object first.
+    let mut ancestors: Vec<Node<'_>> = vec![Node::Object(do_node)];
     while next < parts.len() {
         let step = parts[next];
         let child = current_do.children.iter().find(|c| match c {
@@ -404,6 +775,9 @@ fn lookup_domain_specific_value(
             Some(DoChild::SubDo(sub)) => {
                 current_do = sub;
                 next += 1;
+                if next < parts.len() {
+                    ancestors.push(Node::Object(sub));
+                }
             }
             Some(DoChild::Da(da)) => {
                 reached_da = Some(da);
@@ -441,8 +815,12 @@ fn lookup_domain_specific_value(
                     DataAccessError::TypeInconsistent,
                 ));
             }
+            let target = Node::Object(current_do);
+            if let Some(decided) = scope.decide_from_above(target_fc, item_id, &ancestors, target) {
+                return handled(decided);
+            }
             return match expand_do_for_fc(current_do, target_fc, budget) {
-                Ok(Some(st)) => LookupResult::Result(AccessResult::Success(st)),
+                Ok(Some(st)) => handled(scope.apply(target, target_fc, item_id, st)),
                 Ok(None) => {
                     tracing::warn!(
                         domain = domain,
@@ -461,6 +839,7 @@ fn lookup_domain_specific_value(
 
     let mut current_da = da;
     for sda_name in &parts[next..] {
+        ancestors.push(Node::Attribute(current_da));
         current_da = match current_da.child_by_name(sda_name) {
             Some(c) => c,
             None => {
@@ -477,10 +856,29 @@ fn lookup_domain_specific_value(
         };
     }
 
-    let value = current_da.snapshot();
-    let access = match alt_access {
-        None => AccessResult::Success(mms_value_to_mms_data(&value)),
-        Some(alt) => apply_alt_access_typed(current_da, &value, alt),
+    let target = Node::Attribute(current_da);
+    let access = if scope.is_empty() {
+        let value = current_da.snapshot();
+        match alt_access {
+            None => AccessResult::Success(mms_value_to_mms_data(&value)),
+            Some(alt) => apply_alt_access_typed(current_da, &value, alt),
+        }
+    } else {
+        // The handlers decide the whole attribute; an alternate access then
+        // selects from what they decided.
+        let decided = scope
+            .decide_from_above(target_fc, item_id, &ancestors, target)
+            .unwrap_or_else(|| {
+                let value = mms_value_to_mms_data(&current_da.snapshot());
+                scope.apply(target, target_fc, item_id, value)
+            });
+        match (decided, alt_access) {
+            (Err(e), _) => AccessResult::Failure(e),
+            (Ok(data), None) => AccessResult::Success(data),
+            (Ok(data), Some(alt)) => {
+                apply_alt_access_typed(current_da, &mms_data_to_mms_value(&data), alt)
+            }
+        }
     };
     if let AccessResult::Success(ref data) = access {
         if !budget.consume(data.estimated_encoded_size()) {
@@ -488,6 +886,14 @@ fn lookup_domain_specific_value(
         }
     }
     LookupResult::Result(access)
+}
+
+/// Turns the verdict of the read handlers into a lookup result.
+fn handled(decided: Result<MmsData, DataAccessError>) -> LookupResult {
+    LookupResult::Result(match decided {
+        Ok(data) => AccessResult::Success(data),
+        Err(e) => AccessResult::Failure(e),
+    })
 }
 
 /// The members a group of a logical node holds ahead of its data objects, such
@@ -549,7 +955,7 @@ pub(crate) fn read_ln_with_leading_members(
                 return Err(LookupResult::OverBudget);
             }
         }
-        expand_ln_for_fc(ln, fc, lead, guard).map_err(|()| LookupResult::OverBudget)
+        expand_ln_for_fc(ln, fc, lead, &ReadHandlerScope::none(), guard).map_err(Halt::into_lookup)
     };
 
     let Some(fc_name) = fc_name else {
@@ -619,6 +1025,8 @@ pub fn handle_single_read(
 /// access results; `None` leaves it unbounded. On
 /// [`LookupResult::OverBudget`] the caller replaces the whole ReadResponse with
 /// `ServiceError(Resource(0))`, as IEC 61850-8-1 requires.
+///
+/// No read handler is consulted.
 pub fn handle_single_read_with_budget(
     ied_model: &IedModel,
     _mms_model: &MmsDeviceModel,
@@ -626,10 +1034,29 @@ pub fn handle_single_read_with_budget(
     alt_access: Option<&AlternateAccess>,
     budget: Option<usize>,
 ) -> LookupResult {
+    read_with_handlers(ied_model, name, alt_access, budget, None)
+}
+
+/// Reads one object name under a PDU byte budget, as the Read service does:
+/// once the path resolves, the read handlers of `handlers` that bear on it
+/// have their say on the association `conn_id`, per the module rules.
+pub(crate) fn read_with_handlers(
+    ied_model: &IedModel,
+    name: &ObjectName,
+    alt_access: Option<&AlternateAccess>,
+    budget: Option<usize>,
+    handlers: Option<(&HandlerRegistry, u64)>,
+) -> LookupResult {
     let mut guard = BudgetGuard::new(budget);
     match name {
         ObjectName::DomainSpecific { domain_id, item_id } => {
-            lookup_domain_specific_value(ied_model, domain_id, item_id, alt_access, &mut guard)
+            let scope = match handlers {
+                Some((registry, conn_id)) => ReadHandlerScope::around(registry, item_id, conn_id),
+                None => ReadHandlerScope::none(),
+            };
+            lookup_domain_specific_value(
+                ied_model, domain_id, item_id, alt_access, &scope, &mut guard,
+            )
         }
         ObjectName::VmdSpecific(n) => {
             tracing::warn!(name = n, "read: vmd-specific object names are not served");
@@ -1602,5 +2029,294 @@ mod tests {
             result,
             AccessResult::Failure(DataAccessError::ObjectAccessUnsupported)
         ));
+    }
+
+    // ── Read handlers above and below the target ───────────────────────
+
+    /// `MMXU1.A` is shaped like a WYE under MX: `phsA` is a sub-object whose
+    /// `cVal` is a constructed attribute holding `mag`, and `q` sits on `A`.
+    fn build_handler_model() -> iec61850_model::IedModel {
+        let mag = DataAttribute::new(
+            "mag",
+            FC::Mx,
+            DataAttributeType::Float32,
+            TrgOps::default(),
+            MmsValue::Float32(1.0),
+        );
+        let q = || {
+            DataAttribute::new(
+                "q",
+                FC::Mx,
+                DataAttributeType::Quality,
+                TrgOps::default(),
+                MmsValue::default_for(DataAttributeType::Quality),
+            )
+        };
+        let phs_a = DataObject::new(
+            "phsA",
+            vec![
+                DoChild::Da(DataAttribute::constructed("cVal", FC::Mx, vec![mag])),
+                DoChild::Da(q()),
+            ],
+        );
+        let a = DataObject::new("A", vec![DoChild::SubDo(phs_a), DoChild::Da(q())]);
+        let mmxu_ln = iec61850_model::LogicalNode::new(String::new(), "MMXU", "1", vec![a]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(mmxu_ln)
+            .build()
+            .unwrap();
+        IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Answers with a fixed outcome and counts how often it is asked.
+    #[derive(Debug)]
+    struct Fixed {
+        outcome: ReadOutcome,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReadHandler for Fixed {
+        fn read(&self, _ctx: &ReadContext<'_>) -> ReadOutcome {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome.clone()
+        }
+    }
+
+    fn fixed(outcome: ReadOutcome) -> Arc<Fixed> {
+        Arc::new(Fixed {
+            outcome,
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn asked(handler: &Fixed) -> usize {
+        handler.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn read_through(
+        model: &iec61850_model::IedModel,
+        registry: &HandlerRegistry,
+        item_id: &str,
+    ) -> AccessResult {
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: item_id.to_string(),
+        };
+        match read_with_handlers(model, &name, None, None, Some((registry, 7))) {
+            LookupResult::Result(r) => r,
+            LookupResult::OverBudget => panic!("no budget was set"),
+        }
+    }
+
+    fn quality() -> MmsData {
+        MmsData::BitString {
+            padding: 3,
+            data: vec![0, 0],
+        }
+    }
+
+    /// A handler on a leaf is asked by a read of every node above it, the data
+    /// object, the sub-object and the constructed attribute, as well as by the
+    /// logical node and its functional-constraint group. Its value replaces the
+    /// leaf in each answer.
+    #[test]
+    fn leaf_handler_decides_reads_of_every_node_above_it() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        let leaf = fixed(ReadOutcome::CacheHit(MmsValue::Float32(9.0)));
+        registry
+            .install_read_handler("MMXU1$MX$A$phsA$cVal$mag", leaf.clone())
+            .unwrap();
+        let c_val = MmsData::Structure(vec![MmsData::Float32(9.0)]);
+        let phs_a = MmsData::Structure(vec![c_val.clone(), quality()]);
+        let a = MmsData::Structure(vec![phs_a.clone(), quality()]);
+        let cases = [
+            ("MMXU1$MX$A$phsA$cVal", c_val),
+            ("MMXU1$MX$A$phsA", phs_a),
+            ("MMXU1$MX$A", a.clone()),
+            ("MMXU1$MX", MmsData::Structure(vec![a.clone()])),
+            (
+                "MMXU1",
+                MmsData::Structure(vec![MmsData::Structure(vec![a])]),
+            ),
+        ];
+        for (item_id, expected) in cases {
+            assert_eq!(
+                read_through(&model, &registry, item_id),
+                AccessResult::Success(expected),
+                "{item_id}"
+            );
+        }
+        assert_eq!(asked(&leaf), 5);
+    }
+
+    /// A refusal below the target refuses the whole read, and the answer
+    /// carries no part of the value.
+    #[test]
+    fn refusal_below_the_target_refuses_the_whole_read() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_read_handler(
+                "MMXU1$MX$A$phsA$q",
+                fixed(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+        for item_id in ["MMXU1$MX$A$phsA", "MMXU1$MX$A", "MMXU1$MX", "MMXU1"] {
+            assert_eq!(
+                read_through(&model, &registry, item_id),
+                AccessResult::Failure(DataAccessError::ObjectAccessDenied),
+                "{item_id}"
+            );
+        }
+        // A sibling of the refused node is not below it.
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A$q"),
+            AccessResult::Success(quality())
+        );
+    }
+
+    /// A handler above the target decides a read of anything below it: a
+    /// refusal refuses the read, and a value answers it with the part the
+    /// target occupies; handlers below a deciding one are not asked.
+    #[test]
+    fn handler_above_the_target_decides_the_read() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_read_handler(
+                "MMXU1$MX$A",
+                fixed(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+        for item_id in [
+            "MMXU1$MX$A$phsA$cVal$mag",
+            "MMXU1$MX$A$phsA",
+            "MMXU1$MX$A$q",
+        ] {
+            assert_eq!(
+                read_through(&model, &registry, item_id),
+                AccessResult::Failure(DataAccessError::ObjectAccessDenied),
+                "{item_id}"
+            );
+        }
+
+        let registry = HandlerRegistry::new();
+        let above = fixed(ReadOutcome::CacheHit(MmsValue::Structure(vec![
+            MmsValue::Structure(vec![MmsValue::Float32(4.0)]),
+            MmsValue::BitString {
+                padding: 3,
+                data: vec![0x40, 0x00],
+            },
+        ])));
+        let below = fixed(ReadOutcome::Error(DataAccessError::ObjectAccessDenied));
+        registry
+            .install_read_handler("MMXU1$MX$A$phsA", above.clone())
+            .unwrap();
+        registry
+            .install_read_handler("MMXU1$MX$A$phsA$cVal$mag", below.clone())
+            .unwrap();
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A$phsA$cVal$mag"),
+            AccessResult::Success(MmsData::Float32(4.0))
+        );
+        assert_eq!(
+            read_through(&model, &registry, "MMXU1$MX$A"),
+            AccessResult::Success(MmsData::Structure(vec![
+                MmsData::Structure(vec![
+                    MmsData::Structure(vec![MmsData::Float32(4.0)]),
+                    MmsData::BitString {
+                        padding: 3,
+                        data: vec![0x40, 0x00],
+                    },
+                ]),
+                quality(),
+            ]))
+        );
+        assert_eq!(asked(&below), 0);
+    }
+
+    /// A value from a handler above the target that does not follow the model,
+    /// or that holds a bit string too long for the target, is not sent.
+    #[test]
+    fn misshapen_value_from_above_is_object_value_invalid() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_read_handler(
+                "MMXU1$MX$A$phsA",
+                fixed(ReadOutcome::CacheHit(MmsValue::Structure(vec![
+                    MmsValue::Float32(1.0),
+                    MmsValue::BitString {
+                        padding: 0,
+                        data: vec![0xff, 0xff],
+                    },
+                ]))),
+            )
+            .unwrap();
+        for item_id in ["MMXU1$MX$A$phsA$cVal$mag", "MMXU1$MX$A$phsA$q"] {
+            assert_eq!(
+                read_through(&model, &registry, item_id),
+                AccessResult::Failure(DataAccessError::ObjectValueInvalid),
+                "{item_id}"
+            );
+        }
+    }
+
+    /// With read access ignored, no handler is asked anywhere.
+    #[test]
+    fn ignored_read_access_asks_no_handler() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        let leaf = fixed(ReadOutcome::Error(DataAccessError::ObjectAccessDenied));
+        registry
+            .install_read_handler("MMXU1$MX$A$q", leaf.clone())
+            .unwrap();
+        registry.set_ignore_read_access(true);
+        assert!(matches!(
+            read_through(&model, &registry, "MMXU1$MX$A"),
+            AccessResult::Success(_)
+        ));
+        assert_eq!(asked(&leaf), 0);
+    }
+
+    /// A data set member goes through the same rules as a read of its path.
+    #[test]
+    fn data_set_member_value_passes_the_handlers_above_it() {
+        let model = build_handler_model();
+        let registry = HandlerRegistry::new();
+        registry
+            .install_read_handler(
+                "MMXU1$MX$A$phsA",
+                fixed(ReadOutcome::Error(DataAccessError::ObjectAccessDenied)),
+            )
+            .unwrap();
+        assert_eq!(
+            apply_read_handlers(
+                &model,
+                &registry,
+                7,
+                "IED1LD0",
+                "MMXU1$MX$A$phsA$cVal$mag",
+                AccessResult::Success(MmsData::Float32(1.0)),
+            ),
+            AccessResult::Failure(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            apply_read_handlers(
+                &model,
+                &registry,
+                7,
+                "IED1LD0",
+                "MMXU1$MX$A$q",
+                AccessResult::Success(quality()),
+            ),
+            AccessResult::Success(quality())
+        );
     }
 }

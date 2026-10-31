@@ -114,8 +114,17 @@ pub enum WriteOutcome {
 
 /// Application hook on the Read path.
 ///
-/// A handler is registered against one attribute path; a read of that path
-/// consults it and follows the [`ReadOutcome`] it returns.
+/// A handler is registered against the path of a data object, a
+/// sub-data-object, a data attribute or a sub-attribute. Every read that
+/// covers that node consults it and follows the [`ReadOutcome`] it returns: a
+/// read of the node itself, of any node above it up to the logical node, and
+/// of any node below it, whether named directly or as a data set member.
+///
+/// A handler above the node read decides first, outermost first; its value
+/// answers with the part the node read occupies. A handler below the node
+/// read replaces the part its own node occupies, and its error refuses the
+/// whole read, which then carries no part of the value. Handlers below one
+/// that answered with a value are not consulted.
 pub trait ReadHandler: Send + Sync + core::fmt::Debug {
     /// Answers a read of the attribute this handler is registered against.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
@@ -243,16 +252,6 @@ pub(crate) fn canonicalize_attr_path(raw: &str) -> Result<String> {
     Ok(rebuilt)
 }
 
-/// Extracts the functional constraint from a canonical path, so that a caller
-/// holding the path can fill in a handler context without passing it twice.
-#[cfg_attr(not(feature = "full-server"), allow(dead_code))]
-pub(crate) fn fc_from_canonical_path(path: &str) -> Option<FC> {
-    let mut it = path.split('$');
-    it.next()?; // LN
-    let fc_str = it.next()?;
-    FC::parse(fc_str).ok()
-}
-
 /// Reports whether canonical path `below` names a node beneath the node `above`
 /// names.
 pub(crate) fn is_below(below: &str, above: &str) -> bool {
@@ -320,6 +319,20 @@ impl HandlerRegistry {
         let key = canonicalize_attr_path(path).ok()?;
         let g = crate::compat::rwlock_read(&self.read)?;
         g.get(&key).cloned()
+    }
+
+    /// Returns the read handlers installed on the path `path`, on the nodes
+    /// above it and on the nodes below it, so one read looks the registry up
+    /// once. `path` may name a logical node or a functional-constraint group,
+    /// which no handler is installed on but which has handlers below it.
+    pub(crate) fn read_handlers_around(&self, path: &str) -> Vec<(String, Arc<dyn ReadHandler>)> {
+        let Some(g) = crate::compat::rwlock_read(&self.read) else {
+            return Vec::new();
+        };
+        g.iter()
+            .filter(|(key, _)| on_the_same_branch(key, path))
+            .map(|(key, handler)| (key.clone(), Arc::clone(handler)))
+            .collect()
     }
 
     // ─── Write handlers ─────────────────────────────────────────────────
@@ -459,12 +472,6 @@ mod tests {
             canonicalize_attr_path("MMXU1$XX$TotW$mag"),
             Err(ServerError::InvalidModel(_))
         ));
-    }
-
-    #[test]
-    fn fc_from_canonical_path_works() {
-        let p = canonicalize_attr_path("GGIO1.cf.Mod.ctlModel").unwrap();
-        assert_eq!(fc_from_canonical_path(&p), Some(FC::Cf));
     }
 
     #[test]
