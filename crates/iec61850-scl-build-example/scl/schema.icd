@@ -67,7 +67,7 @@
       <DA name="seqT" fc="MX" bType="INT24"/>
     </DOType>
     <DOType id="CMV_T" cdc="CMV">
-      <DA name="cVal" fc="MX" bType="Struct" type="Vector_T"/>
+      <DA name="cVal" fc="MX" bType="Struct" type="Vector_T" dchg="true"/>
     </DOType>
     <DOType id="RAW_T" cdc="SPS">
       <DA name="i24" fc="ST" bType="INT24"><Val>-8388608</Val></DA>

@@ -504,6 +504,12 @@ impl DataObjectBuilder {
 
     /// Freezes the data object.
     ///
+    /// The trigger options of each data attribute directly below the data
+    /// object reach every sub-attribute below it: IEC 61850-7-2 §17.3.2.3.2
+    /// attaches a trigger option to the data attribute of the CDC, so a leaf
+    /// such as `mag.f` triggers on what `mag` declares. A sub-attribute keeps
+    /// any trigger option of its own as well.
+    ///
     /// # Errors
     ///
     /// [`ModelError::InvalidObjectRef`] when the name is empty, and
@@ -533,11 +539,26 @@ impl DataObjectBuilder {
                 });
             }
         }
+        let mut children = self.children;
+        for c in &mut children {
+            if let DoChild::Da(da) = c {
+                let trg_ops = da.trg_ops;
+                inherit_trg_ops(&mut da.children, trg_ops);
+            }
+        }
         Ok(DataObject {
             name: self.name,
             array_count: self.array_count,
-            children: self.children,
+            children,
         })
+    }
+}
+
+/// Adds `trg_ops` to every sub-attribute in `children`, at every level.
+fn inherit_trg_ops(children: &mut [DataAttribute], trg_ops: TrgOps) {
+    for child in children {
+        child.trg_ops = child.trg_ops | trg_ops;
+        inherit_trg_ops(&mut child.children, trg_ops);
     }
 }
 
@@ -817,6 +838,44 @@ mod tests {
             &["Spt".into(), "setVal".into()],
             FC::Cf
         ));
+    }
+
+    /// A sub-attribute of a constructed attribute takes the trigger options of
+    /// the attribute below the data object, at every level, and keeps its own.
+    #[test]
+    fn sub_attributes_inherit_the_trigger_options_of_their_attribute() {
+        let leaf = |name: &str, trg| {
+            DataAttribute::new(
+                name,
+                FC::Mx,
+                DataAttributeType::Float32,
+                trg,
+                MmsValue::Float32(0.0),
+            )
+        };
+        let mut mag = DataAttribute::constructed(
+            "mag",
+            FC::Mx,
+            vec![
+                leaf("f", TrgOps::NONE),
+                DataAttribute::constructed("inner", FC::Mx, vec![leaf("g", TrgOps::QCHG)]),
+            ],
+        );
+        mag.trg_ops = TrgOps::DCHG | TrgOps::DUPD;
+        let d = DataObjectBuilder::scalar("TotW")
+            .add_da_node(mag)
+            .build()
+            .unwrap();
+        let DoChild::Da(mag) = &d.children[0] else {
+            panic!("mag")
+        };
+        assert_eq!(mag.trg_ops, TrgOps::DCHG | TrgOps::DUPD);
+        assert_eq!(mag.children[0].trg_ops, TrgOps::DCHG | TrgOps::DUPD);
+        assert_eq!(mag.children[1].trg_ops, TrgOps::DCHG | TrgOps::DUPD);
+        assert_eq!(
+            mag.children[1].children[0].trg_ops,
+            TrgOps::DCHG | TrgOps::DUPD | TrgOps::QCHG
+        );
     }
 
     #[test]

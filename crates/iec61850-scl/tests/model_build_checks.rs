@@ -900,3 +900,32 @@ fn se_attribute_below_a_sub_object_is_also_an_sg_attribute() {
         assert_eq!(da[0].snapshot(), MmsValue::Integer(9), "{fc:?}");
     }
 }
+
+/// A leaf of a structured attribute triggers on the trigger options of the
+/// attribute of the CDC (IEC 61850-7-2 §17.3.2.3.2): `mag.f` of an MV takes
+/// the `dchg` and `dupd` of `mag`.
+#[test]
+fn structured_attribute_leaves_take_the_trigger_options_of_the_attribute() {
+    let t = r#"
+    <LNodeType id="MMXU_T" lnClass="MMXU"><DO name="TotW" type="MV_T"/></LNodeType>
+    <DOType id="MV_T" cdc="MV">
+      <DA name="mag" fc="MX" bType="Struct" type="AV_T" dchg="true" dupd="true"/>
+      <DA name="q" fc="MX" bType="Quality" qchg="true"/>
+    </DOType>
+    <DAType id="AV_T"><BDA name="f" bType="FLOAT32"/><BDA name="i" bType="INT32"/></DAType>"#;
+    let m = build(&wrap(
+        t,
+        "",
+        r#"<LN lnClass="MMXU" inst="1" lnType="MMXU_T"/>"#,
+    ));
+    let mag = da(&m, "MMXU1", "TotW", "mag");
+    let want = iec61850_model::TrgOps::DCHG | iec61850_model::TrgOps::DUPD;
+    assert_eq!(mag.trg_ops, want);
+    for leaf in &mag.children {
+        assert_eq!(leaf.trg_ops, want, "{}", leaf.name);
+    }
+    assert_eq!(
+        da(&m, "MMXU1", "TotW", "q").trg_ops,
+        iec61850_model::TrgOps::QCHG
+    );
+}

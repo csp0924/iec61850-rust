@@ -488,6 +488,9 @@ impl DataAttribute {
     /// Creates a constructed data attribute. The authoritative values live on
     /// the leaves in `children`; this node's own `value` is a placeholder, and
     /// every read goes through [`snapshot`](Self::snapshot).
+    ///
+    /// `trg_ops` starts empty; once set, `DataObjectBuilder::build` passes it
+    /// on to every sub-attribute.
     pub fn constructed(name: impl Into<String>, fc: FC, children: Vec<DataAttribute>) -> Self {
         Self {
             name: name.into(),

@@ -99,3 +99,36 @@ fn generated_settings_carry_every_group_value() {
         );
     }
 }
+
+#[test]
+fn generated_structured_leaves_take_the_trigger_options_of_the_attribute() {
+    let generated = build_Schema_model();
+    let ln = generated.lds[0].ln_by_name("MSQI1").expect("MSQI1");
+    let q = match ln
+        .do_by_name("SeqA")
+        .expect("SeqA")
+        .child_by_name("q", None)
+    {
+        Some(iec61850_scl::__private::DoChild::Da(da)) => da,
+        other => panic!("q: {other:?}"),
+    };
+    assert_eq!(q.trg_ops, TrgOps::QCHG);
+    let c1 = match ln
+        .do_by_name("SeqA")
+        .expect("SeqA")
+        .child_by_name("c1", None)
+    {
+        Some(iec61850_scl::__private::DoChild::SubDo(sd)) => sd,
+        other => panic!("c1: {other:?}"),
+    };
+    let cval = match c1.child_by_name("cVal", None) {
+        Some(iec61850_scl::__private::DoChild::Da(da)) => da,
+        other => panic!("cVal: {other:?}"),
+    };
+    assert_eq!(cval.trg_ops, TrgOps::DCHG);
+    let f = cval
+        .child_by_name("mag")
+        .and_then(|mag| mag.child_by_name("f"))
+        .expect("cVal.mag.f");
+    assert_eq!(f.trg_ops, TrgOps::DCHG);
+}
