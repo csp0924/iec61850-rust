@@ -122,3 +122,72 @@ async fn refused_client_certificate_reaches_the_client_with_its_cause() {
     assert!(!conn.is_connected());
     peer.await.expect("peer");
 }
+
+/// The same refusal by our own server: it sends the alert and reads past the
+/// client's COTP request before closing, so the client reports the alert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusal_by_the_iec61850_server_reaches_the_client_with_its_cause() {
+    let (ca, server_cert, server_key) = certificates();
+    let server_tls = TlsConfigBuilder::new()
+        .with_cert_pem(&server_cert, &server_key)
+        .expect("server certificate")
+        .add_ca_pem(&ca)
+        .expect("ca")
+        .require_client_auth(true)
+        .build_server()
+        .expect("server config");
+    let lln0 = iec61850_model::LogicalNodeBuilder::lln0()
+        .build()
+        .expect("lln0");
+    let ld = iec61850_model::LogicalDeviceBuilder::new("LD0")
+        .add_ln(lln0)
+        .build()
+        .expect("ld");
+    let model = iec61850_model::IedModelBuilder::new("TEST")
+        .add_ld(ld)
+        .expect("add ld")
+        .build()
+        .expect("model");
+    let server = iec61850_server::IedServer::builder()
+        .model(Arc::new(model))
+        .bind(
+            "127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .expect("bind address"),
+        )
+        .with_tls(iec61850_tls::TlsAcceptor::new(server_tls))
+        .build()
+        .expect("server");
+    let handle = server.start().await.expect("start");
+
+    let client_tls = TlsConfigBuilder::new()
+        .add_ca_pem(&ca)
+        .expect("ca")
+        .build_client()
+        .expect("client config");
+    let conn = IedConnection::new();
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        conn.connect_tls(
+            handle.bound_addr,
+            &TlsConnector::new(client_tls),
+            "localhost".try_into().expect("server name"),
+        ),
+    )
+    .await
+    .expect("connect does not hang");
+
+    match r {
+        Err(ClientError::Transport(cause)) => {
+            assert_eq!(cause.kind(), IoErrorKind::InvalidData, "{cause}");
+            let detail = cause.detail().unwrap_or_default();
+            assert!(
+                detail.contains("CertificateRequired"),
+                "the alert is carried: {cause}"
+            );
+        }
+        other => panic!("expected a transport error carrying the alert, got {other:?}"),
+    }
+    assert!(!conn.is_connected());
+    handle.stop().await;
+}
