@@ -1097,10 +1097,16 @@ impl WriteOutcome {
 
 /// Selector inside an [`AlternateAccess`] sequence.
 ///
-/// Two access patterns are supported in this scope:
-/// `indexRange`, `allElements`, component-only, named, and multi-member
-/// selections fall outside this scope.
+/// Three forms are represented: an array element, an array element followed by
+/// a component path, and a named component optionally followed by a further
+/// alternate access. A component chain may therefore select components, then an
+/// array element, then components inside that element, which is the form of
+/// IEC 61850-8-1 §24.2.2.4.1.3 Table 139. `indexRange`, `allElements`, named
+/// members and multi-member sequences decode to
+/// [`MmsError::AlternateAccessUnsupported`]; the enum is non-exhaustive so
+/// that they can be represented later.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlternateAccessSelector {
     /// Single array element, no sub-component.
     /// Wire: `0x82 <ulen> <index>` - `selectAccess.index`,
@@ -1115,6 +1121,20 @@ pub enum AlternateAccessSelector {
         index: u32,
         /// Name of the component selected inside that element.
         component: String,
+    },
+    /// A named component, optionally followed by an alternate access applied to
+    /// that component.
+    ///
+    /// Wire: `0x81 <len> <name>` (`selectAccess.component`) when
+    /// `alternate_access` is `None`; otherwise
+    /// `0xa0 <len> { 0x80 <len> <name>, 0x30 <len> <nested> }`, i.e.
+    /// `selectAlternateAccess` with `accessSelection.component` and the nested
+    /// `AlternateAccess`.
+    Component {
+        /// Name of the selected component, a single identifier.
+        component: String,
+        /// Alternate access applied inside the selected component.
+        alternate_access: Option<Box<AlternateAccess>>,
     },
 }
 
@@ -1149,6 +1169,10 @@ pub enum AlternateAccessSelector {
 ///
 /// Note that `accessSelection` (inside `selectAlternateAccess`) uses tags
 /// \[0\]-\[3\] while `selectAccess` uses \[1\]-\[4\].
+///
+/// Every nested `AlternateAccess` is one nesting level. The decoder bounds the
+/// levels by the smaller of [`MAX_DATA_NESTING_DEPTH`] and the negotiated
+/// nesting level, and the builders refuse a selector the decoder would refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlternateAccess {
     /// Selector applied at this level of the access path.
@@ -1171,29 +1195,109 @@ impl AlternateAccess {
     /// here also decodes. Empty input and empty segments are rejected.
     pub fn index_component(index: u32, component: impl Into<String>) -> Result<Self, MmsError> {
         let component = component.into();
-        if component.is_empty() {
-            return Err(MmsError::AlternateAccessUnsupported("component is empty"));
-        }
-        let segments = component.split('$').count();
-        if segments > usize::from(MAX_DATA_NESTING_DEPTH) {
-            return Err(MmsError::NestingLevelExceeded {
-                max: MAX_DATA_NESTING_DEPTH,
-                got: u8::try_from(segments).unwrap_or(u8::MAX),
-            });
-        }
-        for seg in component.split('$') {
-            if seg.is_empty() {
-                return Err(MmsError::AlternateAccessUnsupported(
-                    "component path contains an empty segment",
-                ));
-            }
-            if seg.len() > MAX_IDENTIFIER_LEN {
-                return Err(MmsError::IdentifierTooLong { actual: seg.len() });
-            }
-        }
+        let segments = validate_component_path(&component)?;
+        check_nesting_depth(segments)?;
         Ok(Self {
             selector: AlternateAccessSelector::IndexComponent { index, component },
         })
+    }
+
+    /// Build a selector for a component path, each segment selected inside the
+    /// previous one.
+    ///
+    /// `component` is `$`-separated: `cVal$mag` selects the component `cVal`
+    /// and then `mag` inside it. Segments follow the rules of
+    /// [`AlternateAccess::index_component`]; a path whose nesting exceeds
+    /// [`MAX_DATA_NESTING_DEPTH`] returns [`MmsError::NestingLevelExceeded`].
+    pub fn component(component: impl Into<String>) -> Result<Self, MmsError> {
+        Self::component_chain(&component.into(), None)
+    }
+
+    /// Build a selector for a component path followed by a further alternate
+    /// access applied inside the last component.
+    ///
+    /// `component_then("HA$phsAHar", AlternateAccess::index_component(7, "cVal$mag$f")?)`
+    /// selects element 7 of `HA$phsAHar` and then `cVal$mag$f` inside it. The
+    /// path follows the rules of [`AlternateAccess::component`], and the
+    /// combined nesting is bounded by [`MAX_DATA_NESTING_DEPTH`].
+    pub fn component_then(
+        component: impl Into<String>,
+        then: AlternateAccess,
+    ) -> Result<Self, MmsError> {
+        Self::component_chain(&component.into(), Some(then))
+    }
+
+    fn component_chain(path: &str, tail: Option<AlternateAccess>) -> Result<Self, MmsError> {
+        let segments = validate_component_path(path)?;
+        let tail_depth = tail.as_ref().map_or(0, |t| 1 + t.nesting_depth());
+        check_nesting_depth(segments - 1 + tail_depth)?;
+        let mut nested = tail.map(Box::new);
+        for seg in path.rsplit('$') {
+            nested = Some(Box::new(Self {
+                selector: AlternateAccessSelector::Component {
+                    component: seg.to_owned(),
+                    alternate_access: nested,
+                },
+            }));
+        }
+        match nested {
+            Some(access) => Ok(*access),
+            None => Err(MmsError::AlternateAccessUnsupported("component is empty")),
+        }
+    }
+
+    /// Number of `AlternateAccess` sequences nested inside this one, the depth
+    /// the decoder bounds by the nesting level.
+    pub fn nesting_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = self;
+        loop {
+            match &current.selector {
+                AlternateAccessSelector::Index(_) => return depth,
+                AlternateAccessSelector::IndexComponent { component, .. } => {
+                    return depth + component.split('$').count();
+                }
+                AlternateAccessSelector::Component {
+                    alternate_access, ..
+                } => match alternate_access {
+                    Some(nested) => {
+                        depth += 1;
+                        current = nested;
+                    }
+                    None => return depth,
+                },
+            }
+        }
+    }
+
+    /// Splits off the component selections that lead this access.
+    ///
+    /// Returns the components selected before any array index, outermost first,
+    /// and the alternate access that remains after them: `None` when the access
+    /// is a component chain alone. An access that starts with an index returns
+    /// no components and itself.
+    ///
+    /// A component chain names the same variable as the flattened name
+    /// `<item>$<c1>$<c2>…` (IEC 61850-8-1 §7.3.1), so a server may append the
+    /// components to the item identifier and apply only the remainder.
+    pub fn leading_components(&self) -> (Vec<&str>, Option<&AlternateAccess>) {
+        let mut names = Vec::new();
+        let mut current = self;
+        loop {
+            match &current.selector {
+                AlternateAccessSelector::Component {
+                    component,
+                    alternate_access,
+                } => {
+                    names.push(component.as_str());
+                    match alternate_access {
+                        Some(nested) => current = nested,
+                        None => return (names, None),
+                    }
+                }
+                _ => return (names, Some(current)),
+            }
+        }
     }
 
     /// Encode the value into `buf`, including the outer `0x30 <len>` SEQUENCE OF wrapper.
@@ -1215,12 +1319,11 @@ impl AlternateAccess {
     /// `0x30 <len>` SEQUENCE OF wrapper. Returns the decoded value and the
     /// total number of bytes consumed (header + content).
     ///
-    /// Only the two selector forms produced by [`AlternateAccess::index`] and
-    /// [`AlternateAccess::index_component`] are accepted. Any other
-    /// `accessSelection` branch (`indexRange`, `allElements`, `named`,
-    /// component-only, multi-member) yields [`MmsError::AlternateAccessUnsupported`].
+    /// The three [`AlternateAccessSelector`] forms are accepted. Any other
+    /// branch (`indexRange`, `allElements`, `named`, multi-member) yields
+    /// [`MmsError::AlternateAccessUnsupported`].
     ///
-    /// The nested component chain is bounded by [`MAX_DATA_NESTING_DEPTH`]; use
+    /// Nesting is bounded by [`MAX_DATA_NESTING_DEPTH`]; use
     /// [`AlternateAccess::decode_with_negotiated_cap`] to apply a negotiated
     /// nesting level as well.
     pub fn decode(data: &[u8]) -> Result<(Self, usize), MmsError> {
@@ -1229,9 +1332,9 @@ impl AlternateAccess {
 
     /// Decodes an `AlternateAccess` under the negotiated `dataStructureNestingLevel`.
     ///
-    /// The component chain may nest at most as deep as the smaller of
+    /// The nested sequences may go at most as deep as the smaller of
     /// [`MAX_DATA_NESTING_DEPTH`] and `negotiated`; `None` applies the local
-    /// ceiling alone. A deeper chain returns [`MmsError::NestingLevelExceeded`].
+    /// ceiling alone. A deeper access returns [`MmsError::NestingLevelExceeded`].
     pub fn decode_with_negotiated_cap(
         data: &[u8],
         negotiated: Option<u8>,
@@ -1242,45 +1345,149 @@ impl AlternateAccess {
         )
     }
 
-    /// Decodes an `AlternateAccess` whose component chain nests at most
-    /// `max_depth` levels, itself capped at [`MAX_DATA_NESTING_DEPTH`].
+    /// Decodes an `AlternateAccess` whose nested sequences go at most
+    /// `max_depth` levels deep, itself capped at [`MAX_DATA_NESTING_DEPTH`].
     pub(crate) fn decode_with_max(data: &[u8], max_depth: u8) -> Result<(Self, usize), MmsError> {
         let max_depth = max_depth.min(MAX_DATA_NESTING_DEPTH);
-        if data.is_empty() {
-            return Err(MmsError::TruncatedPdu);
-        }
-        if data[0] != 0x30 {
-            return Err(MmsError::InvalidTag {
-                expected: 0x30,
-                actual: data[0],
-            });
-        }
-        let (inner_len, hdr) = decode_length(&data[1..])?;
-        let inner_start = 1 + hdr;
-        let total = inner_start + inner_len;
-        if total > data.len() {
-            return Err(MmsError::TruncatedPdu);
-        }
-        let inner = &data[inner_start..total];
-        if inner.is_empty() {
-            return Err(MmsError::AlternateAccessUnsupported(
-                "empty AlternateAccess sequence",
-            ));
-        }
-        let (selector, consumed) = decode_alt_access_member(inner, max_depth)?;
-        if consumed != inner.len() {
-            return Err(MmsError::AlternateAccessUnsupported(
-                "multi-member AlternateAccess",
-            ));
-        }
+        let (inner, total) = alt_access_sequence_body(data)?;
+        let selector = decode_single_member(inner, 0, max_depth)?;
         Ok((Self { selector }, total))
     }
 }
 
-/// Decode one `AlternateAccess__Member.unnamed` body. Returns the selector and
-/// the number of bytes consumed from `data`.
+/// Checks a `$`-separated component path and returns its number of segments.
+///
+/// Empty input, empty segments and segments longer than [`MAX_IDENTIFIER_LEN`]
+/// are rejected.
+fn validate_component_path(component: &str) -> Result<usize, MmsError> {
+    if component.is_empty() {
+        return Err(MmsError::AlternateAccessUnsupported("component is empty"));
+    }
+    let mut segments = 0;
+    for seg in component.split('$') {
+        if seg.is_empty() {
+            return Err(MmsError::AlternateAccessUnsupported(
+                "component path contains an empty segment",
+            ));
+        }
+        if seg.len() > MAX_IDENTIFIER_LEN {
+            return Err(MmsError::IdentifierTooLong { actual: seg.len() });
+        }
+        segments += 1;
+    }
+    Ok(segments)
+}
+
+/// Refuses a nesting depth the decoder would refuse.
+fn check_nesting_depth(depth: usize) -> Result<(), MmsError> {
+    if depth > usize::from(MAX_DATA_NESTING_DEPTH) {
+        return Err(MmsError::NestingLevelExceeded {
+            max: MAX_DATA_NESTING_DEPTH,
+            got: u8::try_from(depth).unwrap_or(u8::MAX),
+        });
+    }
+    Ok(())
+}
+
+/// Reads the `0x30 <len>` SEQUENCE OF header at the start of `data` and returns
+/// its body and the total number of bytes it occupies.
+fn alt_access_sequence_body(data: &[u8]) -> Result<(&[u8], usize), MmsError> {
+    if data.is_empty() {
+        return Err(MmsError::TruncatedPdu);
+    }
+    if data[0] != 0x30 {
+        return Err(MmsError::InvalidTag {
+            expected: 0x30,
+            actual: data[0],
+        });
+    }
+    let (inner_len, hdr) = decode_length(&data[1..])?;
+    let inner_start = 1 + hdr;
+    let total = inner_start + inner_len;
+    if total > data.len() {
+        return Err(MmsError::TruncatedPdu);
+    }
+    Ok((&data[inner_start..total], total))
+}
+
+/// Decodes the body of an `AlternateAccess` sequence at nesting level `depth`,
+/// which must carry exactly one member.
+fn decode_single_member(
+    inner: &[u8],
+    depth: u8,
+    max_depth: u8,
+) -> Result<AlternateAccessSelector, MmsError> {
+    if inner.is_empty() {
+        return Err(MmsError::AlternateAccessUnsupported(
+            "empty AlternateAccess sequence",
+        ));
+    }
+    let (selector, consumed) = decode_alt_access_member(inner, depth, max_depth)?;
+    if consumed != inner.len() {
+        return Err(MmsError::AlternateAccessUnsupported(
+            "multi-member AlternateAccess",
+        ));
+    }
+    Ok(selector)
+}
+
+/// Decodes the nested `AlternateAccess` that ends a `selectAlternateAccess`,
+/// at nesting level `depth`.
+///
+/// A sequence nested past `max_depth` is rejected before its body is read, so a
+/// crafted PDU cannot exhaust the stack.
+fn decode_nested_alt_access(
+    data: &[u8],
+    depth: u8,
+    max_depth: u8,
+) -> Result<AlternateAccess, MmsError> {
+    check_decode_depth(depth, max_depth)?;
+    let (inner, total) = alt_access_sequence_body(data)?;
+    if total != data.len() {
+        return Err(MmsError::AlternateAccessUnsupported(
+            "trailing data after the nested AlternateAccess",
+        ));
+    }
+    let selector = decode_single_member(inner, depth, max_depth)?;
+    Ok(AlternateAccess { selector })
+}
+
+fn check_decode_depth(depth: u8, max_depth: u8) -> Result<(), MmsError> {
+    if depth > max_depth {
+        tracing::warn!(
+            "alternateaccess nesting depth {} exceeds the effective cap {} (local cap {})",
+            depth,
+            max_depth,
+            MAX_DATA_NESTING_DEPTH
+        );
+        return Err(MmsError::NestingLevelExceeded {
+            max: max_depth,
+            got: depth,
+        });
+    }
+    Ok(())
+}
+
+/// Decodes a component identifier: UTF-8, non-empty, at most
+/// [`MAX_IDENTIFIER_LEN`] bytes.
+fn decode_component_identifier(val: &[u8]) -> Result<String, MmsError> {
+    let s = core::str::from_utf8(val).map_err(|_| MmsError::InvalidUtf8)?;
+    if s.is_empty() {
+        return Err(MmsError::AlternateAccessUnsupported(
+            "component segment is empty",
+        ));
+    }
+    if s.len() > MAX_IDENTIFIER_LEN {
+        return Err(MmsError::IdentifierTooLong { actual: s.len() });
+    }
+    Ok(s.to_owned())
+}
+
+/// Decode one `AlternateAccess__Member.unnamed` body at nesting level `depth`.
+/// Returns the selector and the number of bytes consumed from `data`.
 fn decode_alt_access_member(
     data: &[u8],
+    depth: u8,
     max_depth: u8,
 ) -> Result<(AlternateAccessSelector, usize), MmsError> {
     if data.is_empty() {
@@ -1301,17 +1508,18 @@ fn decode_alt_access_member(
             let idx = decode_unsigned_int(val)? as u32;
             Ok((AlternateAccessSelector::Index(idx), total))
         }
+        // selectAccess.component - CONTEXT [1] IMPLICIT Identifier
+        0x81 => Ok((
+            AlternateAccessSelector::Component {
+                component: decode_component_identifier(val)?,
+                alternate_access: None,
+            },
+            total,
+        )),
         // selectAlternateAccess - CONTEXT [0] IMPLICIT SEQUENCE
-        0xa0 => {
-            let (index, component) = decode_select_alternate_access(val, max_depth)?;
-            Ok((
-                AlternateAccessSelector::IndexComponent { index, component },
-                total,
-            ))
-        }
-        // selectAccess.component / indexRange / allElements not in scope
-        0x81 => Err(MmsError::AlternateAccessUnsupported(
-            "selectAccess.component (component-only) is not supported",
+        0xa0 => Ok((
+            decode_select_alternate_access(val, depth, max_depth)?,
+            total,
         )),
         0xa3 => Err(MmsError::AlternateAccessUnsupported(
             "selectAccess.indexRange is not supported",
@@ -1328,32 +1536,50 @@ fn decode_alt_access_member(
     }
 }
 
-/// Decode the body of `selectAlternateAccess `[0]` IMPLICIT SEQUENCE`.
-/// Expects exactly two members: `accessSelection.index` (`[1]` IMPLICIT
-/// Unsigned32) followed by a nested `AlternateAccess` carrying the
-/// component chain, which nests at most `max_depth` levels.
-fn decode_select_alternate_access(data: &[u8], max_depth: u8) -> Result<(u32, String), MmsError> {
-    // accessSelection.index [1] IMPLICIT Unsigned32
+/// Decode the body of `selectAlternateAccess `[0]` IMPLICIT SEQUENCE` at nesting
+/// level `depth`: an `accessSelection` followed by the nested `AlternateAccess`
+/// one level deeper.
+///
+/// `accessSelection.index` must be followed by a component chain alone, which
+/// becomes [`AlternateAccessSelector::IndexComponent`];
+/// `accessSelection.component` may be followed by any supported access, which
+/// becomes [`AlternateAccessSelector::Component`].
+fn decode_select_alternate_access(
+    data: &[u8],
+    depth: u8,
+    max_depth: u8,
+) -> Result<AlternateAccessSelector, MmsError> {
     if data.is_empty() {
         return Err(MmsError::TruncatedPdu);
     }
-    if data[0] != 0x81 {
+    let selection_tag = data[0];
+    if selection_tag != 0x80 && selection_tag != 0x81 {
         return Err(MmsError::AlternateAccessUnsupported(
-            "selectAlternateAccess: only accessSelection.index is supported",
+            "selectAlternateAccess: indexRange and allElements are not supported",
         ));
     }
-    let (idx_len, idx_hdr) = decode_length(&data[1..])?;
-    let idx_start = 1 + idx_hdr;
-    let idx_end = idx_start + idx_len;
-    if idx_end > data.len() {
+    let (sel_len, sel_hdr) = decode_length(&data[1..])?;
+    let sel_start = 1 + sel_hdr;
+    let sel_end = sel_start + sel_len;
+    if sel_end > data.len() {
         return Err(MmsError::TruncatedPdu);
     }
-    let index = decode_unsigned_int(&data[idx_start..idx_end])? as u32;
-
-    // Nested AlternateAccess carrying the component chain (SEQUENCE OF, 0x30).
-    let tail = &data[idx_end..];
-    let component = decode_component_chain_sequence(tail, 1, max_depth)?;
-    Ok((index, component))
+    let selection = &data[sel_start..sel_end];
+    let tail = &data[sel_end..];
+    if selection_tag == 0x81 {
+        // accessSelection.index [1] IMPLICIT Unsigned32
+        let index = decode_unsigned_int(selection)? as u32;
+        let component = decode_component_chain_sequence(tail, depth + 1, max_depth)?;
+        Ok(AlternateAccessSelector::IndexComponent { index, component })
+    } else {
+        // accessSelection.component [0] IMPLICIT Identifier
+        let component = decode_component_identifier(selection)?;
+        let nested = decode_nested_alt_access(tail, depth + 1, max_depth)?;
+        Ok(AlternateAccessSelector::Component {
+            component,
+            alternate_access: Some(Box::new(nested)),
+        })
+    }
 }
 
 /// Decode a component chain wrapped in `0x30 <len>` SEQUENCE OF.
@@ -1369,33 +1595,8 @@ fn decode_component_chain_sequence(
     depth: u8,
     max_depth: u8,
 ) -> Result<String, MmsError> {
-    if depth > max_depth {
-        tracing::warn!(
-            "alternateaccess nesting depth {} exceeds the effective cap {} (local cap {})",
-            depth,
-            max_depth,
-            MAX_DATA_NESTING_DEPTH
-        );
-        return Err(MmsError::NestingLevelExceeded {
-            max: max_depth,
-            got: depth,
-        });
-    }
-    if data.is_empty() {
-        return Err(MmsError::TruncatedPdu);
-    }
-    if data[0] != 0x30 {
-        return Err(MmsError::InvalidTag {
-            expected: 0x30,
-            actual: data[0],
-        });
-    }
-    let (inner_len, hdr) = decode_length(&data[1..])?;
-    let inner_start = 1 + hdr;
-    if inner_start + inner_len > data.len() {
-        return Err(MmsError::TruncatedPdu);
-    }
-    let inner = &data[inner_start..inner_start + inner_len];
+    check_decode_depth(depth, max_depth)?;
+    let (inner, _) = alt_access_sequence_body(data)?;
     decode_component_chain_member(inner, depth, max_depth)
 }
 
@@ -1416,18 +1617,7 @@ fn decode_component_chain_member(
     let val = &data[val_start..val_start + len];
     match tag {
         // selectAccess.component - terminal Identifier
-        0x81 => {
-            let s = core::str::from_utf8(val).map_err(|_| MmsError::InvalidUtf8)?;
-            if s.is_empty() {
-                return Err(MmsError::AlternateAccessUnsupported(
-                    "component segment is empty",
-                ));
-            }
-            if s.len() > MAX_IDENTIFIER_LEN {
-                return Err(MmsError::IdentifierTooLong { actual: s.len() });
-            }
-            Ok(s.to_owned())
-        }
+        0x81 => decode_component_identifier(val),
         // selectAlternateAccess - recurse
         0xa0 => {
             // val = accessSelection.component (0x80) + nested AlternateAccess (0x30)
@@ -1445,16 +1635,7 @@ fn decode_component_chain_member(
             if head_end > val.len() {
                 return Err(MmsError::TruncatedPdu);
             }
-            let head_bytes = &val[head_start..head_end];
-            let head = core::str::from_utf8(head_bytes).map_err(|_| MmsError::InvalidUtf8)?;
-            if head.is_empty() {
-                return Err(MmsError::AlternateAccessUnsupported(
-                    "component segment is empty",
-                ));
-            }
-            if head.len() > MAX_IDENTIFIER_LEN {
-                return Err(MmsError::IdentifierTooLong { actual: head.len() });
-            }
+            let head = decode_component_identifier(&val[head_start..head_end])?;
             let rest = decode_component_chain_sequence(&val[head_end..], depth + 1, max_depth)?;
             Ok(format!("{head}${rest}"))
         }
@@ -1490,6 +1671,28 @@ fn encode_alt_access_member(selector: &AlternateAccessSelector, buf: &mut BytesM
             encode_length(sel.len(), buf);
             buf.extend_from_slice(&sel);
         }
+        AlternateAccessSelector::Component {
+            component,
+            alternate_access: None,
+        } => {
+            buf.extend_from_slice(&[0x81]);
+            encode_length(component.len(), buf);
+            buf.extend_from_slice(component.as_bytes());
+        }
+        AlternateAccessSelector::Component {
+            component,
+            alternate_access: Some(nested),
+        } => {
+            let mut sel = BytesMut::new();
+            sel.extend_from_slice(&[0x80]);
+            encode_length(component.len(), &mut sel);
+            sel.extend_from_slice(component.as_bytes());
+            nested.encode(&mut sel);
+
+            buf.extend_from_slice(&[0xa0]);
+            encode_length(sel.len(), buf);
+            buf.extend_from_slice(&sel);
+        }
     }
 }
 
@@ -1503,6 +1706,18 @@ fn alt_access_member_len(selector: &AlternateAccessSelector) -> usize {
             let idx_n = encode_unsigned_int_minimal(*index as u64).len();
             let chain_n = component_chain_len(component);
             let inner = (1 + ber_len_size(idx_n) + idx_n) + (1 + ber_len_size(chain_n) + chain_n);
+            1 + ber_len_size(inner) + inner
+        }
+        AlternateAccessSelector::Component {
+            component,
+            alternate_access: None,
+        } => 1 + ber_len_size(component.len()) + component.len(),
+        AlternateAccessSelector::Component {
+            component,
+            alternate_access: Some(nested),
+        } => {
+            let inner =
+                (1 + ber_len_size(component.len()) + component.len()) + nested.encoded_len();
             1 + ber_len_size(inner) + inner
         }
     }
@@ -2567,6 +2782,215 @@ mod tests {
         assert!(matches!(
             AlternateAccess::index_component(0, past_cap),
             Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+        ));
+    }
+
+    // AlternateAccess component selection
+
+    /// Builds the unnamed member `selectAlternateAccess { accessSelection, nested }`.
+    fn select_alternate(selection_tag: u8, selection: &[u8], nested_member: &[u8]) -> Vec<u8> {
+        let mut sel = tlv(selection_tag, selection);
+        sel.extend_from_slice(&tlv(0x30, nested_member));
+        tlv(0xa0, &sel)
+    }
+
+    /// Builds `AlternateAccess` bytes for a chain of `segments` one-letter
+    /// components, each nested one level inside the previous one.
+    fn component_only_chain(segments: usize) -> Vec<u8> {
+        let mut member = tlv(0x81, b"a");
+        for _ in 1..segments {
+            member = select_alternate(0x80, b"a", &member);
+        }
+        tlv(0x30, &member)
+    }
+
+    #[test]
+    fn alt_access_component_single_byte_exact() {
+        let aa = AlternateAccess::component("GoEna").unwrap();
+        let mut buf = BytesMut::new();
+        aa.encode(&mut buf);
+        let expected = [0x30, 0x07, 0x81, 0x05, b'G', b'o', b'E', b'n', b'a'];
+        assert_eq!(&buf[..], &expected[..]);
+        assert_eq!(aa.encoded_len(), expected.len());
+        let (decoded, consumed) = AlternateAccess::decode(&expected).unwrap();
+        assert_eq!(consumed, expected.len());
+        assert_eq!(decoded, aa);
+        assert_eq!(decoded.leading_components(), (vec!["GoEna"], None));
+    }
+
+    #[test]
+    fn alt_access_component_chain_byte_exact() {
+        let aa = AlternateAccess::component("a$b").unwrap();
+        let mut buf = BytesMut::new();
+        aa.encode(&mut buf);
+        let expected = [
+            0x30, 0x0a, // AlternateAccess SEQUENCE OF
+            0xa0, 0x08, // selectAlternateAccess
+            0x80, 0x01, b'a', // accessSelection.component
+            0x30, 0x03, // nested AlternateAccess
+            0x81, 0x01, b'b', // selectAccess.component
+        ];
+        assert_eq!(&buf[..], &expected[..]);
+        assert_eq!(aa.encoded_len(), expected.len());
+        assert_eq!(AlternateAccess::decode(&expected).unwrap().0, aa);
+        assert_eq!(aa.nesting_depth(), 1);
+    }
+
+    /// The chain of IEC 61850-8-1 §24.2.2.4.1.3 Table 139: components, an
+    /// array index, then components inside the element.
+    #[test]
+    fn alt_access_table_139_chain_round_trips() {
+        let inner = tlv(0x81, b"f");
+        let inner = select_alternate(0x80, b"mag", &inner);
+        let inner = select_alternate(0x80, b"cVal", &inner);
+        let inner = select_alternate(0x81, &[0x07], &inner);
+        let inner = select_alternate(0x80, b"phsAHar", &inner);
+        let inner = select_alternate(0x80, b"HA", &inner);
+        let member = select_alternate(0x80, b"MX", &inner);
+        let wire = tlv(0x30, &member);
+
+        let built = AlternateAccess::component_then(
+            "MX$HA$phsAHar",
+            AlternateAccess::index_component(7, "cVal$mag$f").unwrap(),
+        )
+        .unwrap();
+        let mut buf = BytesMut::new();
+        built.encode(&mut buf);
+        assert_eq!(&buf[..], &wire[..]);
+        assert_eq!(built.encoded_len(), wire.len());
+
+        let (decoded, consumed) = AlternateAccess::decode(&wire).unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(decoded, built);
+        let (components, rest) = decoded.leading_components();
+        assert_eq!(components, vec!["MX", "HA", "phsAHar"]);
+        assert_eq!(
+            rest.map(|r| &r.selector),
+            Some(&AlternateAccessSelector::IndexComponent {
+                index: 7,
+                component: "cVal$mag$f".into(),
+            })
+        );
+        assert_eq!(decoded.nesting_depth(), 6);
+    }
+
+    #[test]
+    fn alt_access_component_then_index_round_trips() {
+        let aa = AlternateAccess::component_then("phsAHar", AlternateAccess::index(3)).unwrap();
+        let mut buf = BytesMut::new();
+        aa.encode(&mut buf);
+        let decoded = AlternateAccess::decode(&buf).unwrap().0;
+        assert_eq!(decoded, aa);
+        let (components, rest) = decoded.leading_components();
+        assert_eq!(components, vec!["phsAHar"]);
+        assert_eq!(rest, Some(&AlternateAccess::index(3)));
+    }
+
+    #[test]
+    fn alt_access_index_has_no_leading_components() {
+        let aa = AlternateAccess::index_component(1, "stVal").unwrap();
+        assert_eq!(aa.leading_components(), (Vec::<&str>::new(), Some(&aa)));
+    }
+
+    #[test]
+    fn alt_access_component_builder_rejects_malformed_paths() {
+        assert!(matches!(
+            AlternateAccess::component(""),
+            Err(MmsError::AlternateAccessUnsupported(_))
+        ));
+        assert!(matches!(
+            AlternateAccess::component("a$$b"),
+            Err(MmsError::AlternateAccessUnsupported(_))
+        ));
+        assert!(matches!(
+            AlternateAccess::component("x".repeat(MAX_IDENTIFIER_LEN + 1)),
+            Err(MmsError::IdentifierTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn alt_access_component_chain_at_depth_cap_ok() {
+        let segments = usize::from(MAX_DATA_NESTING_DEPTH) + 1;
+        let bytes = component_only_chain(segments);
+        let (aa, consumed) = AlternateAccess::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(aa.leading_components(), (vec!["a"; segments], None));
+
+        let built = AlternateAccess::component(vec!["a"; segments].join("$")).unwrap();
+        assert_eq!(built, aa);
+    }
+
+    #[test]
+    fn alt_access_component_chain_past_depth_cap_rejected() {
+        let segments = usize::from(MAX_DATA_NESTING_DEPTH) + 2;
+        assert!(matches!(
+            AlternateAccess::decode(&component_only_chain(segments)),
+            Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+        ));
+        assert!(matches!(
+            AlternateAccess::component(vec!["a"; segments].join("$")),
+            Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+        ));
+        assert!(matches!(
+            AlternateAccess::component_then(
+                vec!["a"; usize::from(MAX_DATA_NESTING_DEPTH)].join("$"),
+                AlternateAccess::index_component(0, "b").unwrap(),
+            ),
+            Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+        ));
+    }
+
+    #[test]
+    fn alt_access_component_chain_bounded_by_negotiated_level() {
+        let bytes = component_only_chain(4);
+        assert!(AlternateAccess::decode_with_negotiated_cap(&bytes, Some(3)).is_ok());
+        assert!(matches!(
+            AlternateAccess::decode_with_negotiated_cap(&bytes, Some(2)),
+            Err(MmsError::NestingLevelExceeded { max: 2, got: 3 })
+        ));
+    }
+
+    /// A component chain thousands of levels deep stops at the cap without
+    /// exhausting a small stack.
+    #[test]
+    fn alt_access_component_depth_bomb_rejected() {
+        let bomb = component_only_chain(5000);
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || AlternateAccess::decode(&bomb))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(MmsError::NestingLevelExceeded { max: 32, got: 33 })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn alt_access_component_rejects_trailing_data_after_nested_access() {
+        let mut sel = tlv(0x80, b"a");
+        sel.extend_from_slice(&tlv(0x30, &tlv(0x81, b"b")));
+        sel.extend_from_slice(&[0x05, 0x00]);
+        let bytes = tlv(0x30, &tlv(0xa0, &sel));
+        assert!(matches!(
+            AlternateAccess::decode(&bytes),
+            Err(MmsError::AlternateAccessUnsupported(_))
+        ));
+    }
+
+    #[test]
+    fn alt_access_select_alternate_rejects_index_range() {
+        let bytes = tlv(
+            0x30,
+            &select_alternate(0xa2, &[0x80, 0x01, 0x00], &tlv(0x81, b"b")),
+        );
+        assert!(matches!(
+            AlternateAccess::decode(&bytes),
+            Err(MmsError::AlternateAccessUnsupported(_))
         ));
     }
 }

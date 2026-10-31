@@ -686,6 +686,12 @@ pub fn apply_alt_access(result: AccessResult, alt: &AlternateAccess) -> AccessRe
                 Err(e) => AccessResult::Failure(e),
             }
         }
+        _ => {
+            tracing::warn!(
+                "alternate-access: only an index selection applies here; leading components are resolved by name before the read"
+            );
+            AccessResult::Failure(DataAccessError::ObjectAccessUnsupported)
+        }
     }
 }
 
@@ -756,6 +762,13 @@ pub fn apply_alt_access_typed(
         AlternateAccessSelector::Index(i) => (*i, None),
         AlternateAccessSelector::IndexComponent { index, component } => {
             (*index, Some(component.as_str()))
+        }
+        _ => {
+            tracing::warn!(
+                da = %da.name,
+                "alternate-access: only an index selection applies here; leading components are resolved by name before the read"
+            );
+            return AccessResult::Failure(DataAccessError::ObjectAccessUnsupported);
         }
     };
     let i = index as usize;

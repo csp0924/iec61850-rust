@@ -101,7 +101,16 @@ pub(crate) fn member_from_entry(entry: &ListOfVariableEntry) -> Result<DataSetMe
         path = segments[SEG_FIRST_PATH..].join(".")
     );
 
-    match entry.alt_access.as_ref().map(|aa| &aa.selector) {
+    let mut remaining = entry.alt_access.as_ref();
+    if let Some(aa) = remaining {
+        let (components, rest) = aa.leading_components();
+        for seg in components {
+            reference.push('.');
+            reference.push_str(seg);
+        }
+        remaining = rest;
+    }
+    match remaining.map(|aa| &aa.selector) {
         None => {}
         Some(AlternateAccessSelector::Index(index)) => {
             reference.push_str(&format!("({index})"));
@@ -117,6 +126,11 @@ pub(crate) fn member_from_entry(entry: &ListOfVariableEntry) -> Result<DataSetMe
                 reference.push('.');
                 reference.push_str(seg);
             }
+        }
+        Some(_) => {
+            return Err(ClientError::InvalidArgument(format!(
+                "data set member '{domain}/{item_id}' carries an alternate access this client does not map"
+            )));
         }
     }
 
@@ -248,6 +262,24 @@ mod tests {
         let arr = path.array.expect("array element");
         assert_eq!(arr.index, 3);
         assert_eq!(arr.component.as_deref(), Some("q$stVal"));
+    }
+
+    #[test]
+    fn maps_component_alternate_access_to_iec_path() {
+        let entry = ListOfVariableEntry::with_alt_access(
+            ObjectName::DomainSpecific {
+                domain_id: "IED1LD0".to_string(),
+                item_id: "MHAI1$MX$HA".to_string(),
+            },
+            AlternateAccess::component_then(
+                "phsAHar",
+                AlternateAccess::index_component(7, "cVal$mag$f").expect("selector"),
+            )
+            .expect("selector"),
+        );
+        let m = member_from_entry(&entry).expect("map");
+        assert_eq!(m.reference, "IED1LD0/MHAI1.HA.phsAHar(7).cVal.mag.f");
+        assert_eq!(m.fc, FC::Mx);
     }
 
     #[test]
