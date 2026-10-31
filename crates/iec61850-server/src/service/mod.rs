@@ -1767,7 +1767,7 @@ fn dispatch_write(
                 error = %e,
                 "write request failed to decode, answering confirmed-error"
             );
-            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
+            return make_confirmed_error(invoke_id, decode_failure_class(&e));
         }
     };
 
@@ -2002,7 +2002,7 @@ fn dispatch_write(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(invoke_id, error = %e, "write request failed to decode, answering confirmed-error");
-            return make_confirmed_error(invoke_id, ErrorClass::Access(access::OTHER));
+            return make_confirmed_error(invoke_id, decode_failure_class(&e));
         }
     };
     let entries = match &req.variable_access_spec {
@@ -3590,6 +3590,22 @@ pub(crate) fn make_confirmed_error_pub(
     error_class: ErrorClass,
 ) -> ConfirmedResponse {
     make_confirmed_error(invoke_id, error_class)
+}
+
+/// The error class a request that failed to decode is answered with.
+///
+/// A list longer than the decoder accepts asks for more variables than the
+/// server handles in one request: `resource` `capability-unavailable`
+/// (IEC 61850-8-1 §8.1.3.4.3.4). Any other decoding failure is `access`
+/// `other`.
+pub(crate) fn decode_failure_class(error: &iec61850_mms::MmsError) -> ErrorClass {
+    match error {
+        iec61850_mms::MmsError::TooManyDefineEntries { .. }
+        | iec61850_mms::MmsError::TooManyWriteItems { .. } => {
+            ErrorClass::Resource(resource::CAPABILITY_UNAVAILABLE)
+        }
+        _ => ErrorClass::Access(access::OTHER),
+    }
 }
 
 fn make_confirmed_error(invoke_id: u32, error_class: ErrorClass) -> ConfirmedResponse {

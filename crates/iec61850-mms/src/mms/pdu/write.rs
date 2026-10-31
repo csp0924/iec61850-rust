@@ -29,7 +29,8 @@
 //! - The number of outcomes in a response must equal the number of items requested.
 //! - A failure outcome carries a properly encoded BER INTEGER; the DataAccessError
 //!   codes 0 to 11 all fit in one byte.
-//! - At most 100 items may be written in one request; more are rejected.
+//! - At most [`MAX_WRITE_ITEMS`] items may be written in one request; more are
+//!   rejected with [`MmsError::TooManyWriteItems`].
 
 use super::super::error::MmsError;
 use super::common::{
@@ -45,8 +46,14 @@ use bytes::BytesMut;
 /// Tag of Write inside the ConfirmedService CHOICE.
 pub const SERVICE_TAG_WRITE: u8 = 0xa5;
 
-/// Largest number of items accepted in one WriteRequest.
-pub const MAX_WRITE_ITEMS: usize = 100;
+/// Largest number of items one WriteRequest may carry.
+///
+/// The bound keeps a decoded request from growing without limit and is also
+/// the number of items a server writes in one request; a server answers a
+/// request beyond it with `resource` `capability-unavailable`. It exceeds the
+/// largest data set a client can create, so SetDataSetValues reaches every
+/// member of any data set CreateDataSet accepts.
+pub const MAX_WRITE_ITEMS: usize = 4096;
 
 // WriteRequest
 
@@ -661,11 +668,13 @@ mod tests {
     #[test]
     fn write_request_too_many_items_err() {
         use crate::mms::pdu::common::VariableAccessSpecification;
-        // 101 items, one past MAX_WRITE_ITEMS
-        let entries: Vec<super::super::common::ListOfVariableEntry> = (0..=100)
+        // one item past MAX_WRITE_ITEMS
+        let entries: Vec<super::super::common::ListOfVariableEntry> = (0..=MAX_WRITE_ITEMS)
             .map(|i| ObjectName::VmdSpecific(format!("V{}", i)).into())
             .collect();
-        let data: Vec<MmsData> = (0..=100).map(|_| MmsData::Boolean(true)).collect();
+        let data: Vec<MmsData> = (0..=MAX_WRITE_ITEMS)
+            .map(|_| MmsData::Boolean(true))
+            .collect();
         let req = WriteRequest {
             variable_access_spec: VariableAccessSpecification::ListOfVariable(entries),
             list_of_data: data,
@@ -686,7 +695,28 @@ mod tests {
         buf.extend_from_slice(&inner);
 
         let result = WriteRequest::decode(&buf);
-        assert!(matches!(result, Err(MmsError::TooManyWriteItems { .. })));
+        assert!(matches!(
+            result,
+            Err(MmsError::TooManyWriteItems { count }) if count == MAX_WRITE_ITEMS + 1
+        ));
+    }
+
+    #[test]
+    fn write_request_at_the_item_limit_decodes() {
+        use crate::mms::pdu::common::VariableAccessSpecification;
+        let req = WriteRequest {
+            variable_access_spec: VariableAccessSpecification::VariableListName(
+                ObjectName::DomainSpecific {
+                    domain_id: "D".into(),
+                    item_id: "LLN0$ds".into(),
+                },
+            ),
+            list_of_data: vec![MmsData::Boolean(true); MAX_WRITE_ITEMS],
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        let decoded = WriteRequest::decode(&buf).expect("the limit itself is accepted");
+        assert_eq!(decoded.list_of_data.len(), MAX_WRITE_ITEMS);
     }
 
     // A nesting depth bomb inside listOfData

@@ -8,7 +8,7 @@
 //! - the variableListName path
 //! - WriteResponse outcomes: success, failure and a mixture
 //! - a mismatch between the access specification and listOfData, which is rejected
-//! - more than MAX_WRITE_ITEMS, that is 100, which is rejected
+//! - more than MAX_WRITE_ITEMS, which is rejected
 //! - a nesting depth bomb inside listOfData
 //! - decode_with_expected_count, which requires the outcome count to match
 
@@ -305,11 +305,11 @@ fn write_request_vaspec_data_count_mismatch_err() {
     );
 }
 
-// more than MAX_WRITE_ITEMS, that is 100
+// more than MAX_WRITE_ITEMS
 
 #[test]
-fn write_request_101_items_too_many_err() {
-    const N: usize = MAX_WRITE_ITEMS + 1; // 101
+fn write_request_one_item_past_the_limit_too_many_err() {
+    const N: usize = MAX_WRITE_ITEMS + 1;
     let names: Vec<ObjectName> = (0..N)
         .map(|i| ObjectName::VmdSpecific(format!("V{:03}", i)))
         .collect();
@@ -378,8 +378,8 @@ fn write_request_101_items_too_many_err() {
 
     let result = WriteRequest::decode(&buf);
     assert!(
-        matches!(result, Err(MmsError::TooManyWriteItems { count: 101, .. })),
-        "101 items must return TooManyWriteItems, got: {:?}",
+        matches!(result, Err(MmsError::TooManyWriteItems { count, .. }) if count == N),
+        "{N} items must return TooManyWriteItems, got: {:?}",
         result
     );
 }

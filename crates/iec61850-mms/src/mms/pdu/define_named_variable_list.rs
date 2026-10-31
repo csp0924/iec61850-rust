@@ -60,8 +60,15 @@ const TAG_VAR_SPEC_NAME: u8 = 0xa0;
 /// The UNIVERSAL 16 CONSTRUCTED SEQUENCE tag.
 const TAG_SEQUENCE: u8 = 0x30;
 
-/// Largest number of entries accepted, matching the WriteRequest limit.
-pub const MAX_DEFINE_ENTRIES: usize = 100;
+/// Largest number of entries a request may carry, in either direction.
+///
+/// The bound keeps a decoded request from growing without limit. A server
+/// enforces its own limit on the members of a data set, which is never above
+/// this one; a request beyond either is a request for more variables than the
+/// server allows, answered with `resource` `capability-unavailable`
+/// (IEC 61850-8-1 §8.1.3.4.3.4). The decoder reports this bound as
+/// [`MmsError::TooManyDefineEntries`] so the service can answer that error.
+pub const MAX_DEFINE_ENTRIES: usize = 4096;
 
 // Request
 
@@ -546,6 +553,48 @@ mod tests {
         let mut buf = BytesMut::new();
         let err = req.encode(&mut buf).unwrap_err();
         assert!(matches!(err, MmsError::TooManyDefineEntries { .. }));
+    }
+
+    #[test]
+    fn entries_up_to_the_limit_round_trip() {
+        let entries: Vec<_> = (0..MAX_DEFINE_ENTRIES)
+            .map(|i| DefineNamedVariableEntry::domain("D", format!("i{i}")))
+            .collect();
+        let req = DefineNamedVariableListRequest::domain("D", "LLN0$ds", entries);
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+        let decoded = DefineNamedVariableListRequest::decode(&buf).unwrap();
+        assert_eq!(decoded.list_of_variable.len(), MAX_DEFINE_ENTRIES);
+    }
+
+    #[test]
+    fn too_many_entries_rejected_at_decode() {
+        let mut list = BytesMut::new();
+        for i in 0..=MAX_DEFINE_ENTRIES {
+            encode_member(
+                &DefineNamedVariableEntry::domain("D", format!("i{i}")),
+                &mut list,
+            );
+        }
+        let mut inner = BytesMut::new();
+        ObjectName::DomainSpecific {
+            domain_id: "D".into(),
+            item_id: "LLN0$ds".into(),
+        }
+        .encode(&mut inner);
+        inner.extend_from_slice(&[TAG_LIST_OF_VARIABLE]);
+        encode_length(list.len(), &mut inner);
+        inner.extend_from_slice(&list);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST]);
+        encode_length(inner.len(), &mut buf);
+        buf.extend_from_slice(&inner);
+
+        let err = DefineNamedVariableListRequest::decode(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            MmsError::TooManyDefineEntries { count } if count == MAX_DEFINE_ENTRIES + 1
+        ));
     }
 
     #[test]

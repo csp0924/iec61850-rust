@@ -243,6 +243,10 @@ name = "data_model_services_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "list_limits_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "data_set_fcd_e2e"
 required-features = ["full-server"]
 

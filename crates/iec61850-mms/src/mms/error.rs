@@ -129,8 +129,12 @@ pub enum MmsError {
         actual: usize,
     },
 
-    /// A WriteRequest carries more than the 100 items accepted.
-    #[error("write item count {count} exceeds the limit of 100")]
+    /// A WriteRequest carries more than the
+    /// [`MAX_WRITE_ITEMS`](crate::mms::pdu::MAX_WRITE_ITEMS) items accepted.
+    #[error(
+        "write item count {count} exceeds the limit of {limit}",
+        limit = crate::mms::pdu::MAX_WRITE_ITEMS
+    )]
     #[non_exhaustive]
     TooManyWriteItems {
         /// Number of items requested.
@@ -194,8 +198,13 @@ pub enum MmsError {
     #[error("definenamedvariablelist is missing a field: {0}")]
     DefineNamedVariableListMissingField(&'static str),
 
-    /// A DefineNamedVariableList request carries more than the 100 entries accepted.
-    #[error("definenamedvariablelist entry count {count} exceeds the limit of 100")]
+    /// A DefineNamedVariableList request carries more than the
+    /// [`MAX_DEFINE_ENTRIES`](crate::mms::pdu::MAX_DEFINE_ENTRIES) entries
+    /// accepted.
+    #[error(
+        "definenamedvariablelist entry count {count} exceeds the limit of {limit}",
+        limit = crate::mms::pdu::MAX_DEFINE_ENTRIES
+    )]
     #[non_exhaustive]
     TooManyDefineEntries {
         /// Number of entries requested.

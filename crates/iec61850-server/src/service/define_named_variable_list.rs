@@ -153,7 +153,7 @@ pub(crate) fn handle_define_named_variable_list(
             );
             return crate::service::make_confirmed_error_pub(
                 invoke_id,
-                ErrorClass::Access(access::OTHER),
+                crate::service::decode_failure_class(&e),
             );
         }
     };

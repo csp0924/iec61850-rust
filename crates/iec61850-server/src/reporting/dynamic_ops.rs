@@ -115,8 +115,19 @@ pub struct DatasetMeta {
     pub entry_count: usize,
 }
 
+const _: () = assert!(
+    iec61850_mms::mms::pdu::MAX_DEFINE_ENTRIES >= DynamicDatasetOps::MAX_MEMBERS,
+    "a request at the member limit must decode"
+);
+
 impl DynamicDatasetOps {
     /// Largest number of members of a data set created at run time.
+    ///
+    /// A DefineNamedVariableList request decodes with up to
+    /// [`MAX_DEFINE_ENTRIES`](iec61850_mms::mms::pdu::MAX_DEFINE_ENTRIES)
+    /// members, which is never fewer, so a request at this limit always
+    /// reaches the service; one with more members than this is answered
+    /// `resource` `capability-unavailable` whichever limit refuses it.
     pub const MAX_MEMBERS: usize = 1024;
 
     /// Largest number of leaves, summed over its members, of a data set created
