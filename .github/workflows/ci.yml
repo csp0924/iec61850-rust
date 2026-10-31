@@ -54,6 +54,99 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The wire tests (`*_e2e` binaries and the TLS handshake tests) again, with the
+  # TLS paths of the client and the MMS stack compiled in, so that a secure
+  # association runs end to end against the server of this workspace.
+  e2e:
+    name: e2e over TLS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run the wire tests with TLS enabled
+        run: >-
+          cargo nextest run --workspace
+          --features iec61850-client/tls,iec61850-mms/tls
+          -E "binary(/_e2e$/) | binary(/tls/)"
+
+  # The raw Ethernet backends, and GOOSE and SV publishers and subscribers of
+  # this workspace, over a veth pair. The tests need CAP_NET_RAW, so they are
+  # built as the runner user and their binaries run under sudo.
+  l2:
+    name: L2 over veth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Create the veth pair
+        run: |
+          sudo ip link add vf0 type veth peer name vf1
+          sudo sysctl -w net.ipv6.conf.vf0.disable_ipv6=1 net.ipv6.conf.vf1.disable_ipv6=1
+          sudo ip link set vf0 up
+          sudo ip link set vf1 up
+
+      - name: Run the ignored veth tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_ignored() {
+            cargo test --no-run --message-format=json "$@" \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
+              | while read -r exe; do
+                  sudo IEC61850_VETH=vf0,vf1 "$exe" --ignored --test-threads=1
+                done
+          }
+          run_ignored -p iec61850-hal --features ethernet-linux-afpacket --test afpacket_veth
+          run_ignored -p iec61850-hal --features ethernet-pcap --test pcap_veth
+          run_ignored -p iec61850-goose --test afpacket_veth
+          run_ignored -p iec61850-sv --test afpacket_veth
+
+  embedded:
+    name: thumbv7em-none-eabihf
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the no_std crates
+        run: |
+          cargo check -p iec61850-asn1   --target thumbv7em-none-eabihf --no-default-features --features alloc
+          cargo check -p iec61850-model  --target thumbv7em-none-eabihf --no-default-features --features embedded
+          cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features alloc,transport
+          cargo check -p iec61850-hal    --target thumbv7em-none-eabihf --no-default-features --features transport-embassy
+          cargo check -p iec61850-mms    --target thumbv7em-none-eabihf --no-default-features --features embedded
+          cargo check -p iec61850-client --target thumbv7em-none-eabihf --no-default-features --features minimal,embedded
+          cargo check -p iec61850-client --target thumbv7em-none-eabihf --no-default-features --features embedded,reporting,control,datasets
+          cargo check -p iec61850-server --target thumbv7em-none-eabihf --no-default-features --features minimal,embedded
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
