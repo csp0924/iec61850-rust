@@ -211,7 +211,9 @@ pub struct Brcb {
     pub name: String,
     /// Initial RptID; when empty, `"<LD>/<LN>$BR$<name>"` is used.
     pub rpt_id: String,
-    /// Referenced data set name.
+    /// Referenced data set name, `"<LN>$<dsName>"` or an absolute reference; the
+    /// DatSet attribute carries it qualified with the domain of the control
+    /// block.
     pub dataset_name: String,
     /// Initial ConfRev.
     pub conf_rev: u32,
@@ -333,7 +335,9 @@ pub struct BrcbState {
     pub rpt_id: String,
     /// RptEna: whether reporting is enabled.
     pub rpt_ena: bool,
-    /// DatSet: the name of the data set in use.
+    /// DatSet: the name of the data set in use, as the attribute and the reports
+    /// carry it. `BufferedReportControl::new` qualifies it with the domain of the
+    /// control block, per IEC 61850-8-1 §8.1.3.2.2.
     pub dat_set: String,
     /// ConfRev; not writable by a client.
     pub conf_rev: u32,
@@ -627,27 +631,29 @@ pub struct BufferedReportControl {
 
 impl BufferedReportControl {
     /// Creates a BRCB backed by an in-memory report buffer.
+    ///
+    /// A data set name without a domain is qualified with the domain of
+    /// `mms_path`.
     pub fn new(mms_path: impl Into<String>, brcb: Brcb) -> Self {
-        let state = BrcbState::from_brcb(&brcb);
         let backend: Box<dyn ReportBufferBackend> =
             Box::new(InMemoryReportBuffer::new(brcb.buffer_capacity));
-        Self {
-            mms_path: mms_path.into(),
-            state: std::sync::Mutex::new(state),
-            report_buffer: std::sync::Mutex::new(backend),
-            brcb,
-        }
+        Self::with_backend(mms_path, brcb, backend)
     }
 
     /// Creates a BRCB with a caller-supplied buffer backend.
+    ///
+    /// A data set name without a domain is qualified with the domain of
+    /// `mms_path`.
     pub fn with_backend(
         mms_path: impl Into<String>,
         brcb: Brcb,
         backend: Box<dyn ReportBufferBackend>,
     ) -> Self {
-        let state = BrcbState::from_brcb(&brcb);
+        let mms_path = mms_path.into();
+        let mut state = BrcbState::from_brcb(&brcb);
+        state.dat_set = super::rcb::qualified_dat_set(&mms_path, &state.dat_set);
         Self {
-            mms_path: mms_path.into(),
+            mms_path,
             state: std::sync::Mutex::new(state),
             report_buffer: std::sync::Mutex::new(backend),
             brcb,
@@ -706,6 +712,9 @@ impl BufferedReportControl {
 
     /// The single entry point for changing BRCB configuration.
     ///
+    /// A DatSet value without a domain names a data set in the domain of the
+    /// control block and is stored qualified with it.
+    ///
     /// Changing DatSet, TrgOps, IntgPd, BufTm, or RptID to a different value purges
     /// the report buffer, per IEC 61850-8-1 Table 72, and logs a warning naming the
     /// control block, the field, and how many entries were discarded. Only a
@@ -735,11 +744,12 @@ impl BufferedReportControl {
         // Purge only when the value actually changes.
         let changed = match &field {
             BrcbConfigField::DatSet(v) => {
-                let c = state.dat_set != *v;
+                let v = super::rcb::qualified_dat_set(&self.mms_path, v);
+                let c = state.dat_set != v;
                 if c {
-                    state.dat_set = v.clone();
                     // An empty DatSet stops buffering.
                     state.is_buffering = !v.is_empty();
+                    state.dat_set = v;
                 }
                 c
             }

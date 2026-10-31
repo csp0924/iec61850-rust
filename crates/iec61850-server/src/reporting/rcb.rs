@@ -41,7 +41,9 @@ pub struct Rcb {
     pub name: String,
     /// Initial RptID; when empty, `"<LD>/<LN>$RP$<name>"` is used.
     pub rpt_id: String,
-    /// Referenced data set name, `"<LN>$<dsName>"` or an absolute reference.
+    /// Referenced data set name, `"<LN>$<dsName>"` or an absolute reference; the
+    /// DatSet attribute carries it qualified with the domain of the control
+    /// block.
     pub dataset_name: String,
     /// Initial ConfRev.
     pub conf_rev: u32,
@@ -247,7 +249,9 @@ pub struct RcbState {
     pub rpt_ena: bool,
     /// Resv: the client reservation flag, which only a URCB has.
     pub resv: bool,
-    /// DatSet: the name of the data set in use.
+    /// DatSet: the name of the data set in use, as the attribute and the reports
+    /// carry it. `ReportControl::new` qualifies it with the domain of the control
+    /// block, per IEC 61850-8-1 §8.1.3.2.2.
     pub dat_set: String,
     /// ConfRev; not writable by a client.
     pub conf_rev: u32,
@@ -356,6 +360,14 @@ impl RcbState {
     }
 }
 
+/// Returns the DatSet value of the control block at `mms_path` for the data set
+/// name `dat_set`: a name without a domain is qualified with the domain of the
+/// control block, per IEC 61850-8-1 §8.1.3.2.2.
+pub(crate) fn qualified_dat_set(mms_path: &str, dat_set: &str) -> String {
+    let domain = mms_path.split_once('/').map_or("", |(domain, _)| domain);
+    crate::service::qualified_object_reference(domain, dat_set)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ReportControl: the public runtime handle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,10 +395,14 @@ impl ReportControl {
     /// Creates a report control handle.
     ///
     /// `mms_path` has the form `"<domain>/<LN>$RP$<rcb_name>"`, without a field name.
+    /// A data set name without a domain is qualified with the domain of
+    /// `mms_path`.
     pub fn new(mms_path: impl Into<String>, rcb: Rcb) -> Self {
-        let state = RcbState::from_rcb(&rcb);
+        let mms_path = mms_path.into();
+        let mut state = RcbState::from_rcb(&rcb);
+        state.dat_set = qualified_dat_set(&mms_path, &state.dat_set);
         Self {
-            mms_path: mms_path.into(),
+            mms_path,
             state: std::sync::Mutex::new(state),
             metrics: RcbMetrics::new(),
             rcb,

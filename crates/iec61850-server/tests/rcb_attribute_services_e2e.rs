@@ -457,3 +457,93 @@ async fn brcb_on_sqlite_exposes_its_newest_entry() {
         MmsData::BinaryTime(time_of_entry)
     );
 }
+
+/// DatSet reads back as `<LD>/<LN>$<data set>` on both control blocks, alone and
+/// in a whole-block read, and reports carry the same name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dat_set_carries_the_logical_device() {
+    const QUALIFIED: &str = "IED1LD0/LLN0$dsPos";
+    let f = start().await;
+    let mut mms = f.connect().await;
+    assert_eq!(
+        read_urcb(&mut mms, "DatSet").await,
+        MmsData::VisibleString(QUALIFIED.into())
+    );
+    assert_eq!(
+        read_brcb(&mut mms, "DatSet").await,
+        MmsData::VisibleString(QUALIFIED.into())
+    );
+    let MmsData::Structure(members) = mms.read(DOMAIN, BRCB_ITEM).await.expect("read BRCB") else {
+        panic!("a BRCB reads as a structure");
+    };
+    assert_eq!(members[2], MmsData::VisibleString(QUALIFIED.into()));
+    let MmsData::Structure(members) = mms.read(DOMAIN, URCB_ITEM).await.expect("read URCB") else {
+        panic!("a URCB reads as a structure");
+    };
+    assert_eq!(members[3], MmsData::VisibleString(QUALIFIED.into()));
+
+    let opt_flds = OptFlds::SEQ_NUM | OptFlds::DATA_SET;
+    let [padding, data @ ..] = opt_flds.to_ber_bit_string();
+    write_urcb(&mut mms, "Resv", MmsData::Boolean(true))
+        .await
+        .expect("reserve");
+    for item in [URCB_ITEM, BRCB_ITEM] {
+        mms.write(
+            DOMAIN,
+            &format!("{item}$OptFlds"),
+            MmsData::BitString {
+                padding,
+                data: data.to_vec(),
+            },
+        )
+        .await
+        .expect("write OptFlds");
+        mms.write(DOMAIN, &format!("{item}$RptEna"), MmsData::Boolean(true))
+            .await
+            .expect("enable");
+    }
+    f.set_st_val(2);
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let report = next_report(&mut mms).await;
+        assert_eq!(report.data_set_name.as_deref(), Some(QUALIFIED));
+        seen.push(report.rpt_id);
+    }
+    seen.sort();
+    assert_eq!(seen, [BRCB_PATH, URCB_PATH]);
+}
+
+/// The client reads DatSet and writes it back unchanged: the server takes the
+/// qualified name it reported, the data set stays bound, and ConfRev does not
+/// move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_writes_back_the_dat_set_it_read() {
+    use iec61850_client::rcb::RcbWriteMask;
+    use iec61850_client::IedConnection;
+    let f = start().await;
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", f.handle.bound_addr.port())
+        .await
+        .expect("connect");
+    for path in [URCB_PATH, BRCB_PATH] {
+        let mut rcb = conn.get_rcb_values(path).await.expect("get_rcb_values");
+        assert_eq!(rcb.data_set_reference(), Some("IED1LD0/LLN0$dsPos"));
+        rcb.set_resv(true);
+        let mask = if rcb.is_buffered() {
+            RcbWriteMask::DAT_SET
+        } else {
+            RcbWriteMask::RESV | RcbWriteMask::DAT_SET
+        };
+        conn.set_rcb_values(&rcb, mask, false)
+            .await
+            .expect("write DatSet back");
+        let after = conn.get_rcb_values(path).await.expect("get_rcb_values");
+        assert_eq!(after.data_set_reference(), Some("IED1LD0/LLN0$dsPos"));
+        assert_eq!(after.conf_rev(), 1);
+    }
+}

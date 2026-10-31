@@ -17,7 +17,9 @@
 //! A DatSet write must name a data set the server knows; a name it does not
 //! know is refused with ObjectValueInvalid. An accepted DatSet write binds the
 //! control block to the members of the named data set, for URCBs and BRCBs
-//! alike.
+//! alike. DatSet reads back as the fully qualified `<domain>/<LN>$<name>` of
+//! IEC 61850-8-1 §8.1.3.2.2; a write may name the data set either that way or
+//! without the domain, which then means the domain of the control block.
 
 use super::engine::ReportingEngine;
 use crate::connection::ConnectionId;
@@ -352,7 +354,7 @@ pub fn handle_set_rcb_field(
         }
         RcbField::DatSet => {
             let s = match value {
-                RcbWriteValue::VisibleString(s) => s,
+                RcbWriteValue::VisibleString(s) => super::rcb::qualified_dat_set(mms_path, &s),
                 _ => return Err(DataAccessError::TypeInconsistent),
             };
             if s != state.dat_set {
@@ -1048,7 +1050,7 @@ fn set_brcb_dat_set(
     value: RcbWriteValue,
 ) -> Option<Result<(), DataAccessError>> {
     let s = match value {
-        RcbWriteValue::VisibleString(s) => s,
+        RcbWriteValue::VisibleString(s) => super::rcb::qualified_dat_set(&brcb.mms_path, &s),
         _ => return Some(Err(DataAccessError::TypeInconsistent)),
     };
     if s.len() > 129 {
@@ -1334,7 +1336,7 @@ mod tests {
             get,
             Some(iec61850_mms::mms::pdu::common::AccessResult::Success(
                 iec61850_mms::mms::pdu::common::MmsData::VisibleString(ref v)
-            )) if v == "GGIO1$ds1"
+            )) if v == "IED1LD0/GGIO1$ds1"
         ));
         assert_eq!(
             urcb_dataset_refs(&engine, &path),
@@ -1417,7 +1419,7 @@ mod tests {
         );
         assert_eq!(res, Some(Err(DataAccessError::ObjectValueInvalid)));
         let b = engine.lock().unwrap().get_brcb(&path).unwrap();
-        assert_eq!(b.state.lock().unwrap().dat_set, "MMXU1$ds1");
+        assert_eq!(b.state.lock().unwrap().dat_set, "IED1LD0/MMXU1$ds1");
     }
 
     #[test]
@@ -1576,6 +1578,78 @@ mod tests {
             engine.lock().unwrap().value_index().attr_ref_for(&other),
             None
         );
+    }
+
+    fn read_dat_set(engine: &Arc<Mutex<ReportingEngine>>, path: &str) -> String {
+        use iec61850_mms::mms::pdu::common::{AccessResult, MmsData};
+        let r = if path.contains("$BR$") {
+            handle_get_brcb_field(engine, path, RcbField::DatSet)
+        } else {
+            handle_get_rcb_field(engine, path, RcbField::DatSet)
+        };
+        match r {
+            Some(AccessResult::Success(MmsData::VisibleString(v))) => v,
+            other => panic!("expected a VisibleString, got {other:?}"),
+        }
+    }
+
+    /// DatSet reads back qualified with the domain of the control block, for a
+    /// data set configured without one.
+    #[test]
+    fn dat_set_reads_back_with_the_domain() {
+        let (urcb, urcb_path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        assert_eq!(read_dat_set(&urcb, &urcb_path), "IED1LD0/GGIO1$ds1");
+        let (brcb, brcb_path) = make_engine_with_brcb("26", TriggerOptions::DATA_CHANGED);
+        assert_eq!(read_dat_set(&brcb, &brcb_path), "IED1LD0/MMXU1$ds1");
+    }
+
+    /// A DatSet write may name the data set with or without the domain; both
+    /// name the same data set, so writing the other form of the current value
+    /// changes nothing.
+    #[test]
+    fn dat_set_write_takes_either_form_of_the_name() {
+        let (engine, path) = make_engine_with_rcb("urcb01", TriggerOptions::DATA_CHANGED);
+        install_registry(&engine, &[("IED1LD0", "GGIO1$ds2", DS2_MEMBER)]);
+        let set = |value: &str| {
+            handle_set_rcb_field(
+                &engine,
+                &path,
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString(value.to_string()),
+                1,
+            )
+        };
+        handle_set_rcb_field(&engine, &path, RcbField::Resv, RcbWriteValue::Bool(true), 1).unwrap();
+        assert_eq!(set("GGIO1$ds1"), Ok(()));
+        assert_eq!(set("IED1LD0/GGIO1$ds1"), Ok(()));
+        assert_eq!(urcb_conf_rev(&engine, &path), 1, "the same data set");
+        assert_eq!(set("GGIO1$ds2"), Ok(()));
+        assert_eq!(read_dat_set(&engine, &path), "IED1LD0/GGIO1$ds2");
+        assert_eq!(set("IED1LD0/GGIO1$ds2"), Ok(()));
+        assert_eq!(urcb_conf_rev(&engine, &path), 2);
+
+        let (engine, path) = make_engine_with_brcb("27", TriggerOptions::DATA_CHANGED);
+        let brcb = engine.lock().unwrap().get_brcb(&path).unwrap();
+        brcb.enqueue_entry(1000, false, false, bytes::Bytes::from_static(b"x"))
+            .unwrap();
+        assert_eq!(
+            handle_set_brcb_field(
+                &engine,
+                &path,
+                RcbField::DatSet,
+                RcbWriteValue::VisibleString("IED1LD0/MMXU1$ds1".to_string()),
+                1
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(brcb_conf_rev_and_len(&engine, &path), (1, 1));
+    }
+
+    fn urcb_conf_rev(engine: &Arc<Mutex<ReportingEngine>>, path: &str) -> u32 {
+        let rc_arc = engine.lock().unwrap().get_rcb(path).unwrap();
+        let rc = rc_arc.lock().unwrap();
+        let conf_rev = rc.state.lock().unwrap().conf_rev;
+        conf_rev
     }
 
     // ── RcbField parsing ─────────────────────────────────────────────────────

@@ -313,7 +313,10 @@ async fn whole_lcb_read_carries_the_nine_components() {
         empty[1],
         MmsData::VisibleString(format!("{DOM}/{EVENT_LOG}"))
     );
-    assert_eq!(empty[2], MmsData::VisibleString(DATA_SET.into()));
+    assert_eq!(
+        empty[2],
+        MmsData::VisibleString(format!("{DOM}/{DATA_SET}"))
+    );
     assert_eq!(empty[3], MmsData::BinaryTime(vec![0; 6]));
     assert_eq!(empty[4], MmsData::BinaryTime(vec![0; 6]));
     assert_eq!(empty[5], MmsData::OctetString(vec![0; 8]));

@@ -564,7 +564,7 @@ async fn urcb_dat_set_naming_no_data_set_is_refused() {
     assert!(is_object_value_invalid(&r), "{r:?}");
     assert!(matches!(
         read(&mut mms, &format!("{URCB_ITEM}$DatSet")).await,
-        MmsData::VisibleString(ref s) if s == "LLN0$dsPos"
+        MmsData::VisibleString(ref s) if s == "IED1LD0/LLN0$dsPos"
     ));
     write(
         &mut mms,
@@ -592,7 +592,7 @@ async fn brcb_dat_set_naming_no_data_set_is_refused() {
     assert!(is_object_value_invalid(&r), "{r:?}");
     assert!(matches!(
         read(&mut mms, &format!("{BRCB_ITEM}$DatSet")).await,
-        MmsData::VisibleString(ref s) if s == "LLN0$dsPos"
+        MmsData::VisibleString(ref s) if s == "IED1LD0/LLN0$dsPos"
     ));
 }
 

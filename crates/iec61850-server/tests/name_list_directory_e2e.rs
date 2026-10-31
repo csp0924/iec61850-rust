@@ -334,7 +334,7 @@ async fn a_listed_log_control_block_is_readable() {
         .read_string(&format!("{LCB_REF}.DatSet"), FC::Lg)
         .await
         .expect("DatSet must be readable");
-    assert_eq!(dat_set, "LLN0$dsMeas");
+    assert_eq!(dat_set, "DemoIEDLD0/LLN0$dsMeas");
 
     // No LogRef is configured, so the default applies. It carries the logical
     // device, because a LogRef is an MMS path a client hands straight to
