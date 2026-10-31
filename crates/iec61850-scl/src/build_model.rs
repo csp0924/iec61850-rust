@@ -930,7 +930,7 @@ fn apply_instances_at_do(
                         .do_types
                         .get(&sdo.do_type_ref)
                         .expect("the sub-object type_ref was checked in stage 2");
-                    let sub_dobj = match dobj.child_by_name(&sdi.name) {
+                    let sub_dobj = match dobj.child_by_name(&sdi.name, None) {
                         Some(iec61850_model::tree::DoChild::SubDo(sd)) => sd,
                         _ => {
                             tracing::warn!(
@@ -956,7 +956,7 @@ fn apply_instances_at_do(
                         .da_types
                         .get(type_id)
                         .expect("the DA type_ref was checked in stage 2");
-                    let da = match dobj.child_by_name(&sdi.name) {
+                    let da = match dobj.child_by_name(&sdi.name, None) {
                         Some(iec61850_model::tree::DoChild::Da(d)) => d,
                         _ => {
                             tracing::warn!(
@@ -993,7 +993,7 @@ fn apply_instances_at_do(
                         continue;
                     }
                 };
-                let da = match dobj.child_by_name(&dai.name) {
+                let da = match dobj.child_by_name(&dai.name, None) {
                     Some(iec61850_model::tree::DoChild::Da(d)) => d,
                     _ => {
                         tracing::warn!(
@@ -1211,7 +1211,7 @@ pub fn instance_target<'a>(
     let mut da: Option<&DataAttribute> = None;
     for name in path {
         da = Some(match da {
-            None => match dobj.child_by_name(name)? {
+            None => match dobj.child_by_name(name, None)? {
                 iec61850_model::tree::DoChild::SubDo(s) => {
                     dobj = s;
                     continue;
@@ -1240,7 +1240,7 @@ pub fn setting_view_target<'a>(
     let mut da: Option<&DataAttribute> = None;
     for name in path {
         da = Some(match da {
-            None => match dobj.child_by_name(name)? {
+            None => match dobj.child_by_name(name, None)? {
                 iec61850_model::tree::DoChild::SubDo(s) => {
                     dobj = s;
                     continue;
@@ -2612,7 +2612,7 @@ mod tests {
         let mut current_da: Option<&DataAttribute> = None;
         for (i, seg) in da_path.iter().enumerate() {
             if i == 0 {
-                match dobj.child_by_name(seg).expect("child") {
+                match dobj.child_by_name(seg, None).expect("child") {
                     iec61850_model::tree::DoChild::Da(d) => current_da = Some(d),
                     _ => panic!("expected leaf DA at first seg"),
                 }
@@ -2904,11 +2904,11 @@ mod tests {
         // setVal, so the lookup goes through do_by_name and child_by_name.
         let lln0 = &m.ld_by_inst("LD0").unwrap().lns[0];
         let health = lln0.do_by_name("Health").unwrap();
-        let sub = match health.child_by_name("Sub").unwrap() {
+        let sub = match health.child_by_name("Sub", None).unwrap() {
             iec61850_model::tree::DoChild::SubDo(sd) => sd,
             _ => panic!("expected SubDo"),
         };
-        let set_val = match sub.child_by_name("setVal").unwrap() {
+        let set_val = match sub.child_by_name("setVal", None).unwrap() {
             iec61850_model::tree::DoChild::Da(d) => d,
             _ => panic!("expected DA"),
         };

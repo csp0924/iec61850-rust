@@ -1562,7 +1562,7 @@ mod tests {
         assert_eq!(lln0.dos.len(), 2);
         // DOI override: Mod.stVal must become 1, since "on" has ord=1.
         let mod_do = lln0.do_by_name("Mod").expect("Mod DO");
-        let st_val = match mod_do.child_by_name("stVal").expect("Mod.stVal exists") {
+        let st_val = match mod_do.child_by_name("stVal", None).expect("Mod.stVal exists") {
             iec61850_scl::__rt::DoChild::Da(da) => da,
             _ => panic!("stVal should be DA"),
         };

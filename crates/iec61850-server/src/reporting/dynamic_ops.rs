@@ -235,7 +235,7 @@ fn resolve_attr_value(
     // Look for the data attribute among the direct children of the data object;
     // a sub-data-object is descended one level first. Sub-attributes are reached
     // through the data attribute's own children.
-    let mut da = match dobj.child_by_name_fc(da_name, fc) {
+    let mut da = match dobj.child_by_name(da_name, Some(fc)) {
         Some(DoChild::Da(da)) => da,
         Some(DoChild::SubDo(_)) => {
             // A sub-data-object is not a value node.

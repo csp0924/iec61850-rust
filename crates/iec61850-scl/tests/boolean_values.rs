@@ -28,7 +28,7 @@ fn try_build(xml: &str) -> Result<IedModel, String> {
 
 fn value(m: &IedModel, name: &str) -> MmsValue {
     let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("LLN0").unwrap();
-    match ln.do_by_name("B").unwrap().child_by_name(name) {
+    match ln.do_by_name("B").unwrap().child_by_name(name, None) {
         Some(DoChild::Da(d)) => d.snapshot(),
         other => panic!("{name}: {other:?}"),
     }

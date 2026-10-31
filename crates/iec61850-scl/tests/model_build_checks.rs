@@ -47,7 +47,7 @@ fn wrap(templates: &str, ln0_body: &str, extra_lns: &str) -> String {
 
 fn da<'a>(model: &'a IedModel, ln: &str, do_name: &str, da_name: &str) -> &'a DataAttribute {
     let ln = model.ld_by_inst("LD0").unwrap().ln_by_name(ln).unwrap();
-    match ln.do_by_name(do_name).unwrap().child_by_name(da_name) {
+    match ln.do_by_name(do_name).unwrap().child_by_name(da_name, None) {
         Some(DoChild::Da(d)) => d,
         other => panic!("{do_name}.{da_name}: {other:?}"),
     }
@@ -890,7 +890,7 @@ fn se_attribute_below_a_sub_object_is_also_an_sg_attribute() {
       <DOI name="TmSet"><SDI name="tm"><DAI name="setVal"><Val>9</Val></DAI></SDI></DOI></LN>"#;
     let m = build(&wrap(t, "", ln));
     let ln = m.ld_by_inst("LD0").unwrap().ln_by_name("PTOC1").unwrap();
-    let sub = match ln.do_by_name("TmSet").unwrap().child_by_name("tm") {
+    let sub = match ln.do_by_name("TmSet").unwrap().child_by_name("tm", None) {
         Some(DoChild::SubDo(s)) => s,
         other => panic!("tm: {other:?}"),
     };

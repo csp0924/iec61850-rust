@@ -376,8 +376,9 @@ async fn run_value_updater(server: IedServer, handles: UpdaterHandles) {
 /// Resolve a data set member, under its functional constraint, to an owned
 /// handle on the shared value slot.
 fn resolve_da_fc(model: &IedModel, iec_path: &str, fc: FC) -> Option<DataAttribute> {
-    let r = ObjectRef::parse_iec(iec_path).ok()?;
-    match model.node_by_object_ref_fc(&r, fc)? {
+    let mut r = ObjectRef::parse_iec(iec_path).ok()?;
+    r.fc = Some(fc);
+    match model.node_by_object_ref(&r)? {
         NodeRef::Da(da) => Some(DataAttribute::with_shared_value(
             da.name.clone(),
             da.fc,

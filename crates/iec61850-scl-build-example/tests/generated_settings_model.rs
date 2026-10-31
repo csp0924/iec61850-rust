@@ -56,7 +56,7 @@ fn generated_model_carries_the_sg_view_of_each_se_setting() {
         .ld_by_inst("LD0")
         .and_then(|ld| ld.ln_by_name("PTOC1"))
         .expect("PTOC1");
-    let sub = match ln.do_by_name("TmSet").and_then(|d| d.child_by_name("tm")) {
+    let sub = match ln.do_by_name("TmSet").and_then(|d| d.child_by_name("tm", None)) {
         Some(iec61850_scl::__rt::DoChild::SubDo(s)) => s,
         other => panic!("TmSet.tm: {other:?}"),
     };

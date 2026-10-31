@@ -73,26 +73,17 @@ impl IedModel {
     /// Resolves an object reference to a node, walking domain, logical node,
     /// data object and then data attributes, sub-attributes and array indices.
     ///
+    /// When `r.fc` is `Some`, a data attribute named right below a data object
+    /// or sub-object resolves only if it carries that functional constraint, so
+    /// of the FC=SE and FC=SG data attributes of one setting the one the
+    /// reference names is returned. When `r.fc` is `None`, the first data
+    /// attribute of that name in declaration order is returned. A path ending
+    /// at a data object or logical node resolves whatever the constraint is.
+    ///
     /// Returns `None` when nothing matches. An over-long reference is rejected
     /// earlier, by the `ObjectRef` parser, so no lookup silently overflows.
-    ///
-    /// An object reference carries no functional constraint, so of the FC=SE
-    /// and FC=SG data attributes of one setting the one declared first is
-    /// returned; [`node_by_object_ref_fc`](Self::node_by_object_ref_fc) selects
-    /// by constraint.
     pub fn node_by_object_ref(&self, r: &ObjectRef) -> Option<NodeRef<'_>> {
-        self.resolve_object_ref(r, None)
-    }
-
-    /// Resolves an object reference as
-    /// [`node_by_object_ref`](Self::node_by_object_ref) does, except that a
-    /// data attribute named right below a data object or sub-object is the one
-    /// carrying `fc`.
-    ///
-    /// Returns `None` when the attribute the path names does not carry `fc`. A
-    /// path ending at a data object or logical node resolves whatever `fc` is.
-    pub fn node_by_object_ref_fc(&self, r: &ObjectRef, fc: FC) -> Option<NodeRef<'_>> {
-        self.resolve_object_ref(r, Some(fc))
+        self.resolve_object_ref(r, r.fc)
     }
 
     fn resolve_object_ref(&self, r: &ObjectRef, fc: Option<FC>) -> Option<NodeRef<'_>> {
@@ -128,11 +119,7 @@ impl IedModel {
                 }
                 Segment::Name(name) => {
                     // Look the name up among the data object's children.
-                    let child = match fc {
-                        Some(fc) => current_do.child_by_name_fc(name, fc),
-                        None => current_do.child_by_name(name),
-                    };
-                    match child {
+                    match current_do.child_by_name(name, fc) {
                         Some(DoChild::SubDo(sd)) => {
                             current_do = sd;
                             idx += 1;
@@ -372,22 +359,14 @@ impl DataObject {
 
     /// Finds a direct child by name, one level only.
     ///
-    /// Of the FC=SE and FC=SG data attributes of one setting, which share a
-    /// name, the one declared first is returned;
-    /// [`child_by_name_fc`](Self::child_by_name_fc) selects by constraint.
-    pub fn child_by_name(&self, name: &str) -> Option<&DoChild> {
+    /// With `fc` set, a data attribute matches only when it carries that
+    /// functional constraint, while a sub-object matches by name alone; this
+    /// selects between the FC=SE and FC=SG data attributes of one setting,
+    /// which share a name. With `fc` unset, the first child of that name in
+    /// declaration order is returned.
+    pub fn child_by_name(&self, name: &str, fc: Option<FC>) -> Option<&DoChild> {
         self.children.iter().find(|c| match c {
-            DoChild::Da(da) => da.name == name,
-            DoChild::SubDo(sd) => sd.name == name,
-        })
-    }
-
-    /// Finds a direct child named `name` on a path under the functional
-    /// constraint `fc`: the sub-object of that name, or the data attribute of
-    /// that name carrying `fc`.
-    pub fn child_by_name_fc(&self, name: &str, fc: FC) -> Option<&DoChild> {
-        self.children.iter().find(|c| match c {
-            DoChild::Da(da) => da.name == name && da.fc == fc,
+            DoChild::Da(da) => da.name == name && fc.is_none_or(|fc| da.fc == fc),
             DoChild::SubDo(sd) => sd.name == name,
         })
     }
@@ -941,9 +920,8 @@ mod tests {
         assert_eq!(d.children_with_fc(FC::Mx).count(), 0);
     }
 
-    /// Of the FC=SE and FC=SG data attributes of one setting, the
-    /// constraint-aware lookups select by constraint and the plain ones return
-    /// the one declared first.
+    /// Of the FC=SE and FC=SG data attributes of one setting, a lookup with a
+    /// constraint selects by it and one without returns the one declared first.
     #[test]
     fn setting_lookup_by_constraint() {
         let setting = |fc, v| {
@@ -967,10 +945,10 @@ mod tests {
             Some(DoChild::Da(d)) => Some(d.fc),
             _ => None,
         };
-        assert_eq!(fc_of(spt.child_by_name("setVal")), Some(FC::Sg));
-        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Se)), Some(FC::Se));
-        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Sg)), Some(FC::Sg));
-        assert_eq!(fc_of(spt.child_by_name_fc("setVal", FC::Cf)), None);
+        assert_eq!(fc_of(spt.child_by_name("setVal", None)), Some(FC::Sg));
+        assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Se))), Some(FC::Se));
+        assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Sg))), Some(FC::Sg));
+        assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Cf))), None);
 
         let ln = LogicalNode {
             prefix: String::new(),
@@ -995,16 +973,24 @@ mod tests {
             Some(NodeRef::Da(d)) => Some(d.snapshot()),
             _ => None,
         };
-        assert_eq!(value(m.node_by_object_ref(&r)), Some(MmsValue::Integer(1)));
+        let with_fc = |fc| {
+            let mut r = r.clone();
+            r.fc = fc;
+            r
+        };
         assert_eq!(
-            value(m.node_by_object_ref_fc(&r, FC::Se)),
+            value(m.node_by_object_ref(&with_fc(None))),
+            Some(MmsValue::Integer(1))
+        );
+        assert_eq!(
+            value(m.node_by_object_ref(&with_fc(Some(FC::Se)))),
             Some(MmsValue::Integer(2))
         );
         assert_eq!(
-            value(m.node_by_object_ref_fc(&r, FC::Sg)),
+            value(m.node_by_object_ref(&with_fc(Some(FC::Sg)))),
             Some(MmsValue::Integer(1))
         );
-        assert_eq!(value(m.node_by_object_ref_fc(&r, FC::St)), None);
+        assert_eq!(value(m.node_by_object_ref(&with_fc(Some(FC::St)))), None);
     }
 
     // store and snapshot
@@ -1071,7 +1057,7 @@ mod tests {
             .expect("LN GGIO1")
             .do_by_name("Ind1")
             .expect("DO Ind1")
-            .child_by_name("stVal")
+            .child_by_name("stVal", None)
             .expect("DA stVal")
         {
             DoChild::Da(da) => da,

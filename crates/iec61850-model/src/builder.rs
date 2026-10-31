@@ -228,7 +228,7 @@ fn entry_resolves(ln: &LogicalNode, do_path: &[String], fc: FC) -> bool {
     };
     for seg in names {
         let next = match node {
-            PathNode::Do(d) => match d.child_by_name_fc(seg, fc) {
+            PathNode::Do(d) => match d.child_by_name(seg, Some(fc)) {
                 Some(DoChild::SubDo(s)) => PathNode::Do(s),
                 Some(DoChild::Da(a)) => PathNode::Da(a),
                 None => return false,
