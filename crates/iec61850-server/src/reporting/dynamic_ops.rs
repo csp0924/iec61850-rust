@@ -6,10 +6,13 @@
 //! yields the `Arc<RwLock<MmsValue>>` shared with `DataAttribute::value`, the same
 //! handle a statically registered data set uses.
 //!
-//! A member path is `<LN>$<FC>$<DO>[$<SDA>...]`, for example
-//! `GGIO1$ST$Ind1$stVal`: logical node class and instance, functional constraint,
-//! data object name, data attribute name. A fifth and later segment is a
-//! sub-attribute nested inside the data attribute and is descended in order.
+//! A member path is `<LN>$<FC>$<DO>[$<SDO>...]$<DA>[$<SDA>...]`, for example
+//! `GGIO1$ST$Ind1$stVal` or `MMXU1$MX$A$phsA$cVal$mag$f`: logical node class
+//! and instance, functional constraint, data object name, any number of
+//! sub-data-objects, data attribute name, and any sub-attributes nested inside
+//! it. The data attribute is matched by name and functional constraint, as
+//! IEC 61850-7-2 §13.2.2.3 makes a member a functional-constrained data
+//! attribute.
 //!
 //! A member is one attribute of a basic type. A member that names a data
 //! object, a sub-data-object, or a constructed attribute is refused: an entry
@@ -21,7 +24,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use iec61850_model::{DataAttributeType, DoChild, IedModel, MmsValue, FC};
+use iec61850_model::{IedModel, MmsValue, FC};
+
+use crate::service::read::Node;
 
 use super::dataset::{Dataset, DatasetEntry};
 use super::DatasetRegistry;
@@ -187,8 +192,8 @@ impl DynamicDatasetOps {
     }
 }
 
-/// Resolves the MMS path `<LN>$<FC>$<DO>[$<SDA>...]` to the value handle shared
-/// with the model.
+/// Resolves the MMS path `<LN>$<FC>$<DO>[$<SDO>...]$<DA>[$<SDA>...]` to the
+/// value handle shared with the model.
 fn resolve_attr_value(
     ied_model: &IedModel,
     domain: &str,
@@ -200,86 +205,37 @@ fn resolve_attr_value(
             path: format!("{domain}/{mms_path}"),
         });
     }
-    let ln_name = parts[0];
-    let fc_token = parts[1];
-    let do_name = parts[2];
-    let da_name = parts[3];
-    let sda_segments = &parts[4..];
-
-    if ln_name.is_empty() || do_name.is_empty() || da_name.is_empty() {
-        return Err(DatasetError::MemberInvalidPath {
-            path: format!("{domain}/{mms_path}"),
-        });
-    }
-
-    let fc = FC::parse(fc_token).map_err(|_| DatasetError::MemberInvalidPath {
+    let invalid = || DatasetError::MemberInvalidPath {
         path: format!("{domain}/{mms_path}"),
-    })?;
-
-    let ld = ied_model
-        .ld_by_domain(domain)
-        .ok_or_else(|| DatasetError::MemberNotFound {
-            path: format!("{domain}/{mms_path}"),
-        })?;
-    let ln = ld
-        .ln_by_name(ln_name)
-        .ok_or_else(|| DatasetError::MemberNotFound {
-            path: format!("{domain}/{mms_path}"),
-        })?;
-    let dobj = ln
-        .do_by_name(do_name)
-        .ok_or_else(|| DatasetError::MemberNotFound {
-            path: format!("{domain}/{mms_path}"),
-        })?;
-
-    // Look for the data attribute among the direct children of the data object;
-    // a sub-data-object is descended one level first. Sub-attributes are reached
-    // through the data attribute's own children.
-    let mut da = match dobj.child_by_name(da_name, Some(fc)) {
-        Some(DoChild::Da(da)) => da,
-        Some(DoChild::SubDo(_)) => {
-            // A sub-data-object is not a value node.
-            return Err(DatasetError::MemberInvalidPath {
-                path: format!("{domain}/{mms_path}"),
-            });
-        }
-        None => {
-            return Err(DatasetError::MemberNotFound {
-                path: format!("{domain}/{mms_path}"),
-            });
-        }
     };
+    let not_found = || DatasetError::MemberNotFound {
+        path: format!("{domain}/{mms_path}"),
+    };
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(invalid());
+    }
+    let fc = FC::parse(parts[1]).map_err(|_| invalid())?;
 
-    // The functional constraint in the path must match the one the data attribute
-    // declares; the check is explicit rather than implied by the variable name.
-    if da.fc != fc {
-        return Err(DatasetError::MemberNotFound {
-            path: format!("{domain}/{mms_path}"),
-        });
+    let ln = ied_model
+        .ld_by_domain(domain)
+        .and_then(|ld| ld.ln_by_name(parts[0]))
+        .ok_or_else(not_found)?;
+    let dobj = ln.do_by_name(parts[2]).ok_or_else(not_found)?;
+
+    // Sub-data-objects may nest to any depth before the data attribute, which
+    // must carry the functional constraint of the path; sub-attributes are
+    // descended by name.
+    let mut node = Node::Object(dobj);
+    for seg in &parts[3..] {
+        node = node.child(fc, seg).ok_or_else(not_found)?;
     }
 
-    // Remaining segments are sub-attributes, descended one level at a time.
-    for seg in sda_segments {
-        if seg.is_empty() {
-            return Err(DatasetError::MemberInvalidPath {
-                path: format!("{domain}/{mms_path}"),
-            });
-        }
-        da = da
-            .child_by_name(seg)
-            .ok_or_else(|| DatasetError::MemberNotFound {
-                path: format!("{domain}/{mms_path}"),
-            })?;
+    // A data object, a sub-data-object or a constructed attribute holds no
+    // value of its own.
+    match node {
+        Node::Attribute(da) if node.is_leaf() => Ok(Arc::clone(&da.value)),
+        _ => Err(invalid()),
     }
-
-    // A constructed attribute holds no value of its own.
-    if da.ty == DataAttributeType::Constructed || !da.children.is_empty() {
-        return Err(DatasetError::MemberInvalidPath {
-            path: format!("{domain}/{mms_path}"),
-        });
-    }
-
-    Ok(Arc::clone(&da.value))
 }
 
 #[cfg(test)]
@@ -339,6 +295,44 @@ mod tests {
         let model = build_model();
         let err = resolve_attr_value(&model, "IED1LD0", "GGIO1$MX$Ind1$stVal").unwrap_err();
         assert!(matches!(err, DatasetError::MemberNotFound { .. }));
+    }
+
+    /// A member reaches a data attribute across any depth of
+    /// sub-data-objects; one that stops on a sub-data-object is not a
+    /// single value.
+    #[test]
+    fn resolve_descends_sub_data_objects() {
+        let set_mag = DataAttribute::new(
+            "setMag",
+            FC::Sp,
+            DataAttributeType::Float32,
+            TrgOps::default(),
+            MmsValue::Float32(2.5),
+        );
+        let cmv = DataObject::new("cmv", vec![DoChild::Da(set_mag)]);
+        let phs_a = DataObject::new("phsA", vec![DoChild::SubDo(cmv)]);
+        let phset = DataObject::new("PhSet", vec![DoChild::SubDo(phs_a)]);
+        let ggio1 = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![phset]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio1)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("IED1")
+            .add_ld(ld)
+            .unwrap()
+            .build()
+            .unwrap();
+        let v = resolve_attr_value(&model, "IED1LD0", "GGIO1$SP$PhSet$phsA$cmv$setMag").unwrap();
+        assert_eq!(*v.read().unwrap(), MmsValue::Float32(2.5));
+        assert!(matches!(
+            resolve_attr_value(&model, "IED1LD0", "GGIO1$SP$PhSet$phsA"),
+            Err(DatasetError::MemberInvalidPath { .. })
+        ));
+        assert!(matches!(
+            resolve_attr_value(&model, "IED1LD0", "GGIO1$ST$PhSet$phsA$cmv$setMag"),
+            Err(DatasetError::MemberNotFound { .. })
+        ));
     }
 
     #[test]

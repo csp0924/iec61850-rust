@@ -12,6 +12,8 @@
 //!
 //! A read handler decides every read that covers its node, from above or from
 //! below, and a refused read carries no part of the value.
+//!
+//! A data set created at run time may take a member beneath a sub-data-object.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -672,6 +674,43 @@ async fn logical_node_and_group_reads_ask_the_read_handlers() {
             .read(DOMAIN, "GGIO1$SP")
             .await
             .expect("another group");
+
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// CreateDataSet takes a member beneath a sub-data-object, and
+/// GetDataSetValues reads its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_set_member_beneath_a_sub_data_object() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_server, handle) = start().await;
+        let mut client = connect(&handle).await;
+
+        client
+            .write(DOMAIN, "GGIO1$SP$Pt$phsA$lim", MmsData::Unsigned(42))
+            .await
+            .expect("write the member");
+        client
+            .define_named_variable_list(
+                DOMAIN,
+                "GGIO1$dsSdo",
+                vec![DefineNamedVariableEntry::domain(
+                    DOMAIN,
+                    "GGIO1$SP$Pt$phsA$lim",
+                )],
+            )
+            .await
+            .expect("CreateDataSet with a member beneath a sub-data-object");
+        assert_eq!(
+            client
+                .read_named_variable_list_values(DOMAIN, "GGIO1$dsSdo")
+                .await
+                .expect("GetDataSetValues"),
+            vec![AccessResult::Success(MmsData::Unsigned(42))]
+        );
 
         handle.stop().await;
     })
