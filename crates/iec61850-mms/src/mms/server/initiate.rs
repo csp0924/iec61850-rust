@@ -10,7 +10,9 @@
 //!
 //! ## Negotiation rules
 //!
-//! - A proposed maximum PDU size below 64 bytes is refused with an Initiate error.
+//! - The maximum PDU size is the smaller of the proposal and the server
+//!   maximum. A proposal below 64 bytes is refused with an Initiate error; a
+//!   request without `localDetailCalling` takes the server maximum.
 //! - maxServOutstandingCalling and maxServOutstandingCalled are clamped to at
 //!   least 1, since 0 has no useful meaning.
 //! - dataStructureNestingLevel is clamped to 32.
@@ -70,8 +72,7 @@ pub enum InitiateRejectReason {
         /// Version number the peer proposed.
         proposed: u16,
     },
-    /// `localDetailCalling` is below `MIN_PDU_SIZE`, which includes the case where
-    /// the peer omitted the field.
+    /// `localDetailCalling` is below `MIN_PDU_SIZE`.
     PduSizeTooSmall {
         /// Maximum PDU size the peer proposed.
         proposed: u32,
@@ -103,10 +104,10 @@ pub fn negotiate_initiate(incoming: &[u8], services_supported: [u8; 11]) -> Init
         return reject_with(InitiateRejectReason::VersionTooLow { proposed: version });
     }
 
-    // localDetailCalling: the smaller of the two proposals, floored at MIN_PDU_SIZE.
-    // A proposal below that floor is refused, as is an absent field: a peer that
-    // cannot state a usable PDU size has nothing this server can serve.
-    let proposed_pdu = req.local_detail_calling.unwrap_or(0);
+    // localDetailCalling: the smaller of the two proposals. A proposal below
+    // MIN_PDU_SIZE is refused; the field is OPTIONAL, and an absent one leaves the
+    // server maximum in force.
+    let proposed_pdu = req.local_detail_calling.unwrap_or(SERVER_MAX_PDU_SIZE);
     if proposed_pdu < MIN_PDU_SIZE {
         tracing::warn!(
             proposed = proposed_pdu,
@@ -381,6 +382,32 @@ mod tests {
                 assert_eq!(params.client_proposed_services, Some(custom_services));
                 // the response still carries the server bitmap
                 assert_eq!(params.services_supported_called, SERVER_SERVICES_SUPPORTED);
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    /// `localDetailCalling` is OPTIONAL: a request without it is accepted at the
+    /// server maximum, which the response states as `localDetailCalled`.
+    #[test]
+    fn request_without_local_detail_calling_takes_the_server_maximum() {
+        let req = InitiateRequestPdu {
+            local_detail_calling: None,
+            ..InitiateRequestPdu::default()
+        };
+        let wire = encode_request(&req);
+        assert!(
+            !wire.windows(2).any(|w| w == [0x80, 0x03]),
+            "the request must omit localDetailCalling"
+        );
+        match negotiate_initiate(&wire, SERVER_SERVICES_SUPPORTED) {
+            InitiateOutcome::Accepted {
+                params,
+                response_bytes,
+            } => {
+                assert_eq!(params.max_pdu_size, SERVER_MAX_PDU_SIZE);
+                let resp = crate::mms::InitiateResponsePdu::decode(&response_bytes).unwrap();
+                assert_eq!(resp.local_detail_called, Some(SERVER_MAX_PDU_SIZE));
             }
             other => panic!("expected Accepted, got {:?}", other),
         }

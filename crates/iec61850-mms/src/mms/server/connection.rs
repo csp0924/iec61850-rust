@@ -163,7 +163,10 @@ pub const MIN_OUTSTANDING: u16 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NegotiatedParams {
-    /// Negotiated maximum PDU size: the smaller proposal, floored at `MIN_PDU_SIZE`.
+    /// Negotiated maximum PDU size: the smaller of the peer proposal and
+    /// `SERVER_MAX_PDU_SIZE`, or `SERVER_MAX_PDU_SIZE` when the peer proposed
+    /// none. A proposal below `MIN_PDU_SIZE` refuses the Initiate, so the value
+    /// is never below it.
     pub max_pdu_size: u32,
     /// Negotiated calling outstanding ceiling, floored at `MIN_OUTSTANDING`.
     pub max_serv_outstanding_calling: u16,
