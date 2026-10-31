@@ -24,6 +24,18 @@ fn publisher_encodes_smp_mod_in_two_octets() {
 }
 
 #[test]
+fn publisher_encodes_an_smp_mod_above_255() {
+    let mut b = SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 1]);
+    let h = b.add_asdu("MU01", None::<String>, 1, 8).unwrap();
+    b.set_smp_mod(h, 0x0102).unwrap();
+    let p = b.setup_complete().unwrap();
+    let frame = p.frame_bytes();
+    assert_eq!(&frame[frame.len() - 4..], &[0x88, 0x02, 0x01, 0x02]);
+    let pdu = decode_sav_pdu(&frame[SV_HEADER_NO_VLAN..]).unwrap();
+    assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::Unknown(0x0102)));
+}
+
+#[test]
 fn publisher_without_smp_mod_sends_none() {
     let mut b = SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 1]);
     b.add_asdu("MU01", None::<String>, 1, 8).unwrap();
@@ -60,15 +72,10 @@ fn pdu_with_smp_mod(smp_mod: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn unassigned_smp_mod_is_dropped_and_logged_once() {
+fn unassigned_smp_mod_is_kept() {
     let frame = pdu_with_smp_mod(&[0x01, 0x00]);
-    let logged = warnings_containing("smpmod value", || {
-        for _ in 0..10 {
-            let pdu = decode_sav_pdu(&frame).unwrap();
-            assert_eq!(pdu.asdus[0].smp_mod, None);
-        }
-    });
-    assert_eq!(logged, 1);
+    let pdu = decode_sav_pdu(&frame).unwrap();
+    assert_eq!(pdu.asdus[0].smp_mod, Some(SmpMod::Unknown(256)));
 }
 
 #[test]

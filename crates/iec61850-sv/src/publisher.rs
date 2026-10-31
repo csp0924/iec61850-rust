@@ -80,8 +80,8 @@ struct AsduConfig {
     /// smpRate; fixed for the life of the publisher.
     smp_rate: Option<u16>,
     /// smpMod; fixed for the life of the publisher and encoded as an INT16U
-    /// in two octets, the high one 0.
-    smp_mod: Option<u8>,
+    /// in two octets.
+    smp_mod: Option<u16>,
     /// Initial gmIdentity; when present the field can also be rewritten after
     /// setup.
     gm_identity: Option<[u8; 8]>,
@@ -271,12 +271,14 @@ impl SvPublisherBuilder {
         Ok(())
     }
 
-    /// Sets smpMod for this ASDU.
+    /// Sets smpMod for this ASDU, the INT16U of IEC 61850-9-2 §8.5.2
+    /// Table 14; [`SmpMod::to_u16`](crate::pdu::SmpMod::to_u16) gives the
+    /// value of a named mode.
     ///
     /// # Errors
     ///
     /// Returns `InvalidAsduHandle` when `h` is not a configured ASDU.
-    pub fn set_smp_mod(&mut self, h: AsduHandle, smp_mod: u8) -> Result<(), SvError> {
+    pub fn set_smp_mod(&mut self, h: AsduHandle, smp_mod: u16) -> Result<(), SvError> {
         let cfg = self
             .asdus
             .get_mut(h.0)
@@ -743,7 +745,8 @@ fn write_pdu_to_buffer(
         bm.extend_from_slice(&zeroes);
 
         if let Some(smp_mod) = cfg.smp_mod {
-            bm.extend_from_slice(&[TAG_SMP_MOD, 0x02, 0x00, smp_mod]);
+            bm.extend_from_slice(&[TAG_SMP_MOD, 0x02]);
+            bm.extend_from_slice(&smp_mod.to_be_bytes());
         }
 
         let gm_identity_offset = if let Some(ref gm) = cfg.gm_identity {

@@ -124,9 +124,8 @@ impl SmpSynch {
 
 /// Sampling mode, the smpMod field.
 ///
-/// IEC 61850-9-2 §8.5.2 Table 14 carries smpMod as a 2-octet INT16U. The
-/// defined values fit one octet, so the variants map to the low octet;
-/// unassigned values up to 255 are preserved rather than rejected.
+/// IEC 61850-9-2 §8.5.2 Table 14 carries smpMod as a 2-octet INT16U; every
+/// value outside the three defined ones is preserved as `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SmpMod {
@@ -137,22 +136,22 @@ pub enum SmpMod {
     /// 2: seconds per sample.
     SecondsPerSample,
     /// Any other value, preserved as sent.
-    Unknown(u8),
+    Unknown(u16),
 }
 
 impl SmpMod {
-    /// Decodes the value from its low octet.
-    pub fn from_byte(b: u8) -> Self {
-        match b {
+    /// Decodes the INT16U value.
+    pub fn from_u16(v: u16) -> Self {
+        match v {
             0 => SmpMod::PerNominalPeriod,
             1 => SmpMod::SamplesPerSecond,
             2 => SmpMod::SecondsPerSample,
-            _ => SmpMod::Unknown(b),
+            _ => SmpMod::Unknown(v),
         }
     }
 
-    /// Returns the low octet of the value; the high octet is 0.
-    pub fn to_byte(self) -> u8 {
+    /// Returns the INT16U value.
+    pub fn to_u16(self) -> u16 {
         match self {
             SmpMod::PerNominalPeriod => 0,
             SmpMod::SamplesPerSecond => 1,
@@ -379,7 +378,8 @@ fn encode_asdu(asdu: &Asdu, buf: &mut BytesMut) -> Result<(), SvError> {
 
     // smpMod is an INT16U in two octets.
     if let Some(smp_mod) = asdu.smp_mod {
-        buf.extend_from_slice(&[TAG_SMP_MOD, 0x02, 0x00, smp_mod.to_byte()]);
+        buf.extend_from_slice(&[TAG_SMP_MOD, 0x02]);
+        buf.extend_from_slice(&smp_mod.to_u16().to_be_bytes());
     }
 
     if let Some(ref gm) = asdu.gm_identity {
@@ -775,15 +775,10 @@ fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
 /// in every ASDU logs it once.
 static ONE_OCTET_SMP_MOD_REPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Set once an smpMod above 255 has been reported, for the same reason.
-static WIDE_SMP_MOD_REPORTED: AtomicBool = AtomicBool::new(false);
-
 /// Decodes smpMod, an INT16U in two octets.
 ///
 /// A one-octet value, which some publishers send, is accepted as the same
-/// value and reported once per process. A value above 255 has no `SmpMod`
-/// representation and the field is dropped, like any other unusable optional
-/// field; that too is reported once per process.
+/// value and reported once per process.
 ///
 /// # Errors
 ///
@@ -805,18 +800,7 @@ fn decode_smp_mod(value: &[u8]) -> Result<Option<SmpMod>, SvError> {
             });
         }
     };
-    match u8::try_from(v) {
-        Ok(b) => Ok(Some(SmpMod::from_byte(b))),
-        Err(_) => {
-            if !WIDE_SMP_MOD_REPORTED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "smpmod value {} is unassigned, dropping the field; later ones are not logged",
-                    v
-                );
-            }
-            Ok(None)
-        }
-    }
+    Ok(Some(SmpMod::from_u16(v)))
 }
 
 #[cfg(test)]
@@ -880,9 +864,11 @@ mod tests {
             SmpMod::SamplesPerSecond,
             SmpMod::SecondsPerSample,
             SmpMod::Unknown(42),
+            SmpMod::Unknown(256),
+            SmpMod::Unknown(u16::MAX),
         ];
         for m in cases {
-            assert_eq!(SmpMod::from_byte(m.to_byte()), m);
+            assert_eq!(SmpMod::from_u16(m.to_u16()), m);
         }
     }
 
@@ -1164,10 +1150,25 @@ mod tests {
     }
 
     #[test]
-    fn smp_mod_above_255_is_dropped() {
+    fn smp_mod_above_255_decodes_as_unknown() {
         let decoded =
             decode_sav_pdu(&sav_pdu_with_smp_mod(&[TAG_SMP_MOD, 0x02, 0x01, 0x00])).unwrap();
-        assert_eq!(decoded.asdus[0].smp_mod, None);
+        assert_eq!(decoded.asdus[0].smp_mod, Some(SmpMod::Unknown(256)));
+    }
+
+    #[test]
+    fn smp_mod_above_255_round_trips() {
+        let mut asdu = minimal_asdu("sv1", 0);
+        asdu.smp_mod = Some(SmpMod::Unknown(0x1234));
+        let pdu = SavPdu { asdus: vec![asdu] };
+        let mut buf = BytesMut::new();
+        encode_sav_pdu(&pdu, &mut buf).unwrap();
+        assert!(
+            buf.windows(4).any(|w| w == [TAG_SMP_MOD, 0x02, 0x12, 0x34]),
+            "smpmod is sent big-endian in two octets"
+        );
+        let decoded = decode_sav_pdu(&buf).unwrap();
+        assert_eq!(decoded.asdus[0].smp_mod, Some(SmpMod::Unknown(0x1234)));
     }
 
     #[test]
