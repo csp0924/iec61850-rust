@@ -271,8 +271,8 @@ Service tags are as in ISO 9506-2.
 | Initiate | – | Y | Y |
 | Conclude | – | Y | Y |
 | Abort | – | Y | Y |
-| Cancel | `0x83` | N | N |
-| Status | `0x80` | N | N |
+| Cancel | `0x85` | N | N |
+| Status | `0x80` | Y | Y |
 | GetNameList | `0xa1` | Y | Y |
 | Identify | `0x82` | Y | Y |
 | Read | `0xa4` | Y | Y |
@@ -323,8 +323,7 @@ includes, so that it announces exactly what the dispatcher answers.
 
 | Bit | Announced when |
 |---|---|
-| `status` | Never; no handler exists |
-| `getNameList`, `identify`, `read`, `write`, `getVariableAccessAttributes` | Always |
+| `status`, `getNameList`, `identify`, `read`, `write`, `getVariableAccessAttributes` | Always |
 | `defineNamedVariableList`, `getNamedVariableListAttributes`, `deleteNamedVariableList`, `informationReport` | The reporting subsystem is compiled in |
 | `readJournal` | The logging subsystem is compiled in |
 | `writeJournal` | Never; the request is answered with an access error rather than served |
