@@ -1,5 +1,5 @@
 //! MMS confirmed services: Read, Write, GetNameList, GetVariableAccessAttributes,
-//! Identify and the named variable list services.
+//! Identify, Status and the named variable list services.
 //!
 //! Every service function follows the same shape:
 //! 1. Take a fresh invokeID from the allocator.
@@ -44,17 +44,19 @@ use crate::mms::pdu::{
     decode_confirmed_get_named_variable_list_attrs_response,
     decode_confirmed_get_var_access_attrs_response, decode_confirmed_identify_response,
     decode_confirmed_read_journal_response, decode_confirmed_read_response,
-    decode_confirmed_write_response, encode_confirmed_define_named_variable_list_request,
+    decode_confirmed_status_response, decode_confirmed_write_response,
+    encode_confirmed_define_named_variable_list_request,
     encode_confirmed_delete_named_variable_list_request, encode_confirmed_get_name_list_request,
     encode_confirmed_get_named_variable_list_attrs_request,
     encode_confirmed_get_var_access_attrs_request, encode_confirmed_identify_request,
     encode_confirmed_read_journal_request, encode_confirmed_read_request,
-    encode_confirmed_write_request, AccessResult, AlternateAccess, DefineNamedVariableEntry,
-    DefineNamedVariableListRequest, DeleteNamedVariableListRequest, GetNameListRequest,
-    GetNamedVariableListAttributesRequest, GetNamedVariableListAttributesResponse,
-    GetVariableAccessAttributesRequest, IdentifyResponse, ListOfVariableEntry, MmsData, MmsPdu,
-    ObjectClass, ObjectName, ObjectScope, ReadJournalRequest, ReadJournalResponse, ReadRequest,
-    TypeSpecification, VariableAccessSpecification, WriteRequest,
+    encode_confirmed_status_request, encode_confirmed_write_request, AccessResult, AlternateAccess,
+    DefineNamedVariableEntry, DefineNamedVariableListRequest, DeleteNamedVariableListRequest,
+    GetNameListRequest, GetNamedVariableListAttributesRequest,
+    GetNamedVariableListAttributesResponse, GetVariableAccessAttributesRequest, IdentifyResponse,
+    ListOfVariableEntry, MmsData, MmsPdu, ObjectClass, ObjectName, ObjectScope, ReadJournalRequest,
+    ReadJournalResponse, ReadRequest, StatusResponse, TypeSpecification,
+    VariableAccessSpecification, WriteRequest,
 };
 use bytes::{Bytes, BytesMut};
 use iec61850_hal::time::Timer;
@@ -659,6 +661,49 @@ fn dispatch_identify_response(pdu: MmsPdu) -> Result<IdentifyResponse, ClientErr
     }
 }
 
+/// Asks the server for the logical and physical status of its VMD.
+///
+/// With `extended_derivation` the server derives the status by executing its
+/// own checks rather than reporting the status it holds. A confirmed error
+/// becomes `ClientError::ServiceError` and a reject `ClientError::RejectError`,
+/// which is how a server without the service answers.
+pub async fn status<T: AsyncTransport, Tm: Timer>(
+    conn: &mut MmsConnection<T, Tm>,
+    alloc: &mut InvokeIdAllocator,
+    extended_derivation: bool,
+) -> Result<StatusResponse, ClientError> {
+    let invoke_id = alloc.allocate()?;
+
+    let mut full = BytesMut::new();
+    encode_confirmed_status_request(invoke_id, extended_derivation, &mut full);
+    let resp_pdu = exchange(conn, alloc, invoke_id, full).await?;
+    dispatch_status_response(resp_pdu)
+}
+
+fn dispatch_status_response(pdu: MmsPdu) -> Result<StatusResponse, ClientError> {
+    match pdu {
+        MmsPdu::ConfirmedResponse(inner) => {
+            let full = rewrap_response(0xa1, &inner);
+            let (_id, resp) = decode_confirmed_status_response(&full).map_err(|e| {
+                warn!("status response failed to decode: {e}");
+                ClientError::PduParse(format!("{e}"))
+            })?;
+            Ok(resp)
+        }
+        MmsPdu::ConfirmedError(inner) => Err(handle_confirmed_error(&inner)),
+        MmsPdu::Reject(reject) => {
+            warn!("status received a reject pdu: {:?}", reject.reason);
+            Err(ClientError::RejectError {
+                reason: reject.reason,
+            })
+        }
+        other => Err(ClientError::PduParse(format!(
+            "unexpected PDU tag=0x{:02X}",
+            other.tag_byte()
+        ))),
+    }
+}
+
 fn dispatch_define_named_variable_list_response(pdu: MmsPdu) -> Result<(), ClientError> {
     match pdu {
         MmsPdu::ConfirmedResponse(inner) => {
@@ -1023,6 +1068,66 @@ mod tests {
         let content = Bytes::from_static(&[0x02, 0x01, 0x03, 0xa1, 0x03, 0xa0, 0x01, 0x00]);
         let err = dispatch_identify_response(MmsPdu::ConfirmedResponse(content))
             .expect_err("not an identify response");
+        assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn status_response_yields_both_values() {
+        use crate::mms::pdu::{VmdLogicalStatus, VmdPhysicalStatus};
+        let mut sent = StatusResponse::new(
+            VmdLogicalStatus::NoStateChangesAllowed,
+            VmdPhysicalStatus::PartiallyOperational,
+        );
+        sent.local_detail = Some(vec![true, false, true]);
+        let mut full = BytesMut::new();
+        crate::mms::pdu::encode_confirmed_status_response(3, &sent, &mut full);
+        let pdu = MmsPdu::ConfirmedResponse(response_content(&full));
+        let resp = dispatch_status_response(pdu).expect("a well-formed response");
+        assert_eq!(resp, sent);
+    }
+
+    #[test]
+    fn status_confirmed_error_becomes_service_error() {
+        use crate::mms::pdu::{encode_confirmed_error_pdu, ErrorClass, ServiceError};
+        let mut full = BytesMut::new();
+        encode_confirmed_error_pdu(3, &ServiceError::new(ErrorClass::Service(1)), &mut full);
+        let pdu = MmsPdu::ConfirmedError(response_content(&full));
+        let err = dispatch_status_response(pdu).expect_err("a confirmed error");
+        assert!(
+            matches!(
+                err,
+                ClientError::ServiceError {
+                    error_class: ErrorClass::Service(1)
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn status_reject_becomes_reject_error() {
+        use crate::mms::pdu::{ConfirmedRequestRejectReason, RejectPdu, RejectReason};
+        let reason =
+            RejectReason::ConfirmedRequest(ConfirmedRequestRejectReason::UnrecognizedService);
+        let pdu = MmsPdu::Reject(RejectPdu {
+            invoke_id: Some(3),
+            reason: reason.clone(),
+        });
+        let err = dispatch_status_response(pdu).expect_err("a reject");
+        assert!(
+            matches!(&err, ClientError::RejectError { reason: r } if *r == reason),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn status_response_of_another_service_is_a_parse_error() {
+        // an Identify response body under the status invokeID
+        let content = Bytes::from_static(&[
+            0x02, 0x01, 0x03, 0xa2, 0x09, 0x80, 0x01, b'V', 0x81, 0x01, b'M', 0x82, 0x01, b'1',
+        ]);
+        let err = dispatch_status_response(MmsPdu::ConfirmedResponse(content))
+            .expect_err("not a status response");
         assert!(matches!(err, ClientError::PduParse(_)), "got {err:?}");
     }
 

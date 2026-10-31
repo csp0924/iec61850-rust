@@ -494,6 +494,20 @@ impl<T: AsyncTransport, Tm: Timer> MmsClient<T, Tm> {
         services::identify(&mut self.conn, &mut self.alloc).await
     }
 
+    /// Asks the server for the logical and physical status of its VMD with the
+    /// MMS Status service.
+    ///
+    /// With `extended_derivation` the server derives the status by executing
+    /// its own checks rather than reporting the status it holds. A server that
+    /// does not offer the service answers with a reject, which becomes
+    /// `ClientError::RejectError`.
+    pub async fn status(
+        &mut self,
+        extended_derivation: bool,
+    ) -> Result<crate::mms::pdu::StatusResponse, ClientError> {
+        services::status(&mut self.conn, &mut self.alloc, extended_derivation).await
+    }
+
     /// Retrieves a list of object names.
     ///
     /// `object_class` selects the class to enumerate, such as `ObjectClass::NamedVariable`.

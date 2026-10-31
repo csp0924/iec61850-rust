@@ -23,7 +23,8 @@
 use super::error::ClientError;
 use super::{ConnectionState, MmsClient, MmsClientBuilder, MmsValue};
 use crate::mms::pdu::{
-    GetNamedVariableListAttributesResponse, IdentifyResponse, ObjectClass, TypeSpecification,
+    GetNamedVariableListAttributesResponse, IdentifyResponse, ObjectClass, StatusResponse,
+    TypeSpecification,
 };
 
 /// Synchronous wrapper over [`MmsClient`], owning a private current-thread runtime.
@@ -111,6 +112,11 @@ impl BlockingMmsClient {
     /// Asks the server to identify itself with the MMS Identify service.
     pub fn identify(&mut self) -> Result<IdentifyResponse, ClientError> {
         self.rt.block_on(self.inner.identify())
+    }
+
+    /// Asks the server for the status of its VMD with the MMS Status service.
+    pub fn status(&mut self, extended_derivation: bool) -> Result<StatusResponse, ClientError> {
+        self.rt.block_on(self.inner.status(extended_derivation))
     }
 
     /// Retrieves a list of object names.
