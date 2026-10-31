@@ -153,6 +153,7 @@ impl SvFrameHeader {
 
 /// A complete SV Ethernet frame: header plus savPdu bytes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SvFrame {
     /// Frame header.
     pub header: SvFrameHeader,
@@ -161,6 +162,11 @@ pub struct SvFrame {
 }
 
 impl SvFrame {
+    /// Creates a frame from a header and the encoded savPdu bytes.
+    pub fn new(header: SvFrameHeader, pdu_bytes: Vec<u8>) -> Self {
+        SvFrame { header, pdu_bytes }
+    }
+
     /// Returns the header size, with or without a VLAN tag.
     pub fn header_size(with_vlan: bool) -> usize {
         if with_vlan {

@@ -296,7 +296,7 @@ fn make_frame(pdu_bytes: Vec<u8>, vlan: Option<VlanTag>) -> Vec<u8> {
     let mut header = SvFrameHeader::new(SV_DEFAULT_DST_MAC, [0x02, 0, 0, 0, 0, 1], 0x4000);
     header.vlan = vlan;
     header.length = (pdu_bytes.len() + 8) as u16;
-    let frame = SvFrame { header, pdu_bytes };
+    let frame = SvFrame::new(header, pdu_bytes);
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).expect("frame encode");
     buf.to_vec()

@@ -24,15 +24,15 @@ fn encode_frame(pdu: &SavPdu, app_id: u16, dst_mac: [u8; 6]) -> Vec<u8> {
     encode_sav_pdu(pdu, &mut pdu_buf).unwrap();
     let pdu_bytes = pdu_buf.to_vec();
     let pdu_len = pdu_bytes.len();
-    let frame = SvFrame {
-        header: {
+    let frame = SvFrame::new(
+        {
             let mut header =
                 SvFrameHeader::new(dst_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], app_id);
             header.length = (SV_APP_HEADER_SIZE + pdu_len) as u16;
             header
         },
         pdu_bytes,
-    };
+    );
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).unwrap();
     buf.to_vec()

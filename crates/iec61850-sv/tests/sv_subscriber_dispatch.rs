@@ -289,15 +289,15 @@ fn too_many_asdus_tick_returns_err() {
     pdu_buf.extend_from_slice(&inner);
     let pdu_bytes = pdu_buf.to_vec();
 
-    let frame = SvFrame {
-        header: {
+    let frame = SvFrame::new(
+        {
             let mut header =
                 SvFrameHeader::new(iec61850_sv::SV_DEFAULT_DST_MAC, [0u8; 6], SV_DEFAULT_APPID);
             header.length = (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16;
             header
         },
         pdu_bytes,
-    };
+    );
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).unwrap();
 
@@ -343,15 +343,15 @@ fn corrupt_frame_incomplete_asdu_returns_err() {
     pdu_buf.extend_from_slice(&contents);
     let pdu_bytes = pdu_buf.to_vec();
 
-    let frame = SvFrame {
-        header: {
+    let frame = SvFrame::new(
+        {
             let mut header =
                 SvFrameHeader::new(iec61850_sv::SV_DEFAULT_DST_MAC, [0u8; 6], SV_DEFAULT_APPID);
             header.length = (SV_APP_HEADER_SIZE + pdu_bytes.len()) as u16;
             header
         },
         pdu_bytes,
-    };
+    );
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).unwrap();
 
