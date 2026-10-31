@@ -215,12 +215,13 @@ impl MmsError {
 /// Converts an `Asn1Error` into an `MmsError` so `?` works over the shared BER helpers.
 ///
 /// - `TruncatedInput` -> `TruncatedPdu`
-/// - `LengthTooLong { .. }` -> `InvalidLength`
+/// - `LengthTooLong { .. }` and any other length error -> `InvalidLength`
 impl From<Asn1Error> for MmsError {
     fn from(err: Asn1Error) -> Self {
         match err {
             Asn1Error::TruncatedInput => MmsError::TruncatedPdu,
             Asn1Error::LengthTooLong { .. } => MmsError::InvalidLength,
+            _ => MmsError::InvalidLength,
         }
     }
 }

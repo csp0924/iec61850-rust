@@ -10,6 +10,7 @@ use thiserror::Error;
 ///
 /// Produced by `decode_length`; `encode_length` cannot fail.
 #[derive(Debug, Error, PartialEq, Eq, Clone, Copy)]
+#[non_exhaustive]
 pub enum Asn1Error {
     /// The input ends before the length field is complete: an empty slice in
     /// the short form, or missing bytes after a long-form prefix.
