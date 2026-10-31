@@ -153,6 +153,20 @@ pub enum ConfigChangeResult {
     },
 }
 
+/// Why a BRCB configuration or PurgeBuf write failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BrcbWriteError {
+    /// Reporting is enabled, and the attribute is not writable while RptEna is
+    /// true, per IEC 61850-8-1 Table 72. The dispatcher answers
+    /// `DataAccessError::TemporarilyUnavailable`.
+    #[error("the attribute is not writable while RptEna is true")]
+    ReportingEnabled,
+    /// A state or buffer mutex is poisoned.
+    #[error(transparent)]
+    Server(#[from] crate::error::ServerError),
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Transmit anchor and the EntryID write path
 // ─────────────────────────────────────────────────────────────────────────────
@@ -726,17 +740,15 @@ impl BufferedReportControl {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError::InvalidModel` when reporting is enabled, or when the
-    /// state or buffer mutex is poisoned.
+    /// Returns `BrcbWriteError::ReportingEnabled` when reporting is enabled, and
+    /// `BrcbWriteError::Server` when the state or buffer mutex is poisoned.
     pub fn set_config_field(
         &self,
         field: BrcbConfigField,
-    ) -> Result<ConfigChangeResult, crate::error::ServerError> {
+    ) -> Result<ConfigChangeResult, BrcbWriteError> {
         let mut state = self.lock_state()?;
         if state.rpt_ena {
-            return Err(crate::error::ServerError::InvalidModel(
-                "brcb config cannot be modified while RptEna=true".into(),
-            ));
+            return Err(BrcbWriteError::ReportingEnabled);
         }
 
         let field_name = field.field_name();
@@ -820,18 +832,17 @@ impl BufferedReportControl {
     ///
     /// # Errors
     ///
-    /// Returns `ServerError::InvalidModel` when reporting is enabled, whatever the
-    /// value, or when the state or buffer mutex is poisoned.
-    pub fn handle_purge_buf_write(&self, value: bool) -> Result<usize, crate::error::ServerError> {
+    /// Returns `BrcbWriteError::ReportingEnabled` when reporting is enabled,
+    /// whatever the value, and `BrcbWriteError::Server` when the state or buffer
+    /// mutex is poisoned.
+    pub fn handle_purge_buf_write(&self, value: bool) -> Result<usize, BrcbWriteError> {
         let state = self.lock_state()?;
         if state.rpt_ena {
             tracing::warn!(
                 mms_path = %self.mms_path,
                 "PurgeBuf write refused while RptEna is true"
             );
-            return Err(crate::error::ServerError::InvalidModel(
-                "brcb PurgeBuf cannot be written while RptEna=true".into(),
-            ));
+            return Err(BrcbWriteError::ReportingEnabled);
         }
         drop(state);
         if !value {
@@ -1300,7 +1311,7 @@ mod tests {
         let rc = BufferedReportControl::new("IED1/LN0$BR$brcb01", brcb);
         rc.lock_state().unwrap().rpt_ena = true;
         let result = rc.set_config_field(BrcbConfigField::BufTmMs(999));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(BrcbWriteError::ReportingEnabled)));
     }
 
     // ─── PurgeBuf writes ─────────────────────────────────────────────────────
@@ -1338,8 +1349,12 @@ mod tests {
         rc.enqueue_entry(1000, false, false, Bytes::from_static(b"a"))
             .unwrap();
         rc.lock_state().unwrap().rpt_ena = true;
-        assert!(rc.handle_purge_buf_write(true).is_err());
-        assert!(rc.handle_purge_buf_write(false).is_err());
+        for value in [true, false] {
+            assert!(matches!(
+                rc.handle_purge_buf_write(value),
+                Err(BrcbWriteError::ReportingEnabled)
+            ));
+        }
         assert_eq!(rc.lock_buffer().unwrap().len(), 1);
     }
 

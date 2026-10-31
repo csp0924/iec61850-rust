@@ -929,10 +929,7 @@ fn set_brcb_purge_buf(
     // the buffer; while it is true, either value is refused.
     match brcb.handle_purge_buf_write(v) {
         Ok(_purged) => Some(Ok(())),
-        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
-            Some(Err(DataAccessError::TemporarilyUnavailable))
-        }
-        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+        Err(e) => Some(Err(brcb_write_error(&brcb.mms_path, e))),
     }
 }
 
@@ -1014,6 +1011,22 @@ fn set_brcb_gi(
     Some(Ok(()))
 }
 
+/// Maps a refused BRCB configuration or PurgeBuf write to the error the client
+/// is answered with: TemporarilyUnavailable while reporting is enabled,
+/// HardwareFault for a poisoned lock.
+fn brcb_write_error(mms_path: &str, e: super::brcb::BrcbWriteError) -> DataAccessError {
+    match e {
+        super::brcb::BrcbWriteError::ReportingEnabled => {
+            tracing::warn!(mms_path, "SetBRCBValues: the control block is enabled");
+            DataAccessError::TemporarilyUnavailable
+        }
+        e => {
+            tracing::warn!(mms_path, error = %e, "SetBRCBValues: the write could not be applied");
+            DataAccessError::HardwareFault
+        }
+    }
+}
+
 fn set_brcb_config_string(
     brcb: &Arc<super::brcb::BufferedReportControl>,
     value: RcbWriteValue,
@@ -1033,11 +1046,7 @@ fn set_brcb_config_string(
     };
     match brcb.set_config_field(field) {
         Ok(_) => Some(Ok(())),
-        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
-            // Configuration may not change while RptEna is true.
-            Some(Err(DataAccessError::TemporarilyUnavailable))
-        }
-        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+        Err(e) => Some(Err(brcb_write_error(&brcb.mms_path, e))),
     }
 }
 
@@ -1101,10 +1110,7 @@ fn set_brcb_dat_set(
             eng.rebind_brcb_dataset(&brcb.mms_path, dataset);
             Some(Ok(()))
         }
-        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
-            Some(Err(DataAccessError::TemporarilyUnavailable))
-        }
-        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+        Err(e) => Some(Err(brcb_write_error(&brcb.mms_path, e))),
     }
 }
 
@@ -1124,10 +1130,7 @@ fn set_brcb_unsigned32(
     };
     match brcb.set_config_field(field) {
         Ok(_) => Some(Ok(())),
-        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
-            Some(Err(DataAccessError::TemporarilyUnavailable))
-        }
-        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+        Err(e) => Some(Err(brcb_write_error(&brcb.mms_path, e))),
     }
 }
 
@@ -1145,10 +1148,7 @@ fn set_brcb_trg_ops(
     };
     match brcb.set_config_field(BrcbConfigField::TrgOps(ops)) {
         Ok(_) => Some(Ok(())),
-        Err(crate::error::ServerError::InvalidModel(msg)) if msg.contains("RptEna=true") => {
-            Some(Err(DataAccessError::TemporarilyUnavailable))
-        }
-        Err(_) => Some(Err(DataAccessError::HardwareFault)),
+        Err(e) => Some(Err(brcb_write_error(&brcb.mms_path, e))),
     }
 }
 

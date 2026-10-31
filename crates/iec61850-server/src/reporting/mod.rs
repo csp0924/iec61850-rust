@@ -34,8 +34,8 @@ pub type DatasetRegistry = std::sync::Arc<
     std::sync::RwLock<std::collections::HashMap<(String, String), std::sync::Arc<Dataset>>>,
 >;
 pub use brcb::{
-    ApplyEntryIdError, Brcb, BrcbConfigField, BrcbState, BufferedReportControl, ConfigChangeResult,
-    ResvTmsState, TransmitAnchor, RESV_TMS_IMPLICIT_VALUE_S,
+    ApplyEntryIdError, Brcb, BrcbConfigField, BrcbState, BrcbWriteError, BufferedReportControl,
+    ConfigChangeResult, ResvTmsState, TransmitAnchor, RESV_TMS_IMPLICIT_VALUE_S,
 };
 pub use buffer::{
     EnqueuedSnapshot, EntryId, InMemoryReportBuffer, OverflowStrategy, ReportBufferBackend,
