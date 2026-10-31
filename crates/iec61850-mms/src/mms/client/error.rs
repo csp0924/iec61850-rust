@@ -278,7 +278,7 @@ impl ClientError {
 
     /// Sets the reason code (PI 50) of a [`ClientError::SessionRefused`]; any
     /// other error is returned unchanged.
-    pub fn with_refuse_reason(mut self, code: u8) -> Self {
+    pub fn with_reason_code(mut self, code: u8) -> Self {
         if let Self::SessionRefused { reason_code, .. } = &mut self {
             *reason_code = Some(code);
         }
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn a_session_refusal_takes_each_parameter_afterwards() {
         let e = ClientError::session_refused()
-            .with_refuse_reason(129)
+            .with_reason_code(129)
             .with_transport_disconnect(1)
             .with_provider_reason(3);
         assert!(matches!(
@@ -348,7 +348,7 @@ mod tests {
     fn a_setter_leaves_another_error_unchanged() {
         let e = ClientError::service_timeout(5)
             .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(1))
-            .with_refuse_reason(2);
+            .with_reason_code(2);
         assert!(matches!(e, ClientError::ServiceTimeout { timeout_ms: 5 }));
     }
 }
