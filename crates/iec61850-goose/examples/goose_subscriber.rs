@@ -118,7 +118,6 @@ mod linux_impl {
 
         // Starting the receiver moves it from the idle state into the running one.
         let mut receiver = GooseReceiver::new();
-        receiver.set_interface_id(iface.clone());
         receiver.add_subscriber(subscriber);
         let mut receiver = receiver.start();
 

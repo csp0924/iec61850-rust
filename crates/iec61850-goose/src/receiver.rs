@@ -46,8 +46,6 @@ pub struct Running;
 /// handles frames. Mutating the subscriber list of a running receiver is a
 /// compile error rather than a documented hazard.
 pub struct GooseReceiver<S = Idle> {
-    /// Network interface name used when binding the L2 socket.
-    interface_id: Option<String>,
     /// Owned receive buffer; no caller-supplied buffer is accepted.
     _buffer: Box<[u8; ETH_BUFFER_LENGTH]>,
     /// Subscribers by index; a removed slot becomes `None` so the indexes
@@ -65,23 +63,12 @@ impl GooseReceiver<Idle> {
     /// Creates an idle receiver with no subscribers.
     pub fn new() -> Self {
         Self {
-            interface_id: None,
             _buffer: Box::new([0u8; ETH_BUFFER_LENGTH]),
             subscribers: Vec::new(),
             appid_index: HashMap::new(),
             wildcard_indices: Vec::new(),
             _state: std::marker::PhantomData,
         }
-    }
-
-    /// Sets the interface name used by `start_thread`.
-    pub fn set_interface_id(&mut self, id: impl Into<String>) {
-        self.interface_id = Some(id.into());
-    }
-
-    /// Returns the configured interface name.
-    pub fn interface_id(&self) -> Option<&str> {
-        self.interface_id.as_deref()
     }
 
     /// Adds a subscriber and returns its index, which `remove_subscriber` and
@@ -125,7 +112,6 @@ impl GooseReceiver<Idle> {
     /// arrive through `handle_message` or through `start_thread`.
     pub fn start(self) -> GooseReceiver<Running> {
         GooseReceiver {
-            interface_id: self.interface_id,
             _buffer: self._buffer,
             subscribers: self.subscribers,
             appid_index: self.appid_index,
@@ -145,7 +131,6 @@ impl GooseReceiver<Running> {
     /// Returns the receiver to the idle state so subscribers can be changed.
     pub fn stop(self) -> GooseReceiver<Idle> {
         GooseReceiver {
-            interface_id: self.interface_id,
             _buffer: self._buffer,
             subscribers: self.subscribers,
             appid_index: self.appid_index,
