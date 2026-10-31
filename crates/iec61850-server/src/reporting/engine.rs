@@ -122,7 +122,7 @@ pub struct ReportingEngine {
     /// a BRCB reservation across connections, and its negotiated PDU size.
     peers: HashMap<ConnectionId, Peer>,
     /// Data sets a DatSet write may name, shared with the server.
-    dataset_registry: Option<super::DatasetRegistry>,
+    dataset_registry: super::DatasetRegistry,
     /// Attribute reference of every member a DatSet write bound a control
     /// block to.
     value_index: ValueIndex,
@@ -264,9 +264,14 @@ impl std::fmt::Debug for ReportingEngine {
 impl ReportingEngine {
     /// Creates an empty engine; `sink` is injected by the connection lifecycle layer.
     ///
+    /// A DatSet write must name a data set in `registry`, keyed by
+    /// `(domain, <LN>$<name>)`; a value without a domain names one in the
+    /// domain of the control block. The server passes the registry its
+    /// dispatcher serves, so both resolve the same data sets.
+    ///
     /// Use `new_with_channel_sink` instead when the sink is an
     /// `Arc<ChannelReportSink>`, to enable backpressure handling.
-    pub fn new(sink: Arc<dyn ReportSink>) -> Self {
+    pub fn new(sink: Arc<dyn ReportSink>, registry: super::DatasetRegistry) -> Self {
         Self {
             rcbs: HashMap::new(),
             brcbs: HashMap::new(),
@@ -280,7 +285,7 @@ impl ReportingEngine {
             brcb_blocked: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
-            dataset_registry: None,
+            dataset_registry: registry,
             value_index: ValueIndex::default(),
         }
     }
@@ -291,7 +296,13 @@ impl ReportingEngine {
     /// rest of a URCB report and keeps a BRCB entry buffered for the next tick;
     /// neither changes RptEna or Resv. Only a channel whose receiver is gone
     /// releases the control blocks of the connection.
-    pub fn new_with_channel_sink(sink: Arc<ChannelReportSink>) -> Self {
+    ///
+    /// `registry` is the data set registry DatSet writes resolve against, as
+    /// for `new`.
+    pub fn new_with_channel_sink(
+        sink: Arc<ChannelReportSink>,
+        registry: super::DatasetRegistry,
+    ) -> Self {
         let trait_sink = sink.clone() as Arc<dyn ReportSink>;
         Self {
             rcbs: HashMap::new(),
@@ -306,15 +317,16 @@ impl ReportingEngine {
             brcb_blocked: Mutex::new(HashSet::new()),
             metrics: ReportingEngineMetrics::new(),
             peers: HashMap::new(),
-            dataset_registry: None,
+            dataset_registry: registry,
             value_index: ValueIndex::default(),
         }
     }
 
-    /// Creates an engine with a `NullReportSink`, for tests.
+    /// Creates an engine with a `NullReportSink` and an empty data set
+    /// registry, for tests.
     #[cfg(test)]
     pub fn new_null() -> Self {
-        Self::new(Arc::new(NullReportSink))
+        Self::new(Arc::new(NullReportSink), Default::default())
     }
 
     // ─── RCB management ───────────────────────────────────────────────────────
@@ -472,14 +484,10 @@ impl ReportingEngine {
 
     // ─── Data set binding ─────────────────────────────────────────────────────
 
-    /// Installs the data set registry that DatSet writes are resolved against.
-    ///
-    /// A write of DatSet must name a data set in this registry, keyed by
-    /// `(domain, <LN>$<name>)`; a value without a domain names one in the domain
-    /// of the control block. Without a registry, no DatSet write that changes the
-    /// value is accepted.
-    pub fn set_dataset_registry(&mut self, registry: super::DatasetRegistry) {
-        self.dataset_registry = Some(registry);
+    /// Returns the data set registry DatSet writes resolve against.
+    #[cfg(test)]
+    pub(crate) fn dataset_registry(&self) -> &super::DatasetRegistry {
+        &self.dataset_registry
     }
 
     /// Returns the index of the members bound to a control block, which the
@@ -499,7 +507,7 @@ impl ReportingEngine {
     /// `rcb_mms_path`.
     pub(crate) fn resolve_dataset(&self, rcb_mms_path: &str, dat_set: &str) -> Option<Dataset> {
         let key = dataset_key(rcb_mms_path, dat_set)?;
-        let registry = self.dataset_registry.as_ref()?.read().ok()?;
+        let registry = self.dataset_registry.read().ok()?;
         registry.get(&key).map(|ds| Dataset::clone(ds))
     }
 
@@ -2433,7 +2441,8 @@ mod tests {
         use crate::reporting::sink::ChannelReportSink;
 
         let ch_sink = Arc::new(ChannelReportSink::new());
-        let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
 
         let (rc, ds) = make_rcb_and_ds(
             "urcb01",
@@ -2539,7 +2548,8 @@ mod tests {
     #[test]
     fn tick_sends_pdu_when_buf_tm_expired() {
         let sink = Arc::new(CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let (rc, ds) = make_rcb_and_ds(
             "urcb01",
@@ -2629,7 +2639,8 @@ mod tests {
         use crate::reporting::sink::{ChannelReportSink, REPORT_CHANNEL_CAP};
 
         let ch_sink = Arc::new(ChannelReportSink::new());
-        let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
         let (rc, ds) = make_rcb_and_ds(
             "urcb01",
             "IED1LD0/GGIO1$ST$Ind1$stVal",
@@ -2686,7 +2697,8 @@ mod tests {
         use crate::reporting::sink::ChannelReportSink;
 
         let ch_sink = Arc::new(ChannelReportSink::new());
-        let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
         let (rc, ds) = make_rcb_and_ds(
             "urcb01",
             "IED1LD0/GGIO1$ST$Ind1$stVal",
@@ -2713,7 +2725,7 @@ mod tests {
         use crate::reporting::sink::{ChannelReportSink, REPORT_CHANNEL_CAP};
 
         let ch_sink = Arc::new(ChannelReportSink::new());
-        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
         let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
         let brcb = Brcb::new("brcb01", "GGIO1$ds1")
             .with_trg_ops(TriggerOptions::DATA_CHANGED)
@@ -2988,7 +3000,7 @@ mod tests {
     fn flush_brcb_pending_sends_from_head_when_anchor_is_from_head() {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
@@ -3024,7 +3036,7 @@ mod tests {
         // An AfterEntryId anchor resumes with the entries that follow that id.
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
@@ -3060,7 +3072,7 @@ mod tests {
         // The anchor advances to AfterEntryId only once an entry is fully sent.
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
@@ -3095,7 +3107,7 @@ mod tests {
         // in place.
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
@@ -3118,7 +3130,7 @@ mod tests {
         // A None anchor means the buffer has not been resynchronized yet.
         use crate::reporting::brcb::{Brcb, BufferedReportControl};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
@@ -3141,7 +3153,7 @@ mod tests {
     ) {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
         eng.register_brcb(brc).unwrap();
@@ -3206,7 +3218,7 @@ mod tests {
     fn flush_brcb_pending_clears_overflow_after_send() {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let brcb = Brcb::new("brcb01", "GGIO1$ds1").with_buffer_capacity(8);
         let brc = BufferedReportControl::new("IED1LD0/GGIO1$BR$brcb01", brcb);
         eng.register_brcb(brc).unwrap();
@@ -3243,7 +3255,7 @@ mod tests {
         use std::sync::RwLock;
 
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         let val = Arc::new(RwLock::new(MmsValue::Boolean(false)));
         let mut ds = Dataset::new("GGIO1$ds1");
@@ -3444,7 +3456,8 @@ mod tests {
     #[test]
     fn urcb_retrigger_inside_buf_tm_sends_the_first_value_at_once() {
         let sink = Arc::new(CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
         let (rc, ds) = make_rcb_and_ds("urcb01", &attr, TriggerOptions::DATA_CHANGED);
         let path = rc.mms_path.clone();
@@ -3483,7 +3496,8 @@ mod tests {
     #[test]
     fn urcb_trigger_of_another_member_inside_buf_tm_is_merged() {
         let sink = Arc::new(CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let a = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
         let b = "IED1LD0/GGIO1$ST$Ind2$stVal".to_string();
         let rcb = Rcb::new("urcb01", "GGIO1$ds1")
@@ -3523,7 +3537,7 @@ mod tests {
     ) {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
         let ds = make_ds(vec![(attr.as_str(), MmsValue::Integer(0))]);
         let brcb = Brcb::new("brcb01", "GGIO1$ds1")
@@ -3657,7 +3671,8 @@ mod tests {
     /// PDUs it produced; `max_pdu` registers the association with that size.
     fn urcb_gi_pdus(max_pdu: Option<usize>) -> Vec<Bytes> {
         let sink = Arc::new(CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let rcb = Rcb::new("urcb01", "GGIO1$ds1")
             .with_trg_ops(TriggerOptions::GI)
             .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
@@ -3693,7 +3708,7 @@ mod tests {
     fn brcb_gi_pdus(max_pdu: Option<usize>) -> Vec<Bytes> {
         use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
         let sink = Arc::new(CollectReportSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let brcb = Brcb::new("brcb01", "GGIO1$ds1")
             .with_trg_ops(TriggerOptions::GI)
             .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE | OptFlds::ENTRY_ID);
@@ -3758,7 +3773,8 @@ mod tests {
     #[test]
     fn urcb_retrigger_restarts_the_buffer_time() {
         let sink = Arc::new(CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut engine =
+            ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         let attr = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
         let (rc, ds) = make_rcb_and_ds("urcb01", &attr, TriggerOptions::DATA_CHANGED);
         let path = rc.mms_path.clone();

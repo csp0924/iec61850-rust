@@ -1663,8 +1663,8 @@ impl IedServerBuilder<Bound> {
         let dataset_registry: crate::reporting::DatasetRegistry =
             Arc::new(RwLock::new(HashMap::new()));
         // DatSet writes resolve against the same registry the dispatcher serves.
-        let mut engine = ReportingEngine::new_with_channel_sink(report_sink.clone());
-        engine.set_dataset_registry(dataset_registry.clone());
+        let engine =
+            ReportingEngine::new_with_channel_sink(report_sink.clone(), dataset_registry.clone());
         let value_index = engine.value_index();
         let reporting_engine: Arc<Mutex<ReportingEngine>> = Arc::new(Mutex::new(engine));
 

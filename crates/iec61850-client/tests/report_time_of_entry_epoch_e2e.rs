@@ -149,7 +149,7 @@ fn round_trip_brcb_time_of_entry(time_of_entry_ms: u64) -> u64 {
 
     // Server: an enabled BRCB whose last sent report carries the instant under
     // test; GetBRCBValues exposes that entry while RptEna is true.
-    let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
+    let mut engine = ReportingEngine::new(Arc::new(NullReportSink), Default::default());
     let brcb = Brcb::new("01", "MMXU1$ds1").with_trg_ops(TriggerOptions::DATA_CHANGED);
     let path = "IED1LD0/MMXU1$BR$brcb01".to_string();
     engine

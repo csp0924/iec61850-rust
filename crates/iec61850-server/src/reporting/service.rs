@@ -1324,7 +1324,10 @@ mod tests {
     ) -> (Arc<Mutex<ReportingEngine>>, String) {
         use super::super::engine::ReportingEngine;
 
-        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(super::super::engine::NullReportSink),
+            Default::default(),
+        );
         let rcb = Rcb::new(rcb_name, "GGIO1$ds1")
             .with_trg_ops(trg_ops)
             .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::TIME_STAMP)
@@ -1341,13 +1344,13 @@ mod tests {
         (Arc::new(Mutex::new(engine)), path)
     }
 
-    /// Installs a registry on `engine` holding one single-member data set per
+    /// Adds to the registry of `engine` one single-member data set per
     /// `(domain, list_name, member)`, and returns the member value locks.
     fn install_registry(
         engine: &Arc<Mutex<ReportingEngine>>,
         sets: &[(&str, &str, &str)],
     ) -> Vec<Arc<RwLock<MmsValue>>> {
-        let registry: super::super::DatasetRegistry = Default::default();
+        let registry = engine.lock().unwrap().dataset_registry().clone();
         let mut values = Vec::new();
         for (domain, list_name, member) in sets {
             let value = Arc::new(RwLock::new(MmsValue::Integer(0)));
@@ -1359,7 +1362,6 @@ mod tests {
                 .insert((domain.to_string(), list_name.to_string()), Arc::new(ds));
             values.push(value);
         }
-        engine.lock().unwrap().set_dataset_registry(registry);
         values
     }
 
@@ -2045,7 +2047,10 @@ mod tests {
         // Enabling with an empty DatSet is refused with TemporarilyUnavailable.
         use super::super::engine::ReportingEngine;
 
-        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(super::super::engine::NullReportSink),
+            Default::default(),
+        );
         let rcb = Rcb::new("urcb01", "").with_trg_ops(TriggerOptions::DATA_CHANGED);
         let path = "IED1LD0/GGIO1$RP$urcb01".to_string();
         let rc = super::super::rcb::ReportControl::new(&path, rcb);
@@ -2244,7 +2249,10 @@ mod tests {
         use super::super::brcb::{Brcb, BufferedReportControl};
         use super::super::engine::ReportingEngine;
 
-        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(super::super::engine::NullReportSink),
+            Default::default(),
+        );
         let brcb = Brcb::new(rcb_name, "MMXU1$ds1")
             .with_trg_ops(trg_ops)
             .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::BUFFER_OVERFLOW | OptFlds::ENTRY_ID)
@@ -2675,7 +2683,10 @@ mod tests {
         use super::super::brcb::{Brcb, BufferedReportControl};
         let backend = CountingBuffer::default();
         let (iter_calls, newest_calls) = (backend.iter_calls.clone(), backend.newest_calls.clone());
-        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(super::super::engine::NullReportSink),
+            Default::default(),
+        );
         let path = "IED1LD0/MMXU1$BR$brcbCount".to_string();
         engine
             .register_brcb(BufferedReportControl::with_backend(
@@ -2939,7 +2950,7 @@ mod tests {
     fn integrity_fixture(trg_ops: TriggerOptions, intg_pd_ms: u32) -> IntegrityFixture {
         use super::super::brcb::{Brcb, BufferedReportControl};
         let sink = Arc::new(super::super::engine::CollectReportSink::default());
-        let mut engine = ReportingEngine::new(sink.clone());
+        let mut engine = ReportingEngine::new(sink.clone(), Default::default());
         let value = Arc::new(RwLock::new(MmsValue::Boolean(false)));
         let data_set = || {
             let mut ds = Dataset::new("GGIO1$ds1");
@@ -3129,7 +3140,10 @@ mod tests {
     ) -> (Arc<Mutex<ReportingEngine>>, String) {
         use super::super::brcb::BufferedReportControl;
         let path = "IED1LD0/MMXU1$BR$brcbResv".to_string();
-        let mut engine = ReportingEngine::new(Arc::new(super::super::engine::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(super::super::engine::NullReportSink),
+            Default::default(),
+        );
         engine
             .register_brcb(BufferedReportControl::new(&path, brcb))
             .unwrap();

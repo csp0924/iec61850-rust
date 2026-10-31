@@ -303,7 +303,7 @@ impl CaptureSink {
 /// to the head of its buffer.
 fn brcb_engine(buf_tm_ms: u32) -> (ReportingEngine, Arc<CaptureSink>) {
     let sink = Arc::new(CaptureSink::default());
-    let mut engine = ReportingEngine::new(sink.clone());
+    let mut engine = ReportingEngine::new(sink.clone(), Default::default());
     let mut ds = Dataset::new("LLN0$dsPos");
     ds.push(DatasetEntry::new(
         ST_VAL_REF,

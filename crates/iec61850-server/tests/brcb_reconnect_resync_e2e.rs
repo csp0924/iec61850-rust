@@ -180,7 +180,7 @@ async fn brcb_reconnect_resync_5clients_5rounds_no_loss_strict_increasing_entry_
     tokio::time::timeout(Duration::from_secs(30), async {
         // Engine and sink.
         let sink: Arc<BucketSink> = Arc::new(BucketSink::new());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
         // One control block per client.
         let conn_ids: [ConnectionId; 5] = [10, 20, 30, 40, 50];

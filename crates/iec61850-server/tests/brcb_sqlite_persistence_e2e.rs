@@ -73,7 +73,8 @@ fn brcb_sqlite_buffer_survives_engine_drop_and_resyncs_after_entry() {
             BufferedReportControl::with_backend("IED1LD0/GGIO1$BR$brcb01", brcb, Box::new(backend));
 
         let sink_a = Arc::new(CollectSink::default());
-        let mut eng_a = ReportingEngine::new(sink_a.clone() as Arc<dyn ReportSink>);
+        let mut eng_a =
+            ReportingEngine::new(sink_a.clone() as Arc<dyn ReportSink>, Default::default());
         eng_a
             .register_brcb(brc)
             .expect("register the control block");
@@ -149,7 +150,7 @@ fn brcb_sqlite_buffer_survives_engine_drop_and_resyncs_after_entry() {
         BufferedReportControl::with_backend("IED1LD0/GGIO1$BR$brcb01", brcb, Box::new(backend_b));
 
     let sink_b = Arc::new(CollectSink::default());
-    let mut eng_b = ReportingEngine::new(sink_b.clone() as Arc<dyn ReportSink>);
+    let mut eng_b = ReportingEngine::new(sink_b.clone() as Arc<dyn ReportSink>, Default::default());
     eng_b
         .register_brcb(brc)
         .expect("register the control block");

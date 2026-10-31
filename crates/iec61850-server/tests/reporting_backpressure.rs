@@ -48,7 +48,7 @@ fn enable_rcb(rc_arc: &Arc<Mutex<ReportControl>>, conn_id: u64) {
 #[tokio::test]
 async fn backpressure_normal_receiver_no_drops() {
     let ch_sink = Arc::new(ChannelReportSink::new());
-    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
 
     let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
     let rc = make_rc("urcb01", TriggerOptions::DATA_CHANGED);
@@ -128,7 +128,8 @@ fn backpressure_slow_receiver_drops_reports_and_keeps_rpt_ena() {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         let ch_sink = Arc::new(ChannelReportSink::new());
-        let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
 
         let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
         let rc = make_rc("urcb01", TriggerOptions::DATA_CHANGED);
@@ -227,7 +228,7 @@ fn metrics_snapshot_default_all_zero() {
 
 #[test]
 fn metrics_skipped_trgops_incremented_on_mismatch() {
-    let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
+    let mut engine = ReportingEngine::new(Arc::new(NullReportSink), Default::default());
     // The control block triggers on quality change only, so a value change is
     // skipped.
     let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
@@ -258,7 +259,7 @@ fn metrics_skipped_trgops_incremented_on_mismatch() {
 
 #[test]
 fn metrics_coalesced_buftm_incremented_on_buftm_bypass() {
-    let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
+    let mut engine = ReportingEngine::new(Arc::new(NullReportSink), Default::default());
     let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
     let rc = make_rc("urcb01", TriggerOptions::DATA_CHANGED);
     let ds = make_ds_one(attr);
@@ -319,7 +320,7 @@ fn metrics_dropped_buffer_full_always_zero_in_urcb() {
 #[test]
 fn metrics_sent_counter_incremented_on_successful_flush() {
     let ch_sink = Arc::new(ChannelReportSink::new());
-    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
 
     let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
     let rc = make_rc("urcb01", TriggerOptions::DATA_CHANGED);
@@ -368,7 +369,7 @@ fn metrics_sent_counter_incremented_on_successful_flush() {
 #[test]
 fn metrics_dropped_socket_full_incremented_per_would_block() {
     let ch_sink = Arc::new(ChannelReportSink::new());
-    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone());
+    let mut engine = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
 
     let attr = "IED1LD0/GGIO1$ST$Ind1$stVal";
     let rc = make_rc("urcb01", TriggerOptions::DATA_CHANGED);

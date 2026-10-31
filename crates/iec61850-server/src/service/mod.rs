@@ -245,7 +245,10 @@ impl MmsModelDispatcher {
             #[cfg(feature = "control")]
             control_objects: Arc::new(ControlObjectsRegistry::new()),
             #[cfg(feature = "reporting")]
-            reporting_engine: Arc::new(Mutex::new(ReportingEngine::new(Arc::new(NullReportSink)))),
+            reporting_engine: Arc::new(Mutex::new(ReportingEngine::new(
+                Arc::new(NullReportSink),
+                Default::default(),
+            ))),
             #[cfg(feature = "reporting")]
             dataset_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "logging")]
@@ -5407,7 +5410,10 @@ mod brcb_structure_tests {
     /// buffer, even when a newer entry is enqueued while the structure is read.
     #[test]
     fn whole_brcb_read_pairs_entry_id_with_its_time_of_entry() {
-        let mut engine = ReportingEngine::new(Arc::new(crate::reporting::NullReportSink));
+        let mut engine = ReportingEngine::new(
+            Arc::new(crate::reporting::NullReportSink),
+            Default::default(),
+        );
         let path = "IED1LD0/LLN0$BR$brcbCount";
         engine
             .register_brcb(BufferedReportControl::with_backend(

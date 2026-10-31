@@ -47,8 +47,10 @@ fn build_dispatcher_with_urcb() -> (MmsModelDispatcher, Arc<Mutex<ReportingEngin
     let policies = WriteAccessPolicies::default();
 
     // Register the control block on a fresh engine.
-    let engine: Arc<Mutex<ReportingEngine>> =
-        Arc::new(Mutex::new(ReportingEngine::new(Arc::new(NullReportSink))));
+    let engine: Arc<Mutex<ReportingEngine>> = Arc::new(Mutex::new(ReportingEngine::new(
+        Arc::new(NullReportSink),
+        Default::default(),
+    )));
 
     {
         let mut eng = engine.lock().unwrap();
@@ -354,8 +356,10 @@ fn build_dispatcher_with_enabled_urcb() -> (MmsModelDispatcher, Arc<Mutex<Report
     let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
     let policies = WriteAccessPolicies::default();
 
-    let engine: Arc<Mutex<ReportingEngine>> =
-        Arc::new(Mutex::new(ReportingEngine::new(Arc::new(NullReportSink))));
+    let engine: Arc<Mutex<ReportingEngine>> = Arc::new(Mutex::new(ReportingEngine::new(
+        Arc::new(NullReportSink),
+        Default::default(),
+    )));
 
     {
         let mut eng = engine.lock().unwrap();
@@ -470,8 +474,10 @@ fn build_dispatcher_with_brcb() -> (MmsModelDispatcher, Arc<Mutex<ReportingEngin
     let mms_model = MmsDeviceModel::from_ied_model(&model).unwrap();
     let policies = WriteAccessPolicies::default();
 
-    let engine: Arc<Mutex<ReportingEngine>> =
-        Arc::new(Mutex::new(ReportingEngine::new(Arc::new(NullReportSink))));
+    let engine: Arc<Mutex<ReportingEngine>> = Arc::new(Mutex::new(ReportingEngine::new(
+        Arc::new(NullReportSink),
+        Default::default(),
+    )));
 
     {
         let mut eng = engine.lock().unwrap();
@@ -622,7 +628,7 @@ fn brcb_send_path_after_entry_id_zero_e2e_w3b() {
     // The engine and control block are built directly; this test is about the
     // send path rather than about routing.
     let sink = Arc::new(CollectingSink::default());
-    let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+    let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
 
     let brcb = Brcb::new("brcb01", "MMXU1$ds1").with_buffer_capacity(8);
     let mms_path = "IED1LD0/MMXU1$BR$brcb01";

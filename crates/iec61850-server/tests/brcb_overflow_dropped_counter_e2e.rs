@@ -105,7 +105,7 @@ async fn brcb_overflow_dropped_counter_e2e() {
 
         // The engine sends into the collecting sink.
         let sink = Arc::new(CollectingSink::default());
-        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>);
+        let mut eng = ReportingEngine::new(sink.clone() as Arc<dyn ReportSink>, Default::default());
         eng.register_brcb_with_dataset(brc, ds)
             .expect("register_brcb_with_dataset");
 

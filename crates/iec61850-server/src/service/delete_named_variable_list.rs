@@ -225,7 +225,10 @@ mod tests {
             ("IED1LD0".to_string(), "GGIO1$dsStatic".to_string()),
             Arc::new(Dataset::new("GGIO1$dsStatic")),
         );
-        let engine = Mutex::new(ReportingEngine::new(Arc::new(NullReportSink)));
+        let engine = Mutex::new(ReportingEngine::new(
+            Arc::new(NullReportSink),
+            Default::default(),
+        ));
         let mut body = BytesMut::new();
         DeleteNamedVariableListRequest::specific_domain("IED1LD0", list_name).encode(&mut body);
         let ConfirmedResponse::Response(pdu) = handle_delete_named_variable_list(
@@ -274,7 +277,7 @@ mod tests {
         if dynamic {
             keys.lock().unwrap().insert(key.clone());
         }
-        let mut engine = ReportingEngine::new(Arc::new(NullReportSink));
+        let mut engine = ReportingEngine::new(Arc::new(NullReportSink), Default::default());
         engine
             .register_rcb(
                 ReportControl::new("IED1LD0/GGIO1$RP$urcb01", Rcb::new("urcb01", "GGIO1$ds")),
