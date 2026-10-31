@@ -47,7 +47,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     ///
     /// `NotConnected` if the association is not established. A confirmed
     /// error or a reject from the server, which is how a server without the
-    /// service answers, becomes `ClientError::Mms`.
+    /// service answers, becomes `ClientError::Service` or
+    /// `ClientError::Reject`.
     pub async fn get_server_status(
         &self,
         extended_derivation: bool,

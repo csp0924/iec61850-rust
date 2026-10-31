@@ -103,6 +103,8 @@ tokio          = { workspace = true, features = ["sync", "rt", "macros", "rt-mul
 # the client/server dev-dependency cycle out of the publish graph.
 iec61850-server = { path = "../iec61850-server" }
 iec61850-model  = { workspace = true }
+# Certificates for the TLS end-to-end tests, which run under feature `tls`.
+rcgen           = { workspace = true }
 
 # Minimal client binary used as a code-size baseline: connect, read_object,
 # write_object, disconnect, without reporting, control or datasets.

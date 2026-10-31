@@ -139,8 +139,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     ///
     /// `NotConnected` if the association is not established, `InvalidArgument`
     /// for a malformed data set reference or a member reference the server
-    /// returns in a form that cannot be mapped back, and `Mms` if the server
-    /// refuses the request, which is what an unknown data set produces.
+    /// returns in a form that cannot be mapped back, and `Service` if the
+    /// server refuses the request, which is what an unknown data set produces.
     pub async fn get_data_set_directory(
         &self,
         dataset_ref: &str,
@@ -154,8 +154,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
             let mut client = self.mms_client.lock().await;
             client
                 .get_named_variable_list_attributes(&ds.domain, &ds.list_name)
-                .await
-                .map_err(|e| ClientError::Mms(format!("{e}")))?
+                .await?
         };
 
         let mut members = Vec::with_capacity(resp.list_of_variable.len());

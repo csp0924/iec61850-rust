@@ -132,8 +132,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     ///
     /// # Errors
     ///
-    /// `Mms` when the server refuses the Conclude; the association then stays
-    /// established and `is_connected` reports true again.
+    /// `ConcludeRejected` when the server refuses the Conclude; the
+    /// association then stays established and `is_connected` reports true
+    /// again.
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.is_connected
             .store(false, core::sync::atomic::Ordering::Release);

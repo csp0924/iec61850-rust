@@ -303,7 +303,11 @@ async fn ied_connection_read_after_a_timeout_returns_its_own_object() {
 
     proxy.send(Cmd::HoldNext, "hold").await;
     let first = conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await;
-    assert!(first.is_err(), "the held read times out");
+    assert_eq!(
+        first,
+        Err(ClientError::Timeout { after_ms: 300 }),
+        "the held read times out"
+    );
     assert_eq!(proxy.ack.recv().await, Some("held"));
     assert!(conn.is_connected(), "a timeout keeps the association");
     proxy.send(Cmd::Release, "released").await;
@@ -454,7 +458,7 @@ async fn transport_loss_clears_is_connected() {
 
     proxy.send(Cmd::Cut, "cut").await;
     let r = conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await;
-    assert!(r.is_err());
+    assert_eq!(r, Err(ClientError::ConnectionLost));
     assert!(!conn.is_connected(), "a lost transport clears is_connected");
     assert_eq!(
         conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await,
@@ -480,6 +484,60 @@ async fn transport_loss_while_polling_is_not_connected() {
     let r = conn.poll_reports(Duration::from_millis(2_000)).await;
     assert_eq!(r, Err(ClientError::NotConnected));
     assert!(!conn.is_connected());
+    handle.stop().await;
+}
+
+// Release by the server
+
+/// A Session FN carrying an ACSE RLRQ, as a server releasing the association
+/// sends it.
+fn server_finish_frame() -> Vec<u8> {
+    let mut rlrq = [0u8; 5];
+    iec61850_mms::iso::acse::encode_rlrq(&mut rlrq);
+    let mut pres = BytesMut::new();
+    iec61850_mms::iso::presentation::encode_user_data_acse(
+        &iec61850_mms::iso::presentation::IsoPresentation::new(),
+        &rlrq,
+        &mut pres,
+    );
+    let mut spdu = BytesMut::new();
+    iec61850_mms::iso::session::encode_finish(&pres, &mut spdu).unwrap();
+    let len = 4 + 3 + spdu.len();
+    let mut frame = vec![0x03, 0x00, (len >> 8) as u8, len as u8, 0x02, 0xf0, 0x80];
+    frame.extend_from_slice(&spdu);
+    frame
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_by_the_server_is_answered_and_reported() {
+    let handle = start_server("127.0.0.1:0").await;
+    let mut proxy = start_proxy(handle.bound_addr).await;
+    let conn = IedConnection::with_mms_client(mms_client(3_000));
+    conn.connect("127.0.0.1", proxy.port)
+        .await
+        .expect("connect");
+
+    proxy
+        .send(Cmd::Inject(server_finish_frame()), "injected")
+        .await;
+    let r = conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await;
+    assert_eq!(r, Err(ClientError::ReleasedByPeer));
+    assert!(!conn.is_connected(), "a release clears is_connected");
+
+    settle(&proxy, |p| {
+        p.spdus_to_server()
+            .iter()
+            .any(|s| is_disconnect_with_rlre(s))
+    })
+    .await;
+    assert!(
+        proxy
+            .spdus_to_server()
+            .iter()
+            .any(|s| is_disconnect_with_rlre(s)),
+        "the release is answered with an rlre in a session dn: {:02x?}",
+        proxy.spdus_to_server()
+    );
     handle.stop().await;
 }
 

@@ -92,8 +92,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// # Errors
     ///
     /// `NotConnected` if the association is not established, `InvalidArgument`
-    /// for a malformed reference or a member carrying an array index, and `Mms`
-    /// if the server rejects the request.
+    /// for a malformed reference or a member carrying an array index, and
+    /// `Service` or `Reject` if the server refuses the request.
     pub async fn create_data_set(
         &self,
         reference: &str,
@@ -121,7 +121,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         guard
             .define_named_variable_list(&domain, &list_name, entries)
             .await
-            .map_err(|e| ClientError::Mms(format!("{e}")))
+            .map_err(ClientError::from)
     }
 
     /// Deletes a dynamic data set from the server (ACSI DeleteDataSet).
@@ -133,7 +133,8 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// # Errors
     ///
     /// `NotConnected` if the association is not established, `InvalidArgument`
-    /// for a malformed reference, and `Mms` if the server rejects the request.
+    /// for a malformed reference, and `Service` or `Reject` if the server
+    /// refuses the request.
     pub async fn delete_data_set(&self, reference: &str) -> Result<bool, ClientError> {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
@@ -143,8 +144,7 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         let mut guard = self.mms_client.lock().await;
         let (_matched, deleted) = guard
             .delete_named_variable_list(&domain, &list_name)
-            .await
-            .map_err(|e| ClientError::Mms(format!("{e}")))?;
+            .await?;
         Ok(deleted >= 1)
     }
 }

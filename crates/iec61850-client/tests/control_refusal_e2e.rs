@@ -478,7 +478,10 @@ async fn late_last_appl_error_of_an_earlier_command_is_not_taken() {
     let conn = connect(start_server().await, 300).await;
     let spc = handle(&conn, "SPCLATELAE", ControlModel::DirectNormal);
     let first = spc.operate(MmsValue::Boolean(true)).await;
-    assert!(matches!(first, Err(ClientError::Mms(_))), "got {first:?}");
+    assert!(
+        matches!(first, Err(ClientError::Timeout { after_ms: 300 })),
+        "got {first:?}"
+    );
     // The LastApplError ahead of this response carries the previous ctlNum.
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(outcome, ControlOutcome::Failure(ControlAddCause::Unknown));
@@ -611,7 +614,10 @@ async fn unanswered_operate_is_an_error() {
     let conn = connect(start_server().await, 300).await;
     let spc = handle(&conn, "SPCSILENT", ControlModel::DirectNormal);
     let r = spc.operate(MmsValue::Boolean(true)).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert!(
+        matches!(r, Err(ClientError::Timeout { after_ms: 300 })),
+        "got {r:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -619,7 +625,10 @@ async fn unanswered_cancel_is_an_error() {
     let conn = connect(start_server().await, 300).await;
     let spc = handle(&conn, "SPCSILENT", ControlModel::SboNormal);
     let r = spc.cancel(MmsValue::Boolean(true)).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert!(
+        matches!(r, Err(ClientError::Timeout { after_ms: 300 })),
+        "got {r:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -627,7 +636,7 @@ async fn rejected_operate_is_an_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCREJECT", ControlModel::DirectNormal);
     let r = spc.operate(MmsValue::Boolean(true)).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert!(matches!(r, Err(ClientError::Reject { .. })), "got {r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -635,7 +644,7 @@ async fn select_with_value_on_a_lost_connection_is_an_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCDROP", ControlModel::SboEnhanced);
     let r = spc.select_with_value(MmsValue::Boolean(true)).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert!(matches!(r, Err(ClientError::ConnectionLost)), "got {r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -643,7 +652,7 @@ async fn enhanced_operate_on_a_lost_connection_is_an_error() {
     let conn = connect(start_server().await, 3_000).await;
     let spc = handle(&conn, "SPCDROP", ControlModel::DirectEnhanced);
     let r = spc.operate(MmsValue::Boolean(true)).await;
-    assert!(matches!(r, Err(ClientError::Mms(_))), "got {r:?}");
+    assert!(matches!(r, Err(ClientError::ConnectionLost)), "got {r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -146,7 +146,11 @@ async fn rejected_identify_fails_and_keeps_the_association() {
 
     let err = identify(&conn).await.expect_err("a rejected identify");
     match &err {
-        ClientError::Mms(msg) => assert!(msg.contains("reject"), "got {msg}"),
+        ClientError::Reject { reason, .. } => assert_eq!(
+            reason.reject_type(),
+            1,
+            "a confirmed-request reject, got {reason:?}"
+        ),
         other => panic!("expected the MMS reject error, got {other:?}"),
     }
     assert!(conn.is_connected());

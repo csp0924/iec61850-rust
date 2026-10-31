@@ -201,10 +201,9 @@ async fn a_refusal_is_never_reported_as_a_parse_failure() {
     );
 }
 
-/// The `IedConnection` facade flattens a layered MMS error into
-/// `ClientError::Mms`, keeping its rendered text. The text must be the one a
-/// service error renders, carrying the errorClass, and not the one a decode
-/// failure renders.
+/// The `IedConnection` facade carries a confirmed error as
+/// `ClientError::Service` with its errorClass, and renders it with the text of
+/// the MMS service error, not the one a decode failure renders.
 ///
 /// The expected text is built from the typed error rather than written out, so
 /// it follows the `Display` of `ServiceError` instead of pinning a snapshot of
@@ -227,16 +226,19 @@ async fn get_data_set_directory_of_an_unknown_set_reports_the_error_class() {
 
     let err = result.expect_err("an unknown data set must fail");
 
-    let expected = iec61850_client::ClientError::Mms(
-        ClientError::ServiceError {
-            error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
-        }
-        .to_string(),
-    );
-    assert_eq!(
-        err, expected,
-        "an unknown data set must surface as a service error carrying object-non-existent"
-    );
+    match &err {
+        iec61850_client::ClientError::Service { error_class, .. } => assert_eq!(
+            *error_class,
+            ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+            "an unknown data set must surface as a service error carrying object-non-existent"
+        ),
+        other => panic!("expected a service error, got {other:?}"),
+    }
+    let mms_text = ClientError::ServiceError {
+        error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+    }
+    .to_string();
+    assert_eq!(err.to_string(), format!("mms layer error: {mms_text}"));
 }
 
 /// The same call must not surface as a parse failure, pinned apart from the
