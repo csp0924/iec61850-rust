@@ -182,6 +182,7 @@ pub enum ClientError {
     /// certificate from a refusal by the peer, a version or cipher mismatch, a
     /// timeout or a broken transport; `message` is the text of the TLS error.
     #[error("mms layer error: TLS handshake failed: {message}")]
+    #[non_exhaustive]
     TlsHandshake {
         /// What made the handshake fail.
         kind: TlsFailureKind,
@@ -305,7 +306,7 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::ConnectionLost => ClientError::ConnectionLost,
             M::ReleasedByPeer => ClientError::ReleasedByPeer,
             M::Transport(cause) => ClientError::Transport(cause),
-            M::TlsHandshake { kind, message } => ClientError::TlsHandshake { kind, message },
+            M::TlsHandshake { kind, message, .. } => ClientError::TlsHandshake { kind, message },
             #[cfg(feature = "std")]
             M::Io(io) => ClientError::Transport(TransportError::from(io)),
             M::ServiceError {
@@ -383,22 +384,18 @@ mod tests {
         }
     }
 
+    /// The mapping from the MMS layer is exercised end to end by the TLS
+    /// tests of `own_server_matrix_e2e`; its variant is not constructible
+    /// outside that crate.
     #[test]
-    fn a_failed_tls_handshake_keeps_its_kind() {
-        let mapped = map(M::TlsHandshake {
-            kind: iec61850_mms::TlsFailureKind::Verification,
-            message: "certificate verification failed: UnknownIssuer".into(),
-        });
+    fn a_failed_tls_handshake_renders_its_message_once() {
+        let error = ClientError::TlsHandshake {
+            kind: TlsFailureKind::AlertReceived,
+            message: "received fatal alert: ProtocolVersion".into(),
+        };
         assert_eq!(
-            mapped,
-            ClientError::TlsHandshake {
-                kind: TlsFailureKind::Verification,
-                message: "certificate verification failed: UnknownIssuer".into(),
-            }
-        );
-        assert_eq!(
-            mapped.to_string(),
-            "mms layer error: TLS handshake failed: certificate verification failed: UnknownIssuer"
+            error.to_string(),
+            "mms layer error: TLS handshake failed: received fatal alert: ProtocolVersion"
         );
     }
 

@@ -176,6 +176,7 @@ pub enum ClientError {
     /// `kind` classifies the failure and `message` is the text of the TLS
     /// error.
     #[error("TLS handshake failed: {message}")]
+    #[non_exhaustive]
     TlsHandshake {
         /// What made the handshake fail.
         kind: TlsFailureKind,

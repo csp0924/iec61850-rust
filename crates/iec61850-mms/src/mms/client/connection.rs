@@ -79,6 +79,16 @@ use iec61850_tls::{TlsConnector, TlsError, TlsStream};
 #[cfg(feature = "tls")]
 use rustls::pki_types::ServerName;
 
+/// The text of a failed client handshake, without the prefix of
+/// `TlsError::Handshake`, which the error carrying it already has.
+#[cfg(feature = "tls")]
+fn tls_failure_message(e: &TlsError) -> String {
+    match e {
+        TlsError::Handshake(inner) => inner.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Classifies a failed client handshake.
 #[cfg(feature = "tls")]
 fn tls_failure_kind(e: &TlsError) -> TlsFailureKind {
@@ -466,7 +476,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         })?
         .map_err(|e: TlsError| ClientError::TlsHandshake {
             kind: tls_failure_kind(&e),
-            message: e.to_string(),
+            message: tls_failure_message(&e),
         })?;
         debug!("tls handshake complete");
 
@@ -1597,6 +1607,63 @@ fn check_session_accept(raw: &[u8], indication: SessionIndication) -> Result<(),
 
 // The connect request is built on the std transport and timer, so these run on
 // a std build only.
+#[cfg(all(test, feature = "tls"))]
+mod tls_failure_tests {
+    use super::*;
+    use rustls::{AlertDescription, Error as R, PeerIncompatible};
+
+    /// Each handshake error of the TLS layer maps to its kind.
+    #[test]
+    fn every_tls_error_has_its_kind() {
+        let cases = [
+            (
+                TlsError::Verification(R::NoCertificatesPresented),
+                TlsFailureKind::Verification,
+            ),
+            (
+                TlsError::VersionUnsupported(R::PeerIncompatible(
+                    PeerIncompatible::ServerDoesNotSupportTls12Or13,
+                )),
+                TlsFailureKind::VersionUnsupported,
+            ),
+            (
+                TlsError::CipherUnsupported(R::PeerIncompatible(
+                    PeerIncompatible::NoCipherSuitesInCommon,
+                )),
+                TlsFailureKind::CipherUnsupported,
+            ),
+            (
+                TlsError::Handshake(R::AlertReceived(AlertDescription::HandshakeFailure)),
+                TlsFailureKind::AlertReceived,
+            ),
+            (
+                TlsError::Handshake(R::General("other".into())),
+                TlsFailureKind::Other,
+            ),
+            (
+                TlsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                TlsFailureKind::Io,
+            ),
+            (TlsError::CertLoad("bad pem".into()), TlsFailureKind::Other),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(tls_failure_kind(&error), kind, "{error}");
+        }
+    }
+
+    /// The text of a handshake error carries the TLS error once.
+    #[test]
+    fn the_message_does_not_repeat_the_handshake_prefix() {
+        let alert = TlsError::Handshake(R::AlertReceived(AlertDescription::ProtocolVersion));
+        assert_eq!(
+            tls_failure_message(&alert),
+            "received fatal alert: ProtocolVersion"
+        );
+        let verification = TlsError::Verification(R::NoCertificatesPresented);
+        assert_eq!(tls_failure_message(&verification), verification.to_string());
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;

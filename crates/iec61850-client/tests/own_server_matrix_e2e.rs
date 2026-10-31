@@ -1091,7 +1091,7 @@ mod over_tls {
             .await;
         assert!(!conn.is_connected());
         match result {
-            Err(ClientError::TlsHandshake { kind, message }) => {
+            Err(ClientError::TlsHandshake { kind, message, .. }) => {
                 assert!(!message.is_empty(), "the TLS error is carried");
                 kind
             }
