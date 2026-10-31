@@ -173,6 +173,7 @@ impl CompileBuilder {
 
 /// An error raised by code generation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CompileError {
     /// The input SCL file could not be read.
     #[error("failed to read the input SCL `{path}`: {source}")]
