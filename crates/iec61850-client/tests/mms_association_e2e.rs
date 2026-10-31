@@ -4,10 +4,7 @@
 //! release it, or cut the transport at a chosen point, and records every frame
 //! in both directions. A held answer never arrives on its own, so a request
 //! timeout is reached deterministically rather than through a sleep margin.
-//!
-//! The tests named `oracle_*` run against an external IEC 61850 server when
-//! `IEC_MMS_ORACLE_ADDR` names one (for example `127.0.0.1:10102`, a
-//! `server_example_basic_io` model); without it they return immediately.
+//! A test that needs a frame to have passed waits for the proxy to record it.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,7 +25,7 @@ use iec61850_model::{
 use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 const DOMAIN: &str = "IED1LD0";
 
@@ -124,6 +121,8 @@ struct Proxy {
     cmd: mpsc::UnboundedSender<Cmd>,
     ack: mpsc::UnboundedReceiver<&'static str>,
     frames: Arc<Mutex<Frames>>,
+    /// Notified whenever a frame is recorded or a side closes.
+    changed: Arc<Notify>,
 }
 
 impl Proxy {
@@ -160,20 +159,25 @@ async fn start_proxy(upstream: SocketAddr) -> Proxy {
     let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
     let (ack_tx, ack_rx) = mpsc::unbounded_channel::<&'static str>();
     let frames = Arc::new(Mutex::new(Frames::default()));
+    let changed = Arc::new(Notify::new());
     let rec = Arc::clone(&frames);
+    let notify = Arc::clone(&changed);
     tokio::spawn(async move {
         let (client, _) = listener.accept().await.unwrap();
         let server = TcpStream::connect(upstream).await.unwrap();
         let (mut cr, mut cw) = client.into_split();
         let (mut sr, mut sw) = server.into_split();
         let rec_c2s = Arc::clone(&rec);
+        let notify_c2s = Arc::clone(&notify);
         let c2s = tokio::spawn(async move {
             while let Some(f) = read_tpkt(&mut cr).await {
                 rec_c2s.lock().unwrap().to_server.push(f.clone());
+                notify_c2s.notify_waiters();
                 if sw.write_all(&f).await.is_err() {
                     break;
                 }
             }
+            notify_c2s.notify_waiters();
             let _ = sw.shutdown().await;
         });
         let mut hold_next = false;
@@ -201,10 +205,12 @@ async fn start_proxy(upstream: SocketAddr) -> Proxy {
                 },
                 f = read_tpkt(&mut sr) => {
                     let Some(f) = f else {
+                        notify.notify_waiters();
                         let _ = cw.shutdown().await;
                         return;
                     };
                     rec.lock().unwrap().to_client.push(f.clone());
+                    notify.notify_waiters();
                     if hold_next {
                         hold_next = false;
                         held = Some(f);
@@ -221,6 +227,7 @@ async fn start_proxy(upstream: SocketAddr) -> Proxy {
         cmd: tx,
         ack: ack_rx,
         frames,
+        changed,
     }
 }
 
@@ -243,16 +250,26 @@ fn is_abort_with_user_abrt(spdu: &[u8]) -> bool {
     spdu.first() == Some(&0x19) && contains(spdu, &[0x64, 0x03, 0x80, 0x01, 0x00])
 }
 
-/// Waits until the proxy has seen the upstream close, so that every frame of
-/// the release is recorded.
+/// Waits until `done` holds over the frames the proxy recorded, checking again
+/// each time it records a frame. The bound only keeps a broken run from
+/// hanging; the wait ends on the recorded frame.
 async fn settle(proxy: &Proxy, done: impl Fn(&Proxy) -> bool) {
-    for _ in 0..200 {
-        if done(proxy) {
-            return;
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let changed = proxy.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if done(proxy) {
+                return;
+            }
+            changed.await;
         }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "the proxy never recorded the expected frame"
+    );
 }
 
 // Request timeout and late answers
@@ -510,6 +527,10 @@ fn server_finish_frame() -> Vec<u8> {
     frame
 }
 
+/// The client meets the release only when it next receives, after it has sent
+/// the Read; the server's answer to that Read is held in the proxy, so the
+/// client closes with nothing unread and its Session DN cannot be lost to a
+/// reset of the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_by_the_server_is_answered_and_reported() {
     let handle = start_server("127.0.0.1:0").await;
@@ -522,6 +543,7 @@ async fn release_by_the_server_is_answered_and_reported() {
     proxy
         .send(Cmd::Inject(server_finish_frame()), "injected")
         .await;
+    proxy.send(Cmd::HoldNext, "hold").await;
     let r = conn.read_object("IED1LD0/GGIO1.Ind1.stVal", FC::St).await;
     assert_eq!(r, Err(ClientError::ReleasedByPeer));
     assert!(!conn.is_connected(), "a release clears is_connected");
@@ -643,8 +665,11 @@ async fn pdu_at_the_negotiated_size_is_sent_and_one_above_is_refused() {
 
 // Release and abort
 
+/// The client releases with an RLRQ in a Session FN and the server answers
+/// with an RLRE in a Session DN, which the client has received by the time
+/// the release returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn release_sends_rlrq_in_a_session_finish() {
+async fn release_is_a_finish_answered_by_a_disconnect() {
     let handle = start_server("127.0.0.1:0").await;
     let proxy = start_proxy(handle.bound_addr).await;
     let mut client = mms_client(1_000);
@@ -658,6 +683,11 @@ async fn release_sends_rlrq_in_a_session_finish() {
     assert!(
         sent.iter().any(|s| is_finish_with_rlrq(s)),
         "no session finish with an rlrq among {sent:02x?}"
+    );
+    let answers = proxy.spdus_to_client();
+    assert!(
+        answers.iter().any(|s| is_disconnect_with_rlre(s)),
+        "no session disconnect with an rlre among {answers:02x?}"
     );
     handle.stop().await;
 }
@@ -711,80 +741,26 @@ async fn create_data_set_answer_is_a_primitive_null() {
     handle.stop().await;
 }
 
-// Against an external server
-
-fn oracle_addr() -> Option<SocketAddr> {
-    std::env::var("IEC_MMS_ORACLE_ADDR").ok()?.parse().ok()
-}
-
+/// A data set whose member names a data object, under its functional
+/// constraint, is created and then deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_release_is_answered_with_rlre_in_a_disconnect() {
-    let Some(addr) = oracle_addr() else {
-        return;
-    };
-    let proxy = start_proxy(addr).await;
-    let mut client = mms_client(3_000);
-    client
-        .connect("127.0.0.1", proxy.port)
-        .await
-        .expect("connect");
-    client.disconnect().await.expect("disconnect");
-    let sent = proxy.spdus_to_server();
-    assert!(sent.iter().any(|s| is_finish_with_rlrq(s)), "{sent:02x?}");
-    settle(&proxy, |p| {
-        p.spdus_to_client()
-            .iter()
-            .any(|s| is_disconnect_with_rlre(s))
-    })
-    .await;
-    let answers = proxy.spdus_to_client();
-    assert!(
-        answers.iter().any(|s| is_disconnect_with_rlre(s)),
-        "no session disconnect with an rlre among {answers:02x?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_abort_is_a_user_abrt() {
-    let Some(addr) = oracle_addr() else {
-        return;
-    };
-    let proxy = start_proxy(addr).await;
-    let mut client = mms_client(3_000);
-    client
-        .connect("127.0.0.1", proxy.port)
-        .await
-        .expect("connect");
-    client.abort().await.expect("abort");
-    settle(&proxy, |p| {
-        p.spdus_to_server().iter().any(|s| s.first() == Some(&0x19))
-    })
-    .await;
-    let sent = proxy.spdus_to_server();
-    assert!(
-        sent.iter().any(|s| is_abort_with_user_abrt(s)),
-        "{sent:02x?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_create_data_set_succeeds() {
-    let Some(addr) = oracle_addr() else {
-        return;
-    };
+async fn create_data_set_with_a_data_object_member_succeeds() {
+    let handle = start_server("127.0.0.1:0").await;
     let conn = IedConnection::with_mms_client(mms_client(3_000));
-    conn.connect(&addr.ip().to_string(), addr.port())
+    conn.connect("127.0.0.1", handle.bound_addr.port())
         .await
         .expect("connect");
-    let ld = "simpleIOGenericIO";
-    let name = format!("{ld}/LLN0.dynF1");
+    let name = "IED1LD0/LLN0.dynF1";
     let created = conn
-        .create_data_set(
-            &name,
-            &[DataSetMember::new(format!("{ld}/GGIO1.Ind1"), FC::St)],
-        )
+        .create_data_set(name, &[DataSetMember::new("IED1LD0/GGIO1.Ind1", FC::St)])
         .await;
     assert_eq!(created, Ok(()));
-    let _ = conn.delete_data_set(&name).await;
+    assert_eq!(
+        conn.get_data_set_values(name).await.map(|v| v.len()),
+        Ok(1),
+        "the data set holds its one member"
+    );
+    assert_eq!(conn.delete_data_set(name).await, Ok(true));
     conn.disconnect().await.expect("disconnect");
+    handle.stop().await;
 }
