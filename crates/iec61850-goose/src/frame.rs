@@ -81,8 +81,21 @@ impl VlanPriority {
     }
 }
 
+/// Priority 4, the default user priority of a time-critical GOOSE frame.
+///
+/// IEC 61850-8-1 Annex C.2.4 assigns priorities 4 to 7 to high-priority
+/// frames; 4 matches the default of IEC 61850-9-2 Table 7 for Sampled Values.
+impl Default for VlanPriority {
+    fn default() -> Self {
+        VlanPriority(4)
+    }
+}
+
 /// 802.1Q VLAN tag fields carried in a GOOSE frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is priority 4 with VID 0, the default VID of IEC 61850-8-1
+/// Table C.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VlanTag {
     /// Priority code point, 0-7.
     pub priority: VlanPriority,

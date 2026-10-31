@@ -121,6 +121,32 @@ fn appid_only_subscription_drops_other_appids_on_the_wire() {
 
 #[test]
 #[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
+fn default_parameters_send_a_priority_tag_with_vid_0() {
+    let (mut tx, rx) = veth_pair();
+    let (handle, states) = listen(
+        rx,
+        GooseSubscriberBuilder::new()
+            .gocb_ref("LD/LLN0$GO$vdef")
+            .app_id(0x1005),
+    );
+
+    let comm = CommParameters::new(0x1005, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05]);
+    let mut publisher =
+        GoosePublisher::new(comm, "LD/LLN0$GO$vdef", None, "LD/LLN0$ds", 1).unwrap();
+    tx.send(&publisher.publish(&[MmsValue::Boolean(true)]).unwrap())
+        .expect("send");
+
+    let state = states
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the default-tagged publication was not received");
+    handle.stop_and_join();
+    let tag = state.vlan.expect("the default 802.1q tag was lost");
+    assert_eq!(tag.vlan_id, 0);
+    assert_eq!(tag.priority.value(), 4);
+}
+
+#[test]
+#[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
 fn published_frame_arrives_with_vlan_tag_and_interface_source() {
     let (mut tx, rx) = veth_pair();
     let hw = tx.hw_addr().expect("veth has an ethernet address");

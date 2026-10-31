@@ -25,7 +25,12 @@ use crate::pdu::GoosePdu;
 pub const GOOSE_MAX_FRAME_SIZE: usize = 1518;
 
 /// Communication parameters of a GOOSE publication: APPID, destination MAC,
-/// and the optional VLAN tag and source MAC.
+/// the 802.1Q tag, and the optional source MAC.
+///
+/// IEC 61850-8-1 Annex C.2.2 requires the 802.1Q tag in every frame a GOOSE
+/// publisher sends, so `new` starts from [`VlanTag::default`], priority 4
+/// with VID 0. [`without_vlan`](Self::without_vlan) removes the tag for a
+/// network that cannot carry it.
 ///
 /// ## Example
 ///
@@ -45,18 +50,19 @@ pub struct CommParameters {
     /// which the `iec61850-hal` AF_PACKET backend, and its pcap backend on
     /// Linux, replace with the interface address when sending.
     pub src_mac: Option<[u8; 6]>,
-    /// Optional 802.1Q VLAN tag.
+    /// 802.1Q VLAN tag; `None` sends an untagged frame.
     pub vlan: Option<VlanTag>,
 }
 
 impl CommParameters {
-    /// Creates parameters with no VLAN tag and no source MAC override.
+    /// Creates parameters with the default 802.1Q tag, priority 4 and VID 0,
+    /// and no source MAC override.
     pub fn new(app_id: u16, dst_mac: [u8; 6]) -> Self {
         Self {
             app_id,
             dst_mac,
             src_mac: None,
-            vlan: None,
+            vlan: Some(VlanTag::default()),
         }
     }
 
@@ -66,14 +72,20 @@ impl CommParameters {
         self
     }
 
+    /// Removes the 802.1Q tag, so frames are sent untagged.
+    pub fn without_vlan(mut self) -> Self {
+        self.vlan = None;
+        self
+    }
+
     /// Sets the source MAC address.
     pub fn with_src_mac(mut self, src: [u8; 6]) -> Self {
         self.src_mac = Some(src);
         self
     }
 
-    /// Sets the VLAN priority, keeping the current VLAN ID or 0 when no tag
-    /// has been set yet.
+    /// Sets the VLAN priority, keeping the current VLAN ID, or 0 when the tag
+    /// was removed.
     pub fn with_priority(mut self, priority: VlanPriority) -> Self {
         let vlan_id = self.vlan.map(|v| v.vlan_id).unwrap_or(0);
         self.vlan = Some(VlanTag { priority, vlan_id });
@@ -631,9 +643,12 @@ mod tests {
     use super::*;
     use crate::frame::{VlanPriority, VlanTag, GOOSE_ETHER_TYPE};
 
+    /// Untagged parameters, so the tests can address header fields at their
+    /// untagged offsets.
     fn sample_comm() -> CommParameters {
         CommParameters::new(0x1000, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
             .with_src_mac([0x00, 0x50, 0xc2, 0x12, 0x34, 0x56])
+            .without_vlan()
     }
 
     fn sample_publisher() -> GoosePublisher {
@@ -663,6 +678,47 @@ mod tests {
         let p = GoosePublisher::new(comm, "A/L$GO$gcb", None, "A/L$DS", 1).unwrap();
         // 18 Ethernet bytes with the VLAN tag, plus the 8-byte GOOSE header.
         assert_eq!(p.frame_header_bytes().len(), 18 + 8);
+    }
+
+    #[test]
+    fn default_parameters_tag_frames_with_priority_4_and_vid_0() {
+        let comm = CommParameters::new(0x1000, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01]);
+        assert_eq!(comm.vlan, Some(VlanTag::default()));
+        let mut p = GoosePublisher::new(comm, "A/L$GO$gcb", None, "A/L$DS", 1).unwrap();
+        let frame = p.publish(&sample_data()).unwrap();
+        assert_eq!(
+            &frame[12..16],
+            &[0x81, 0x00, 0x80, 0x00],
+            "tpid, pcp 4, vid 0"
+        );
+        assert_eq!(u16::from_be_bytes([frame[16], frame[17]]), GOOSE_ETHER_TYPE);
+        let decoded = GooseFrame::decode(&frame).unwrap();
+        let tag = decoded.header.vlan.expect("tagged");
+        assert_eq!(tag.priority.value(), 4);
+        assert_eq!(tag.vlan_id, 0);
+        let pdu = GoosePdu::decode_ber(&decoded.pdu_bytes).unwrap();
+        assert_eq!(pdu.gocb_ref, "A/L$GO$gcb");
+    }
+
+    #[test]
+    fn without_vlan_sends_untagged_frames() {
+        let comm = CommParameters::new(0x1000, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01]).without_vlan();
+        assert_eq!(comm.vlan, None);
+        let mut p = GoosePublisher::new(comm, "A/L$GO$gcb", None, "A/L$DS", 1).unwrap();
+        let frame = p.publish(&sample_data()).unwrap();
+        assert_eq!(u16::from_be_bytes([frame[12], frame[13]]), GOOSE_ETHER_TYPE);
+    }
+
+    #[test]
+    fn with_priority_keeps_the_default_vid() {
+        let comm = CommParameters::new(0x1000, [0; 6]).with_priority(VlanPriority::new(6).unwrap());
+        assert_eq!(
+            comm.vlan,
+            Some(VlanTag {
+                priority: VlanPriority::new(6).unwrap(),
+                vlan_id: 0
+            })
+        );
     }
 
     #[test]
