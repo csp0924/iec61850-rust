@@ -956,11 +956,11 @@ impl IedServer {
                 continue;
             };
             let data: Vec<(String, MmsValue)> = {
-                let _values = self
-                    .inner
-                    .mms_view
-                    .as_ref()
-                    .and_then(|view| crate::compat::rwlock_read(view.value_lock()));
+                let _values = self.inner.mms_view.as_ref().map(|view| {
+                    view.value_lock()
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                });
                 ds.entries
                     .iter()
                     .filter_map(|e| e.read_value().map(|v| (e.attr_ref.clone(), v)))
@@ -2299,6 +2299,46 @@ mod tests {
             engine.tick_brcb(Instant::now(), 0)
         });
         assert_eq!(brcb.lock_buffer().unwrap().len(), 1, "the GI entry");
+    }
+
+    /// An integrity log entry takes its snapshot under the value lock.
+    #[test]
+    fn integrity_log_takes_its_snapshot_under_the_value_lock() {
+        use crate::logging::{InMemoryLogStorage, LogControl, LogControlBlock, LogStorage};
+        let (server, ds, view, b) = server_with_a_data_object_data_set();
+        server.register_dataset("TESTLD0".to_string(), ds);
+        let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+        let block = LogControlBlock::new("lcbSet")
+            .with_dataset("LLN0$dsSet")
+            .with_trg_ops(TriggerOptions::INTEGRITY)
+            .with_intg_pd_ms(1_000)
+            .with_log_ref("TESTLD0/LLN0$SetLog");
+        server.register_log_control(
+            "TESTLD0",
+            "LLN0$LG$lcbSet",
+            Arc::new(
+                LogControl::new("TESTLD0/LLN0$LG$lcbSet", block).with_storage(storage.clone()),
+            ),
+        );
+        let due = Instant::now() + std::time::Duration::from_millis(1_001);
+
+        let hold = b.write().unwrap();
+        let ticking = std::thread::spawn({
+            let server = server.clone();
+            move || server.tick_log_integrity(due, 0)
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while view.value_lock().try_write().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the integrity log snapshot never takes the value lock"
+            );
+            std::thread::yield_now();
+        }
+        drop(hold);
+        assert_eq!(ticking.join().unwrap(), 1, "one integrity entry");
+        assert!(view.value_lock().try_write().is_ok());
+        assert_eq!(storage.count(), 1);
     }
 
     /// A read handler that, once released, updates `GGIO1$SP$Set$b` and
