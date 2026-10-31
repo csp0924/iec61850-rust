@@ -403,8 +403,9 @@ async fn brcb_entry_id_and_purge_buf_refused_while_enabled() {
     );
 }
 
-/// A BRCB on the SQLite backend exposes its newest buffered entry: the EntryID
-/// and TimeofEntry read while it is disabled belong to the last report it then
+/// A BRCB on the SQLite backend reports each buffered entry with the values it
+/// was enqueued with, and exposes its newest buffered entry: the EntryID and
+/// TimeofEntry read while it is disabled belong to the last report it then
 /// sends.
 #[cfg(feature = "sqlite-backend")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -449,6 +450,8 @@ async fn brcb_on_sqlite_exposes_its_newest_entry() {
         .expect("enable");
     let r1 = next_report(&mut mms).await;
     let r2 = next_report(&mut mms).await;
+    assert_eq!(r1.data_values, [dbpos(2)]);
+    assert_eq!(r2.data_values, [dbpos(1)]);
     assert_eq!(MmsData::OctetString(r1.entry_id.clone().unwrap()), first);
     assert_eq!(MmsData::OctetString(r2.entry_id.clone().unwrap()), newest);
     assert_eq!(read_brcb(&mut mms, "EntryID").await, newest);

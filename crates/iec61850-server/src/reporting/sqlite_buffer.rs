@@ -15,14 +15,33 @@
 //! in a `Mutex`; because `ReportBufferBackend` also requires `Send + Sync`, the
 //! caller's own lock sits outside it.
 //!
+//! Each row keeps the entry's enqueue-time snapshot, the inclusion flag and the
+//! captured value of every data set member, so an entry read back reports the
+//! values it was enqueued with. A database created by an earlier release, whose
+//! table has no snapshot column, is upgraded in place when opened; its rows read
+//! back without a snapshot. The upgrade runs in one `BEGIN IMMEDIATE`
+//! transaction, so connections that open the same file at once upgrade it once,
+//! and an opening connection waits up to `BUSY_TIMEOUT` for another's lock,
+//! including while it switches the file to WAL; within one process, opening is
+//! serialized.
+//!
+//! A row whose snapshot cannot be decoded is treated as absent: `iter_entries`
+//! and `iter_from` skip it with a warning, and `find_entry`,
+//! `seek_to_after_entry_id` and `newest_entry` do not find it, so a client that
+//! resynchronizes on its EntryID is answered as for an evicted entry.
+//!
 //! Behavior matches the in-memory backend exactly: `is_overflow` starts true,
 //! `purge()` removes the entries without touching `is_overflow`, `DropOldest`
 //! evicts while `DropNewest` and `Reject` refuse the new entry, and the shared
 //! `dropped_buffer_full` counter injected through `set_dropped_counter` is
 //! incremented on every dropped entry.
 
-use super::buffer::{EntryId, OverflowStrategy, ReportBufferBackend, ReportEntry, SeekResult};
-use bytes::Bytes;
+use super::buffer::{
+    EnqueuedSnapshot, EntryId, OverflowStrategy, ReportBufferBackend, ReportEntry, SeekResult,
+};
+use crate::flags::InclusionFlag;
+use bytes::{Bytes, BytesMut};
+use iec61850_mms::mms::pdu::common::MmsData;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,13 +59,80 @@ use std::sync::{Arc, Mutex};
 ///     time_of_entry_ms INTEGER NOT NULL,
 ///     is_integrity     INTEGER NOT NULL,
 ///     is_gi            INTEGER NOT NULL,
-///     payload          BLOB    NOT NULL
+///     payload          BLOB    NOT NULL,
+///     snapshot         BLOB
 /// );
 /// CREATE INDEX IF NOT EXISTS idx_brcb_entry
 ///     ON report_entries (brcb_id, entry_id);
 /// ```
 pub struct SqliteReportBuffer {
     inner: Mutex<SqliteInner>,
+}
+
+/// Version of the table layout, kept in `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 1;
+
+/// How long opening a database waits for a lock another connection holds.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Version byte that starts an encoded snapshot.
+const SNAPSHOT_FORMAT: u8 = 1;
+
+/// Encodes an enqueue-time snapshot for the snapshot column.
+///
+/// The layout is a format byte, the data set length as a big-endian `u32`, and
+/// then per member its inclusion flag, a presence byte, and, when a value was
+/// captured, the value as a BER-encoded MMS Data.
+fn encode_snapshot(snapshot: &EnqueuedSnapshot) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(&[SNAPSHOT_FORMAT]);
+    let len = u32::try_from(snapshot.data_set_len).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_be_bytes());
+    for i in 0..snapshot.data_set_len {
+        let flag = snapshot.inclusion_flags.get(i).map_or(0, |f| f.0);
+        match snapshot.values.get(i).and_then(Option::as_ref) {
+            Some(value) => {
+                buf.extend_from_slice(&[flag, 1]);
+                crate::service::convert::mms_value_to_mms_data(value).encode(&mut buf);
+            }
+            None => buf.extend_from_slice(&[flag, 0]),
+        }
+    }
+    buf.to_vec()
+}
+
+/// Decodes a snapshot written by `encode_snapshot`; `None` when the bytes are
+/// not in that layout.
+fn decode_snapshot(bytes: &[u8]) -> Option<EnqueuedSnapshot> {
+    let (&format, rest) = bytes.split_first()?;
+    if format != SNAPSHOT_FORMAT {
+        return None;
+    }
+    let len_bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    let data_set_len = usize::try_from(u32::from_be_bytes(len_bytes)).ok()?;
+    let mut pos = 4;
+    let mut inclusion_flags = Vec::new();
+    let mut values = Vec::new();
+    for _ in 0..data_set_len {
+        let flag = *rest.get(pos)?;
+        let present = *rest.get(pos + 1)?;
+        pos += 2;
+        inclusion_flags.push(InclusionFlag(flag));
+        match present {
+            0 => values.push(None),
+            1 => {
+                let (data, used) = MmsData::decode(rest.get(pos..)?).ok()?;
+                pos += used;
+                values.push(Some(crate::service::convert::mms_data_to_mms_value(&data)));
+            }
+            _ => return None,
+        }
+    }
+    (pos == rest.len()).then_some(EnqueuedSnapshot {
+        inclusion_flags,
+        values,
+        data_set_len,
+    })
 }
 
 struct SqliteInner {
@@ -94,7 +180,7 @@ impl SqliteReportBuffer {
         strategy: OverflowStrategy,
     ) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        Self::init_schema(&conn)?;
+        Self::init_schema_serialized(&conn)?;
         Ok(Self {
             inner: Mutex::new(SqliteInner {
                 conn,
@@ -117,7 +203,7 @@ impl SqliteReportBuffer {
         strategy: OverflowStrategy,
     ) -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::init_schema(&conn)?;
+        Self::init_schema_serialized(&conn)?;
         Ok(Self {
             inner: Mutex::new(SqliteInner {
                 conn,
@@ -130,26 +216,94 @@ impl SqliteReportBuffer {
         })
     }
 
+    /// Runs `init_schema` while no other `SqliteReportBuffer` of this process is
+    /// opening a database, so connections that open one file from several
+    /// threads do not contend for the lock switching it to WAL needs.
+    fn init_schema_serialized(conn: &Connection) -> rusqlite::Result<()> {
+        static OPENING: Mutex<()> = Mutex::new(());
+        let _guard = OPENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::init_schema(conn)
+    }
+
     fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // WAL improves concurrent reads and stays crash-safe; synchronous = NORMAL
         // is still ACID under WAL and does fewer fsyncs than FULL, which suits a
         // buffer written in bursts and read later. The PRAGMA result is consumed
         // through query_row because some SQLite versions otherwise buffer it.
-        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Self::enable_wal(conn)?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        // Creating the table and upgrading it form one write transaction, so two
+        // connections opening the same file at once cannot both add the column.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let created = Self::create_or_upgrade(conn);
+        let end = if created.is_ok() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        let ended = conn.execute_batch(end);
+        created.and(ended)
+    }
+
+    /// Puts the database in WAL mode.
+    ///
+    /// Switching the journal mode needs the file to itself, and SQLite answers
+    /// busy at once, without the busy handler, while another connection is
+    /// opening the same file; a busy answer is therefore retried every few
+    /// milliseconds until `BUSY_TIMEOUT` has passed.
+    fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+        let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+        loop {
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Creates the table and its index, or brings a table of an earlier schema
+    /// version up to `SCHEMA_VERSION`; runs inside the transaction `init_schema`
+    /// opens.
+    fn create_or_upgrade(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
-            "PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS report_entries (
+            "CREATE TABLE IF NOT EXISTS report_entries (
                  seq              INTEGER PRIMARY KEY AUTOINCREMENT,
                  brcb_id          TEXT    NOT NULL,
                  entry_id         BLOB    NOT NULL,
                  time_of_entry_ms INTEGER NOT NULL,
                  is_integrity     INTEGER NOT NULL,
                  is_gi            INTEGER NOT NULL,
-                 payload          BLOB    NOT NULL
+                 payload          BLOB    NOT NULL,
+                 snapshot         BLOB
              );
              CREATE INDEX IF NOT EXISTS idx_brcb_entry
                  ON report_entries (brcb_id, entry_id);",
         )?;
+        // Schema version 1 added the snapshot column; a table created before it
+        // gains the column, and its existing rows keep a NULL snapshot.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < SCHEMA_VERSION {
+            let has_snapshot: bool = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('report_entries') WHERE name = 'snapshot'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if !has_snapshot {
+                conn.execute_batch("ALTER TABLE report_entries ADD COLUMN snapshot BLOB")?;
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        }
         Ok(())
     }
 
@@ -226,10 +380,11 @@ impl SqliteInner {
     /// Inserts one entry. Capacity is the caller's concern: eviction or rejection
     /// has already been decided.
     fn insert(&self, entry: &Arc<ReportEntry>) -> rusqlite::Result<()> {
+        let snapshot = entry.snapshot.as_deref().map(encode_snapshot);
         self.conn.execute(
             "INSERT INTO report_entries
-                (brcb_id, entry_id, time_of_entry_ms, is_integrity, is_gi, payload)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                (brcb_id, entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
                 &self.brcb_id,
                 &entry.entry_id.0[..],
@@ -237,27 +392,69 @@ impl SqliteInner {
                 entry.is_integrity as i32,
                 entry.is_gi as i32,
                 entry.encoded_payload.as_ref(),
+                snapshot,
             ],
         )?;
         Ok(())
     }
 
-    /// Builds a `ReportEntry` from a SQL row. `rusqlite` rows cannot be borrowed
-    /// past the statement, so every value is copied out.
+    /// Builds a `ReportEntry` from a row of `entry_id, time_of_entry_ms,
+    /// is_integrity, is_gi, payload, snapshot`. `rusqlite` rows cannot be
+    /// borrowed past the statement, so every value is copied out.
+    ///
+    /// A row with a snapshot gets it back; a row without one, written before the
+    /// snapshot column existed, gets its payload.
     fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arc<ReportEntry>> {
         let entry_id_blob: Vec<u8> = row.get(0)?;
-        let entry_id = Self::entry_id_from_blob(&entry_id_blob)?;
-        let time_of_entry_ms: i64 = row.get(1)?;
-        let is_integrity: i32 = row.get(2)?;
-        let is_gi: i32 = row.get(3)?;
+        let entry_id = EntryId(Self::entry_id_from_blob(&entry_id_blob)?);
+        let time_of_entry_ms = row.get::<_, i64>(1)? as u64;
+        let is_integrity = row.get::<_, i32>(2)? != 0;
+        let is_gi = row.get::<_, i32>(3)? != 0;
         let payload: Vec<u8> = row.get(4)?;
-        Ok(Arc::new(ReportEntry::new(
-            EntryId(entry_id),
-            time_of_entry_ms as u64,
-            is_integrity != 0,
-            is_gi != 0,
-            Bytes::from(payload),
-        )))
+        let snapshot: Option<Vec<u8>> = row.get(5)?;
+        let entry = match snapshot {
+            Some(blob) => {
+                let snapshot = decode_snapshot(&blob).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Blob,
+                        Box::<dyn std::error::Error + Send + Sync>::from(
+                            "snapshot BLOB is not in the expected layout",
+                        ),
+                    )
+                })?;
+                ReportEntry::with_snapshot(
+                    entry_id,
+                    time_of_entry_ms,
+                    is_integrity,
+                    is_gi,
+                    Arc::new(snapshot),
+                )
+            }
+            None => ReportEntry::new(
+                entry_id,
+                time_of_entry_ms,
+                is_integrity,
+                is_gi,
+                Bytes::from(payload),
+            ),
+        };
+        Ok(Arc::new(entry))
+    }
+
+    /// Collects the entries of a query, warning about each row that cannot be
+    /// decoded rather than dropping it silently.
+    fn collect_rows(
+        rows: impl Iterator<Item = rusqlite::Result<Arc<ReportEntry>>>,
+    ) -> Vec<Arc<ReportEntry>> {
+        rows.filter_map(|r| match r {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                tracing::warn!(error = %e, "sqlite report buffer row could not be decoded, skipped");
+                None
+            }
+        })
+        .collect()
     }
 }
 
@@ -334,7 +531,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         let mut stmt = g
             .conn
             .prepare(
-                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot
                  FROM report_entries
                  WHERE brcb_id = ? AND entry_id = ?
                  LIMIT 1",
@@ -383,7 +580,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         let next_row = g
             .conn
             .query_row(
-                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot
                  FROM report_entries
                  WHERE brcb_id = ? AND seq > ?
                  ORDER BY seq ASC
@@ -446,7 +643,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
             return Vec::new();
         };
         let Ok(mut stmt) = g.conn.prepare(
-            "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+            "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot
              FROM report_entries
              WHERE brcb_id = ?
              ORDER BY seq ASC",
@@ -455,7 +652,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         };
         let rows = stmt.query_map(params![&g.brcb_id], SqliteInner::row_to_entry);
         match rows {
-            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Ok(iter) => SqliteInner::collect_rows(iter),
             Err(e) => {
                 tracing::warn!(error = %e, "sqlite report buffer iter_entries failed");
                 Vec::new()
@@ -469,7 +666,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         match g
             .conn
             .query_row(
-                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+                "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot
                  FROM report_entries
                  WHERE brcb_id = ?
                  ORDER BY seq DESC
@@ -495,7 +692,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         // big-endian u64 is the numeric order. The comparison uses the
         // (brcb_id, entry_id) index.
         let Ok(mut stmt) = g.conn.prepare(
-            "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload
+            "SELECT entry_id, time_of_entry_ms, is_integrity, is_gi, payload, snapshot
              FROM report_entries
              WHERE brcb_id = ? AND entry_id > ?
              ORDER BY entry_id ASC",
@@ -504,7 +701,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
         };
         let rows = stmt.query_map(params![&g.brcb_id, &after.0[..]], SqliteInner::row_to_entry);
         match rows {
-            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Ok(iter) => SqliteInner::collect_rows(iter),
             Err(e) => {
                 tracing::warn!(error = %e, "sqlite report buffer iter_from failed");
                 Vec::new()
@@ -534,6 +731,7 @@ impl ReportBufferBackend for SqliteReportBuffer {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use iec61850_model::MmsValue;
     use tempfile::TempDir;
 
     fn make_entry(id_ms: u64, payload_byte: u8) -> Arc<ReportEntry> {
@@ -716,6 +914,183 @@ mod tests {
             buf_b.newest_entry().map(|e| e.entry_id),
             Some(EntryId::from_ms(5000))
         );
+    }
+
+    fn snapshot_entry(id_ms: u64) -> Arc<ReportEntry> {
+        let mut snap = EnqueuedSnapshot::new(3);
+        snap.inclusion_flags[0] = InclusionFlag::VALUE_CHANGED;
+        snap.inclusion_flags[2] =
+            InclusionFlag(InclusionFlag::QUALITY_CHANGED.0 | InclusionFlag::VALUE_UPDATE.0);
+        snap.values[0] = Some(MmsValue::Float32(3.25));
+        snap.values[2] = Some(MmsValue::Structure(vec![
+            MmsValue::BitString {
+                padding: 6,
+                data: vec![0x80],
+            },
+            MmsValue::UtcTime([1, 2, 3, 4, 5, 6, 7, 8]),
+        ]));
+        Arc::new(ReportEntry::with_snapshot(
+            EntryId::from_ms(id_ms),
+            id_ms,
+            false,
+            false,
+            Arc::new(snap),
+        ))
+    }
+
+    fn assert_same_snapshot(got: &ReportEntry, want: &ReportEntry) {
+        let (got, want) = (
+            got.snapshot.as_deref().expect("a snapshot read back"),
+            want.snapshot.as_deref().unwrap(),
+        );
+        assert_eq!(got.data_set_len, want.data_set_len);
+        assert_eq!(got.inclusion_flags, want.inclusion_flags);
+        assert_eq!(got.values, want.values);
+    }
+
+    /// An entry pushed with an enqueue-time snapshot reads back with the same
+    /// inclusion flags and values on every read path.
+    #[test]
+    fn snapshot_survives_the_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let first = snapshot_entry(100);
+        let second = snapshot_entry(200);
+        {
+            let mut buf =
+                SqliteReportBuffer::open(&path, "brcb01", 8, OverflowStrategy::DropOldest).unwrap();
+            buf.push(first.clone());
+            buf.push(second.clone());
+        }
+        let buf =
+            SqliteReportBuffer::open(&path, "brcb01", 8, OverflowStrategy::DropOldest).unwrap();
+        let all = buf.iter_entries();
+        assert_eq!(all.len(), 2);
+        assert_same_snapshot(&all[0], &first);
+        assert_same_snapshot(&buf.newest_entry().unwrap(), &second);
+        assert_same_snapshot(&buf.find_entry(&first.entry_id).unwrap(), &first);
+        assert_same_snapshot(&buf.iter_from(&first.entry_id)[0], &second);
+        match buf.seek_to_after_entry_id(&first.entry_id) {
+            SeekResult::FoundWithNext(next) => assert_same_snapshot(&next, &second),
+            other => panic!("expected FoundWithNext, got {other:?}"),
+        }
+    }
+
+    /// A database whose table predates the snapshot column is upgraded when
+    /// opened: its rows read back with their payload and no snapshot, and new
+    /// entries keep theirs.
+    #[test]
+    fn table_without_a_snapshot_column_is_upgraded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE report_entries (
+                     seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     brcb_id          TEXT    NOT NULL,
+                     entry_id         BLOB    NOT NULL,
+                     time_of_entry_ms INTEGER NOT NULL,
+                     is_integrity     INTEGER NOT NULL,
+                     is_gi            INTEGER NOT NULL,
+                     payload          BLOB    NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO report_entries
+                    (brcb_id, entry_id, time_of_entry_ms, is_integrity, is_gi, payload)
+                 VALUES ('brcb01', ?, 50, 0, 0, x'aabb')",
+                params![&EntryId::from_ms(50).0[..]],
+            )
+            .unwrap();
+        }
+        let mut buf =
+            SqliteReportBuffer::open(&path, "brcb01", 8, OverflowStrategy::DropOldest).unwrap();
+        let fresh = snapshot_entry(300);
+        buf.push(fresh.clone());
+        let all = buf.iter_entries();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].snapshot.is_none());
+        assert_eq!(all[0].encoded_payload.as_ref(), [0xaa, 0xbb]);
+        assert_same_snapshot(&all[1], &fresh);
+        drop(buf);
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Connections that open the same file at once, on several threads, all
+    /// succeed, and an earlier-schema table is upgraded exactly once.
+    #[test]
+    fn concurrent_opens_upgrade_the_schema_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE report_entries (
+                     seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     brcb_id          TEXT    NOT NULL,
+                     entry_id         BLOB    NOT NULL,
+                     time_of_entry_ms INTEGER NOT NULL,
+                     is_integrity     INTEGER NOT NULL,
+                     is_gi            INTEGER NOT NULL,
+                     payload          BLOB    NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    SqliteReportBuffer::open(
+                        &path,
+                        &format!("brcb{i}"),
+                        8,
+                        OverflowStrategy::DropOldest,
+                    )
+                    .map(|_| ())
+                })
+            })
+            .collect();
+        let opened: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        for result in opened {
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let conn = Connection::open(&path).unwrap();
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('report_entries') WHERE name = 'snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A snapshot BLOB that is not in the expected layout is not decoded.
+    #[test]
+    fn malformed_snapshot_is_refused() {
+        let good = encode_snapshot(snapshot_entry(1).snapshot.as_deref().unwrap());
+        assert!(decode_snapshot(&good).is_some());
+        assert!(decode_snapshot(&good[..good.len() - 1]).is_none());
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(decode_snapshot(&trailing).is_none());
+        let mut format = good;
+        format[0] = 2;
+        assert!(decode_snapshot(&format).is_none());
+        assert!(decode_snapshot(&[]).is_none());
     }
 
     /// `iter_from` returns the entries whose EntryID is strictly greater than the
