@@ -2493,33 +2493,28 @@ mod write_context_tests {
         Arc::clone(&da.value)
     }
 
-    /// A write of `Lim` = {5, 9} whose triggers are raised after another
-    /// client has already written {6, 10}: the report and the log entry of
-    /// the first write carry {5, 9}, the state it left, and not the mix
-    /// {5, 10} of its changed leaf and the other client's value of `hi`,
-    /// which the first write left unchanged and so raised nothing for.
-    #[test]
-    fn a_write_reports_its_own_values_after_a_concurrent_write() {
-        let (server, storage) = server();
-        let (lo, hi) = (cell(&server, "lo"), cell(&server, "hi"));
-        *lo.write().unwrap() = MmsValue::Integer(6);
-        *hi.write().unwrap() = MmsValue::Integer(10);
-
-        server.raise_written(&[
+    /// The leaves of a write of `Lim` = {5, 9} over {1, 9}: `lo` changes and
+    /// `hi` keeps its value, so only `lo` raises a trigger.
+    fn write_of_5_9(lo: &Arc<RwLock<MmsValue>>, hi: &Arc<RwLock<MmsValue>>) -> [WrittenLeaf; 2] {
+        [
             WrittenLeaf {
-                value: Arc::clone(&lo),
+                value: Arc::clone(lo),
                 trg_ops: TrgOps::DCHG,
                 old: MmsValue::Integer(1),
                 new: MmsValue::Integer(5),
             },
             WrittenLeaf {
-                value: Arc::clone(&hi),
+                value: Arc::clone(hi),
                 trg_ops: TrgOps::DCHG,
                 old: MmsValue::Integer(9),
                 new: MmsValue::Integer(9),
             },
-        ]);
+        ]
+    }
 
+    /// Checks that the pending report and the only log entry carry `Lim` as
+    /// {5, 9}.
+    fn assert_carries_5_9(server: &IedServer, storage: &Arc<dyn crate::logging::LogStorage>) {
         let written = MmsValue::Structure(vec![MmsValue::Integer(5), MmsValue::Integer(9)]);
         {
             let engine = server.inner.reporting_engine.lock().unwrap();
@@ -2533,5 +2528,39 @@ mod write_context_tests {
         storage.query_by_time(0, u64::MAX / 2, &mut v).unwrap();
         assert_eq!(v.entries.len(), 1);
         assert_eq!(v.entries[0].variables[0].value, written, "log entry");
+    }
+
+    /// A write of `Lim` = {5, 9} whose triggers are raised after another
+    /// client has already written {6, 10}: the report and the log entry of
+    /// the first write carry {5, 9}, the state it left, and not the mix
+    /// {5, 10} of its changed leaf and the other client's value of `hi`,
+    /// which the first write left unchanged and so raised nothing for.
+    #[test]
+    fn a_write_reports_its_own_values_after_a_concurrent_write() {
+        let (server, storage) = server();
+        let (lo, hi) = (cell(&server, "lo"), cell(&server, "hi"));
+        *lo.write().unwrap() = MmsValue::Integer(6);
+        *hi.write().unwrap() = MmsValue::Integer(10);
+
+        server.raise_written(&write_of_5_9(&lo, &hi));
+
+        assert_carries_5_9(&server, &storage);
+    }
+
+    /// The same write handed over while the data model is locked, with the
+    /// other client's {6, 10} stored before the lock is released: the
+    /// deferred batch keeps the value of `hi` that raised nothing, so the
+    /// report and the log entry carry {5, 9} once the lock is released.
+    #[test]
+    fn a_deferred_write_reports_its_own_values() {
+        let (server, storage) = server();
+        let (lo, hi) = (cell(&server, "lo"), cell(&server, "hi"));
+        let guard = server.lock_data_model().unwrap();
+        server.raise_written(&write_of_5_9(&lo, &hi));
+        *lo.write().unwrap() = MmsValue::Integer(6);
+        *hi.write().unwrap() = MmsValue::Integer(10);
+        drop(guard);
+
+        assert_carries_5_9(&server, &storage);
     }
 }
