@@ -1271,3 +1271,164 @@ async fn version_mismatch_raises_a_version_event_on_the_server() {
         events.codes()
     );
 }
+
+// -----------------------------------------------------------------------------
+// Hand-built ClientHello
+// -----------------------------------------------------------------------------
+
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_EC_POINT_FORMATS: u16 = 0x000b;
+const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
+
+/// A u16 length-prefixed list of u16 values.
+fn u16_list(values: &[u16]) -> Vec<u8> {
+    let mut out = ((values.len() * 2) as u16).to_be_bytes().to_vec();
+    for v in values {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// A ClientHello record at `legacy_version` offering `suites`, with the
+/// given extensions.
+fn client_hello(legacy_version: u16, suites: &[u16], extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut body = legacy_version.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0x5a; 32]);
+    body.push(0);
+    body.extend_from_slice(&u16_list(suites));
+    body.extend_from_slice(&[1, 0]);
+    let mut exts = Vec::new();
+    for (ty, data) in extensions {
+        exts.extend_from_slice(&ty.to_be_bytes());
+        exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        exts.extend_from_slice(data);
+    }
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let mut handshake = vec![1];
+    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// The signature_algorithms extension of a TLS 1.2 client.
+fn tls12_signature_algorithms() -> (u16, Vec<u8>) {
+    (
+        EXT_SIGNATURE_ALGORITHMS,
+        u16_list(&[0x0804, 0x0401, 0x0403]),
+    )
+}
+
+/// An acceptor presenting an RSA certificate, reporting to `events`.
+fn rsa_acceptor(events: Arc<Recorder>) -> TlsAcceptor {
+    let ca = Ca::new();
+    let leaf = rsa_leaf(&ca, SERVER_NAME);
+    TlsAcceptor::new(
+        server_with(&leaf)
+            .with_event_handler(events)
+            .build_server()
+            .unwrap(),
+    )
+}
+
+/// Sends `hello` to an RSA server and returns the events the server raised
+/// while refusing it.
+async fn server_events_for_refused_hello(hello: Vec<u8>) -> Vec<TlsEventCode> {
+    let events = Arc::new(Recorder::default());
+    let acceptor = rsa_acceptor(events.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        acceptor.accept(tcp).await.map(|_| ())
+    });
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(&hello).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server task finishes")
+        .unwrap();
+    assert!(result.is_err(), "handshake accepted");
+    events.codes()
+}
+
+#[tokio::test]
+async fn rsa_key_exchange_only_hello_raises_a_cipher_event() {
+    // TLS_RSA_WITH_AES_128_GCM_SHA256 without supported_groups.
+    let hello = client_hello(0x0303, &[0x009c], &[tls12_signature_algorithms()]);
+    let codes = server_events_for_refused_hello(hello).await;
+    assert_eq!(codes, vec![TlsEventCode::AlmCipherNotAllowed]);
+}
+
+#[tokio::test]
+async fn dhe_only_hello_raises_a_cipher_event() {
+    // TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 with the ffdhe2048 group.
+    let hello = client_hello(
+        0x0303,
+        &[0x009e],
+        &[
+            (EXT_SUPPORTED_GROUPS, u16_list(&[0x0100])),
+            tls12_signature_algorithms(),
+        ],
+    );
+    let codes = server_events_for_refused_hello(hello).await;
+    assert_eq!(codes, vec![TlsEventCode::AlmCipherNotAllowed]);
+}
+
+#[tokio::test]
+async fn tls11_hello_raises_a_version_event() {
+    // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA and TLS_RSA_WITH_AES_128_CBC_SHA,
+    // without signature_algorithms, as a TLS 1.1 client sends them.
+    let hello = client_hello(
+        0x0302,
+        &[0xc013, 0x002f],
+        &[
+            (EXT_SUPPORTED_GROUPS, u16_list(&[0x001d, 0x0017])),
+            (EXT_EC_POINT_FORMATS, vec![1, 0]),
+        ],
+    );
+    let codes = server_events_for_refused_hello(hello).await;
+    assert_eq!(codes, vec![TlsEventCode::AlmVersionTooOld]);
+}
+
+#[tokio::test]
+async fn hand_built_hello_with_a_whitelisted_suite_gets_a_server_hello() {
+    let events = Arc::new(Recorder::default());
+    let acceptor = rsa_acceptor(events.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        acceptor.accept(tcp).await.map(|_| ())
+    });
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 with x25519.
+    let hello = client_hello(
+        0x0303,
+        &[0xc02f],
+        &[
+            (EXT_SUPPORTED_GROUPS, u16_list(&[0x001d])),
+            (EXT_EC_POINT_FORMATS, vec![1, 0]),
+            tls12_signature_algorithms(),
+        ],
+    );
+    tcp.write_all(&hello).await.unwrap();
+    let mut header = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(10), tcp.read_exact(&mut header))
+        .await
+        .expect("server answers")
+        .unwrap();
+    assert_eq!(header[0], 0x16, "not a handshake record");
+    assert_eq!(header[5], 2, "not a ServerHello");
+    drop(tcp);
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("server task finishes")
+        .unwrap();
+    assert!(result.is_err(), "handshake completed");
+    assert!(events.codes().is_empty(), "events: {:?}", events.codes());
+}

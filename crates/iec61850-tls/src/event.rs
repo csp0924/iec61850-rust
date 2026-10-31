@@ -66,11 +66,14 @@ pub enum TlsEventCode {
     AlmCertRevoked = 202,
     /// The certificate common name or SAN does not match.
     AlmCertSanMismatch = 203,
-    /// The peer offered no cipher suite of the IEC 62351-3 whitelist. Raised
-    /// by the acceptor and the connector.
+    /// The peer offered no cipher suite of the IEC 62351-3 whitelist, or no
+    /// key exchange group a whitelisted suite can use, as a client offering
+    /// only RSA key exchange or DHE suites does. Raised by the acceptor and
+    /// the connector.
     AlmCipherNotAllowed = 204,
-    /// The peer offered no TLS version this end accepts. Raised by the
-    /// acceptor and the connector.
+    /// The peer offered no TLS version this end accepts, or a client sent a
+    /// ClientHello without the signature_algorithms extension, as TLS 1.1 and
+    /// older clients do. Raised by the acceptor and the connector.
     AlmVersionTooOld = 205,
     /// A connection was attempted from an unauthorized address or port. Not
     /// raised by this crate.
@@ -159,11 +162,14 @@ pub(crate) fn report_handshake_failure(
     };
     let code = match tls_err {
         E::NoCertificatesPresented => TlsEventCode::AlmCertNotConfigured,
-        E::PeerIncompatible(P::NoCipherSuitesInCommon) => TlsEventCode::AlmCipherNotAllowed,
+        E::PeerIncompatible(P::NoCipherSuitesInCommon | P::NoKxGroupsInCommon) => {
+            TlsEventCode::AlmCipherNotAllowed
+        }
         E::PeerIncompatible(
             P::Tls12NotOffered
             | P::Tls12NotOfferedOrEnabled
             | P::SupportedVersionsExtensionRequired
+            | P::SignatureAlgorithmsExtensionRequired
             | P::ServerDoesNotSupportTls12Or13
             | P::ServerTlsVersionIsDisabledByOurConfig,
         ) => TlsEventCode::AlmVersionTooOld,
