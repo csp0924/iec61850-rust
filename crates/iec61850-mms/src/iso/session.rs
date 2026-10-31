@@ -9,8 +9,13 @@
 //!    connection state stays with the caller.
 //!
 //! Strictness rules enforced by this module:
-//! - Encoding never uses the long form of LI; a payload past 255 bytes returns
-//!   `SessionError::PayloadTooLarge`. An incoming REFUSE may use it.
+//! - Every LI, of an SPDU and of each of its parameters, is read in the short
+//!   form (one octet, at most 254) or the long form (0xFF followed by two
+//!   octets). Encoding uses the long form only for a length above 254; a
+//!   length above 65 535 returns `SessionError::PayloadTooLarge`.
+//! - A CONNECT carries at most 512 octets of user data in the User Data PGI
+//!   (193) and more in the Extended User Data parameter (194). Both are read in
+//!   every SPDU that carries user data.
 //! - SESSION_NOT_FINISHED (SPDU ID 8) is not reassembled and returns
 //!   `SessionError::UnsupportedSpdu`.
 //! - An unknown PGI is skipped by its declared length, never byte by byte.
@@ -58,14 +63,21 @@ const PI_EXTENDED_USER_DATA: u8 = 0xC2; // 194
 /// LI value announcing the long form, where the true length follows in two octets.
 const LI_LONG_FORM: u8 = 0xFF;
 
+/// Largest length the one-octet short form of LI carries.
+const LI_SHORT_MAX: usize = 254;
+
+/// Largest length the long form of LI carries.
+const LI_LONG_MAX: usize = 65_535;
+
+/// Most user data a CONNECT carries in the User Data PGI; more goes in the
+/// Extended User Data parameter.
+const CONNECT_USER_DATA_MAX: usize = 512;
+
 /// Number of octets the long form of LI occupies after the LI byte itself.
 const LI_LONG_FORM_OCTETS: usize = 2;
 
 /// Number of bytes preceding the parameter block: the SPDU ID and the LI byte.
 const SPDU_HEADER_LEN: usize = 2;
-
-/// Smallest complete parameter header: an identifier byte and a length byte.
-const PARAM_HEADER_LEN: usize = 2;
 
 /// The fixed four-byte header of a Data SPDU: GT followed by DT.
 ///
@@ -77,9 +89,6 @@ const SESSION_REQ_DUPLEX: u16 = 0x0002;
 
 /// Maximum length of a Session Selector in bytes.
 const SSELECTOR_MAX_SIZE: usize = 16;
-
-/// Largest value a one-byte LI can carry.
-const LI_MAX: usize = 255;
 
 // Error types
 
@@ -135,8 +144,9 @@ pub enum SessionError {
         id: u8,
     },
 
-    /// The payload exceeds the 255 bytes a one-byte LI can express.
-    #[error("payload size {size} exceeds the li maximum of 255; the long form is unsupported")]
+    /// The payload makes the parameter block longer than the 65 535 octets a
+    /// long-form LI can express.
+    #[error("payload size {size} makes the spdu exceed the li maximum of 65535")]
     PayloadTooLarge {
         /// Payload size requested.
         size: usize,
@@ -425,8 +435,8 @@ impl IsoSession {
 
         while offset + 1 < params_end {
             let id = msg[offset];
-            let len = msg[offset + 1] as usize;
-            offset += PARAM_HEADER_LEN;
+            offset += 1;
+            let len = read_li(msg, &mut offset, params_end)?;
 
             if offset + len > params_end {
                 warn!(
@@ -476,39 +486,23 @@ impl IsoSession {
         Ok(SessionIndication::Refuse(info))
     }
 
-    /// Parses a FINISH or DISCONNECT SPDU and returns the payload after PGI 0xC1.
+    /// Parses a FINISH or DISCONNECT SPDU and records the range of its user
+    /// data, carried by PGI 193 or PI 194.
     fn extract_user_data_from_simple(&mut self, msg: &[u8]) -> Result<(), SessionError> {
-        // offset 0 = SPDU ID, offset 1 = LI, then params
-        let li = msg[1] as usize;
-        let total_expected = 2 + li;
-        if total_expected > msg.len() {
-            warn!(li, buf_len = msg.len(), "spdu li exceeds the buffer length");
-            return Err(SessionError::LiMismatch {
-                li,
-                buf_len: msg.len(),
-            });
-        }
-        // look for PGI 0xC1 inside the parameter block
-        let params = &msg[2..2 + li];
-        let mut offset = 0usize;
-        while offset + 1 < params.len() {
-            let pgi = params[offset];
-            let plen = params[offset + 1] as usize;
-            offset += 2;
-            if offset + plen > params.len() {
+        let (mut offset, params_end) = spdu_parameter_bounds(msg)?;
+        while offset + 1 < params_end {
+            let pgi = msg[offset];
+            offset += 1;
+            let plen = read_li(msg, &mut offset, params_end)?;
+            if offset + plen > params_end {
                 warn!(pgi, plen, "spdu parameter block runs past the end");
                 return Err(SessionError::LiMismatch {
-                    li,
+                    li: plen,
                     buf_len: msg.len(),
                 });
             }
-            if pgi == PGI_USER_DATA {
-                // the user-data offset inside msg: two header bytes plus the parameter offset
-                let abs_start = 2 + (offset - 2) + 2; // skip the two header bytes
-                let pgi_abs = 2 + (offset - 2); // position of the pgi byte inside msg
-                let payload_abs = pgi_abs + 2; // skip the pgi and length bytes
-                let _ = abs_start;
-                self.user_data_start = payload_abs;
+            if pgi == PGI_USER_DATA || pgi == PI_EXTENDED_USER_DATA {
+                self.user_data_start = offset;
                 self.user_data_len = plen;
                 return Ok(());
             }
@@ -537,25 +531,8 @@ impl IsoSession {
     /// Updates `calling_selector`, `called_selector`, `session_requirement`,
     /// `protocol_options`, `user_data_start` and `user_data_len`.
     fn parse_header_parameters(&mut self, msg: &[u8]) -> Result<(), SessionError> {
-        if msg.len() < 2 {
-            return Err(SessionError::TooShort { len: msg.len() });
-        }
-        let li = msg[1] as usize;
-        // LI excludes the SPDU ID and LI bytes, so 2 + li is the end of the parameters
-        let params_end = 2 + li;
-        if params_end > msg.len() {
-            warn!(
-                li,
-                buf_len = msg.len(),
-                "cn/ac spdu li exceeds the buffer length"
-            );
-            return Err(SessionError::LiMismatch {
-                li,
-                buf_len: msg.len(),
-            });
-        }
-
-        let mut offset = 2usize; // skip the SPDU ID and the LI byte
+        let (mut offset, params_end) = spdu_parameter_bounds(msg)?;
+        let li = params_end - offset;
 
         while offset < params_end {
             // every read first checks that enough bytes remain
@@ -564,8 +541,8 @@ impl IsoSession {
                 break;
             }
             let pgi = msg[offset];
-            let pgi_len = msg[offset + 1] as usize;
-            offset += 2;
+            offset += 1;
+            let pgi_len = read_li(msg, &mut offset, params_end)?;
 
             // bounds check
             if offset + pgi_len > params_end {
@@ -625,7 +602,7 @@ impl IsoSession {
                     }
                     self.called_selector = SSelector::from_slice(param_data)?;
                 }
-                PGI_USER_DATA => {
+                PGI_USER_DATA | PI_EXTENDED_USER_DATA => {
                     // record the absolute offset of the user-data inside msg
                     self.user_data_start = offset;
                     self.user_data_len = pgi_len;
@@ -685,6 +662,72 @@ impl Default for IsoSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reads an LI field at `msg[*pos]`, in the short or the long form, and
+/// advances `*pos` past it.
+///
+/// # Errors
+///
+/// Returns `TooShort` when the field runs past `end`.
+fn read_li(msg: &[u8], pos: &mut usize, end: usize) -> Result<usize, SessionError> {
+    if *pos >= end {
+        return Err(SessionError::TooShort { len: msg.len() });
+    }
+    let first = msg[*pos];
+    *pos += 1;
+    if first != LI_LONG_FORM {
+        return Ok(first as usize);
+    }
+    if *pos + LI_LONG_FORM_OCTETS > end {
+        warn!(len = msg.len(), "long-form li is truncated");
+        return Err(SessionError::TooShort { len: msg.len() });
+    }
+    let value = u16::from_be_bytes([msg[*pos], msg[*pos + 1]]) as usize;
+    *pos += LI_LONG_FORM_OCTETS;
+    Ok(value)
+}
+
+/// Returns the number of octets the LI field of `len` occupies.
+fn li_size(len: usize) -> usize {
+    if len <= LI_SHORT_MAX {
+        1
+    } else {
+        1 + LI_LONG_FORM_OCTETS
+    }
+}
+
+/// Appends the LI field of `len`: one octet up to 254, the long form above.
+///
+/// `len` must not exceed 65 535; callers check it first.
+fn put_li(out: &mut impl Extend<u8>, len: usize) {
+    if len <= LI_SHORT_MAX {
+        out.extend([len as u8]);
+    } else {
+        let [hi, lo] = (len as u16).to_be_bytes();
+        out.extend([LI_LONG_FORM, hi, lo]);
+    }
+}
+
+/// Returns the offsets bounding the parameter block of an SPDU whose LI follows
+/// its SPDU identifier.
+///
+/// # Errors
+///
+/// - `TooShort` when a long-form LI is truncated.
+/// - `LiMismatch` when the declared length runs past the buffer.
+fn spdu_parameter_bounds(msg: &[u8]) -> Result<(usize, usize), SessionError> {
+    let mut pos = 1usize;
+    let li = read_li(msg, &mut pos, msg.len())?;
+    let end = pos + li;
+    if end > msg.len() {
+        warn!(li, buf_len = msg.len(), "spdu li exceeds the buffer length");
+        return Err(SessionError::LiMismatch {
+            li,
+            buf_len: msg.len(),
+        });
+    }
+    Ok((pos, end))
 }
 
 /// Returns the offsets bounding the parameter block of an RF SPDU.
@@ -748,10 +791,13 @@ fn refuse_parameter_bounds(msg: &[u8]) -> Result<(usize, usize), SessionError> {
 
 /// Encodes a CN, CONNECT, SPDU with ID 13 into `out`.
 ///
+/// A payload of up to 512 octets goes in the User Data PGI (193), a longer one
+/// in the Extended User Data parameter (194).
+///
 /// # Errors
 ///
-/// Returns `SessionError::PayloadTooLarge` when the header plus payload exceeds the
-/// 255-byte LI maximum.
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
 pub fn encode_connect(
     params: &IsoParameters,
     session: &IsoSession,
@@ -768,7 +814,8 @@ pub fn encode_connect(
 ///
 /// # Errors
 ///
-/// Returns `SessionError::PayloadTooLarge` when the header plus payload exceeds 255 bytes.
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
 pub fn encode_accept(
     session: &IsoSession,
     payload: &[u8],
@@ -790,26 +837,25 @@ pub fn encode_data(payload: &[u8], out: &mut BytesMut) {
 ///
 /// # Errors
 ///
-/// Returns `SessionError::PayloadTooLarge` when the LI would exceed 255.
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
 pub fn encode_abort(payload: &[u8], out: &mut BytesMut) -> Result<(), SessionError> {
-    // LI = 5 (Transport Disconnect PI + User Data PGI header) + payload.len()
-    // Transport Disconnect: PI=0x11(1) + len=1(1) + value(1) = 3 bytes
-    // user-data PGI: 0xC1 plus its length byte, 2 bytes, so 5 in all
-    let li = 5usize + payload.len();
-    if li > LI_MAX {
+    // Transport Disconnect PI (3 octets), then the user-data PGI and its LI
+    let li = 3 + 1 + li_size(payload.len()) + payload.len();
+    if li > LI_LONG_MAX {
         return Err(SessionError::PayloadTooLarge {
             size: payload.len(),
         });
     }
+    out.extend_from_slice(&[SPDU_ID_ABORT]);
+    put_li(out, li);
     out.extend_from_slice(&[
-        SPDU_ID_ABORT,
-        li as u8,
-        0x11, // PI = Transport Disconnect
+        PI_TRANSPORT_DISCONNECT,
         0x01, // PI length = 1
         0x0B, // value: transport-connection-released | user-abort | no-reason
         PGI_USER_DATA,
-        payload.len() as u8,
     ]);
+    put_li(out, payload.len());
     out.extend_from_slice(payload);
     Ok(())
 }
@@ -818,37 +864,34 @@ pub fn encode_abort(payload: &[u8], out: &mut BytesMut) -> Result<(), SessionErr
 ///
 /// # Errors
 ///
-/// Returns `SessionError::PayloadTooLarge` when the LI would exceed 255.
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
 pub fn encode_finish(payload: &[u8], out: &mut BytesMut) -> Result<(), SessionError> {
-    let li = 2usize + payload.len(); // PGI 0xC1(1) + len(1) + payload
-    if li > LI_MAX {
-        return Err(SessionError::PayloadTooLarge {
-            size: payload.len(),
-        });
-    }
-    out.extend_from_slice(&[SPDU_ID_FINISH, li as u8, PGI_USER_DATA, payload.len() as u8]);
-    out.extend_from_slice(payload);
-    Ok(())
+    encode_user_data_spdu(SPDU_ID_FINISH, payload, out)
 }
 
 /// Encodes a DN, DISCONNECT, SPDU with ID 10 into `out`.
 ///
 /// # Errors
 ///
-/// Returns `SessionError::PayloadTooLarge` when the LI would exceed 255.
+/// Returns `SessionError::PayloadTooLarge` when the parameter block would exceed
+/// the 65 535 octets an LI can express.
 pub fn encode_disconnect(payload: &[u8], out: &mut BytesMut) -> Result<(), SessionError> {
-    let li = 2usize + payload.len();
-    if li > LI_MAX {
+    encode_user_data_spdu(SPDU_ID_DISCONNECT, payload, out)
+}
+
+/// Encodes an SPDU whose only parameter is the User Data PGI.
+fn encode_user_data_spdu(id: u8, payload: &[u8], out: &mut BytesMut) -> Result<(), SessionError> {
+    let li = 1 + li_size(payload.len()) + payload.len();
+    if li > LI_LONG_MAX {
         return Err(SessionError::PayloadTooLarge {
             size: payload.len(),
         });
     }
-    out.extend_from_slice(&[
-        SPDU_ID_DISCONNECT,
-        li as u8,
-        PGI_USER_DATA,
-        payload.len() as u8,
-    ]);
+    out.extend_from_slice(&[id]);
+    put_li(out, li);
+    out.extend_from_slice(&[PGI_USER_DATA]);
+    put_li(out, payload.len());
     out.extend_from_slice(payload);
     Ok(())
 }
@@ -896,39 +939,30 @@ fn build_connect_header(
     session: &IsoSession,
     payload_len: usize,
 ) -> Result<Vec<u8>, SessionError> {
-    // header length:
-    // PGI 5, the Connect/Accept Item: 2 header bytes plus PI 19 and PI 22
-    //   PI 19 is 3 bytes and PI 22 is 3 bytes, so the PGI content is 6 bytes
-    //   giving 8 bytes in all: the PGI byte, the length byte and 6 of content
-    // PGI 20 (Session Req): 1+1+2 = 4 bytes
-    // PGI 51 (Calling SS-SEL): 1+1+size
-    // PGI 52 (Called SS-SEL): 1+1+size
-    // PGI 0xC1, user data: 2 header bytes, with the payload counted separately
-    // payload_len is the length of the payload itself
-    //
-    // LI counts every PGI byte plus the payload, excluding the SPDU ID and LI bytes
-
     let calling_size = params.local_selector.size as usize;
     let called_size = params.remote_selector.size as usize;
+    let user_data_id = if payload_len > CONNECT_USER_DATA_MAX {
+        PI_EXTENDED_USER_DATA
+    } else {
+        PGI_USER_DATA
+    };
 
-    // the PGI block, excluding the SPDU ID and LI bytes
+    // the parameter block, excluding the SPDU ID and LI
     let pgi_area_len: usize = 8  // PGI 5 (ConnectAcceptItem: 1+1+6)
         + 4  // PGI 20 (SessionReq: 1+1+2)
         + 2 + calling_size  // PGI 51 (Calling SS-SEL: 1+1+size)
         + 2 + called_size   // PGI 52 (Called SS-SEL: 1+1+size)
-        + 2                 // PGI 0xC1 header, 1 + 1, with the payload right after
+        + 1 + li_size(payload_len) // user data identifier and LI
         + payload_len;
 
-    if pgi_area_len > LI_MAX {
+    if pgi_area_len > LI_LONG_MAX {
         return Err(SessionError::PayloadTooLarge { size: payload_len });
     }
 
-    let li = pgi_area_len as u8;
-    let mut h = Vec::with_capacity(2 + pgi_area_len - payload_len);
+    let mut h = Vec::with_capacity(1 + li_size(pgi_area_len) + pgi_area_len - payload_len);
 
-    // SPDU ID + LI
     h.push(SPDU_ID_CONNECT);
-    h.push(li);
+    put_li(&mut h, pgi_area_len);
 
     // PGI 5: Connect/Accept Item
     encode_connect_accept_item(&mut h, session.protocol_options);
@@ -948,9 +982,9 @@ fn build_connect_header(
     h.push(called_size as u8);
     h.extend_from_slice(params.remote_selector.as_slice());
 
-    // PGI 0xC1: User Data header
-    h.push(PGI_USER_DATA);
-    h.push(payload_len as u8);
+    // User Data (PGI 193) or Extended User Data (PI 194) header
+    h.push(user_data_id);
+    put_li(&mut h, payload_len);
 
     Ok(h)
 }
@@ -962,18 +996,17 @@ fn build_accept_header(session: &IsoSession, payload_len: usize) -> Result<Vec<u
     let pgi_area_len: usize = 8  // PGI 5
         + 4  // PGI 20
         + 2 + called_size  // PGI 52; an AC carries no Calling SS-SEL
-        + 2                // PGI 0xC1 header
+        + 1 + li_size(payload_len) // PGI 193 and its LI
         + payload_len;
 
-    if pgi_area_len > LI_MAX {
+    if pgi_area_len > LI_LONG_MAX {
         return Err(SessionError::PayloadTooLarge { size: payload_len });
     }
 
-    let li = pgi_area_len as u8;
-    let mut h = Vec::with_capacity(2 + pgi_area_len - payload_len);
+    let mut h = Vec::with_capacity(1 + li_size(pgi_area_len) + pgi_area_len - payload_len);
 
     h.push(SPDU_ID_ACCEPT);
-    h.push(li);
+    put_li(&mut h, pgi_area_len);
 
     encode_connect_accept_item(&mut h, session.protocol_options);
 
@@ -986,7 +1019,7 @@ fn build_accept_header(session: &IsoSession, payload_len: usize) -> Result<Vec<u
     h.extend_from_slice(session.called_selector.as_slice());
 
     h.push(PGI_USER_DATA);
-    h.push(payload_len as u8);
+    put_li(&mut h, payload_len);
 
     Ok(h)
 }
@@ -1570,8 +1603,8 @@ mod tests {
 
     #[test]
     fn payload_too_large_returns_err() {
-        // a 253-byte payload plus the session header exceeds 255
-        let big_payload = vec![0u8; 253];
+        // a payload of 65 535 bytes plus the session header exceeds the long-form maximum
+        let big_payload = vec![0u8; LI_LONG_MAX];
         let params = default_params();
         let session = default_session();
         let mut out = BytesMut::new();
@@ -1584,6 +1617,176 @@ mod tests {
             result.unwrap_err(),
             SessionError::PayloadTooLarge { .. }
         ));
+    }
+
+    // long-form LI
+
+    /// Builds a CN SPDU by hand whose SPDU LI and user data LI both use the
+    /// long form, carrying `payload` under the identifier `user_data_id`.
+    fn long_form_connect(user_data_id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut params = vec![
+            0x05,
+            0x06,
+            0x13,
+            0x01,
+            0x00,
+            0x16,
+            0x01,
+            0x02, // connect/accept item
+            0x14,
+            0x02,
+            0x00,
+            0x02, // session requirements
+            0x33,
+            0x02,
+            0x00,
+            0x01, // calling ss-sel
+            0x34,
+            0x02,
+            0x00,
+            0x01, // called ss-sel
+            user_data_id,
+            LI_LONG_FORM,
+        ];
+        params.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        params.extend_from_slice(payload);
+        let mut msg = vec![SPDU_ID_CONNECT, LI_LONG_FORM];
+        msg.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&params);
+        msg
+    }
+
+    #[test]
+    fn cn_with_long_form_lengths_yields_its_user_data() {
+        let payload: Vec<u8> = (0..300u16).map(|i| i as u8).collect();
+        let msg = long_form_connect(PGI_USER_DATA, &payload);
+        let mut sess = IsoSession::new();
+        assert_eq!(sess.parse_message(&msg), Ok(SessionIndication::Connect));
+        assert_eq!(sess.user_data(&msg), &payload[..]);
+    }
+
+    #[test]
+    fn cn_with_extended_user_data_yields_its_user_data() {
+        let payload = vec![0x5a; 700];
+        let msg = long_form_connect(PI_EXTENDED_USER_DATA, &payload);
+        let mut sess = IsoSession::new();
+        assert_eq!(sess.parse_message(&msg), Ok(SessionIndication::Connect));
+        assert_eq!(sess.user_data(&msg), &payload[..]);
+    }
+
+    #[test]
+    fn truncated_long_form_parameter_li_is_rejected() {
+        // the user-data LI announces the long form but only one octet follows
+        let msg = [SPDU_ID_CONNECT, 0x03, PGI_USER_DATA, LI_LONG_FORM, 0x01];
+        let mut sess = IsoSession::new();
+        assert_eq!(
+            sess.parse_message(&msg),
+            Err(SessionError::TooShort { len: msg.len() })
+        );
+    }
+
+    #[test]
+    fn long_form_li_past_the_buffer_is_rejected() {
+        let msg = [
+            SPDU_ID_FINISH,
+            LI_LONG_FORM,
+            0x01,
+            0x00,
+            PGI_USER_DATA,
+            0x00,
+        ];
+        let mut sess = IsoSession::new();
+        assert_eq!(
+            sess.parse_message(&msg),
+            Err(SessionError::LiMismatch {
+                li: 256,
+                buf_len: 6
+            })
+        );
+    }
+
+    #[test]
+    fn cn_over_254_octets_round_trips_in_the_long_form() {
+        let payload = vec![0xa5; 400];
+        let mut out = BytesMut::new();
+        encode_connect(&default_params(), &default_session(), &payload, &mut out).unwrap();
+        assert_eq!(out[1], LI_LONG_FORM);
+        let li = u16::from_be_bytes([out[2], out[3]]) as usize;
+        assert_eq!(li, out.len() - 4);
+        let ud_at = out.len() - payload.len() - 4;
+        assert_eq!(
+            &out[ud_at..ud_at + 4],
+            &[PGI_USER_DATA, LI_LONG_FORM, 0x01, 0x90]
+        );
+
+        let mut sess = IsoSession::new();
+        assert_eq!(sess.parse_message(&out), Ok(SessionIndication::Connect));
+        assert_eq!(sess.user_data(&out), &payload[..]);
+    }
+
+    #[test]
+    fn cn_over_512_octets_uses_extended_user_data() {
+        let payload = vec![0x3c; 513];
+        let mut out = BytesMut::new();
+        encode_connect(&default_params(), &default_session(), &payload, &mut out).unwrap();
+        let ud_at = out.len() - payload.len() - 4;
+        assert_eq!(
+            &out[ud_at..ud_at + 4],
+            &[PI_EXTENDED_USER_DATA, LI_LONG_FORM, 0x02, 0x01]
+        );
+
+        let mut sess = IsoSession::new();
+        assert_eq!(sess.parse_message(&out), Ok(SessionIndication::Connect));
+        assert_eq!(sess.user_data(&out), &payload[..]);
+    }
+
+    #[test]
+    fn cn_of_exactly_512_octets_keeps_the_user_data_pgi() {
+        let payload = vec![0x3c; 512];
+        let mut out = BytesMut::new();
+        encode_connect(&default_params(), &default_session(), &payload, &mut out).unwrap();
+        let ud_at = out.len() - payload.len() - 4;
+        assert_eq!(out[ud_at], PGI_USER_DATA);
+    }
+
+    #[test]
+    fn length_254_keeps_the_short_form_and_255_switches_to_the_long_form() {
+        let mut out = BytesMut::new();
+        encode_finish(&[0u8; 252], &mut out).unwrap();
+        assert_eq!(out[1], 254);
+        assert_eq!(out[3], 252);
+
+        let mut out = BytesMut::new();
+        encode_finish(&[0u8; 253], &mut out).unwrap();
+        assert_eq!(&out[1..4], &[LI_LONG_FORM, 0x00, 0xff]);
+        assert_eq!(out[4], PGI_USER_DATA);
+        assert_eq!(out[5], 253);
+    }
+
+    #[test]
+    fn ac_fn_dn_and_ab_round_trip_in_the_long_form() {
+        let payload = vec![0x11; 600];
+
+        let mut ac = BytesMut::new();
+        encode_accept(&default_session(), &payload, &mut ac).unwrap();
+        let mut sess = IsoSession::new();
+        assert_eq!(sess.parse_message(&ac), Ok(SessionIndication::Accept));
+        assert_eq!(sess.user_data(&ac), &payload[..]);
+
+        let mut fin = BytesMut::new();
+        encode_finish(&payload, &mut fin).unwrap();
+        assert_eq!(sess.parse_message(&fin), Ok(SessionIndication::Finish));
+        assert_eq!(sess.user_data(&fin), &payload[..]);
+
+        let mut dn = BytesMut::new();
+        encode_disconnect(&payload, &mut dn).unwrap();
+        assert_eq!(sess.parse_message(&dn), Ok(SessionIndication::Disconnect));
+        assert_eq!(sess.user_data(&dn), &payload[..]);
+
+        let mut ab = BytesMut::new();
+        encode_abort(&payload, &mut ab).unwrap();
+        assert_eq!(&ab[1..4], &[LI_LONG_FORM, 0x02, 0x5f]);
+        assert_eq!(&ab[4..9], &[0x11, 0x01, 0x0b, PGI_USER_DATA, LI_LONG_FORM]);
     }
 
     #[test]
