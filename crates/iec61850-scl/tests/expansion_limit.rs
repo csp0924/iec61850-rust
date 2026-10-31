@@ -124,3 +124,80 @@ fn ordinary_file_resolves_with_the_default_limit() {
     let xml = fan_out(5);
     assert!(iec61850_scl::parse_scl(&xml).unwrap().resolve().is_ok());
 }
+
+/// An IED whose LLN0 data object `D` holds the DOType body `body`, with the
+/// DAType `P` of two floats available to it.
+fn with_do_type(body: &str) -> String {
+    format!(
+        r#"<SCL>
+  <IED name="IED1"><AccessPoint name="AP1"><Server><LDevice inst="LD0">
+    <LN0 inst="" lnClass="LLN0" lnType="LLN0_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="D" type="D_T"/></LNodeType>
+    <DOType id="D_T" cdc="SPS">{body}</DOType>
+    <DOType id="E_T" cdc="SPS"><DA name="v" fc="ST" bType="Struct" type="P"/></DOType>
+    <DAType id="P"><BDA name="x" bType="FLOAT32"/><BDA name="y" bType="FLOAT32"/></DAType>
+  </DataTypeTemplates>
+</SCL>"#
+    )
+}
+
+/// A pathological `count` is counted, one node for the array and one subtree
+/// per element, and rejected in stage 2 before any element is built: the
+/// largest count on a structure, a count on a sub-object, and a count that
+/// names an attribute.
+#[test]
+fn pathological_counts_are_counted_not_built() {
+    for (body, kind, nodes) in [
+        (
+            r#"<DA name="a" fc="ST" bType="Struct" type="P" count="4294967295"/>"#,
+            "DOType `D_T`",
+            // 1 + 4294967295 * (1 + 2)
+            12_884_901_886u64,
+        ),
+        (
+            r#"<SDO name="s" type="E_T" count="500000"/>"#,
+            "DOType `D_T`",
+            // 1 + 500000 * (1 + 1 + 2)
+            2_000_001,
+        ),
+        (
+            r#"<DA name="a" fc="ST" bType="INT32" count="n"/><DA name="n" fc="CF" bType="INT32U"><Val>3000000</Val></DA>"#,
+            "DOType `D_T`",
+            // 1 + 3000000 * 1, plus the attribute `n`
+            3_000_002,
+        ),
+    ] {
+        let err = iec61850_scl::parse_scl(&with_do_type(body))
+            .expect("parse")
+            .resolve()
+            .expect_err(body);
+        assert!(
+            err.to_string().contains(&format!(
+                "{kind} expands to {nodes} model nodes, more than the limit of 1000000"
+            )),
+            "{body}: {err}"
+        );
+    }
+}
+
+/// Control: an array within the limit resolves, and its elements count
+/// against a lower limit exactly.
+#[test]
+fn array_elements_count_against_the_limit() {
+    let xml = with_do_type(r#"<DA name="a" fc="ST" bType="Struct" type="P" count="10"/>"#);
+    // D_T: 1 + 10 * 3 = 31; LLN0: 1 + 31 = 32; the IED adds LLN0 itself: 33.
+    iec61850_scl::parse_scl(&xml)
+        .expect("parse")
+        .resolve_with(&options(33))
+        .expect("33 nodes fit a limit of 33");
+    let err = iec61850_scl::parse_scl(&xml)
+        .expect("parse")
+        .resolve_with(&options(32))
+        .expect_err("33 nodes exceed a limit of 32");
+    assert!(
+        err.to_string().contains("expands to 33 model nodes"),
+        "{err}"
+    );
+}

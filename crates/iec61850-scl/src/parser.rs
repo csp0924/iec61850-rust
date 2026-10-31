@@ -25,11 +25,11 @@ use quick_xml::reader::Reader;
 use crate::attrs::{optional, parse_optional, parse_required, required};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
-    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType, RawEnumValue, RawFcda,
-    RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode,
-    RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawVal,
-    SmvOptsBits, TriggerOptionsBits,
+    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawCount, RawDaDef, RawDaType, RawDai,
+    RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType,
+    RawEnumValue, RawFcda, RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice,
+    RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef,
+    RawServer, RawVal, SmvOptsBits, TriggerOptionsBits,
 };
 
 /// Parses an SCL XML string into the stage 1 raw AST.
@@ -1500,11 +1500,13 @@ fn build_do_type(
     })
 }
 
-/// Parses an `<SDO>` inside a `<DOType>`: `name` and `type` are required.
+/// Parses an `<SDO>` inside a `<DOType>`: `name` and `type` are required;
+/// `count` is optional.
 ///
 /// # Errors
 ///
-/// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent.
+/// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent,
+/// and [`ErrorKind::AttributeValueInvalid`] for a malformed `count`.
 fn build_sdo_def(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -1512,10 +1514,11 @@ fn build_sdo_def(
 ) -> Result<RawSdoDef, SclParseError> {
     let name = required(start.attributes(), "name", span, path)?;
     let do_type_ref = required(start.attributes(), "type", span, path)?;
-    warn_count_not_modeled(start, "SDO", &name, path);
+    let count = parse_optional::<RawCount>(start.attributes(), "count", span, path)?;
     Ok(RawSdoDef {
         name,
         do_type_ref,
+        count,
         span,
     })
 }
@@ -1544,7 +1547,7 @@ fn build_da_def(
     let _ = crate::enums::parse_data_fc(&fc_str, span, path)?;
     let b_type = required(start.attributes(), "bType", span, path)?;
     let type_ref = optional(start.attributes(), "type");
-    let count = parse_optional::<u32>(start.attributes(), "count", span, path)?;
+    let count = parse_optional::<RawCount>(start.attributes(), "count", span, path)?;
     let val_kind = optional(start.attributes(), "valKind");
     let dchg = parse_optional::<bool>(start.attributes(), "dchg", span, path)?.unwrap_or(false);
     let qchg = parse_optional::<bool>(start.attributes(), "qchg", span, path)?.unwrap_or(false);
@@ -1569,22 +1572,6 @@ fn build_da_def(
     })
 }
 
-/// Warns that the `count` attribute of an `<SDO>` or a `<BDA>` is not carried
-/// into the raw tree, so the element is built as a single instance.
-///
-/// TODO: carry `count` and model arrays of sub-objects and nested attributes.
-fn warn_count_not_modeled(start: &BytesStart<'_>, element: &str, name: &str, path: &str) {
-    if let Some(count) = optional(start.attributes(), "count") {
-        tracing::warn!(
-            path,
-            count = %count,
-            "{} name=\"{}\" is an array, built as a single element; `count` is not modeled",
-            element,
-            name
-        );
-    }
-}
-
 /// Parses a `<DAType>`: `id` is required.
 ///
 /// # Errors
@@ -1604,11 +1591,12 @@ fn build_da_type(
 }
 
 /// Parses a `<BDA>` inside a `<DAType>`, possibly nested: `name` and `bType`
-/// are required; `type` and `valKind` are optional.
+/// are required; `type`, `count` and `valKind` are optional.
 ///
 /// # Errors
 ///
-/// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent.
+/// [`ErrorKind::MissingRequiredAttribute`] when a required attribute is absent,
+/// and [`ErrorKind::AttributeValueInvalid`] for a malformed `count`.
 fn build_bda(
     start: &BytesStart<'_>,
     span: SourceSpan,
@@ -1617,12 +1605,13 @@ fn build_bda(
     let name = required(start.attributes(), "name", span, path)?;
     let b_type = required(start.attributes(), "bType", span, path)?;
     let type_ref = optional(start.attributes(), "type");
+    let count = parse_optional::<RawCount>(start.attributes(), "count", span, path)?;
     let val_kind = optional(start.attributes(), "valKind");
-    warn_count_not_modeled(start, "BDA", &name, path);
     Ok(RawBda {
         name,
         b_type,
         type_ref,
+        count,
         default_value: None,
         val_kind,
         bda: Vec::new(),

@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::{ErrorKind, SclParseError, SourceSpan, TypeKind};
-use crate::raw::{DataTypeTemplates, RawBda, RawDoTypeChild, RawScl};
+use crate::raw::{DataTypeTemplates, RawBda, RawCount, RawDoTypeChild, RawScl};
 
 /// The default of [`ResolveOptions::max_expanded_nodes`].
 pub const DEFAULT_MAX_EXPANDED_NODES: u64 = 1_000_000;
@@ -59,6 +59,9 @@ pub struct ResolvedScl {
     /// in `raw.data_type_templates.ln_node_types`.
     #[allow(dead_code)]
     pub(crate) ln_type_index: BTreeMap<String, ()>,
+    /// The node limit stage 2 applied, which the model builder applies to an
+    /// array whose element count an instance gives.
+    pub(crate) max_expanded_nodes: u64,
 }
 
 impl ResolvedScl {
@@ -91,6 +94,13 @@ impl ResolvedScl {
     /// `enum_types` when its bType is Enum and in `da_types` when it is
     /// Struct; and the same rule recursively for every nested attribute.
     ///
+    /// A `count` naming an attribute is replaced by the element count that
+    /// attribute declares: IEC 61850-6 §9.5.4.1 Table 47 requires it in the
+    /// same type definition, a `<DA>` of the DOType for a `<DA>` or an
+    /// `<SDO>`, a `<BDA>` of the DAType for a `<BDA>`, and its `<Val>` gives
+    /// the count. When the type gives that attribute no `<Val>`, the count is
+    /// left naming it, and the model builder takes it from each instance.
+    ///
     /// # Errors
     ///
     /// [`ErrorKind::UnresolvedTypeReference`] when a reference does not
@@ -99,8 +109,12 @@ impl ResolvedScl {
     /// referencing element. [`ErrorKind::SemanticConflict`] when structure or
     /// sub-object references form a cycle, nest deeper than 32 levels, or
     /// expand an IED or a type to more than
-    /// [`ResolveOptions::max_expanded_nodes`] nodes.
+    /// [`ResolveOptions::max_expanded_nodes`] nodes, array elements included,
+    /// when a `count` names no attribute of an integer bType in the same type
+    /// definition, or when the `<Val>` of that attribute is not a count.
     pub fn from_raw_with(raw: RawScl, options: &ResolveOptions) -> Result<Self, SclParseError> {
+        let mut raw = raw;
+        resolve_counts(&mut raw.data_type_templates)?;
         // The four tables are already in raw.data_type_templates, and stage 1
         // has rejected any duplicate identifier.
         let dtt = &raw.data_type_templates;
@@ -230,7 +244,11 @@ impl ResolvedScl {
             .map(|k| (k.clone(), ()))
             .collect::<BTreeMap<_, _>>();
 
-        Ok(Self { raw, ln_type_index })
+        Ok(Self {
+            raw,
+            ln_type_index,
+            max_expanded_nodes: options.max_expanded_nodes,
+        })
     }
 
     /// Builds the runtime model of one IED from the resolved SCL.
@@ -247,8 +265,130 @@ impl ResolvedScl {
         &self,
         ied_name: &str,
     ) -> Result<iec61850_model::tree::IedModel, SclParseError> {
-        crate::build_model::build_ied_model(&self.raw, ied_name)
+        crate::build_model::build_ied_model(&self.raw, ied_name, self.max_expanded_nodes)
     }
+}
+
+/// The bTypes whose value can give an element count.
+const INTEGER_B_TYPES: &[&str] = &[
+    "INT8", "INT16", "INT24", "INT32", "INT64", "INT128", "INT8U", "INT16U", "INT24U", "INT32U",
+];
+
+/// Replaces every `count` that names an attribute by the element count that
+/// attribute declares in the same type definition; a count naming an
+/// attribute that declares no `<Val>` is left for the instance to give.
+///
+/// # Errors
+///
+/// [`ErrorKind::SemanticConflict`] when the named attribute does not exist,
+/// is not of an integer bType, or its value is not a count.
+fn resolve_counts(dtt: &mut DataTypeTemplates) -> Result<(), SclParseError> {
+    for (dot_id, dot) in dtt.do_types.iter_mut() {
+        let mut resolved = Vec::new();
+        for (i, child) in dot.children.iter().enumerate() {
+            let (kind, name, count, span) = match child {
+                RawDoTypeChild::Da(da) => ("DA", &da.name, &da.count, da.span),
+                RawDoTypeChild::Sdo(sdo) => ("SDO", &sdo.name, &sdo.count, sdo.span),
+            };
+            let Some(RawCount::Attribute(attr)) = count else {
+                continue;
+            };
+            let path =
+                format!("SCL/DataTypeTemplates/DOType[id=\"{dot_id}\"]/{kind}[name=\"{name}\"]");
+            let target = dot
+                .das()
+                .find(|d| &d.name == attr)
+                .map(|d| (d.b_type.as_str(), d.default_value.as_deref()));
+            if let Some(n) = count_value(attr, target, span, &path)? {
+                resolved.push((i, n));
+            }
+        }
+        for (i, n) in resolved {
+            match dot.children.get_mut(i) {
+                Some(RawDoTypeChild::Da(da)) => da.count = Some(RawCount::Elements(n)),
+                Some(RawDoTypeChild::Sdo(sdo)) => sdo.count = Some(RawCount::Elements(n)),
+                None => {}
+            }
+        }
+        for child in dot.children.iter_mut() {
+            if let RawDoTypeChild::Da(da) = child {
+                let path = format!(
+                    "SCL/DataTypeTemplates/DOType[id=\"{dot_id}\"]/DA[name=\"{}\"]",
+                    da.name
+                );
+                resolve_bda_counts(&mut da.bda, &path)?;
+            }
+        }
+    }
+    for (dat_id, dat) in dtt.da_types.iter_mut() {
+        resolve_bda_counts(
+            &mut dat.bdas,
+            &format!("SCL/DataTypeTemplates/DAType[id=\"{dat_id}\"]"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolves the `count` references among the sibling attributes `bdas`, and
+/// recursively among the inline attributes nested in each.
+fn resolve_bda_counts(bdas: &mut [RawBda], parent_path: &str) -> Result<(), SclParseError> {
+    let mut resolved = Vec::new();
+    for (i, bda) in bdas.iter().enumerate() {
+        let Some(RawCount::Attribute(attr)) = &bda.count else {
+            continue;
+        };
+        let path = format!("{parent_path}/BDA[name=\"{}\"]", bda.name);
+        let target = bdas
+            .iter()
+            .find(|b| &b.name == attr)
+            .map(|b| (b.b_type.as_str(), b.default_value.as_deref()));
+        if let Some(n) = count_value(attr, target, bda.span, &path)? {
+            resolved.push((i, n));
+        }
+    }
+    for (i, n) in resolved {
+        if let Some(bda) = bdas.get_mut(i) {
+            bda.count = Some(RawCount::Elements(n));
+        }
+    }
+    for bda in bdas.iter_mut() {
+        let path = format!("{parent_path}/BDA[name=\"{}\"]", bda.name);
+        resolve_bda_counts(&mut bda.bda, &path)?;
+    }
+    Ok(())
+}
+
+/// Reads the element count a `count` naming `attr` refers to, from `target`,
+/// the bType and `<Val>` of the attribute of that name, if there is one;
+/// `None` when the attribute declares no `<Val>`.
+fn count_value(
+    attr: &str,
+    target: Option<(&str, Option<&str>)>,
+    span: SourceSpan,
+    path: &str,
+) -> Result<Option<u32>, SclParseError> {
+    let conflict = |detail: String| {
+        SclParseError::at(span, path, ErrorKind::SemanticConflict { detail })
+            .with_attribute("count")
+    };
+    let Some((b_type, value)) = target else {
+        return Err(conflict(format!(
+            "count names `{attr}`, which the same type definition does not declare"
+        )));
+    };
+    if !INTEGER_B_TYPES.contains(&b_type) {
+        return Err(conflict(format!(
+            "count names `{attr}`, whose bType {b_type} is not an integer"
+        )));
+    }
+    let Some(text) = value else {
+        return Ok(None);
+    };
+    text.parse::<u32>().map(Some).map_err(|e| {
+        conflict(format!(
+            "count names `{attr}`, whose value `{text}` is not an element count: {e}"
+        ))
+    })
 }
 
 /// The deepest nesting of DOTypes through `<SDO>`, and of DATypes through
@@ -511,9 +651,10 @@ fn check_bda_recursive(
 ///
 /// Counts every logical node, data object, sub-object, data attribute and
 /// nested attribute the model builder would create, a type being counted once
-/// per reference to it. Each type's count is computed once and shared, so the
-/// check is linear in the size of the templates. Every chain must already be
-/// known to be acyclic.
+/// per reference to it and an array once per element, plus once for the array
+/// itself. Each type's count is computed once and shared, so the check is
+/// linear in the size of the templates. Every chain must already be known to
+/// be acyclic.
 fn check_expanded_nodes(raw: &RawScl, max: u64) -> Result<(), SclParseError> {
     let dtt = &raw.data_type_templates;
     let mut counts = ExpansionCounts::default();
@@ -625,7 +766,7 @@ impl ExpansionCounts {
         for child in &bda.bda {
             n = n.saturating_add(self.bda(dtt, child));
         }
-        n
+        with_elements(n, bda.count.as_ref())
     }
 
     fn do_type(&mut self, dtt: &DataTypeTemplates, id: &str) -> u64 {
@@ -636,15 +777,19 @@ impl ExpansionCounts {
         if let Some(dot) = dtt.do_types.get(id) {
             for child in &dot.children {
                 let child_count = match child {
-                    RawDoTypeChild::Da(da) => match (da.b_type.as_str(), da.type_ref.as_deref()) {
-                        ("Struct", Some(type_id)) => {
-                            1u64.saturating_add(self.da_type(dtt, type_id))
-                        }
-                        _ => 1,
-                    },
-                    RawDoTypeChild::Sdo(sdo) => {
-                        1u64.saturating_add(self.do_type(dtt, &sdo.do_type_ref))
+                    RawDoTypeChild::Da(da) => {
+                        let element = match (da.b_type.as_str(), da.type_ref.as_deref()) {
+                            ("Struct", Some(type_id)) => {
+                                1u64.saturating_add(self.da_type(dtt, type_id))
+                            }
+                            _ => 1,
+                        };
+                        with_elements(element, da.count.as_ref())
                     }
+                    RawDoTypeChild::Sdo(sdo) => with_elements(
+                        1u64.saturating_add(self.do_type(dtt, &sdo.do_type_ref)),
+                        sdo.count.as_ref(),
+                    ),
                 };
                 n = n.saturating_add(child_count);
             }
@@ -665,6 +810,16 @@ impl ExpansionCounts {
         }
         self.ln_node_types.insert(id.to_string(), n);
         n
+    }
+}
+
+/// The node count of an attribute or sub-object of `element` nodes: as is for
+/// a scalar, and one node for the array plus `element` per element for an
+/// array.
+fn with_elements(element: u64, count: Option<&RawCount>) -> u64 {
+    match count.and_then(RawCount::elements) {
+        Some(n) => 1u64.saturating_add(element.saturating_mul(u64::from(n))),
+        None => element,
     }
 }
 

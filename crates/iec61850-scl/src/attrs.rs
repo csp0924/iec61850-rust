@@ -187,6 +187,28 @@ impl AttrParse for u32 {
     }
 }
 
+/// A decimal element count, or the name of the attribute holding it: a letter
+/// followed by letters, digits and underscores.
+impl AttrParse for crate::raw::RawCount {
+    const EXPECTED: &'static str = "u32 (decimal) or an attribute name";
+    fn parse(s: &str) -> Result<Self, String> {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_digit() => s
+                .parse::<u32>()
+                .map(crate::raw::RawCount::Elements)
+                .map_err(|e| e.to_string()),
+            Some(c)
+                if c.is_ascii_alphabetic()
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                Ok(crate::raw::RawCount::Attribute(s.to_string()))
+            }
+            _ => Err("neither a decimal count nor an attribute name".to_string()),
+        }
+    }
+}
+
 impl AttrParse for i32 {
     const EXPECTED: &'static str = "i32 (decimal)";
     fn parse(s: &str) -> Result<Self, String> {

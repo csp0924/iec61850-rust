@@ -96,10 +96,10 @@ pub mod __private {
 
     pub use crate::build_model::{
         apply_to_instance, attribute_type, b_type_to_dat, dai_values, derives_setting_view,
-        fcda_do_path, gse_control_go_id, ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model,
-        opt_fields_to_model, parse_fc, parse_val_for_b_type, report_instances,
-        report_trg_ops_to_model, setting_view, skip_indexed_instance, sv_control_sv_id,
-        template_initial_value, trg_ops_to_model, warn_count_not_modeled,
+        doi_children, element_count, fcda_do_path, gse_control_go_id, instance_children,
+        ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model, opt_fields_to_model, parse_fc,
+        parse_val_for_b_type, report_instances, report_trg_ops_to_model, setting_view,
+        sv_control_sv_id, template_initial_value, trg_ops_to_model,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};

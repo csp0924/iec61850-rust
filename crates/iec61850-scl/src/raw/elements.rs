@@ -566,8 +566,37 @@ pub struct RawSdoDef {
     pub name: String,
     /// The `type` attribute, resolved in stage 2.
     pub do_type_ref: String,
+    /// The `count` attribute, the number of elements of an array sub-object.
+    pub count: Option<RawCount>,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
+}
+
+/// The `count` attribute of a `<DA>`, `<BDA>` or `<SDO>`, of the types
+/// `tDACount` and `tSDOCount` of IEC 61850-6 (§9.5.3 Table 44, §9.5.4.1
+/// Table 47).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RawCount {
+    /// The number of elements; 0 marks a scalar.
+    Elements(u32),
+    /// The name of an attribute of the same type definition whose value is the
+    /// number of elements. Stage 2 replaces it by the [`Elements`](Self::Elements)
+    /// it names when the type gives that attribute a `<Val>`; otherwise the
+    /// model builder reads the count from each instance.
+    Attribute(String),
+}
+
+impl RawCount {
+    /// Returns the number of elements of an array, or `None` for a scalar or
+    /// a count that names an attribute, which stage 2 has not resolved yet or
+    /// which each instance gives.
+    pub fn elements(&self) -> Option<u32> {
+        match self {
+            RawCount::Elements(n) if *n > 0 => Some(*n),
+            _ => None,
+        }
+    }
 }
 
 /// A `<DA>` declaration inside a `<DOType>`.
@@ -586,7 +615,7 @@ pub struct RawDaDef {
     /// The `dchg`, `qchg` and `dupd` attributes.
     pub trg_ops: TriggerOptionsBits,
     /// The `count` attribute, the number of elements of an array attribute.
-    pub count: Option<u32>,
+    pub count: Option<RawCount>,
     /// The text of the `<Val>` child, if the declaration carries a default.
     pub default_value: Option<String>,
     /// The `valKind` attribute.
@@ -610,6 +639,8 @@ pub struct RawBda {
     pub b_type: String,
     /// The `type` attribute, resolved in stage 2.
     pub type_ref: Option<String>,
+    /// The `count` attribute, the number of elements of an array attribute.
+    pub count: Option<RawCount>,
     /// The text of the `<Val>` child, if the declaration carries a default.
     pub default_value: Option<String>,
     /// The `valKind` attribute.

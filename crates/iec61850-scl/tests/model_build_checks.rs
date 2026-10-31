@@ -385,7 +385,7 @@ const MMXU_MV: &str = r#"
       <DA name="q" fc="MX" bType="Quality"/>
     </DOType>
     <DOType id="HAR_T" cdc="HWYE">
-      <SDO name="phsAHar" type="CMV_T"/>
+      <SDO name="phsAHar" type="CMV_T" count="16"/>
     </DOType>
     <DOType id="CMV_T" cdc="CMV">
       <DA name="cVal" fc="MX" bType="Struct" type="VEC"/>
@@ -541,9 +541,9 @@ fn coded_enum_unknown_val_keeps_the_default() {
     assert_eq!(da(&m, "GGIO1", "C", "pos").snapshot(), two_bits(0));
 }
 
-/// A `<DAI>` or `<SDI>` with an `ix` addresses an array element, which the
-/// model does not hold, so its value is not written into the single element
-/// the model keeps; the same instance without `ix` is applied.
+/// A `<DAI>` or `<SDI>` with an `ix` on an attribute that is not an array
+/// names no element, so its value is not written into the scalar; the same
+/// instance without `ix` is applied.
 #[test]
 fn indexed_dai_and_sdi_are_skipped() {
     let t = r#"
@@ -600,28 +600,221 @@ impl tracing::Subscriber for CountWarnings {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// An array declared with `count` on a `<DA>`, an `<SDO>` or a `<BDA>` is
-/// built as a single element, and each such declaration is warned about
-/// rather than dropped silently.
-#[test]
-fn count_is_warned_about() {
-    let t = r#"
+/// The data object `Hst` of `GGIO1` in an SCL whose DOType carries the arrays
+/// of `ARRAY_TYPES`.
+const ARRAY_TYPES: &str = r#"
     <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Hst" type="HST_T"/></LNodeType>
     <DOType id="HST_T" cdc="HST">
       <DA name="hstVal" fc="ST" bType="INT32" count="4"/>
       <DA name="cfg" fc="CF" bType="Struct" type="CFG_T"/>
       <SDO name="har" type="CMV_T" count="16"/>
+      <DA name="crvPts" fc="DC" bType="Struct" type="PT_T" count="maxPts"/>
+      <DA name="maxPts" fc="CF" bType="INT16U"><Val>3</Val></DA>
     </DOType>
-    <DOType id="CMV_T" cdc="CMV"><DA name="q" fc="MX" bType="Quality"/></DOType>
-    <DAType id="CFG_T"><BDA name="pts" bType="INT32" count="8"/></DAType>"#;
-    let xml = wrap(t, "", r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#);
+    <DOType id="CMV_T" cdc="CMV">
+      <DA name="cVal" fc="MX" bType="Struct" type="VEC_T"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+    </DOType>
+    <DAType id="CFG_T">
+      <BDA name="pts" bType="INT32" count="n"/>
+      <BDA name="n" bType="INT8U"><Val>2</Val></BDA>
+    </DAType>
+    <DAType id="PT_T"><BDA name="x" bType="FLOAT32"/><BDA name="y" bType="FLOAT32"/></DAType>
+    <DAType id="VEC_T"><BDA name="mag" bType="Struct" type="AV_T"/></DAType>
+    <DAType id="AV_T"><BDA name="f" bType="FLOAT32"/></DAType>"#;
+
+fn hst(m: &IedModel) -> &iec61850_model::tree::DataObject {
+    m.ld_by_inst("LD0")
+        .and_then(|ld| ld.ln_by_name("GGIO1"))
+        .and_then(|ln| ln.do_by_name("Hst"))
+        .expect("Hst")
+}
+
+/// A `count` on a `<DA>`, an `<SDO>` or a `<BDA>` builds an array of that many
+/// elements, each holding values of its own, and is no longer warned about
+/// (IEC 61850-6 §9.5.3 Table 44, §9.5.4.1 Table 47, Table 48).
+#[test]
+fn count_builds_arrays() {
+    let xml = wrap(
+        ARRAY_TYPES,
+        "",
+        r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#,
+    );
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let m = tracing::subscriber::with_default(CountWarnings(seen.clone()), || build(&xml));
-    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let hst_val = da(&m, "GGIO1", "Hst", "hstVal");
+    assert_eq!(hst_val.array_count, Some(4));
+    assert_eq!(hst_val.ty, DataAttributeType::Int32);
+    assert_eq!(
+        hst_val.snapshot(),
+        MmsValue::Array(vec![MmsValue::Integer(0); 4])
+    );
+    // Each element has a value of its own.
+    hst_val.element(2).unwrap().store(MmsValue::Integer(7));
+    assert_eq!(
+        hst_val.snapshot(),
+        MmsValue::Array(vec![
+            MmsValue::Integer(0),
+            MmsValue::Integer(0),
+            MmsValue::Integer(7),
+            MmsValue::Integer(0),
+        ])
+    );
+
+    let pts = da(&m, "GGIO1", "Hst", "cfg").child_by_name("pts").unwrap();
+    assert_eq!(pts.array_count, Some(2));
+
+    let Some(DoChild::SubDo(har)) = hst(&m).child_by_name("har", None) else {
+        panic!("har is a sub-object");
+    };
+    assert_eq!(har.array_count, Some(16));
+    assert_eq!(har.children.len(), 16);
+    let element = har.element(15).unwrap();
+    assert!(element.child_by_name("cVal", None).is_some());
+    // An array has elements, not named children.
+    assert!(har.child_by_name("har", None).is_none());
+}
+
+/// A `count` that names an attribute of the same type definition takes the
+/// value that attribute declares (IEC 61850-6 §9.5.4.1 Table 47, `tDACount`).
+#[test]
+fn count_naming_an_attribute_takes_its_value() {
+    let xml = wrap(
+        ARRAY_TYPES,
+        "",
+        r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#,
+    );
+    let m = build(&xml);
+    let crv = da(&m, "GGIO1", "Hst", "crvPts");
+    assert_eq!(crv.array_count, Some(3));
+    assert_eq!(crv.ty, DataAttributeType::Constructed);
+    let point = crv.element(0).unwrap();
+    assert_eq!(point.children.len(), 2);
+    assert_eq!(
+        crv.snapshot(),
+        MmsValue::Array(vec![
+            MmsValue::Structure(vec![
+                MmsValue::Float32(0.0),
+                MmsValue::Float32(0.0)
+            ]);
+            3
+        ])
+    );
+}
+
+/// A `count` that names no attribute of an integer bType in the same type
+/// definition, or whose value is not a count, or that is neither a number nor
+/// a name, is rejected instead of building a scalar.
+#[test]
+fn unresolvable_count_is_rejected() {
+    let cases = [
+        r#"<DA name="a" fc="ST" bType="INT32" count="nope"/>"#,
+        r#"<DA name="a" fc="ST" bType="INT32" count="n"/><DA name="n" fc="CF" bType="FLOAT32"><Val>2</Val></DA>"#,
+        r#"<DA name="a" fc="ST" bType="INT32" count="n"/><DA name="n" fc="CF" bType="INT16"><Val>-2</Val></DA>"#,
+        r#"<DA name="a" fc="ST" bType="INT32" count="-1"/>"#,
+        r#"<DA name="a" fc="ST" bType="INT32" count="4x"/>"#,
+        r#"<SDO name="s" type="E_T" count="missing"/>"#,
+    ];
+    for body in cases {
+        let t = format!(
+            r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Hst" type="HST_T"/></LNodeType>
+    <DOType id="HST_T" cdc="HST">{body}</DOType>
+    <DOType id="E_T" cdc="ENC"><DA name="v" fc="ST" bType="BOOLEAN"/></DOType>"#
+        );
+        let xml = wrap(&t, "", r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#);
+        let err = try_build(&xml).expect_err(body);
+        assert!(err.contains("count"), "{body}: {err}");
+    }
+    // Control: the same reference to an attribute with a value resolves.
+    let t = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Hst" type="HST_T"/></LNodeType>
+    <DOType id="HST_T" cdc="HST"><DA name="a" fc="ST" bType="INT32" count="n"/><DA name="n" fc="CF" bType="INT16U"><Val>2</Val></DA></DOType>"#;
+    let m = build(&wrap(
+        t,
+        "",
+        r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"/>"#,
+    ));
+    assert_eq!(da(&m, "GGIO1", "Hst", "a").array_count, Some(2));
+}
+
+/// An `ix` on a `<DAI>` or `<SDI>` writes the element it names: of an array of
+/// a basic type, of an array of structures, and of an array of sub-objects
+/// (IEC 61850-6 §9.3.6 Tables 19 and 20). An `ix` out of range, and an array
+/// named without one, are skipped.
+#[test]
+fn indexed_instances_set_their_element() {
+    let ln = r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="Hst">
+            <DAI name="hstVal" ix="1"><Val>7</Val></DAI>
+            <DAI name="hstVal" ix="4"><Val>9</Val></DAI>
+            <DAI name="hstVal"><Val>5</Val></DAI>
+            <SDI name="crvPts" ix="2"><DAI name="y"><Val>1.5</Val></DAI></SDI>
+            <SDI name="cfg"><DAI name="pts" ix="0"><Val>-3</Val></DAI></SDI>
+            <SDI name="har" ix="3"><SDI name="cVal"><SDI name="mag"><DAI name="f"><Val>2.5</Val></DAI></SDI></SDI></SDI>
+          </DOI></LN>"#;
+    let m = build(&wrap(ARRAY_TYPES, "", ln));
     assert_eq!(
         da(&m, "GGIO1", "Hst", "hstVal").snapshot(),
-        MmsValue::Integer(0)
+        MmsValue::Array(vec![
+            MmsValue::Integer(0),
+            MmsValue::Integer(7),
+            MmsValue::Integer(0),
+            MmsValue::Integer(0),
+        ])
     );
+    assert_eq!(
+        da(&m, "GGIO1", "Hst", "crvPts")
+            .element(2)
+            .unwrap()
+            .snapshot(),
+        MmsValue::Structure(vec![MmsValue::Float32(0.0), MmsValue::Float32(1.5)])
+    );
+    assert_eq!(
+        da(&m, "GGIO1", "Hst", "cfg")
+            .child_by_name("pts")
+            .unwrap()
+            .snapshot(),
+        MmsValue::Array(vec![MmsValue::Integer(-3), MmsValue::Integer(0)])
+    );
+    let Some(DoChild::SubDo(har)) = hst(&m).child_by_name("har", None) else {
+        panic!("har is a sub-object");
+    };
+    let f = |i: u32| {
+        let Some(DoChild::Da(c_val)) = har.element(i).unwrap().child_by_name("cVal", None) else {
+            panic!("cVal");
+        };
+        c_val
+            .child_by_name("mag")
+            .unwrap()
+            .child_by_name("f")
+            .unwrap()
+            .snapshot()
+    };
+    assert_eq!(f(3), MmsValue::Float32(2.5));
+    assert_eq!(f(2), MmsValue::Float32(0.0));
+}
+
+/// An FCDA index selects an element of the array on its path; an index with
+/// no array on the path names nothing and fails the build.
+#[test]
+fn fcda_index_needs_an_array() {
+    build(&wrap(
+        MMXU_MV,
+        &fcda(r#"doName="Har.phsAHar(15)" daName="cVal""#),
+        MMXU1,
+    ));
+    for attrs in [
+        r#"doName="TotW" daName="mag(1).f""#,
+        r#"doName="Har.phsAHar(16)" daName="cVal""#,
+        r#"doName="Har" daName="phsAHar.cVal""#,
+    ] {
+        assert!(
+            try_build(&wrap(MMXU_MV, &fcda(attrs), MMXU1)).is_err(),
+            "{attrs} accepted"
+        );
+    }
 }
 
 /// An EnumType with the given ordinals, referenced by `GGIO1.E.stVal`, with
@@ -928,4 +1121,83 @@ fn structured_attribute_leaves_take_the_trigger_options_of_the_attribute() {
         da(&m, "MMXU1", "TotW", "q").trg_ops,
         iec61850_model::TrgOps::QCHG
     );
+}
+
+/// Types whose element counts name attributes the type gives no value: `a` of
+/// `Hst` counted by the DA `n`, the sub-object `s` counted by `n` as well, and
+/// the BDA `pts` of `cfg` counted by the BDA `m`.
+const INSTANCE_COUNT_TYPES: &str = r#"
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="Hst" type="HST_T"/></LNodeType>
+    <DOType id="HST_T" cdc="HST">
+      <DA name="a" fc="ST" bType="INT32" count="n"/>
+      <SDO name="s" type="E_T" count="n"/>
+      <DA name="cfg" fc="CF" bType="Struct" type="CFG_T"/>
+      <DA name="n" fc="CF" bType="INT16U"/>
+    </DOType>
+    <DOType id="E_T" cdc="ENC"><DA name="v" fc="ST" bType="BOOLEAN"/></DOType>
+    <DAType id="CFG_T">
+      <BDA name="pts" bType="INT32" count="m"/>
+      <BDA name="m" bType="INT8U"/>
+    </DAType>"#;
+
+/// A `count` naming an attribute the type gives no `<Val>` takes the value
+/// the instance gives that attribute, at the same level of the instance;
+/// without one the declaration is built as a scalar with a warning, as
+/// IEC 61850-6 §9.5.4.1 Table 47 requires the attribute to exist and not to
+/// carry a type value.
+#[test]
+fn count_naming_an_attribute_without_a_type_value_reads_the_instance() {
+    let lns = r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="Hst">
+            <DAI name="n"><Val>3</Val></DAI>
+            <SDI name="cfg"><DAI name="m"><Val>2</Val></DAI></SDI>
+          </DOI></LN>
+          <LN lnClass="GGIO" inst="2" lnType="GGIO_T"/>"#;
+    let xml = wrap(INSTANCE_COUNT_TYPES, "", lns);
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let m = tracing::subscriber::with_default(CountWarnings(seen.clone()), || build(&xml));
+
+    assert_eq!(da(&m, "GGIO1", "Hst", "a").array_count, Some(3));
+    let ggio = |ln: &str| {
+        m.ld_by_inst("LD0")
+            .and_then(|ld| ld.ln_by_name(ln))
+            .and_then(|ln| ln.do_by_name("Hst"))
+            .expect("Hst")
+    };
+    let Some(DoChild::SubDo(s)) = ggio("GGIO1").child_by_name("s", None) else {
+        panic!("s is a sub-object");
+    };
+    assert_eq!(s.array_count, Some(3));
+    let pts = da(&m, "GGIO1", "Hst", "cfg").child_by_name("pts").unwrap();
+    assert_eq!(pts.array_count, Some(2));
+    assert_eq!(
+        da(&m, "GGIO1", "Hst", "n").snapshot(),
+        MmsValue::Unsigned(3)
+    );
+
+    // The second instance gives no value: three scalars, three warnings.
+    assert_eq!(da(&m, "GGIO2", "Hst", "a").array_count, None);
+    let Some(DoChild::SubDo(s)) = ggio("GGIO2").child_by_name("s", None) else {
+        panic!("s is a sub-object");
+    };
+    assert_eq!(s.array_count, None);
+    let pts = da(&m, "GGIO2", "Hst", "cfg").child_by_name("pts").unwrap();
+    assert_eq!(pts.array_count, None);
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+/// An instance value that is not an element count, or one that would expand
+/// the array past the model node limit, is rejected.
+#[test]
+fn instance_counts_are_checked() {
+    for (val, needle) in [
+        ("x", "not an element count"),
+        ("-1", "not an element count"),
+        ("3000000", "more than the limit of 1000000"),
+    ] {
+        let lns = format!(
+            r#"<LN lnClass="GGIO" inst="1" lnType="GGIO_T"><DOI name="Hst"><DAI name="n"><Val>{val}</Val></DAI></DOI></LN>"#
+        );
+        let err = try_build(&wrap(INSTANCE_COUNT_TYPES, "", &lns)).expect_err(val);
+        assert!(err.contains(needle), "{val}: {err}");
+    }
 }

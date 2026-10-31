@@ -28,15 +28,15 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__private::{
-    attribute_type, dai_values, derives_setting_view, fcda_do_path, gse_control_go_id,
-    ld_domain_name, ld_num_of_sgs, parse_fc, report_instances, skip_indexed_instance,
-    sv_control_sv_id, template_initial_value, warn_count_not_modeled, MmsValue,
+    attribute_type, dai_values, derives_setting_view, doi_children, element_count, fcda_do_path,
+    gse_control_go_id, instance_children, ld_domain_name, ld_num_of_sgs, parse_fc,
+    report_instances, sv_control_sv_id, template_initial_value, MmsValue,
 };
 use iec61850_scl::raw::{
-    DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
-    RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLogControl, RawLogicalDevice,
-    RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef,
-    RawSettingControl,
+    DataTypeTemplates, RawBda, RawCount, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet,
+    RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLogControl,
+    RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl,
+    RawSdi, RawSdoDef, RawSettingControl,
 };
 use iec61850_scl::ResolvedScl;
 
@@ -272,7 +272,7 @@ fn emit_ln_expr(
     let do_exprs = lnt
         .dos
         .iter()
-        .map(|do_def| emit_do_expr(do_def, dtt))
+        .map(|do_def| emit_do_expr(do_def, dtt, doi_children(ln, &do_def.name)))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Data sets, sorted for determinism.
@@ -337,20 +337,25 @@ fn emit_ln_expr(
 
 /// Emits a data object as
 /// `DataObjectBuilder::scalar(...).add_da_node(...).add_sub_do(...).build()`.
-fn emit_do_expr(do_def: &RawDoDef, dtt: &DataTypeTemplates) -> Result<TokenStream, CompileError> {
+fn emit_do_expr(
+    do_def: &RawDoDef,
+    dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
+) -> Result<TokenStream, CompileError> {
     let dot = dtt.do_types.get(&do_def.do_type_ref).ok_or_else(|| {
         CompileError::Emit(format!(
             "DO type_ref `{}` is absent from do_types; the resolve stage should have rejected it",
             do_def.do_type_ref
         ))
     })?;
-    emit_do_type_expansion(&do_def.name, dot, dtt)
+    emit_do_type_expansion(&do_def.name, dot, dtt, values)
 }
 
 fn emit_do_type_expansion(
     name: &str,
     dot: &RawDoType,
     dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
 ) -> Result<TokenStream, CompileError> {
     let name_lit = name;
 
@@ -361,7 +366,7 @@ fn emit_do_type_expansion(
         .iter()
         .map(|child| match child {
             RawDoTypeChild::Da(da) => {
-                let expr = emit_da_expr(da, dtt)?;
+                let expr = emit_da_expr(da, dtt, values)?;
                 Ok(if derives_setting_view(da, dot) {
                     quote! {
                         {
@@ -375,7 +380,7 @@ fn emit_do_type_expansion(
                 })
             }
             RawDoTypeChild::Sdo(sdo) => {
-                let expr = emit_sdo_expr(sdo, dtt)?;
+                let expr = emit_sdo_expr(sdo, dtt, values)?;
                 Ok(quote! { __do = __do.add_sub_do(#expr); })
             }
         })
@@ -390,14 +395,40 @@ fn emit_do_type_expansion(
     })
 }
 
-fn emit_sdo_expr(sdo: &RawSdoDef, dtt: &DataTypeTemplates) -> Result<TokenStream, CompileError> {
+/// Emits a sub-object, or an array of them when its `count`, given by the
+/// type or, for a count naming an attribute the type gives no value, by the
+/// instance `values`, is above 0, as the runtime path does.
+fn emit_sdo_expr(
+    sdo: &RawSdoDef,
+    dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
+) -> Result<TokenStream, CompileError> {
     let dot = dtt.do_types.get(&sdo.do_type_ref).ok_or_else(|| {
         CompileError::Emit(format!(
             "SDO type_ref `{}` is absent from do_types; the resolve stage should have rejected it",
             sdo.do_type_ref
         ))
     })?;
-    emit_do_type_expansion(&sdo.name, dot, dtt)
+    let count = element_count(sdo.count.as_ref(), values, sdo.span, "SDO").map_err(model_error)?;
+    let element =
+        emit_do_type_expansion(&sdo.name, dot, dtt, instance_children(values, &sdo.name))?;
+    Ok(match count {
+        Some(count) => quote! {
+            DataObject::array(#element, #count).expect("codegen: DataObject::array failed")
+        },
+        None => element,
+    })
+}
+
+/// Wraps the expression of one attribute element into an array of `count`
+/// elements when there is a count, as the runtime path does.
+fn emit_array_of(element: TokenStream, count: Option<u32>) -> TokenStream {
+    match count {
+        Some(count) => quote! {
+            DataAttribute::array(#element, #count).expect("codegen: DataAttribute::array failed")
+        },
+        None => element,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -405,11 +436,29 @@ fn emit_sdo_expr(sdo: &RawSdoDef, dtt: &DataTypeTemplates) -> Result<TokenStream
 // -----------------------------------------------------------------------------
 
 /// Emits a data attribute as `DataAttribute::new(...)`, or as
-/// `DataAttribute::constructed(...)` when its bType is a structure.
+/// `DataAttribute::constructed(...)` when its bType is a structure, wrapped
+/// into `DataAttribute::array(...)` when it carries a `count`.
 ///
 /// Every bType-to-type, fc-to-FC and trigger-option conversion calls the
 /// runtime helper.
-fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, CompileError> {
+fn emit_da_expr(
+    da: &RawDaDef,
+    dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
+) -> Result<TokenStream, CompileError> {
+    let count = element_count(da.count.as_ref(), values, da.span, "DA").map_err(model_error)?;
+    Ok(emit_array_of(
+        emit_da_element(da, dtt, instance_children(values, &da.name))?,
+        count,
+    ))
+}
+
+/// Emits one element of a data attribute; see [`emit_da_expr`].
+fn emit_da_element(
+    da: &RawDaDef,
+    dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
+) -> Result<TokenStream, CompileError> {
     // The functional constraint goes through the runtime helper; an unknown
     // token becomes an SclParseError.
     let fc = parse_fc(
@@ -422,7 +471,6 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
     let fc_tok = emit_fc_value(fc);
     let trg_tok = emit_trg_ops(da.trg_ops);
     let name_lit = da.name.as_str();
-    warn_count_not_modeled(da, "DA");
 
     if da.b_type == "Struct" {
         let type_id = da.type_ref.as_deref().ok_or_else(|| {
@@ -437,7 +485,7 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
         let child_exprs = dat
             .bdas
             .iter()
-            .map(|bda| emit_bda_expr(bda, &fc_tok, dtt))
+            .map(|bda| emit_bda_expr(bda, &fc_tok, dtt, values))
             .collect::<Result<Vec<_>, _>>()?;
         // Matches the runtime path: a constructed DA, then its trigger options.
         return Ok(quote! {
@@ -482,7 +530,8 @@ fn emit_da_expr(da: &RawDaDef, dtt: &DataTypeTemplates) -> Result<TokenStream, C
     })
 }
 
-/// Emits a BDA as a `DataAttribute`.
+/// Emits a BDA as a `DataAttribute`, an array of them when it carries a
+/// `count`.
 ///
 /// A BDA has no functional constraint of its own and inherits the one of its
 /// parent DA or BDA.
@@ -490,6 +539,21 @@ fn emit_bda_expr(
     bda: &RawBda,
     parent_fc: &TokenStream,
     dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
+) -> Result<TokenStream, CompileError> {
+    let count = element_count(bda.count.as_ref(), values, bda.span, "BDA").map_err(model_error)?;
+    Ok(emit_array_of(
+        emit_bda_element(bda, parent_fc, dtt, instance_children(values, &bda.name))?,
+        count,
+    ))
+}
+
+/// Emits one element of a BDA; see [`emit_bda_expr`].
+fn emit_bda_element(
+    bda: &RawBda,
+    parent_fc: &TokenStream,
+    dtt: &DataTypeTemplates,
+    values: Option<&[RawDataInstance]>,
 ) -> Result<TokenStream, CompileError> {
     let name_lit = bda.name.as_str();
 
@@ -509,7 +573,7 @@ fn emit_bda_expr(
         let child_exprs = dat
             .bdas
             .iter()
-            .map(|child| emit_bda_expr(child, parent_fc, dtt))
+            .map(|child| emit_bda_expr(child, parent_fc, dtt, values))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(quote! {
             DataAttribute::constructed(
@@ -778,7 +842,8 @@ fn emit_sgcb_expr(
 /// the parsed value, and the parsed value of each setting group.
 #[derive(Debug, Clone, PartialEq)]
 struct DaiOverride {
-    path: Vec<String>,
+    /// The data object name, then each `<SDI>` and `<DAI>` name with its `ix`.
+    path: Vec<(String, Option<u32>)>,
     value: MmsValue,
     sgroup_values: Vec<(u8, MmsValue)>,
 }
@@ -808,10 +873,17 @@ fn emit_doi_overrides(
 /// Emits the write of one DAI value into every attribute its path reaches.
 fn emit_dai_override(o: &DaiOverride) -> TokenStream {
     let (do_name, rest) = match o.path.split_first() {
-        Some((first, rest)) => (first.as_str(), rest),
+        Some((first, rest)) => (first.0.as_str(), rest),
         None => ("", &[][..]),
     };
-    let names: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = rest.iter().map(|(s, _)| s.as_str()).collect();
+    let indices: Vec<TokenStream> = rest
+        .iter()
+        .map(|(_, ix)| match ix {
+            Some(i) => quote! { ::core::option::Option::Some(#i) },
+            None => quote! { ::core::option::Option::None },
+        })
+        .collect();
     let value_tok = emit_mms_value(&o.value);
     let sgroups = (!o.sgroup_values.is_empty()).then(|| {
         let groups = o.sgroup_values.iter().map(|(g, _)| *g);
@@ -824,7 +896,7 @@ fn emit_dai_override(o: &DaiOverride) -> TokenStream {
         ::iec61850_scl::__private::apply_to_instance(
             &mut __ln,
             #do_name,
-            &[ #( #names ),* ],
+            &[ #( (#names, #indices) ),* ],
             |__da| {
                 __da.store(#value_tok);
                 #sgroups
@@ -877,7 +949,7 @@ fn collect_doi_overrides(
         );
         // path_segments is the path from the logical node down to the data
         // attribute: the DO name first, then the SDI and DAI names.
-        let mut base_path: Vec<String> = vec![raw_doi.name.clone()];
+        let mut base_path: Vec<(String, Option<u32>)> = vec![(raw_doi.name.clone(), None)];
         let ctx = EmitContext { dtt, num_of_sgs };
         emit_instances_at_do(
             &raw_doi.children,
@@ -910,13 +982,10 @@ fn emit_instances_at_do(
     dot: &RawDoType,
     ctx: &EmitContext<'_>,
     parent_path: &str,
-    base_path: &mut Vec<String>,
+    base_path: &mut Vec<(String, Option<u32>)>,
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     for inst in children {
-        if skip_indexed_instance(inst) {
-            continue;
-        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 handle_sdi_at_do(sdi, dot, ctx, parent_path, base_path, out)?;
@@ -934,8 +1003,11 @@ fn emit_instances_at_do(
                         continue;
                     }
                 };
+                if !element_matches("DAI", &dai.name, da_def.count.as_ref(), dai.ix) {
+                    continue;
+                }
                 let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
-                base_path.push(dai.name.clone());
+                base_path.push((dai.name.clone(), dai.ix));
                 emit_dai_assignment(
                     dai,
                     da_def.b_type.as_str(),
@@ -952,12 +1024,39 @@ fn emit_instances_at_do(
     Ok(())
 }
 
+/// Reports whether the `ix` of an `<SDI>` or `<DAI>` matches the `count` of
+/// the declaration it names, and warns when it does not, as the runtime path
+/// skips such an instance: an index needs an array and must lie below its
+/// count, and an array needs an index.
+fn element_matches(kind: &str, name: &str, count: Option<&RawCount>, ix: Option<u32>) -> bool {
+    // A count the instance gives is known only to the model builder, which
+    // skips a mismatched instance itself when the generated code runs.
+    if matches!(count, Some(RawCount::Attribute(_))) {
+        return true;
+    }
+    let matches = match (count.and_then(RawCount::elements), ix) {
+        (None, None) => true,
+        (Some(n), Some(i)) => i < n,
+        _ => false,
+    };
+    if !matches {
+        tracing::warn!(
+            target: "iec61850-scl-build",
+            "{} name=\"{}\" ix=\"{:?}\" does not match the array it names, skipping",
+            kind,
+            name,
+            ix
+        );
+    }
+    matches
+}
+
 fn handle_sdi_at_do(
     sdi: &RawSdi,
     dot: &RawDoType,
     ctx: &EmitContext<'_>,
     parent_path: &str,
-    base_path: &mut Vec<String>,
+    base_path: &mut Vec<(String, Option<u32>)>,
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     // Two possibilities: a sub-DO, or a constructed DA with bType=Struct.
@@ -968,8 +1067,11 @@ fn handle_sdi_at_do(
                 sdo.do_type_ref
             ))
         })?;
+        if !element_matches("SDI", &sdi.name, sdo.count.as_ref(), sdi.ix) {
+            return Ok(());
+        }
         let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-        base_path.push(sdi.name.clone());
+        base_path.push((sdi.name.clone(), sdi.ix));
         emit_instances_at_do(&sdi.children, sub_dot, ctx, &path, base_path, out)?;
         base_path.pop();
     } else if let Some(da_def) = dot.das().find(|d| d.name == sdi.name) {
@@ -994,8 +1096,11 @@ fn handle_sdi_at_do(
                 type_id
             ))
         })?;
+        if !element_matches("SDI", &sdi.name, da_def.count.as_ref(), sdi.ix) {
+            return Ok(());
+        }
         let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-        base_path.push(sdi.name.clone());
+        base_path.push((sdi.name.clone(), sdi.ix));
         emit_instances_at_da(&sdi.children, dat, ctx, &path, base_path, out)?;
         base_path.pop();
     } else {
@@ -1014,13 +1119,10 @@ fn emit_instances_at_da(
     dat: &RawDaType,
     ctx: &EmitContext<'_>,
     parent_path: &str,
-    base_path: &mut Vec<String>,
+    base_path: &mut Vec<(String, Option<u32>)>,
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     for inst in children {
-        if skip_indexed_instance(inst) {
-            continue;
-        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 let bda_def = match dat.bdas.iter().find(|b| b.name == sdi.name) {
@@ -1056,8 +1158,11 @@ fn emit_instances_at_da(
                         type_id
                     ))
                 })?;
+                if !element_matches("SDI", &sdi.name, bda_def.count.as_ref(), sdi.ix) {
+                    continue;
+                }
                 let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-                base_path.push(sdi.name.clone());
+                base_path.push((sdi.name.clone(), sdi.ix));
                 emit_instances_at_da(&sdi.children, sub_dat, ctx, &path, base_path, out)?;
                 base_path.pop();
             }
@@ -1074,8 +1179,11 @@ fn emit_instances_at_da(
                         continue;
                     }
                 };
+                if !element_matches("DAI", &dai.name, bda_def.count.as_ref(), dai.ix) {
+                    continue;
+                }
                 let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
-                base_path.push(dai.name.clone());
+                base_path.push((dai.name.clone(), dai.ix));
                 emit_dai_assignment(
                     dai,
                     bda_def.b_type.as_str(),
@@ -1100,7 +1208,7 @@ fn emit_dai_assignment(
     type_ref: Option<&str>,
     ctx: &EmitContext<'_>,
     path: &str,
-    base_path: &[String],
+    base_path: &[(String, Option<u32>)],
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     if dai.values.is_empty() {
@@ -1449,7 +1557,7 @@ mod tests {
   </LDevice></Server></AccessPoint></IED>
   <DataTypeTemplates>
     <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="W" type="MV_T"/></LNodeType>
-    <DOType id="MV_T" cdc="MV"><DA name="mag" fc="MX" bType="Struct" type="AV"/></DOType>
+    <DOType id="MV_T" cdc="MV"><DA name="mag" fc="MX" bType="Struct" type="AV" count="3"/></DOType>
     <DAType id="AV"><BDA name="f" bType="FLOAT32"/></DAType>
   </DataTypeTemplates>
 </SCL>"#;
@@ -1530,7 +1638,16 @@ mod tests {
             .unwrap();
         let overrides =
             collect_doi_overrides(raw_ln, &raw.data_type_templates, "LD0", None).unwrap();
-        let paths: Vec<String> = overrides.iter().map(|o| o.path.join(".")).collect();
+        let paths: Vec<String> = overrides
+            .iter()
+            .map(|o| {
+                o.path
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect();
         assert_eq!(
             paths,
             vec![
@@ -1548,9 +1665,12 @@ mod tests {
             .unwrap();
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         for o in &overrides {
-            let names: Vec<&str> = o.path[1..].iter().map(|s| s.as_str()).collect();
+            let names: Vec<(&str, Option<u32>)> = o.path[1..]
+                .iter()
+                .map(|(s, ix)| (s.as_str(), *ix))
+                .collect();
             let mut held = Vec::new();
-            iec61850_scl::__private::apply_to_instance(ln, &o.path[0], &names, |da| {
+            iec61850_scl::__private::apply_to_instance(ln, &o.path[0].0, &names, |da| {
                 held.push((da.snapshot(), MmsValue::default_for(da.ty)));
             });
             assert_eq!(

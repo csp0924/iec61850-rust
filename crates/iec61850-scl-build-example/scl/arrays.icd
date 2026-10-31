@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Arrays of data attributes, of nested attributes and of sub-data-objects,
+     with element counts given as numbers, by reference to a type value and
+     by reference to an instance value, and instance values for single
+     elements. -->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
+  <Header id="arrays"/>
+  <IED name="Arrays">
+    <AccessPoint name="AP1">
+      <Server>
+        <Authentication/>
+        <LDevice inst="LD0">
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+            <DataSet name="Harm">
+              <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA.phsAHar(1)" daName="cVal.mag.f" fc="MX"/>
+              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Arr" daName="hstVal" fc="ST"/>
+            </DataSet>
+          </LN0>
+          <LN lnClass="GGIO" inst="1" lnType="GGIO_T">
+            <DOI name="Arr">
+              <DAI name="hstVal" ix="1"><Val>7</Val></DAI>
+              <DAI name="setVals" ix="2"><Val>-4</Val></DAI>
+              <SDI name="pts" ix="2"><DAI name="y"><Val>1.5</Val></DAI></SDI>
+              <SDI name="cfg"><DAI name="lims" ix="0"><Val>-3</Val></DAI></SDI>
+              <DAI name="nExt"><Val>2</Val></DAI>
+              <DAI name="ext" ix="1"><Val>6</Val></DAI>
+            </DOI>
+            <DOI name="Spt">
+              <SDI name="setPts" ix="1"><DAI name="setVal"><Val>11</Val></DAI></SDI>
+            </DOI>
+          </LN>
+          <LN lnClass="MHAI" inst="1" lnType="MHAI_T">
+            <DOI name="HA">
+              <SDI name="phsAHar" ix="3">
+                <SDI name="cVal"><SDI name="mag"><DAI name="f"><Val>3.5</Val></DAI></SDI></SDI>
+              </SDI>
+            </DOI>
+          </LN>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <LNodeType id="GGIO_T" lnClass="GGIO">
+      <DO name="Arr" type="ARR_T"/>
+      <DO name="Spt" type="SPT_T"/>
+    </LNodeType>
+    <LNodeType id="MHAI_T" lnClass="MHAI">
+      <DO name="HA" type="HWYE_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+    </DOType>
+    <DOType id="ARR_T" cdc="HST">
+      <DA name="hstVal" fc="ST" bType="INT32" count="3" dchg="true"/>
+      <DA name="setVals" fc="SP" bType="INT32" count="4"/>
+      <DA name="pts" fc="SP" bType="Struct" type="PT_T" count="3"/>
+      <DA name="cfg" fc="SP" bType="Struct" type="CFG_T"/>
+      <DA name="crvPts" fc="DC" bType="Struct" type="PT_T" count="maxPts"/>
+      <DA name="maxPts" fc="CF" bType="INT16U"><Val>2</Val></DA>
+      <DA name="ext" fc="SP" bType="INT16" count="nExt"/>
+      <DA name="nExt" fc="CF" bType="INT8U"/>
+    </DOType>
+    <DOType id="SPT_T" cdc="ING">
+      <SDO name="setPts" type="ING_T" count="2"/>
+    </DOType>
+    <DOType id="ING_T" cdc="ING">
+      <DA name="setVal" fc="SP" bType="INT32"/>
+    </DOType>
+    <DOType id="HWYE_T" cdc="HWYE">
+      <SDO name="phsAHar" type="CMV_T" count="4"/>
+      <DA name="numHar" fc="CF" bType="INT16U"><Val>4</Val></DA>
+    </DOType>
+    <DOType id="CMV_T" cdc="CMV">
+      <DA name="cVal" fc="MX" bType="Struct" type="VEC_T" dchg="true"/>
+      <DA name="q" fc="MX" bType="Quality" qchg="true"/>
+      <DA name="t" fc="MX" bType="Timestamp"/>
+    </DOType>
+    <DAType id="VEC_T">
+      <BDA name="mag" bType="Struct" type="AV_T"/>
+    </DAType>
+    <DAType id="AV_T">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="PT_T">
+      <BDA name="x" bType="FLOAT32"/>
+      <BDA name="y" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="CFG_T">
+      <BDA name="lims" bType="INT16" count="3"/>
+      <BDA name="name" bType="VisString32"/>
+    </DAType>
+  </DataTypeTemplates>
+</SCL>

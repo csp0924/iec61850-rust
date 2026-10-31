@@ -37,15 +37,19 @@ use iec61850_model::{
 
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    DataTypeTemplates, OptionFieldsBits, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
-    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLNodeType,
-    RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl,
-    RawScl, RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
+    DataTypeTemplates, OptionFieldsBits, RawBda, RawCount, RawDaDef, RawDaType, RawDai,
+    RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl,
+    RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock,
+    RawSampledValueControl, RawScl, RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
 };
 
 /// Builds the runtime model of one IED. Called by
 /// [`crate::resolved::ResolvedScl::build_model`].
-pub(crate) fn build_ied_model(raw: &RawScl, ied_name: &str) -> Result<IedModel, SclParseError> {
+pub(crate) fn build_ied_model(
+    raw: &RawScl,
+    ied_name: &str,
+    max_nodes: u64,
+) -> Result<IedModel, SclParseError> {
     // Locate the requested IED.
     let ied = raw
         .ieds
@@ -78,7 +82,7 @@ pub(crate) fn build_ied_model(raw: &RawScl, ied_name: &str) -> Result<IedModel, 
         };
         for raw_ld in &server.logical_devices {
             had_any_ld = true;
-            let ld = build_ld(raw_ld, dtt, ied_name)?;
+            let ld = build_ld(raw_ld, dtt, ied_name, max_nodes)?;
             model_b = model_b.add_ld(ld).map_err(|e| {
                 SclParseError::at(
                     raw_ld.span,
@@ -153,6 +157,7 @@ fn build_ld(
     raw_ld: &RawLogicalDevice,
     dtt: &DataTypeTemplates,
     ied_name: &str,
+    max_nodes: u64,
 ) -> Result<iec61850_model::LogicalDevice, SclParseError> {
     let mut ld_b = LogicalDeviceBuilder::new(raw_ld.inst.clone());
     if let Some(name) = &raw_ld.ld_name {
@@ -162,7 +167,7 @@ fn build_ld(
     let num_of_sgs = ld_num_of_sgs(raw_ld);
 
     for raw_ln in &raw_ld.logical_nodes {
-        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain, num_of_sgs)?;
+        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain, num_of_sgs, max_nodes)?;
         ld_b = ld_b.add_ln(ln);
     }
 
@@ -196,6 +201,7 @@ fn build_ln(
     ld_inst: &str,
     domain: &str,
     num_of_sgs: Option<u32>,
+    max_nodes: u64,
 ) -> Result<iec61850_model::LogicalNode, SclParseError> {
     // Stage 2 has already checked that ln_type_ref resolves, so `expect` here
     // states an invariant rather than a hope.
@@ -211,7 +217,7 @@ fn build_ln(
     );
 
     for raw_do in &lnt.dos {
-        let dobj = build_do(raw_do, dtt, raw_ln, ld_inst, lnt)?;
+        let dobj = build_do(raw_do, dtt, raw_ln, ld_inst, lnt, max_nodes)?;
         ln_b = ln_b.add_do(dobj);
     }
 
@@ -275,11 +281,16 @@ fn build_do(
     raw_ln: &RawLogicalNode,
     ld_inst: &str,
     lnt: &RawLNodeType,
+    max_nodes: u64,
 ) -> Result<DataObject, SclParseError> {
     let dot = dtt
         .do_types
         .get(&raw_do.do_type_ref)
         .expect("do_type_ref was checked in stage 2");
+    let scope = Scope {
+        values: doi_children(raw_ln, &raw_do.name),
+        max_nodes,
+    };
 
     expand_do_type(
         &raw_do.name,
@@ -290,7 +301,161 @@ fn build_do(
             ld_inst, raw_ln.ln_class, raw_ln.inst, raw_do.name, raw_do.do_type_ref
         ),
         lnt,
+        scope,
     )
+}
+
+/// What a type expansion reads beside the type: the `<SDI>` and `<DAI>` of
+/// the instance at the level being expanded, which may give an element count
+/// the type leaves open, and the node limit an array must stay within.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    values: Option<&'a [RawDataInstance]>,
+    max_nodes: u64,
+}
+
+impl<'a> Scope<'a> {
+    /// The scope one level down, inside the `<SDI>` named `name`.
+    fn child(self, name: &str) -> Scope<'a> {
+        Scope {
+            values: instance_children(self.values, name),
+            max_nodes: self.max_nodes,
+        }
+    }
+}
+
+/// The `<SDI>` and `<DAI>` children of the `<DOI>` named `do_name` of a
+/// logical node.
+///
+/// Also used by the build-script path through [`crate::__private`].
+pub fn doi_children<'a>(
+    raw_ln: &'a RawLogicalNode,
+    do_name: &str,
+) -> Option<&'a [RawDataInstance]> {
+    raw_ln
+        .doi
+        .iter()
+        .find(|d| d.name == do_name)
+        .map(|d| d.children.as_slice())
+}
+
+/// The children of the `<SDI>` named `name`, without `ix`, among `values`.
+///
+/// Also used by the build-script path through [`crate::__private`].
+pub fn instance_children<'a>(
+    values: Option<&'a [RawDataInstance]>,
+    name: &str,
+) -> Option<&'a [RawDataInstance]> {
+    values?.iter().find_map(|v| match v {
+        RawDataInstance::Sdi(sdi) if sdi.name == name && sdi.ix.is_none() => {
+            Some(sdi.children.as_slice())
+        }
+        _ => None,
+    })
+}
+
+/// The element count of a `<DA>`, `<BDA>` or `<SDO>` whose `count` is
+/// `count`, `None` for a scalar.
+///
+/// A count stage 2 left naming an attribute, because the type gives that
+/// attribute no `<Val>`, takes the value of the `<DAI>` of that name among
+/// `values`, the instance at the same level (IEC 61850-6 §9.5.4.1 Table 47
+/// requires the attribute to exist, not to carry a type value). Without one
+/// the attribute is built as a scalar, with a warning.
+///
+/// Also used by the build-script path through [`crate::__private`].
+///
+/// # Errors
+///
+/// [`ErrorKind::SemanticConflict`] when the instance value is not an element
+/// count.
+pub fn element_count(
+    count: Option<&RawCount>,
+    values: Option<&[RawDataInstance]>,
+    span: SourceSpan,
+    path: &str,
+) -> Result<Option<u32>, SclParseError> {
+    let attr = match count {
+        Some(RawCount::Attribute(attr)) => attr,
+        other => return Ok(other.and_then(RawCount::elements)),
+    };
+    let dai = values.and_then(|values| {
+        values.iter().find_map(|v| match v {
+            RawDataInstance::Dai(dai) if &dai.name == attr && dai.ix.is_none() => Some(dai),
+            _ => None,
+        })
+    });
+    let text = dai.and_then(|dai| {
+        dai.values
+            .iter()
+            .find(|v| v.s_group.is_none())
+            .or_else(|| dai.values.first())
+            .map(|v| v.raw_text.as_str())
+    });
+    let Some(text) = text else {
+        tracing::warn!(
+            path,
+            attribute = %attr,
+            "count names an attribute with no value in the type or the instance; built as a scalar"
+        );
+        return Ok(None);
+    };
+    let n = text.parse::<u32>().map_err(|e| {
+        SclParseError::at(
+            span,
+            path.to_string(),
+            ErrorKind::SemanticConflict {
+                detail: format!(
+                    "count names `{attr}`, whose instance value `{text}` is not an element count: {e}"
+                ),
+            },
+        )
+        .with_attribute("count")
+    })?;
+    Ok((n > 0).then_some(n))
+}
+
+/// The number of model nodes below and including `da`.
+fn attribute_nodes(da: &DataAttribute) -> u64 {
+    da.children
+        .iter()
+        .fold(1u64, |n, c| n.saturating_add(attribute_nodes(c)))
+}
+
+/// The number of model nodes below and including `dobj`.
+fn object_nodes(dobj: &DataObject) -> u64 {
+    dobj.children.iter().fold(1u64, |n, c| {
+        n.saturating_add(match c {
+            DoChild::Da(da) => attribute_nodes(da),
+            DoChild::SubDo(sd) => object_nodes(sd),
+        })
+    })
+}
+
+/// Rejects an array of `count` elements of `element_nodes` nodes each that
+/// expands to more than `max_nodes` model nodes, before its elements are
+/// made.
+fn check_array_nodes(
+    count: u32,
+    element_nodes: u64,
+    max_nodes: u64,
+    span: SourceSpan,
+    path: &str,
+) -> Result<(), SclParseError> {
+    let nodes = 1u64.saturating_add(element_nodes.saturating_mul(u64::from(count)));
+    if nodes > max_nodes {
+        return Err(SclParseError::at(
+            span,
+            path.to_string(),
+            ErrorKind::SemanticConflict {
+                detail: format!(
+                    "the array expands to {nodes} model nodes, more than the limit of {max_nodes}"
+                ),
+            },
+        )
+        .with_attribute("count"));
+    }
+    Ok(())
 }
 
 /// Expands a DOType into a [`DataObject`], including every data attribute
@@ -307,6 +472,7 @@ fn expand_do_type(
     dtt: &DataTypeTemplates,
     parent_path: &str,
     lnt: &RawLNodeType,
+    scope: Scope<'_>,
 ) -> Result<DataObject, SclParseError> {
     let mut do_b = DataObjectBuilder::scalar(do_name);
 
@@ -319,6 +485,7 @@ fn expand_do_type(
                     raw_da,
                     dtt,
                     &format!("{}/DA[name=\"{}\"]", parent_path, raw_da.name),
+                    scope,
                 )?;
                 let view = derives_setting_view(raw_da, dot).then(|| setting_view(&da));
                 do_b = do_b.add_da_node(da);
@@ -332,6 +499,7 @@ fn expand_do_type(
                     dtt,
                     &format!("{}/SDO[name=\"{}\"]", parent_path, raw_sdo.name),
                     lnt,
+                    scope,
                 )?;
                 do_b = do_b.add_sub_do(sdo);
             }
@@ -349,17 +517,53 @@ fn expand_do_type(
     })
 }
 
+/// Expands an `<SDO>` into a sub-object, or into an array of `count` of them
+/// (IEC 61850-6 §9.5.3 Table 44).
 fn build_sdo(
     raw_sdo: &RawSdoDef,
     dtt: &DataTypeTemplates,
     sdo_path: &str,
     lnt: &RawLNodeType,
+    scope: Scope<'_>,
 ) -> Result<DataObject, SclParseError> {
     let dot = dtt
         .do_types
         .get(&raw_sdo.do_type_ref)
         .expect("the sub-object type_ref was checked in stage 2");
-    expand_do_type(&raw_sdo.name, dot, dtt, sdo_path, lnt)
+    let count = element_count(raw_sdo.count.as_ref(), scope.values, raw_sdo.span, sdo_path)?;
+    let element = expand_do_type(
+        &raw_sdo.name,
+        dot,
+        dtt,
+        sdo_path,
+        lnt,
+        scope.child(&raw_sdo.name),
+    )?;
+    match count {
+        Some(count) => {
+            check_array_nodes(
+                count,
+                object_nodes(&element),
+                scope.max_nodes,
+                raw_sdo.span,
+                sdo_path,
+            )?;
+            DataObject::array(element, count).map_err(|e| array_error(raw_sdo.span, sdo_path, &e))
+        }
+        None => Ok(element),
+    }
+}
+
+/// Wraps a model error raised while building an array.
+fn array_error(span: SourceSpan, path: &str, e: &ModelError) -> SclParseError {
+    SclParseError::at(
+        span,
+        path.to_string(),
+        ErrorKind::SemanticConflict {
+            detail: format!("the model builder rejected the array: {e}"),
+        },
+    )
+    .with_attribute("count")
 }
 
 /// Whether a `<DA>` of a DOType also yields an FC=SG data attribute.
@@ -373,26 +577,19 @@ pub fn derives_setting_view(raw_da: &RawDaDef, dot: &RawDoType) -> bool {
     raw_da.fc == "SE" && !dot.das().any(|d| d.name == raw_da.name && d.fc == "SG")
 }
 
-/// Builds the FC=SG view of an FC=SE data attribute: the same name, type and
-/// structure under FC=SG, with values of its own that start as copies of the
-/// current values of `da`.
+/// Builds the FC=SG view of an FC=SE data attribute: the same name, type,
+/// structure and array elements under FC=SG, with values of its own that
+/// start as copies of the current values of `da`.
 ///
 /// Also used by the code a build script generates, through [`crate::__private`].
 pub fn setting_view(da: &DataAttribute) -> DataAttribute {
-    if da.ty == DataAttributeType::Constructed {
-        let mut view = DataAttribute::constructed(
-            da.name.clone(),
-            FC::Sg,
-            da.children.iter().map(setting_view).collect(),
-        );
-        view.trg_ops = da.trg_ops;
-        view
-    } else {
-        let mut view =
-            DataAttribute::new(da.name.clone(), FC::Sg, da.ty, da.trg_ops, da.snapshot());
-        view.sgroup_values = da.sgroup_values.clone();
-        view
+    fn set_fc(da: &mut DataAttribute) {
+        da.fc = FC::Sg;
+        da.children.iter_mut().for_each(set_fc);
     }
+    let mut view = da.duplicate();
+    set_fc(&mut view);
+    view
 }
 
 /// Expands a raw data attribute into a [`DataAttribute`].
@@ -400,7 +597,8 @@ pub fn setting_view(da: &DataAttribute) -> DataAttribute {
 /// A bType of Struct is expanded recursively through its DAType into a
 /// constructed attribute. Any other bType yields a leaf whose value starts at
 /// the `<Val>` of the declaration, or at the zero value of its type when the
-/// declaration carries none.
+/// declaration carries none. A `count` above 0 makes an array of that many
+/// such elements (IEC 61850-6 §9.5.4.1 Table 47).
 ///
 /// # Errors
 ///
@@ -410,10 +608,35 @@ fn build_da(
     raw_da: &RawDaDef,
     dtt: &DataTypeTemplates,
     da_path: &str,
+    scope: Scope<'_>,
+) -> Result<DataAttribute, SclParseError> {
+    let count = element_count(raw_da.count.as_ref(), scope.values, raw_da.span, da_path)?;
+    let element = build_da_element(raw_da, dtt, da_path, scope.child(&raw_da.name))?;
+    match count {
+        Some(count) => {
+            check_array_nodes(
+                count,
+                attribute_nodes(&element),
+                scope.max_nodes,
+                raw_da.span,
+                da_path,
+            )?;
+            DataAttribute::array(element, count).map_err(|e| array_error(raw_da.span, da_path, &e))
+        }
+        None => Ok(element),
+    }
+}
+
+/// Expands one element of a raw data attribute; see [`build_da`]. `scope` is
+/// the instance inside the attribute.
+fn build_da_element(
+    raw_da: &RawDaDef,
+    dtt: &DataTypeTemplates,
+    da_path: &str,
+    scope: Scope<'_>,
 ) -> Result<DataAttribute, SclParseError> {
     let fc = parse_fc(&raw_da.fc, raw_da.span, da_path)?;
     let trg_ops = trg_ops_to_model(raw_da.trg_ops);
-    warn_count_not_modeled(raw_da, da_path);
 
     if raw_da.b_type == "Struct" {
         let type_id = raw_da
@@ -433,6 +656,7 @@ fn build_da(
                     fc,
                     dtt,
                     &format!("{}/BDA[name=\"{}\"]", da_path, bda.name),
+                    scope,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -466,24 +690,9 @@ fn build_da(
     ))
 }
 
-/// Warns that the `count` of a `<DA>` is not carried into the model.
-///
-/// TODO: model a data attribute array and build `count` elements.
-///
-/// Also used by the build-script path through [`crate::__private`].
-pub fn warn_count_not_modeled(raw_da: &RawDaDef, da_path: &str) {
-    if let Some(count) = raw_da.count {
-        tracing::warn!(
-            path = da_path,
-            count,
-            "an array attribute is built as a single element; `count` is not modeled"
-        );
-    }
-}
-
 /// Expands a nested attribute. It has no functional constraint of its own and
 /// inherits the one of its parent. A leaf starts at the `<Val>` of the
-/// declaration, as in [`build_da`].
+/// declaration, and a `count` above 0 makes an array, as in [`build_da`].
 ///
 /// # Errors
 ///
@@ -494,6 +703,40 @@ fn build_bda(
     parent_fc: FC,
     dtt: &DataTypeTemplates,
     bda_path: &str,
+    scope: Scope<'_>,
+) -> Result<DataAttribute, SclParseError> {
+    let count = element_count(raw_bda.count.as_ref(), scope.values, raw_bda.span, bda_path)?;
+    let element = build_bda_element(
+        raw_bda,
+        parent_fc,
+        dtt,
+        bda_path,
+        scope.child(&raw_bda.name),
+    )?;
+    match count {
+        Some(count) => {
+            check_array_nodes(
+                count,
+                attribute_nodes(&element),
+                scope.max_nodes,
+                raw_bda.span,
+                bda_path,
+            )?;
+            DataAttribute::array(element, count)
+                .map_err(|e| array_error(raw_bda.span, bda_path, &e))
+        }
+        None => Ok(element),
+    }
+}
+
+/// Expands one element of a nested attribute; see [`build_bda`]. `scope` is
+/// the instance inside the attribute.
+fn build_bda_element(
+    raw_bda: &RawBda,
+    parent_fc: FC,
+    dtt: &DataTypeTemplates,
+    bda_path: &str,
+    scope: Scope<'_>,
 ) -> Result<DataAttribute, SclParseError> {
     if raw_bda.b_type == "Struct" {
         let type_id = raw_bda
@@ -513,6 +756,7 @@ fn build_bda(
                     parent_fc,
                     dtt,
                     &format!("{}/BDA[name=\"{}\"]", bda_path, child.name),
+                    scope,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1076,9 +1320,6 @@ fn apply_instances_at_do(
     ctx: &InstanceContext<'_>,
 ) -> Result<(), SclParseError> {
     for inst in children {
-        if skip_indexed_instance(inst) {
-            continue;
-        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 // Two possibilities: a sub-object, or a constructed attribute.
@@ -1091,6 +1332,13 @@ fn apply_instances_at_do(
                     let sub_dobj = dobj.children.iter_mut().find_map(|c| match c {
                         DoChild::SubDo(sd) if sd.name == sdi.name => Some(sd),
                         _ => None,
+                    });
+                    let sub_dobj = sub_dobj.and_then(|sd| {
+                        let selected = object_element_mut(sd, sdi.ix);
+                        if selected.is_none() {
+                            warn_element_mismatch("SDI", &sdi.name, sdi.ix);
+                        }
+                        selected
                     });
                     let Some(sub_dobj) = sub_dobj else {
                         tracing::warn!(
@@ -1124,6 +1372,10 @@ fn apply_instances_at_do(
                     let mut found = false;
                     for da in attributes_named(dobj, &sdi.name) {
                         found = true;
+                        let Some(da) = attribute_element_mut(da, sdi.ix) else {
+                            warn_element_mismatch("SDI", &sdi.name, sdi.ix);
+                            continue;
+                        };
                         apply_instances_at_da(&sdi.children, da, dat_def, &sub_ctx)?;
                     }
                     if !found {
@@ -1156,6 +1408,10 @@ fn apply_instances_at_do(
                 let mut found = false;
                 for da in attributes_named(dobj, &dai.name) {
                     found = true;
+                    let Some(da) = attribute_element_mut(da, dai.ix) else {
+                        warn_element_mismatch("DAI", &dai.name, dai.ix);
+                        continue;
+                    };
                     apply_dai_value(
                         dai,
                         da,
@@ -1174,6 +1430,49 @@ fn apply_instances_at_do(
         }
     }
     Ok(())
+}
+
+/// Selects the node an `<SDI>` or `<DAI>` addresses with its `ix`: element
+/// `ix` of an array, or a scalar node itself when `ix` is absent. `None`
+/// when `ix` and the array disagree or `ix` is out of range.
+fn attribute_element_mut(da: &mut DataAttribute, ix: Option<u32>) -> Option<&mut DataAttribute> {
+    match (da.is_array(), ix) {
+        (false, None) => Some(da),
+        (true, Some(i)) => da.children.get_mut(usize::try_from(i).ok()?),
+        _ => None,
+    }
+}
+
+/// Selects the sub-object an `<SDI>` addresses with its `ix`; see
+/// [`attribute_element_mut`].
+fn object_element_mut(dobj: &mut DataObject, ix: Option<u32>) -> Option<&mut DataObject> {
+    match (dobj.is_array(), ix) {
+        (false, None) => Some(dobj),
+        (true, Some(i)) => match dobj.children.get_mut(usize::try_from(i).ok()?)? {
+            DoChild::SubDo(element) => Some(element),
+            DoChild::Da(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Warns that an `<SDI>` or `<DAI>` is skipped because its `ix` does not
+/// match the array it names: an index on a scalar, none on an array, or one
+/// out of range.
+fn warn_element_mismatch(kind: &str, name: &str, ix: Option<u32>) {
+    match ix {
+        Some(ix) => tracing::warn!(
+            "{} name=\"{}\" ix=\"{}\" names no element of an array, skipping",
+            kind,
+            name,
+            ix
+        ),
+        None => tracing::warn!(
+            "{} name=\"{}\" names an array without an ix, skipping",
+            kind,
+            name
+        ),
+    }
 }
 
 /// Iterates the data attributes named `name` directly below `dobj`: one, or
@@ -1201,9 +1500,6 @@ fn apply_instances_at_da(
     ctx: &InstanceContext<'_>,
 ) -> Result<(), SclParseError> {
     for inst in children {
-        if skip_indexed_instance(inst) {
-            continue;
-        }
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 let bda_def = match dat.bdas.iter().find(|b| b.name == sdi.name) {
@@ -1238,6 +1534,10 @@ fn apply_instances_at_da(
                     );
                     continue;
                 };
+                let Some(sub_da) = attribute_element_mut(sub_da, sdi.ix) else {
+                    warn_element_mismatch("SDI", &sdi.name, sdi.ix);
+                    continue;
+                };
                 apply_instances_at_da(
                     &sdi.children,
                     sub_da,
@@ -1262,6 +1562,10 @@ fn apply_instances_at_da(
                         "DAI name=\"{}\" has no matching BDA in the built model, skipping",
                         dai.name
                     );
+                    continue;
+                };
+                let Some(sub_da) = attribute_element_mut(sub_da, dai.ix) else {
+                    warn_element_mismatch("DAI", &dai.name, dai.ix);
                     continue;
                 };
                 apply_dai_value(
@@ -1400,67 +1704,49 @@ pub fn dai_values(
     Ok((value, sgroup_values))
 }
 
-/// Reports whether an `<SDI>` or `<DAI>` addresses an array element, through
-/// its `ix` attribute, and warns that it is skipped.
-///
-/// The model holds an array attribute or sub-object as a single element, so an
-/// instance value aimed at one element of it has nowhere to go.
-///
-/// Also used by the build-script path through [`crate::__private`].
-pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
-    let (kind, name, ix) = match inst {
-        RawDataInstance::Sdi(sdi) => ("SDI", sdi.name.as_str(), sdi.ix),
-        RawDataInstance::Dai(dai) => ("DAI", dai.name.as_str(), dai.ix),
-    };
-    match ix {
-        Some(ix) => {
-            tracing::warn!(
-                "{} name=\"{}\" ix=\"{}\" addresses an array element, which the model does not hold, skipping",
-                kind,
-                name,
-                ix
-            );
-            true
-        }
-        None => false,
-    }
-}
-
 /// Calls `apply` on every data attribute that an instance path names below a
-/// logical node: `do_name` names the data object, and each name of `path`
+/// logical node: `do_name` names the data object, and each step of `path`
 /// names a sub-object, a data attribute or a nested attribute below the
-/// previous node, the last one being the target.
+/// previous node, the last one being the target, together with the `ix` of
+/// the `<SDI>` or `<DAI>`, which selects an element of an array.
 ///
 /// The name of the first data attribute on the path reaches every data
 /// attribute of that name below its data object, so the FC=SE and FC=SG
 /// attributes of one setting both take the value. Nothing is called when a
-/// name does not resolve or the path ends at a data object. The code a build
-/// script generates applies its `<DAI>` values through this walk, so a value
-/// lands where the runtime path writes it.
+/// name does not resolve, an `ix` does not match the array it names, or the
+/// path ends at a data object. The code a build script generates applies its
+/// `<DAI>` values through this walk, so a value lands where the runtime path
+/// writes it.
 pub fn apply_to_instance(
     ln: &mut iec61850_model::LogicalNode,
     do_name: &str,
-    path: &[&str],
+    path: &[(&str, Option<u32>)],
     mut apply: impl FnMut(&mut DataAttribute),
 ) {
     let Some(mut dobj) = ln.dos.iter_mut().find(|d| d.name == do_name) else {
         return;
     };
-    for (i, name) in path.iter().enumerate() {
+    for (i, (name, ix)) in path.iter().enumerate() {
         let sub_object = dobj
             .children
             .iter()
             .position(|c| matches!(c, DoChild::SubDo(sd) if sd.name == *name));
         if let Some(at) = sub_object {
-            dobj = match &mut dobj.children[at] {
+            let sub = match &mut dobj.children[at] {
                 DoChild::SubDo(sd) => sd,
                 DoChild::Da(_) => return,
             };
+            let Some(sub) = object_element_mut(sub, *ix) else {
+                return;
+            };
+            dobj = sub;
             continue;
         }
         let rest = &path[i + 1..];
         for da in attributes_named(dobj, name) {
-            if let Some(target) = descend_attribute(da, rest) {
+            if let Some(target) =
+                attribute_element_mut(da, *ix).and_then(|da| descend_attribute(da, rest))
+            {
                 apply(target);
             }
         }
@@ -1468,13 +1754,15 @@ pub fn apply_to_instance(
     }
 }
 
-/// Follows `path` through the sub-attributes of `da`.
+/// Follows `path` through the sub-attributes of `da` and the elements of its
+/// arrays.
 fn descend_attribute<'a>(
     mut da: &'a mut DataAttribute,
-    path: &[&str],
+    path: &[(&str, Option<u32>)],
 ) -> Option<&'a mut DataAttribute> {
-    for name in path {
-        da = da.children.iter_mut().find(|c| c.name == *name)?;
+    for (name, ix) in path {
+        let child = da.children.iter_mut().find(|c| c.name == *name)?;
+        da = attribute_element_mut(child, *ix)?;
     }
     Some(da)
 }
