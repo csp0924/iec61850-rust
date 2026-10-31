@@ -8,6 +8,8 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-31
+
 ### Security
 
 - **`iec61850-tls`** — With `time_validation(false)`, an expired or not yet
@@ -1023,7 +1025,8 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.1
 [0.3.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.0
