@@ -18,6 +18,9 @@ use crate::error::SourceSpan;
 // ------------------------------------------------------------------------
 
 /// The `<Header>` element.
+///
+/// The parser does not read `<Header>` and never constructs this type; see
+/// [`RawScl::header`](crate::raw::RawScl::header).
 #[derive(Debug, Clone, Default)]
 pub struct Header {
     /// The `id` attribute, which names the project.

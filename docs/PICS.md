@@ -412,7 +412,7 @@ model from it. `iec61850-scl-build` generates the same model at compile time.
 
 | SCL element | Support | Remark |
 |---|:---:|---|
-| `Header` | Y | |
+| `Header` | N | Accepted and skipped without a warning; `RawScl::header` is always `None` |
 | `IED`, `AccessPoint`, `Server`, `LDevice`, `LN0`, `LN` | Y | |
 | `DOI`, `SDI`, `DAI`, `Val` | partial | Instance values, including nested sub-data instances. A `<Val>` on a DataTypeTemplates `DA` or `BDA` is the initial value. Octet strings are read as base64Binary and Timestamp as xs:dateTime. A `<Val>` on Quality or EntryID, which IEC 61850-6 does not provide for, and on Check, EntryTime, OptFlds, TrgOps and PhyComAddr is warned about and the default is kept. An `SDI` or `DAI` with `ix` is skipped with a warning |
 | `DataSet`, `FCDA` | Y | |

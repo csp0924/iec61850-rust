@@ -18,7 +18,8 @@ pub use elements::*;
 /// Call [`Self::resolve`] to continue into stage 2.
 #[derive(Debug, Clone, Default)]
 pub struct RawScl {
-    /// The `<Header>` element, if the file carries one.
+    /// The `<Header>` element. The parser skips `<Header>`, so this is
+    /// always `None`.
     pub header: Option<Header>,
     /// Every `<IED>` element, in document order.
     pub ieds: Vec<RawIed>,
