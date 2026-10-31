@@ -239,7 +239,7 @@ pub(crate) fn item_to_field_value(
         }
         RcbWriteItem::EntryId => {
             let bytes = rcb.entry_id.as_deref().unwrap_or(&[]).to_vec();
-            Some(("$EntryId", MmsValue::OctetString(bytes)))
+            Some(("$EntryID", MmsValue::OctetString(bytes)))
         }
         RcbWriteItem::PurgeBuf => {
             let v = rcb.purge_buf.unwrap_or(false);
@@ -435,6 +435,49 @@ mod tests {
         assert!(seq.contains(&RcbWriteItem::DatSet));
         // Exactly RptEnaFalse and DatSet remain.
         assert_eq!(seq.len(), 2);
+    }
+
+    // item_to_field_value.
+
+    /// Each write item maps onto the MMS component name of IEC 61850-8-1, with
+    /// the exact capitalization the server matches on.
+    #[test]
+    fn field_names_match_the_mms_component_names() {
+        let mut rcb = brcb(false);
+        rcb.set_entry_id(Some(vec![1, 2, 3, 4, 5, 6, 7, 8]))
+            .unwrap();
+        let cases = [
+            (RcbWriteItem::RptEnaTrue, "$RptEna"),
+            (RcbWriteItem::ResvTms, "$ResvTms"),
+            (RcbWriteItem::RptId, "$RptID"),
+            (RcbWriteItem::DatSet, "$DatSet"),
+            (RcbWriteItem::OptFlds, "$OptFlds"),
+            (RcbWriteItem::BufTm, "$BufTm"),
+            (RcbWriteItem::TrgOps, "$TrgOps"),
+            (RcbWriteItem::IntgPd, "$IntgPd"),
+            (RcbWriteItem::EntryId, "$EntryID"),
+            (RcbWriteItem::PurgeBuf, "$PurgeBuf"),
+            (RcbWriteItem::Gi, "$GI"),
+        ];
+        for (item, expected) in cases {
+            let (suffix, _) = item_to_field_value(&item, &rcb).unwrap();
+            assert_eq!(suffix, expected, "{item:?}");
+        }
+        assert_eq!(
+            item_to_field_value(&RcbWriteItem::ResvFirst, &urcb(false))
+                .unwrap()
+                .0,
+            "$Resv"
+        );
+    }
+
+    #[test]
+    fn entry_id_write_carries_the_handle_bytes() {
+        let mut rcb = brcb(false);
+        rcb.set_entry_id(Some(vec![1, 2, 3, 4, 5, 6, 7, 8]))
+            .unwrap();
+        let (_, value) = item_to_field_value(&RcbWriteItem::EntryId, &rcb).unwrap();
+        assert_eq!(value, MmsValue::OctetString(vec![1, 2, 3, 4, 5, 6, 7, 8]));
     }
 
     // validate_mask_vs_type.
