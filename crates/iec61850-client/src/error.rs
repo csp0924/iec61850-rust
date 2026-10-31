@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn a_confirmed_error_keeps_its_class_and_code() {
-        match map(M::service_error(ErrorClass::Access(3), None)) {
+        match map(M::service_error(ErrorClass::Access(3))) {
             ClientError::Service { error_class, .. } => {
                 assert_eq!(error_class.context_tag(), 7);
                 assert_eq!(error_class.code(), 3);
@@ -391,10 +391,9 @@ mod tests {
 
     #[test]
     fn a_confirmed_error_keeps_its_service_specific_information() {
-        match map(M::service_error(
-            ErrorClass::Service(6),
-            Some(ServiceSpecificInfo::DeleteNamedVariableList(2)),
-        )) {
+        match map(M::service_error(ErrorClass::Service(6))
+            .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(2)))
+        {
             ClientError::Service {
                 service_specific, ..
             } => assert_eq!(

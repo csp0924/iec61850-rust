@@ -204,17 +204,30 @@ pub enum ClientError {
     },
 }
 
+/// Constructors for code that reports these errors itself, such as a test
+/// double of a peer. Each takes the fields the error always carries; an
+/// optional field starts empty and is set with the matching `with_` method,
+/// so a field added later leaves every signature as it is.
 impl ClientError {
-    /// Builds a [`ClientError::ServiceError`], for code that reports a
-    /// ServiceError itself, such as a test double of a peer.
-    pub fn service_error(
-        error_class: ErrorClass,
-        service_specific: Option<ServiceSpecificInfo>,
-    ) -> Self {
+    /// Builds a [`ClientError::ServiceError`] carrying `error_class` and no
+    /// serviceSpecificInformation.
+    pub fn service_error(error_class: ErrorClass) -> Self {
         Self::ServiceError {
             error_class,
-            service_specific,
+            service_specific: None,
         }
+    }
+
+    /// Sets the serviceSpecificInformation of a [`ClientError::ServiceError`];
+    /// any other error is returned unchanged.
+    pub fn with_service_specific(mut self, info: ServiceSpecificInfo) -> Self {
+        if let Self::ServiceError {
+            service_specific, ..
+        } = &mut self
+        {
+            *service_specific = Some(info);
+        }
+        self
     }
 
     /// Builds a [`ClientError::RejectError`].
@@ -253,18 +266,89 @@ impl ClientError {
         Self::InitiateFailed { error_code }
     }
 
-    /// Builds a [`ClientError::SessionRefused`] from the reason code and the
-    /// transport disconnect parameter of the RF SPDU and the provider-reason of
-    /// the CPR PPDU inside it.
-    pub fn session_refused(
-        reason_code: Option<u8>,
-        transport_disconnect: Option<u8>,
-        provider_reason: Option<u8>,
-    ) -> Self {
+    /// Builds a [`ClientError::SessionRefused`] whose RF SPDU carries no
+    /// parameter.
+    pub fn session_refused() -> Self {
         Self::SessionRefused {
-            reason_code,
-            transport_disconnect,
-            provider_reason,
+            reason_code: None,
+            transport_disconnect: None,
+            provider_reason: None,
         }
+    }
+
+    /// Sets the reason code (PI 50) of a [`ClientError::SessionRefused`]; any
+    /// other error is returned unchanged.
+    pub fn with_refuse_reason(mut self, code: u8) -> Self {
+        if let Self::SessionRefused { reason_code, .. } = &mut self {
+            *reason_code = Some(code);
+        }
+        self
+    }
+
+    /// Sets the transport disconnect parameter (PI 17) of a
+    /// [`ClientError::SessionRefused`]; any other error is returned unchanged.
+    pub fn with_transport_disconnect(mut self, value: u8) -> Self {
+        if let Self::SessionRefused {
+            transport_disconnect,
+            ..
+        } = &mut self
+        {
+            *transport_disconnect = Some(value);
+        }
+        self
+    }
+
+    /// Sets the provider-reason of the CPR PPDU inside a
+    /// [`ClientError::SessionRefused`]; any other error is returned unchanged.
+    pub fn with_provider_reason(mut self, reason: u8) -> Self {
+        if let Self::SessionRefused {
+            provider_reason, ..
+        } = &mut self
+        {
+            *provider_reason = Some(reason);
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_service_error_takes_its_service_specific_information_afterwards() {
+        let e = ClientError::service_error(ErrorClass::Service(6))
+            .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(3));
+        assert!(matches!(
+            e,
+            ClientError::ServiceError {
+                error_class: ErrorClass::Service(6),
+                service_specific: Some(ServiceSpecificInfo::DeleteNamedVariableList(3)),
+            }
+        ));
+    }
+
+    #[test]
+    fn a_session_refusal_takes_each_parameter_afterwards() {
+        let e = ClientError::session_refused()
+            .with_refuse_reason(129)
+            .with_transport_disconnect(1)
+            .with_provider_reason(3);
+        assert!(matches!(
+            e,
+            ClientError::SessionRefused {
+                reason_code: Some(129),
+                transport_disconnect: Some(1),
+                provider_reason: Some(3),
+            }
+        ));
+    }
+
+    #[test]
+    fn a_setter_leaves_another_error_unchanged() {
+        let e = ClientError::service_timeout(5)
+            .with_service_specific(ServiceSpecificInfo::DeleteNamedVariableList(1))
+            .with_refuse_reason(2);
+        assert!(matches!(e, ClientError::ServiceTimeout { timeout_ms: 5 }));
     }
 }

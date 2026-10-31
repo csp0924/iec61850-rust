@@ -456,7 +456,7 @@ fn invoke_id_exhausted_error_can_be_constructed() {
 /// `ClientError::ServiceError` can be constructed and displayed.
 #[test]
 fn service_error_can_be_constructed() {
-    let err = ClientError::service_error(ErrorClass::Access(0), None);
+    let err = ClientError::service_error(ErrorClass::Access(0));
     let msg = format!("{err}");
     assert!(!msg.is_empty());
 }

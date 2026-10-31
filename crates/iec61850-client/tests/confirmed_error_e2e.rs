@@ -235,8 +235,7 @@ async fn get_data_set_directory_of_an_unknown_set_reports_the_error_class() {
         other => panic!("expected a service error, got {other:?}"),
     }
     let mms_text =
-        ClientError::service_error(ErrorClass::Access(access::OBJECT_NON_EXISTENT), None)
-            .to_string();
+        ClientError::service_error(ErrorClass::Access(access::OBJECT_NON_EXISTENT)).to_string();
     assert_eq!(err.to_string(), format!("mms layer error: {mms_text}"));
 }
 
