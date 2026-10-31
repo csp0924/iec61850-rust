@@ -641,17 +641,28 @@ fn list_of_variable_entry(path: IecObjectPath) -> Result<ListOfVariableEntry, Cl
     };
     match path.array {
         None => Ok(ListOfVariableEntry::name(name)),
-        Some(arr) => {
-            let alt_access = match arr.component.as_deref() {
-                None => AlternateAccess::index(arr.index),
-                Some(c) => AlternateAccess::index_component(arr.index, c).map_err(|e| {
-                    ClientError::InvalidArgument(format!(
-                        "array element component `{c}` cannot be addressed: {e}"
-                    ))
-                })?,
-            };
-            Ok(ListOfVariableEntry::with_alt_access(name, alt_access))
-        }
+        Some(arr) => Ok(ListOfVariableEntry::with_alt_access(
+            name,
+            element_access(&arr)?,
+        )),
+    }
+}
+
+/// The `AlternateAccess` selecting an array element: `index` alone, or `index`
+/// plus the sub-component inside the element.
+///
+/// # Errors
+///
+/// `InvalidArgument` if the sub-component path cannot form an
+/// `AlternateAccess` selector.
+pub(crate) fn element_access(element: &ArrayElement) -> Result<AlternateAccess, ClientError> {
+    match element.component.as_deref() {
+        None => Ok(AlternateAccess::index(element.index)),
+        Some(c) => AlternateAccess::index_component(element.index, c).map_err(|e| {
+            ClientError::InvalidArgument(format!(
+                "array element component `{c}` cannot be addressed: {e}"
+            ))
+        }),
     }
 }
 

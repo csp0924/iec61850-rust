@@ -625,12 +625,7 @@ async fn create_data_set_checks_the_list_name() {
     let server = server_with(model(false), IedServerConfig::default());
     let handle = server.start().await.unwrap();
     let mut c = mms(&handle).await;
-    let member = || {
-        vec![DefineNamedVariableEntry {
-            domain_id: DOM.into(),
-            item_id: "GGIO1$ST$Ind1$stVal".into(),
-        }]
-    };
+    let member = || vec![DefineNamedVariableEntry::domain(DOM, "GGIO1$ST$Ind1$stVal")];
 
     for name in ["noLogicalNode", "LLN0$", "$ds", "LLN0$a$b", "NOSUCH1$ds"] {
         let r = t!(c.define_named_variable_list(DOM, name, member()));

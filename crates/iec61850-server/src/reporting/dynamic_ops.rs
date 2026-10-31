@@ -20,8 +20,9 @@
 //! large data objects cannot make the server hold an unbounded number of
 //! value references.
 //!
-//! Array indices, the `(N)` syntax, are not supported; the `dataset_admin` module
-//! of the client crate rejects them before they reach this module.
+//! A member may name an element of an array, and components inside it, with
+//! the index after the array name as the reference of the member carries it
+//! (IEC 61850-8-1 §8.1.3.2.4), for example `MHAI1$MX$HA$phsAHar(3)$cVal$mag$f`.
 
 use std::sync::Arc;
 
@@ -115,6 +116,26 @@ pub struct DatasetMeta {
     pub entry_count: usize,
 }
 
+/// Splits a member path into the path without its array index and the index:
+/// `MHAI1$MX$HA$phsAHar(3)$cVal` gives `MHAI1$MX$HA$phsAHar$cVal` and 3. A path
+/// without an index is returned whole. `None` when the index is not a decimal
+/// number, is not followed by the end of the path or by `$`, or is not the
+/// only one.
+fn split_element_index(path: &str) -> Option<(String, Option<u32>)> {
+    let Some((head, rest)) = path.split_once('(') else {
+        return Some((path.to_string(), None));
+    };
+    let (digits, tail) = rest.split_once(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if tail.contains(['(', ')']) || !(tail.is_empty() || tail.starts_with('$')) {
+        return None;
+    }
+    let index = digits.parse().ok()?;
+    Some((format!("{head}{tail}"), Some(index)))
+}
+
 const _: () = assert!(
     iec61850_mms::mms::pdu::MAX_DEFINE_ENTRIES >= DynamicDatasetOps::MAX_MEMBERS,
     "a request at the member limit must decode"
@@ -136,12 +157,17 @@ impl DynamicDatasetOps {
 
     /// Creates a dynamic data set, resolving every member through the model.
     ///
-    /// Every member is resolved before anything is registered, so a failure part
-    /// way through leaves no half-built data set behind.
+    /// A member is a domain and a path; a path naming an array element carries
+    /// the index after the array name, `<array>(<n>)`, followed by the
+    /// components inside the element, and at most one index. Every member is
+    /// resolved before anything is registered, so a failure part way through
+    /// leaves no half-built data set behind.
     ///
     /// # Errors
     /// - [`DatasetError::NameAlreadyExists`] when the domain and name are taken.
-    /// - [`DatasetError::MemberNotFound`] when a member is not in the model.
+    /// - [`DatasetError::MemberNotFound`] when a member is not in the model,
+    ///   or its index selects no element: one past the end of the array, or
+    ///   one that does not follow the name of the first array on the path.
     /// - [`DatasetError::MemberInvalidPath`] when a member path is malformed.
     /// - [`DatasetError::TooLarge`] when a member or the data set exceeds a size
     ///   limit.
@@ -177,7 +203,26 @@ impl DynamicDatasetOps {
         let mut entries: Vec<DatasetEntry> = Vec::with_capacity(members.len());
         let mut leaves = 0usize;
         for (mem_domain, mem_path) in &members {
-            let entry = DatasetEntry::from_model(ied_model, mem_domain, mem_path)?;
+            let reference = format!("{mem_domain}/{mem_path}");
+            let (path, index) =
+                split_element_index(mem_path).ok_or_else(|| DatasetError::MemberInvalidPath {
+                    path: reference.clone(),
+                })?;
+            // An index that selects no element names no object. The index
+            // selects an element of the first array on the path, so the
+            // reference also shows whether that is where the path puts it.
+            let not_found = || DatasetError::MemberNotFound {
+                path: reference.clone(),
+            };
+            let entry = match DatasetEntry::from_model_at(ied_model, mem_domain, &path, index) {
+                Err(DatasetError::MemberInvalidPath { .. }) if index.is_some() => {
+                    return Err(not_found());
+                }
+                other => other?,
+            };
+            if index.is_some() && entry.attr_ref != reference {
+                return Err(not_found());
+            }
             leaves += entry.leaf_count();
             if leaves > Self::MAX_LEAVES {
                 return Err(too_large());
@@ -473,5 +518,32 @@ mod tests {
             DynamicDatasetOps::add_dynamic(&reg, &big, "IED1LD0", "GGIO1$five", vec![member(); 5]),
             Err(DatasetError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn an_element_index_splits_off_the_path() {
+        assert_eq!(
+            split_element_index("MHAI1$MX$HA$phsAHar(3)$cVal$mag$f"),
+            Some(("MHAI1$MX$HA$phsAHar$cVal$mag$f".to_string(), Some(3)))
+        );
+        assert_eq!(
+            split_element_index("GGIO1$ST$Arr$hstVal(1)"),
+            Some(("GGIO1$ST$Arr$hstVal".to_string(), Some(1)))
+        );
+        assert_eq!(
+            split_element_index("GGIO1$ST$Ind1$stVal"),
+            Some(("GGIO1$ST$Ind1$stVal".to_string(), None))
+        );
+        for bad in [
+            "A$B$C()",
+            "A$B$C(+1)",
+            "A$B$C(1",
+            "A$B$C(1)(2)",
+            "A$B$C(1)$D(2)",
+            "A$B$C(1)x",
+            "A$B$C(99999999999)",
+        ] {
+            assert_eq!(split_element_index(bad), None, "{bad}");
+        }
     }
 }

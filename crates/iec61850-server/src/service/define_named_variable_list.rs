@@ -38,7 +38,7 @@ use iec61850_mms::mms::pdu::{
         subcode::{access, definition, resource},
         ErrorClass,
     },
-    ObjectName,
+    AlternateAccess, AlternateAccessSelector, ObjectName,
 };
 use iec61850_mms::mms::server::dispatcher::ConfirmedResponse;
 use iec61850_model::IedModel;
@@ -133,6 +133,35 @@ fn check_list_name(ied_model: &IedModel, domain: &str, list_name: &str) -> Resul
     Ok(())
 }
 
+/// The path of a member naming `item` with the alternate access `alt_access`.
+///
+/// Leading component selections extend the flattened name (IEC 61850-8-1
+/// §7.3.1); an array element follows as the index after the array name, then
+/// the components inside it, as the reference of the member carries them
+/// (§8.1.3.2.4), which is also the form GetNamedVariableListAttributes turns
+/// back into an alternate access. `None` for a selection that names no
+/// single element.
+fn member_path(item: &str, alt_access: Option<&AlternateAccess>) -> Option<String> {
+    let Some(alt_access) = alt_access else {
+        return Some(item.to_string());
+    };
+    let (components, rest) = alt_access.leading_components();
+    let mut path = item.to_string();
+    for component in components {
+        path.push('$');
+        path.push_str(component);
+    }
+    match rest.map(|r| &r.selector) {
+        None => {}
+        Some(AlternateAccessSelector::Index(index)) => path.push_str(&format!("({index})")),
+        Some(AlternateAccessSelector::IndexComponent { index, component }) => {
+            path.push_str(&format!("({index})${component}"));
+        }
+        Some(_) => return None,
+    }
+    Some(path)
+}
+
 /// Handles a DefineNamedVariableList request (confirmed service tag 0xab).
 pub(crate) fn handle_define_named_variable_list(
     invoke_id: u32,
@@ -185,11 +214,21 @@ pub(crate) fn handle_define_named_variable_list(
 
     // The PDU decoder guarantees every entry is domain-specific; a member whose
     // path does not resolve against the model is reported by `add_dynamic`.
-    let members: Vec<(String, String)> = req
-        .list_of_variable
-        .iter()
-        .map(|e| (e.domain_id.clone(), e.item_id.clone()))
-        .collect();
+    let mut members: Vec<(String, String)> = Vec::with_capacity(req.list_of_variable.len());
+    for entry in &req.list_of_variable {
+        let Some(path) = member_path(&entry.item_id, entry.alt_access.as_ref()) else {
+            tracing::warn!(
+                invoke_id,
+                item = entry.item_id,
+                "define-named-variable-list member selection names no single array element, answering object-access-unsupported"
+            );
+            return crate::service::make_confirmed_error_pub(
+                invoke_id,
+                ErrorClass::Access(access::OBJECT_ACCESS_UNSUPPORTED),
+            );
+        };
+        members.push((entry.domain_id.clone(), path));
+    }
 
     // Held until the data set is registered, so concurrent requests cannot
     // both pass the limit check.

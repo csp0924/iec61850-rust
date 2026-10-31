@@ -10,7 +10,7 @@
 
 use crate::connection::IedConnection;
 use crate::error::ClientError;
-use crate::object_io::parse_iec_object_path;
+use crate::object_io::{element_access, parse_iec_object_path};
 use crate::prelude::{format, String, ToString, Vec};
 use iec61850_hal::time::Timer;
 use iec61850_hal::transport::AsyncTransport;
@@ -87,12 +87,17 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// Creates a dynamic data set on the server (ACSI CreateDataSet).
     ///
     /// `reference` is IEC notation `<LD>/<LN>.<dsName>`; each member carries a
-    /// reference and a functional constraint and is mapped to its MMS path.
+    /// reference and a functional constraint and is mapped to its MMS path. A
+    /// member naming an array element, `<LD>/<LN>.<DO>.<array>(<n>)[.<component>]*`,
+    /// names the array with an alternate access selecting the element and the
+    /// components inside it (IEC 61850-8-1 §7.3.3, §7.3.4), the form
+    /// [`get_data_set_directory`](Self::get_data_set_directory) reads back.
     ///
     /// # Errors
     ///
     /// `NotConnected` if the association is not established, `InvalidArgument`
-    /// for a malformed reference or a member carrying an array index, and
+    /// for a malformed reference, a member with more than one array index, or
+    /// components inside the element that no alternate access can carry, and
     /// `Service` or `Reject` if the server refuses the request.
     pub async fn create_data_set(
         &self,
@@ -108,13 +113,11 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         let mut entries = Vec::with_capacity(members.len());
         for m in members {
             let path = parse_iec_object_path(&m.reference, m.fc)?;
-            if path.array.is_some() {
-                return Err(ClientError::InvalidArgument(format!(
-                    "data set member '{}' carries an array index, which a dynamic data set does not support",
-                    m.reference
-                )));
-            }
-            entries.push(DefineNamedVariableEntry::domain(path.domain, path.item_id));
+            let entry = DefineNamedVariableEntry::domain(path.domain, path.item_id);
+            entries.push(match path.array {
+                None => entry,
+                Some(element) => entry.with_alt_access(element_access(&element)?),
+            });
         }
 
         let mut guard = self.mms_client.lock().await;

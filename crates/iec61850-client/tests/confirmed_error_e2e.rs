@@ -74,10 +74,7 @@ async fn connected_client(port: u16) -> MmsClient {
 }
 
 fn member(reference: &str) -> DefineNamedVariableEntry {
-    DefineNamedVariableEntry {
-        domain_id: DOMAIN.to_string(),
-        item_id: reference.to_string(),
-    }
+    DefineNamedVariableEntry::domain(DOMAIN, reference)
 }
 
 /// A data set the server does not hold is answered with errorClass access

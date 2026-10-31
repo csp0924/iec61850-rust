@@ -1597,3 +1597,257 @@ async fn a_data_set_write_of_an_element_is_reported() {
     .await
     .expect("timed out");
 }
+
+/// A data set a client creates with members naming array elements holds those
+/// elements: GetDataSetValues reads them, GetNamedVariableListAttributes lists
+/// them in the form CreateDataSet took, the client reads back the references
+/// it created them with, and a report names each by the index after the array
+/// name (IEC 61850-8-1 §7.3.3, §7.3.4, Table 151, §8.1.3.2.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_data_set_takes_array_element_members() {
+    use iec61850_client::{DataSetMember, IedConnection};
+    use iec61850_server::{OptFlds, Rcb, ReportControl, TriggerOptions};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (handle, mut client) = serve_with(model(), |server| {
+            register_lims_element(server);
+            let rcb = Rcb::new("urcbDyn", "LLN0$Lims")
+                .with_trg_ops(TriggerOptions::DATA_CHANGED)
+                .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+            let mut ds = iec61850_server::Dataset::new("LLN0$Lims");
+            let model = server.model();
+            let r = ObjectRef::parse(&format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)")).unwrap();
+            let Some(NodeRef::Da(lim)) = model.node_by_object_ref(&r) else {
+                panic!("the element resolves to an attribute");
+            };
+            ds.push(iec61850_server::DatasetEntry::new(
+                format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(1)"),
+                Arc::clone(&lim.value),
+            ));
+            server
+                .register_urcb(
+                    ReportControl::new(format!("{DOMAIN}/LLN0$RP$urcbDyn"), rcb),
+                    ds,
+                )
+                .expect("register_urcb");
+        })
+        .await;
+        let conn = IedConnection::with_mms_client(
+            MmsClientBuilder::new()
+                .connect_timeout_ms(3_000)
+                .request_timeout_ms(3_000)
+                .build(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.connect("127.0.0.1", handle.bound_addr.port()),
+        )
+        .await
+        .expect("timeout")
+        .expect("connect");
+
+        let members = [
+            (format!("{DOMAIN}/MHAI1.HA.phsAHar(3).cVal.mag.f"), FC::Mx),
+            (format!("{DOMAIN}/GGIO1.Arr.hstVal(1)"), FC::St),
+            (format!("{DOMAIN}/GGIO1.Arr.cfg.lims(2)"), FC::Sp),
+            (format!("{DOMAIN}/GGIO1.Arr.cfg.lims"), FC::Sp),
+        ];
+        let requested: Vec<DataSetMember> = members
+            .iter()
+            .map(|(r, fc)| DataSetMember::new(r.clone(), *fc))
+            .collect();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.create_data_set(&format!("{DOMAIN}/LLN0.dynEl"), &requested),
+        )
+        .await
+        .expect("timeout")
+        .expect("CreateDataSet with array element members");
+
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$dynEl"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(
+            values,
+            vec![
+                AccessResult::Success(MmsData::Float32(3.5)),
+                AccessResult::Success(MmsData::Integer(7)),
+                AccessResult::Success(MmsData::Integer(0)),
+                AccessResult::Success(ints(&[-3, 0, 0])),
+            ]
+        );
+
+        let named = |item: &str| ObjectName::DomainSpecific {
+            domain_id: DOMAIN.into(),
+            item_id: item.into(),
+        };
+        let dir = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_named_variable_list_attributes(DOMAIN, "LLN0$dynEl"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetNamedVariableListAttributes");
+        assert_eq!(
+            dir.list_of_variable,
+            vec![
+                ListOfVariableEntry::with_alt_access(
+                    named("MHAI1$MX$HA$phsAHar"),
+                    AlternateAccess::index_component(3, "cVal$mag$f").unwrap()
+                ),
+                ListOfVariableEntry::with_alt_access(
+                    named("GGIO1$ST$Arr$hstVal"),
+                    AlternateAccess::index(1)
+                ),
+                ListOfVariableEntry::with_alt_access(
+                    named("GGIO1$SP$Arr$cfg$lims"),
+                    AlternateAccess::index(2)
+                ),
+                ListOfVariableEntry::name(named("GGIO1$SP$Arr$cfg$lims")),
+            ]
+        );
+        let directory = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.get_data_set_directory(&format!("{DOMAIN}/LLN0.dynEl")),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetDirectory");
+        let read_back: Vec<(String, FC)> = directory
+            .members
+            .iter()
+            .map(|m| (m.reference.clone(), m.fc))
+            .collect();
+        assert_eq!(read_back, members);
+
+        for (field, value) in [
+            ("Resv", MmsData::Boolean(true)),
+            (
+                "DatSet",
+                MmsData::VisibleString(format!("{DOMAIN}/LLN0$dynEl")),
+            ),
+            ("RptEna", MmsData::Boolean(true)),
+        ] {
+            write(&mut client, &format!("LLN0$RP$urcbDyn${field}"), value)
+                .await
+                .expect("set up the control block");
+        }
+        write_element(
+            &mut client,
+            "GGIO1$SP$Arr$cfg$lims",
+            2,
+            None,
+            MmsData::Integer(6),
+        )
+        .await
+        .expect("write the element");
+        assert_eq!(
+            next_report_with_references(&mut client).await,
+            (
+                vec![false, false, true, true],
+                vec![
+                    format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims(2)"),
+                    format!("{DOMAIN}/GGIO1$SP$Arr$cfg$lims"),
+                ],
+                vec![
+                    MmsValue::Integer(6),
+                    MmsValue::Array(vec![
+                        MmsValue::Integer(-3),
+                        MmsValue::Integer(0),
+                        MmsValue::Integer(6),
+                    ]),
+                ],
+            )
+        );
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}
+
+/// An alternate access may select components before the array, as Table 139
+/// does; the member is the same element. An index past the end of the array,
+/// on an attribute that is no array, or after an array that it does not
+/// follow names no object and is answered definition object-undefined, and
+/// nothing is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_data_set_resolves_the_alternate_access_of_a_member() {
+    use iec61850_mms::mms::pdu::service_error::{subcode::definition, ErrorClass};
+    use iec61850_mms::mms::pdu::DefineNamedVariableEntry;
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (handle, mut client) = serve(model()).await;
+        let table_139 = DefineNamedVariableEntry::domain(DOMAIN, "MHAI1$MX$HA").with_alt_access(
+            AlternateAccess::component_then(
+                "phsAHar",
+                AlternateAccess::index_component(3, "cVal$mag$f").unwrap(),
+            )
+            .unwrap(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.define_named_variable_list(DOMAIN, "LLN0$t139", vec![table_139]),
+        )
+        .await
+        .expect("timeout")
+        .expect("a component chain then an element");
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_named_variable_list_values(DOMAIN, "LLN0$t139"),
+        )
+        .await
+        .expect("timeout")
+        .expect("GetDataSetValues");
+        assert_eq!(values, vec![AccessResult::Success(MmsData::Float32(3.5))]);
+
+        for (name, entry) in [
+            (
+                "LLN0$past",
+                DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$ST$Arr$hstVal")
+                    .with_alt_access(AlternateAccess::index(3)),
+            ),
+            (
+                "LLN0$scalar",
+                DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$SP$Arr$cfg$name")
+                    .with_alt_access(AlternateAccess::index(0)),
+            ),
+            (
+                "LLN0$inner",
+                DefineNamedVariableEntry::domain(DOMAIN, "GGIO1$SP$Spt$setPts$setVal")
+                    .with_alt_access(AlternateAccess::index(0)),
+            ),
+        ] {
+            let r = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.define_named_variable_list(DOMAIN, name, vec![entry]),
+            )
+            .await
+            .expect("timeout");
+            assert!(
+                matches!(
+                    r,
+                    Err(ClientError::ServiceError {
+                        error_class: ErrorClass::Definition(definition::OBJECT_UNDEFINED),
+                        ..
+                    })
+                ),
+                "{name}: {r:?}"
+            );
+        }
+        let (lists, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_name_list(ObjectClass::NamedVariableList, Some(DOMAIN), None),
+        )
+        .await
+        .expect("timeout")
+        .expect("names");
+        assert_eq!(lists, ["LLN0$t139"]);
+        handle.stop().await;
+    })
+    .await
+    .expect("timed out");
+}

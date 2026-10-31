@@ -14,7 +14,8 @@
 //!       0x30 <len>     -- Member SEQUENCE
 //!         0xa0 <len>   -- variableSpecification.name [0] EXPLICIT
 //!           <ObjectName>
-//!         [0xa5 <AlternateAccess>]  -- alternateAccess [5] IMPLICIT OPTIONAL
+//!         [0xa5 <AlternateAccess>]  -- alternateAccess [5] IMPLICIT OPTIONAL,
+//!                                   -- an array element and its components
 //!       ... repeated once per member
 //! ```
 //!
@@ -32,7 +33,10 @@
 //! implementations send.
 
 use super::super::error::MmsError;
-use super::common::ObjectName;
+use super::common::{
+    decode_list_of_variable, encode_list_of_variable_seq, AlternateAccess, ListOfVariableEntry,
+    ObjectName, MAX_DATA_NESTING_DEPTH,
+};
 use super::initiate::{decode_length, encode_length};
 use crate::compat::prelude::*;
 use bytes::BytesMut;
@@ -50,16 +54,6 @@ pub const SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST_RESPONSE: u8 = 0x8b;
 /// Outer tag of listOfVariable `[0]` IMPLICIT SEQUENCE OF Member.
 const TAG_LIST_OF_VARIABLE: u8 = 0xa0;
 
-/// Tag of variableSpecification.name `[0]` EXPLICIT inside a Member.
-///
-/// The tag is explicit because the alternative it selects is a CHOICE,
-/// which no implicit tag may replace, so the ObjectName keeps its own tag
-/// inside this wrapper.
-const TAG_VAR_SPEC_NAME: u8 = 0xa0;
-
-/// The UNIVERSAL 16 CONSTRUCTED SEQUENCE tag.
-const TAG_SEQUENCE: u8 = 0x30;
-
 /// Largest number of entries a request may carry, in either direction.
 ///
 /// The bound keeps a decoded request from growing without limit. A server
@@ -72,16 +66,19 @@ pub const MAX_DEFINE_ENTRIES: usize = 4096;
 
 // Request
 
-/// One entry of a DefineNamedVariableList request.
-///
-/// Only a plain domain-specific named variable is supported; an AlternateAccess,
-/// which would select an array element or a component path, is not.
+/// One entry of a DefineNamedVariableList request: a domain-specific named
+/// variable, and optionally an alternate access selecting an array element of
+/// it and components inside that element (IEC 61850-8-1 §7.3.3, §7.3.4,
+/// Table 151).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DefineNamedVariableEntry {
     /// Domain that holds the variable.
     pub domain_id: String,
     /// Name of the variable within the domain.
     pub item_id: String,
+    /// Selection of part of the variable, such as an array element.
+    pub alt_access: Option<AlternateAccess>,
 }
 
 impl DefineNamedVariableEntry {
@@ -90,14 +87,24 @@ impl DefineNamedVariableEntry {
         Self {
             domain_id: domain_id.into(),
             item_id: item_id.into(),
+            alt_access: None,
         }
     }
 
-    /// Returns the entry as an `ObjectName`.
-    fn object_name(&self) -> ObjectName {
-        ObjectName::DomainSpecific {
-            domain_id: self.domain_id.clone(),
-            item_id: self.item_id.clone(),
+    /// Returns the entry with `alt_access` selecting part of the variable.
+    pub fn with_alt_access(mut self, alt_access: AlternateAccess) -> Self {
+        self.alt_access = Some(alt_access);
+        self
+    }
+
+    /// Returns the entry as a `listOfVariable` element.
+    fn list_entry(&self) -> ListOfVariableEntry {
+        ListOfVariableEntry {
+            name: ObjectName::DomainSpecific {
+                domain_id: self.domain_id.clone(),
+                item_id: self.item_id.clone(),
+            },
+            alt_access: self.alt_access.clone(),
         }
     }
 }
@@ -143,7 +150,7 @@ impl DefineNamedVariableListRequest {
         // 2. listOfVariable [0] IMPLICIT SEQUENCE OF Member
         let mut list_buf = BytesMut::new();
         for entry in &self.list_of_variable {
-            encode_member(entry, &mut list_buf);
+            encode_list_of_variable_seq(&entry.list_entry(), &mut list_buf);
         }
         inner.extend_from_slice(&[TAG_LIST_OF_VARIABLE]);
         encode_length(list_buf.len(), &mut inner);
@@ -174,24 +181,6 @@ impl DefineNamedVariableListRequest {
         let inner = &data[inner_start..inner_start + inner_len];
         decode_request_inner(inner)
     }
-}
-
-/// Encodes one Member: a SEQUENCE holding variableSpecification.name and, optionally,
-/// an alternateAccess.
-fn encode_member(entry: &DefineNamedVariableEntry, buf: &mut BytesMut) {
-    let mut member = BytesMut::new();
-
-    // variableSpecification.name [0] EXPLICIT: a 0xa0 wrapper around the ObjectName
-    let mut name_inner = BytesMut::new();
-    entry.object_name().encode(&mut name_inner);
-    member.extend_from_slice(&[TAG_VAR_SPEC_NAME]);
-    encode_length(name_inner.len(), &mut member);
-    member.extend_from_slice(&name_inner);
-
-    // alternateAccess [5] IMPLICIT OPTIONAL is never emitted
-    buf.extend_from_slice(&[TAG_SEQUENCE]);
-    encode_length(member.len(), buf);
-    buf.extend_from_slice(&member);
 }
 
 fn decode_request_inner(data: &[u8]) -> Result<DefineNamedVariableListRequest, MmsError> {
@@ -238,74 +227,29 @@ fn decode_request_inner(data: &[u8]) -> Result<DefineNamedVariableListRequest, M
     })
 }
 
+/// Decodes the members of listOfVariable; `data` is its content.
+///
+/// Every member names a domain-specific variable; an alternate access nests
+/// at most [`MAX_DATA_NESTING_DEPTH`] levels.
 fn decode_member_list(data: &[u8]) -> Result<Vec<DefineNamedVariableEntry>, MmsError> {
-    let mut entries = Vec::new();
-    let mut pos = 0usize;
-    while pos < data.len() {
-        if data[pos] != TAG_SEQUENCE {
-            tracing::warn!(
-                "definenamedvariablelist member expected sequence 0x30, got 0x{:02X}, rejecting",
-                data[pos]
-            );
-            return Err(MmsError::InvalidTag {
-                expected: TAG_SEQUENCE,
-                actual: data[pos],
-            });
-        }
-        let (seq_len, seq_hdr) = decode_length(&data[pos + 1..])?;
-        let seq_start = pos + 1 + seq_hdr;
-        if seq_start + seq_len > data.len() {
-            return Err(MmsError::TruncatedPdu);
-        }
-        let seq_inner = &data[seq_start..seq_start + seq_len];
-        pos = seq_start + seq_len;
-
-        entries.push(decode_member(seq_inner)?);
-    }
-    Ok(entries)
-}
-
-fn decode_member(data: &[u8]) -> Result<DefineNamedVariableEntry, MmsError> {
-    if data.is_empty() {
-        return Err(MmsError::TruncatedPdu);
-    }
-    // the first element is variableSpecification.name [0] EXPLICIT, a 0xa0 over ObjectName
-    if data[0] != TAG_VAR_SPEC_NAME {
-        return Err(MmsError::InvalidTag {
-            expected: TAG_VAR_SPEC_NAME,
-            actual: data[0],
-        });
-    }
-    let (name_len, name_hdr) = decode_length(&data[1..])?;
-    let name_start = 1 + name_hdr;
-    if name_start + name_len > data.len() {
-        return Err(MmsError::TruncatedPdu);
-    }
-    let name_inner = &data[name_start..name_start + name_len];
-    let (object_name, _) = ObjectName::decode(name_inner)?;
-
-    let (domain_id, item_id) = match object_name {
-        ObjectName::DomainSpecific { domain_id, item_id } => (domain_id, item_id),
-        // vmd-specific and aa-specific entries are not supported and are rejected
-        _ => {
-            tracing::warn!("definenamedvariablelist members must be domain-specific, rejecting");
-            return Err(MmsError::DefineNamedVariableListMissingField(
-                "domain-specific entry",
-            ));
-        }
-    };
-
-    // An alternateAccess [5], tag 0xa5, may follow. It is rejected rather than ignored,
-    // because it means the caller needs an array or component path the server would
-    // not preserve.
-    let after_name = name_start + name_len;
-    if after_name < data.len() && data[after_name] == 0xa5 {
-        return Err(MmsError::DefineNamedVariableListMissingField(
-            "alternateAccess not supported in MVP",
-        ));
-    }
-
-    Ok(DefineNamedVariableEntry { domain_id, item_id })
+    decode_list_of_variable(data, MAX_DATA_NESTING_DEPTH)?
+        .into_iter()
+        .map(|entry| match entry.name {
+            ObjectName::DomainSpecific { domain_id, item_id } => Ok(DefineNamedVariableEntry {
+                domain_id,
+                item_id,
+                alt_access: entry.alt_access,
+            }),
+            _ => {
+                tracing::warn!(
+                    "definenamedvariablelist members must be domain-specific, rejecting"
+                );
+                Err(MmsError::DefineNamedVariableListMissingField(
+                    "domain-specific entry",
+                ))
+            }
+        })
+        .collect()
 }
 
 // Response
@@ -571,8 +515,8 @@ mod tests {
     fn too_many_entries_rejected_at_decode() {
         let mut list = BytesMut::new();
         for i in 0..=MAX_DEFINE_ENTRIES {
-            encode_member(
-                &DefineNamedVariableEntry::domain("D", format!("i{i}")),
+            encode_list_of_variable_seq(
+                &DefineNamedVariableEntry::domain("D", format!("i{i}")).list_entry(),
                 &mut list,
             );
         }
@@ -597,40 +541,46 @@ mod tests {
         ));
     }
 
+    /// A member selecting an array element, and components inside it, carries
+    /// the selection as alternateAccess `[5]` and decodes back to it.
     #[test]
-    fn alternate_access_rejected_in_mvp() {
-        // A hand-built Member carrying a 0xa5 alternateAccess must be rejected.
-        // Member SEQUENCE: 0x30 <len>
-        //   0xa0 <len> ObjectName
-        //   0xa5 0x00       -- alternateAccess with an empty body
-        use super::super::common::ObjectName;
-        let mut name_inner = BytesMut::new();
-        ObjectName::DomainSpecific {
-            domain_id: "IED1LD0".into(),
-            item_id: "GGIO1$ST$Ind1".into(),
-        }
-        .encode(&mut name_inner);
+    fn alternate_access_round_trips() {
+        let element = DefineNamedVariableEntry::domain("IED1LD0", "MHAI1$MX$HA$phsAHar")
+            .with_alt_access(AlternateAccess::index_component(3, "cVal$mag$f").unwrap());
+        let whole = DefineNamedVariableEntry::domain("IED1LD0", "GGIO1$ST$Arr$hstVal")
+            .with_alt_access(AlternateAccess::index(1));
+        let plain = DefineNamedVariableEntry::domain("IED1LD0", "GGIO1$ST$Ind1$stVal");
+        let req = DefineNamedVariableListRequest::domain(
+            "IED1LD0",
+            "LLN0$dyn",
+            vec![element.clone(), whole, plain],
+        );
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf).unwrap();
+        assert_eq!(DefineNamedVariableListRequest::decode(&buf).unwrap(), req);
+
         let mut member = BytesMut::new();
-        member.extend_from_slice(&[TAG_VAR_SPEC_NAME]);
-        encode_length(name_inner.len(), &mut member);
-        member.extend_from_slice(&name_inner);
-        member.extend_from_slice(&[0xa5, 0x00]);
+        encode_list_of_variable_seq(&element.list_entry(), &mut member);
+        let name_len = usize::from(member[3]);
+        assert_eq!(member[4 + name_len], 0xa5, "{member:02x?}");
+    }
 
+    #[test]
+    fn member_not_domain_specific_rejected() {
         let mut list = BytesMut::new();
-        list.extend_from_slice(&[TAG_SEQUENCE]);
-        encode_length(member.len(), &mut list);
-        list.extend_from_slice(&member);
-
+        encode_list_of_variable_seq(
+            &ListOfVariableEntry::name(ObjectName::VmdSpecific("v".into())),
+            &mut list,
+        );
         let mut inner = BytesMut::new();
         ObjectName::DomainSpecific {
-            domain_id: "IED1LD0".into(),
-            item_id: "ds_with_alt".into(),
+            domain_id: "D".into(),
+            item_id: "LLN0$ds".into(),
         }
         .encode(&mut inner);
         inner.extend_from_slice(&[TAG_LIST_OF_VARIABLE]);
         encode_length(list.len(), &mut inner);
         inner.extend_from_slice(&list);
-
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&[SERVICE_TAG_DEFINE_NAMED_VARIABLE_LIST]);
         encode_length(inner.len(), &mut buf);
@@ -639,7 +589,7 @@ mod tests {
         let err = DefineNamedVariableListRequest::decode(&buf).unwrap_err();
         assert!(matches!(
             err,
-            MmsError::DefineNamedVariableListMissingField("alternateAccess not supported in MVP")
+            MmsError::DefineNamedVariableListMissingField("domain-specific entry")
         ));
     }
 
