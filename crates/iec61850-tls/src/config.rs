@@ -521,6 +521,9 @@ impl TlsConfigBuilder {
 
     /// Builds the server configuration.
     ///
+    /// A server without trust anchors requests no client certificate; the
+    /// build logs that at warn level, so a missing trust anchor shows.
+    ///
     /// # Errors
     ///
     /// [`TlsError::Validation`] when `min_version` exceeds `max_version`, when
@@ -561,6 +564,11 @@ impl TlsConfigBuilder {
         // Client certificate verifier, outermost first:
         // Reporting(IgnoreValidityTime(AllowOnlyKnownCerts(WebPki))).
         let client_auth_optional = !client_auth_mandatory && !self.ca_certs.is_empty();
+        if self.ca_certs.is_empty() {
+            tracing::warn!(
+                "the server has no trust anchor, so it requests no client certificate and accepts any client"
+            );
+        }
         let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
             if self.ca_certs.is_empty() {
                 WebPkiClientVerifier::no_client_auth()
