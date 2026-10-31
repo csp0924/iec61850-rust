@@ -5014,4 +5014,108 @@ mod tests {
         assert_eq!(buf.len(), 64);
         assert!(buf.is_overflow(), "the long entry was never sent in full");
     }
+
+    /// One update of every member of `wide_ds(150)`, as a batch.
+    fn wide_batch() -> Vec<(DataAttributeRef, MmsValue, InclusionFlag)> {
+        wide_ds(150)
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    e.attr_ref.clone(),
+                    MmsValue::Integer(1_000 + i as i64),
+                    InclusionFlag::VALUE_CHANGED,
+                )
+            })
+            .collect()
+    }
+
+    /// A URCB report built by the batch entry point and longer than the channel
+    /// is sent in parts, each segment once and in order.
+    #[test]
+    fn batched_urcb_report_longer_than_the_channel_is_resumed() {
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut engine =
+            ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let rcb = Rcb::new("urcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$RP$urcb01";
+        engine
+            .register_rcb(ReportControl::new(path, rcb), wide_ds(150))
+            .unwrap();
+        engine.register_peer(7, "10.0.0.7".parse().unwrap(), 200);
+        let rc_arc = engine.get_rcb(path).unwrap();
+        enable_rcb(&rc_arc, 7);
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(7, tx);
+
+        engine.on_values_updated(&wide_batch(), 1_000);
+        engine.tick_at(Instant::now(), 1_000);
+        assert!(engine.has_partial(path));
+        let mut pdus = Vec::new();
+        for t in 0..20 {
+            drain(&mut rx, &mut pdus);
+            if !engine.has_partial(path) {
+                break;
+            }
+            engine.tick_at(Instant::now(), 2_000 + t);
+        }
+        drain(&mut rx, &mut pdus);
+        let n = assert_one_report_in_order(&pdus, 2);
+        assert!(n > REPORT_CHANNEL_CAP, "{n} segments");
+        assert_eq!(
+            rc_arc
+                .lock()
+                .unwrap()
+                .metrics_snapshot()
+                .dropped_socket_full,
+            0
+        );
+    }
+
+    /// A BRCB entry built by the batch entry point and longer than the channel
+    /// is sent in parts, each segment once and in order.
+    #[test]
+    fn batched_brcb_entry_longer_than_the_channel_is_resumed() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl, TransmitAnchor};
+        use crate::reporting::sink::REPORT_CHANNEL_CAP;
+        let ch_sink = Arc::new(ChannelReportSink::new());
+        let mut eng = ReportingEngine::new_with_channel_sink(ch_sink.clone(), Default::default());
+        let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_opt_flds(OptFlds::SEQ_NUM | OptFlds::DATA_REFERENCE);
+        let path = "IED1LD0/GGIO1$BR$brcb01";
+        eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), wide_ds(150))
+            .unwrap();
+        eng.register_peer(5, "10.0.0.5".parse().unwrap(), 200);
+        let brcb_arc = eng.get_brcb(path).unwrap();
+        {
+            let mut s = brcb_arc.state.lock().unwrap();
+            s.rpt_ena = true;
+            s.client_conn_id = Some(5);
+            s.transmit_anchor = TransmitAnchor::FromHead;
+        }
+        let (tx, mut rx) = ChannelReportSink::create_channel();
+        ch_sink.register(5, tx);
+
+        eng.on_values_updated(&wide_batch(), 1_000);
+        assert_eq!(brcb_arc.lock_buffer().unwrap().len(), 1, "one entry");
+        let mut pdus = Vec::new();
+        let mut sent = 0;
+        for _ in 0..20 {
+            drain(&mut rx, &mut pdus);
+            sent += eng.flush_brcb_pending(&brcb_arc, 5);
+            if sent == 1 {
+                break;
+            }
+        }
+        drain(&mut rx, &mut pdus);
+        assert_eq!(sent, 1);
+        let n = assert_one_report_in_order(&pdus, 3);
+        assert!(n > REPORT_CHANNEL_CAP, "{n} segments");
+        assert_eq!(brcb_arc.state.lock().unwrap().sq_num, 1);
+    }
 }
