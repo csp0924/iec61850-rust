@@ -29,7 +29,7 @@
 //! The emit layer turns values into tokens and re-derives no semantics: every
 //! `b_type` lookup, functional-constraint parse and trigger-option composition
 //! calls the same helper the runtime path uses, through
-//! `iec61850_scl::__build_internals`, and only the helper's return value is
+//! `iec61850_scl::__private`, and only the helper's return value is
 //! serialized into a `TokenStream`. A generated model therefore cannot
 //! disagree with a model built at run time.
 //!

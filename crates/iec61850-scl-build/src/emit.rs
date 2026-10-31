@@ -21,13 +21,13 @@
 //! almost line for line; `let x = build_xxx(arg)?` there becomes
 //! `let x_tokens = emit_xxx_expr(arg)?` here. Every conversion from a string to
 //! an enum, and from a bType to a data attribute type, calls the same
-//! `__build_internals` helper the runtime path uses, so generated and runtime
+//! `__private` helper the runtime path uses, so generated and runtime
 //! models cannot diverge.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use iec61850_scl::__build_internals::{
+use iec61850_scl::__private::{
     attribute_type, dai_values, derives_setting_view, fcda_do_path, gse_control_go_id,
     ld_domain_name, ld_num_of_sgs, parse_fc, report_instances, skip_indexed_instance,
     sv_control_sv_id, template_initial_value, warn_count_not_modeled, MmsValue,
@@ -99,7 +99,7 @@ pub fn emit_file(
         // `#[allow(unused_imports)]`, because not every SCL file uses every
         // control block type.
         #[allow(unused_imports)]
-        use ::iec61850_scl::__rt::{
+        use ::iec61850_scl::__private::{
             IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, DataObjectBuilder,
             ReportControlBlock, GooseControlBlock, SvControlBlock, LogControlBlock,
             SettingGroupControlBlock,
@@ -357,7 +357,7 @@ fn emit_do_type_expansion(
                     quote! {
                         {
                             let __se = #expr;
-                            let __sg = ::iec61850_scl::__rt::setting_view(&__se);
+                            let __sg = ::iec61850_scl::__private::setting_view(&__se);
                             __do = __do.add_da_node(__se).add_da_node(__sg);
                         }
                     }
@@ -813,7 +813,7 @@ fn emit_dai_override(o: &DaiOverride) -> TokenStream {
         }
     });
     quote! {
-        ::iec61850_scl::__rt::apply_to_instance(
+        ::iec61850_scl::__private::apply_to_instance(
             &mut __ln,
             #do_name,
             &[ #( #names ),* ],
@@ -1272,7 +1272,7 @@ mod tests {
     /// emitted as a `DataAttribute::new` carrying the same initial value.
     fn assert_leaf_values_match_runtime(xml: &str) {
         use crate::tokens::emit_trg_ops_value;
-        use iec61850_scl::__rt::{DataAttribute, DataObject, DoChild};
+        use iec61850_scl::__private::{DataAttribute, DataObject, DoChild};
 
         fn leaf_exprs(da: &DataAttribute, top: bool, out: &mut Vec<(String, String)>) {
             if !da.children.is_empty() {
@@ -1535,7 +1535,7 @@ mod tests {
         for o in &overrides {
             let names: Vec<&str> = o.path[1..].iter().map(|s| s.as_str()).collect();
             let mut held = Vec::new();
-            iec61850_scl::__rt::apply_to_instance(ln, &o.path[0], &names, |da| {
+            iec61850_scl::__private::apply_to_instance(ln, &o.path[0], &names, |da| {
                 held.push((da.snapshot(), MmsValue::default_for(da.ty)));
             });
             assert_eq!(
@@ -1587,12 +1587,12 @@ mod tests {
             .child_by_name("stVal", None)
             .expect("Mod.stVal exists")
         {
-            iec61850_scl::__rt::DoChild::Da(da) => da,
+            iec61850_scl::__private::DoChild::Da(da) => da,
             _ => panic!("stVal should be DA"),
         };
         let snapshot = st_val.value.read().expect("lock").clone();
         match snapshot {
-            iec61850_scl::__rt::MmsValue::Integer(i) => assert_eq!(i, 1),
+            iec61850_scl::__private::MmsValue::Integer(i) => assert_eq!(i, 1),
             other => panic!("expected Integer(1), got {other:?}"),
         }
     }

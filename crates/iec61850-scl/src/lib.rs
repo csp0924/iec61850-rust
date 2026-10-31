@@ -19,7 +19,7 @@
 //! ```
 
 pub mod attrs;
-pub mod build_model;
+mod build_model;
 pub mod enums;
 pub mod error;
 pub mod parser;
@@ -67,20 +67,19 @@ impl RawScl {
 }
 
 // -----------------------------------------------------------------------------
-// Code generation exports
-//
-// The `model.rs` a build script emits references only the codegen-private
-// modules below, so a user crate need not depend on `iec61850-model` directly.
+// Code generation support
 // -----------------------------------------------------------------------------
 
-/// Codegen-only re-exports, referenced by the `model.rs` a build script emits.
+/// Code generation support for `iec61850-scl-build` and the `model.rs` it
+/// emits: the model types the generated code names, and the helpers the build
+/// script shares with the run-time build path, so the two derive every value
+/// the same way.
 ///
-/// The double-underscore name follows the convention of other code generation
-/// support modules: the contents change without notice, so user code must not
-/// import from here. Model types have a stable public API in
-/// `iec61850-model`.
+/// The contents change without notice and are matched only by the
+/// `iec61850-scl-build` of the same version, so user code must not import
+/// from here. Model types have a stable public API in `iec61850-model`.
 #[doc(hidden)]
-pub mod __rt {
+pub mod __private {
     pub use iec61850_model::builder::{
         DataObjectBuilder, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder,
     };
@@ -95,35 +94,16 @@ pub mod __rt {
     pub use iec61850_model::types::{DataAttributeType, TrgOps};
     pub use iec61850_model::value::MmsValue;
 
-    pub use crate::build_model::{apply_to_instance, setting_view};
-}
-
-/// Codegen-only helper re-exports, giving a build script the same lookup
-/// functions the runtime path uses, among them `b_type_to_dat`, `parse_fc` and
-/// `trg_ops_to_model`. The emit layer therefore turns values into tokens
-/// without re-deriving any semantics.
-///
-/// As with [`__rt`], user code must not import from here.
-#[doc(hidden)]
-pub mod __build_internals {
     pub use crate::build_model::{
-        attribute_type, b_type_to_dat, dai_values, derives_setting_view, fcda_do_path,
-        gse_control_go_id, ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model,
+        apply_to_instance, attribute_type, b_type_to_dat, dai_values, derives_setting_view,
+        fcda_do_path, gse_control_go_id, ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model,
         opt_fields_to_model, parse_fc, parse_val_for_b_type, report_instances,
-        report_trg_ops_to_model, skip_indexed_instance, sv_control_sv_id, template_initial_value,
-        trg_ops_to_model, warn_count_not_modeled,
+        report_trg_ops_to_model, setting_view, skip_indexed_instance, sv_control_sv_id,
+        template_initial_value, trg_ops_to_model, warn_count_not_modeled,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};
-    /// Canonical text dump used to compare the generated and the runtime build
-    /// paths for equivalence. See [`crate::summarize`].
     pub use crate::summarize::summarize_model;
-    // Re-exporting the helper return types keeps the build crate free of a
-    // direct dependency on `iec61850-model`.
-    pub use iec61850_model::cb::OptFlds;
-    pub use iec61850_model::fc::FC;
-    pub use iec61850_model::types::{DataAttributeType, TrgOps};
-    pub use iec61850_model::value::MmsValue;
 }
 
 /// Includes the `model.rs` that a build script generated into `OUT_DIR`.

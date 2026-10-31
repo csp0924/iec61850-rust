@@ -333,8 +333,7 @@ fn build_sdo(
 /// (IEC 61850-6, DA fc attribute), unless the DOType declares an attribute of
 /// the same name with `fc="SG"` itself.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn derives_setting_view(raw_da: &RawDaDef, dot: &RawDoType) -> bool {
     raw_da.fc == "SE" && !dot.das().any(|d| d.name == raw_da.name && d.fc == "SG")
 }
@@ -343,8 +342,7 @@ pub fn derives_setting_view(raw_da: &RawDaDef, dot: &RawDoType) -> bool {
 /// structure under FC=SG, with values of its own that start as copies of the
 /// current values of `da`.
 ///
-/// Also used by the code a build script generates, through [`crate::__rt`].
-#[doc(hidden)]
+/// Also used by the code a build script generates, through [`crate::__private`].
 pub fn setting_view(da: &DataAttribute) -> DataAttribute {
     if da.ty == DataAttributeType::Constructed {
         let mut view = DataAttribute::constructed(
@@ -437,8 +435,7 @@ fn build_da(
 ///
 /// TODO: model a data attribute array and build `count` elements.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn warn_count_not_modeled(raw_da: &RawDaDef, da_path: &str) {
     if let Some(count) = raw_da.count {
         tracing::warn!(
@@ -523,13 +520,12 @@ fn build_bda(
 /// a `<DAI>` on an instance overrides it afterwards (IEC 61850-6). Without a
 /// `<Val>`, the value is [`MmsValue::default_for`] of `dat`.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`], so
+/// Also used by the build-script path through [`crate::__private`], so
 /// a generated model starts from the same values as one built at run time.
 ///
 /// # Errors
 ///
 /// Whatever [`parse_val_for_b_type`] reports for the `<Val>` text.
-#[doc(hidden)]
 pub fn template_initial_value(
     dat: DataAttributeType,
     b_type: &str,
@@ -625,14 +621,13 @@ fn build_fcda(
 /// its name, and the index becomes the array index when the `ix` attribute is
 /// absent.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
+/// Also used by the build-script path through [`crate::__private`].
 ///
 /// # Errors
 ///
 /// [`ErrorKind::AttributeValueInvalid`] when a segment is empty or carries a
 /// malformed index, when the names carry more than one index, or when an index
 /// disagrees with `ix`.
-#[doc(hidden)]
 pub fn fcda_do_path(
     do_name: Option<&str>,
     da_name: Option<&str>,
@@ -796,8 +791,7 @@ fn build_gocb(raw_gcb: &RawGseControl, domain: &str) -> GooseControlBlock {
 /// subscriber filters on. An empty `appID` leaves the GoID at its IEC 61850-8-1
 /// default, the GoCBRef of the control block: `<domain>/LLN0$GO$<name>`.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn gse_control_go_id(raw_gcb: &RawGseControl, domain: &str) -> String {
     if raw_gcb.appl_id.is_empty() {
         format!("{domain}/LLN0$GO${}", raw_gcb.name)
@@ -814,8 +808,7 @@ pub fn gse_control_go_id(raw_gcb: &RawGseControl, domain: &str) -> String {
 /// `<domain>/LLN0$MS$<name>` for a multicast block and `<domain>/LLN0$US$<name>`
 /// for a unicast one.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn sv_control_sv_id(raw_svcb: &RawSampledValueControl, domain: &str) -> String {
     if raw_svcb.smv_id.is_empty() {
         let fc = if raw_svcb.multicast { "MS" } else { "US" };
@@ -828,8 +821,7 @@ pub fn sv_control_sv_id(raw_svcb: &RawSampledValueControl, domain: &str) -> Stri
 /// Returns the MMS domain name of a raw logical device, by the rule of
 /// [`iec61850_model::LogicalDevice::compose_domain_name`].
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn ld_domain_name(raw_ld: &RawLogicalDevice, ied_name: &str) -> String {
     iec61850_model::LogicalDevice::compose_domain_name(
         ied_name,
@@ -1379,8 +1371,7 @@ pub fn dai_values(
 /// The model holds an array attribute or sub-object as a single element, so an
 /// instance value aimed at one element of it has nowhere to go.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
-#[doc(hidden)]
+/// Also used by the build-script path through [`crate::__private`].
 pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
     let (kind, name, ix) = match inst {
         RawDataInstance::Sdi(sdi) => ("SDI", sdi.name.as_str(), sdi.ix),
@@ -1411,7 +1402,6 @@ pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
 /// name does not resolve or the path ends at a data object. The code a build
 /// script generates applies its `<DAI>` values through this walk, so a value
 /// lands where the runtime path writes it.
-#[doc(hidden)]
 pub fn apply_to_instance(
     ln: &mut iec61850_model::LogicalNode,
     do_name: &str,
@@ -1478,7 +1468,7 @@ fn descend_attribute<'a>(
 /// no value representation (§9.5.4.1 Table 45 and its note, §9.5.4.2), so a
 /// value on one is warned about and the attribute keeps its default.
 ///
-/// Also used by the build-script path through [`crate::__build_internals`], so
+/// Also used by the build-script path through [`crate::__private`], so
 /// the value is parsed once while the build script runs and emitted as a
 /// literal.
 ///
@@ -1854,7 +1844,7 @@ fn parse_timestamp(text: &str) -> Result<[u8; 8], String> {
 /// which at attribute level covers DCHG, QCHG and DUPD.
 ///
 /// Also used by the build-script path through
-/// `iec61850-scl::__build_internals`, so the generated model and the runtime
+/// `iec61850_scl::__private`, so the generated model and the runtime
 /// model derive their values the same way.
 pub fn trg_ops_to_model(t: TriggerOptionsBits) -> TrgOps {
     let mut bits = TrgOps::NONE;
@@ -1972,13 +1962,12 @@ pub fn parse_fc(token: &str, span: SourceSpan, path: &str) -> Result<FC, SclPars
 /// [`DataAttributeType::Int16`] or [`DataAttributeType::Int32`]. Any other
 /// bType goes through [`b_type_to_dat`].
 ///
-/// Also used by the build-script path through [`crate::__build_internals`].
+/// Also used by the build-script path through [`crate::__private`].
 ///
 /// # Errors
 ///
 /// Whatever [`b_type_to_dat`] reports, and [`ErrorKind::SemanticConflict`]
 /// when an Enum names no EnumType, which stage 2 has already ruled out.
-#[doc(hidden)]
 pub fn attribute_type(
     b_type: &str,
     type_ref: Option<&str>,

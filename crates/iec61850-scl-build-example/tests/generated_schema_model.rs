@@ -28,8 +28,8 @@ fn child_names(model: &IedModel, do_name: &str) -> Vec<String> {
         .children
         .iter()
         .map(|c| match c {
-            iec61850_scl::__rt::DoChild::Da(da) => da.name.clone(),
-            iec61850_scl::__rt::DoChild::SubDo(sd) => sd.name.clone(),
+            iec61850_scl::__private::DoChild::Da(da) => da.name.clone(),
+            iec61850_scl::__private::DoChild::SubDo(sd) => sd.name.clone(),
         })
         .collect()
 }
@@ -82,7 +82,7 @@ fn generated_settings_carry_every_group_value() {
         .expect("data object")
         .child_by_name(name, Some(fc))
     {
-        Some(iec61850_scl::__rt::DoChild::Da(da)) => da,
+        Some(iec61850_scl::__private::DoChild::Da(da)) => da,
         other => panic!("{do_name}.{name}[{fc}]: {other:?}"),
     };
     for fc in [FC::Se, FC::Sg] {
