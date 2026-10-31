@@ -107,4 +107,6 @@ pub use iso::session::{refuse_reason_name, RefuseInfo, SessionError, SessionIndi
 
 // MMS client types
 pub use mms::client::error::session_refused_message;
-pub use mms::client::{ClientError, ConnectionState, MmsClient, MmsClientBuilder, MmsValue};
+pub use mms::client::{
+    ClientError, ConnectionState, MmsClient, MmsClientBuilder, MmsValue, TlsFailureKind,
+};

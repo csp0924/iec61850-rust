@@ -8,6 +8,7 @@ use alloc::string::{String, ToString};
 
 use iec61850_hal::transport::TransportError;
 use iec61850_mms::mms::pdu::{ErrorClass, RejectReason, ServiceSpecificInfo};
+use iec61850_mms::TlsFailureKind;
 use thiserror::Error;
 
 #[cfg(feature = "reporting")]
@@ -19,9 +20,9 @@ use crate::report::ReportParseError;
 /// typed variant that carries the cause: a timeout, the end of the
 /// association, a transport failure with its [`TransportError`], a confirmed
 /// error with its [`ErrorClass`], a reject with its [`RejectReason`], a data
-/// access error, and the refusals of the association. Only a failure with no
-/// variant of its own, such as a PDU that does not decode, is carried as text
-/// in `Mms`.
+/// access error, the refusals of the association, and a failed TLS handshake
+/// with its [`TlsFailureKind`]. Only a failure with no variant of its own,
+/// such as a PDU that does not decode, is carried as text in `Mms`.
 ///
 /// The variants mapped from the MMS layer render as `mms layer error: `
 /// followed by the text of the MMS error, as in earlier releases; a caller
@@ -175,6 +176,19 @@ pub enum ClientError {
     #[error("mms layer error: transport error: {0}")]
     Transport(TransportError),
 
+    /// The TLS handshake failed. The connection is closed.
+    ///
+    /// `kind` classifies the failure, so a caller can tell a rejected
+    /// certificate from a refusal by the peer, a version or cipher mismatch, a
+    /// timeout or a broken transport; `message` is the text of the TLS error.
+    #[error("mms layer error: TLS handshake failed: {message}")]
+    TlsHandshake {
+        /// What made the handshake fail.
+        kind: TlsFailureKind,
+        /// Text of the TLS error.
+        message: String,
+    },
+
     /// The server answered with a Confirmed-ErrorPDU (ISO 9506-2).
     ///
     /// [`ErrorClass::context_tag`] gives the errorClass alternative and
@@ -291,6 +305,7 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::ConnectionLost => ClientError::ConnectionLost,
             M::ReleasedByPeer => ClientError::ReleasedByPeer,
             M::Transport(cause) => ClientError::Transport(cause),
+            M::TlsHandshake { kind, message } => ClientError::TlsHandshake { kind, message },
             #[cfg(feature = "std")]
             M::Io(io) => ClientError::Transport(TransportError::from(io)),
             M::ServiceError {
@@ -366,6 +381,25 @@ mod tests {
             ClientError::Transport(c) => assert_eq!(c, cause),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_tls_handshake_keeps_its_kind() {
+        let mapped = map(M::TlsHandshake {
+            kind: iec61850_mms::TlsFailureKind::Verification,
+            message: "certificate verification failed: UnknownIssuer".into(),
+        });
+        assert_eq!(
+            mapped,
+            ClientError::TlsHandshake {
+                kind: TlsFailureKind::Verification,
+                message: "certificate verification failed: UnknownIssuer".into(),
+            }
+        );
+        assert_eq!(
+            mapped.to_string(),
+            "mms layer error: TLS handshake failed: certificate verification failed: UnknownIssuer"
+        );
     }
 
     #[cfg(feature = "std")]

@@ -1007,13 +1007,15 @@ async fn release_abort_and_refusal(handle: &ServerHandle, conn: &IedConnection) 
     conn.disconnect().await.expect("release");
 }
 
-/// The same server behind TLS: an association over TLS runs the services, and
-/// a client that does not trust the server's certificate fails the handshake
-/// with an error naming the failed verification.
+/// The same server behind TLS, which allows TLS 1.3 only: an association over
+/// TLS runs the services, and a failed handshake names its kind: a server
+/// certificate the client does not trust, a client limited to TLS 1.2 that
+/// the server refuses with an alert, and a server that never answers.
 #[cfg(feature = "tls")]
 mod over_tls {
     use super::*;
-    use iec61850_tls::{TlsAcceptor, TlsConfigBuilder, TlsConnector};
+    use iec61850_client::TlsFailureKind;
+    use iec61850_tls::{TlsAcceptor, TlsConfigBuilder, TlsConnector, TlsVersion};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     /// A CA certificate, and a server certificate for `localhost` it signed,
@@ -1035,14 +1037,38 @@ mod over_tls {
         )
     }
 
-    fn connector(ca: &[u8]) -> TlsConnector {
+    fn connector(ca: &[u8], max_version: TlsVersion) -> TlsConnector {
         TlsConnector::new(
             TlsConfigBuilder::new()
                 .add_ca_pem(ca)
                 .expect("ca")
+                .max_version(max_version)
                 .build_client()
                 .expect("client config"),
         )
+    }
+
+    /// The kind of a failed handshake; fails on any other outcome.
+    async fn handshake_failure(
+        conn: &IedConnection,
+        addr: SocketAddr,
+        connector: &TlsConnector,
+    ) -> TlsFailureKind {
+        let result = conn
+            .connect_tls(
+                addr,
+                connector,
+                "localhost".try_into().expect("server name"),
+            )
+            .await;
+        assert!(!conn.is_connected());
+        match result {
+            Err(ClientError::TlsHandshake { kind, message }) => {
+                assert!(!message.is_empty(), "the TLS error is carried");
+                kind
+            }
+            other => panic!("expected a failed TLS handshake, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1060,6 +1086,7 @@ mod over_tls {
                     TlsConfigBuilder::new()
                         .with_cert_pem(&cert, &key)
                         .expect("server certificate")
+                        .min_version(TlsVersion::Tls13)
                         .build_server()
                         .expect("server config"),
                 ))
@@ -1071,7 +1098,7 @@ mod over_tls {
             let conn = IedConnection::new();
             conn.connect_tls(
                 handle.bound_addr,
-                &connector(&ca),
+                &connector(&ca, TlsVersion::Tls13),
                 "localhost".try_into().expect("server name"),
             )
             .await
@@ -1089,26 +1116,60 @@ mod over_tls {
             conn.disconnect().await.expect("release");
 
             let (other_ca, _, _) = certificates();
-            let untrusting = IedConnection::new();
-            let refused = untrusting
-                .connect_tls(
+            assert_eq!(
+                handshake_failure(
+                    &IedConnection::new(),
                     handle.bound_addr,
-                    &connector(&other_ca),
-                    "localhost".try_into().expect("server name"),
+                    &connector(&other_ca, TlsVersion::Tls13),
                 )
-                .await;
-            let error = refused.expect_err("a server certificate of another CA is refused");
-            assert!(
-                error
-                    .to_string()
-                    .contains("certificate verification failed"),
-                "the cause is carried: {error:?}"
+                .await,
+                TlsFailureKind::Verification
             );
-            assert!(!untrusting.is_connected());
+            assert_eq!(
+                handshake_failure(
+                    &IedConnection::new(),
+                    handle.bound_addr,
+                    &connector(&ca, TlsVersion::Tls12),
+                )
+                .await,
+                TlsFailureKind::AlertReceived,
+                "the server refuses TLS 1.2 with an alert"
+            );
 
             handle.stop().await;
         })
         .await
         .expect("the TLS matrix finishes within 60 s");
+    }
+
+    /// A handshake the server never answers ends at the connect timeout. The
+    /// listener accepts and then neither reads nor writes, so only the timeout
+    /// can end the handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_handshake_ends_at_the_connect_timeout() {
+        let (ca, _, _) = certificates();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let silent = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let conn = IedConnection::with_mms_client(
+            MmsClientBuilder::new()
+                .connect_timeout_ms(200)
+                .request_timeout_ms(200)
+                .build(),
+        );
+        let kind = tokio::time::timeout(
+            Duration::from_secs(30),
+            handshake_failure(&conn, addr, &connector(&ca, TlsVersion::Tls13)),
+        )
+        .await
+        .expect("the connect ends");
+        assert_eq!(kind, TlsFailureKind::Timeout);
+        silent.abort();
     }
 }

@@ -40,6 +40,9 @@
 //! - An I/O error of the transport closes the connection and surfaces as
 //!   `Transport`, carrying the category and text the transport reported; a TLS
 //!   alert received after the handshake arrives this way.
+//! - A failed TLS handshake surfaces as `TlsHandshake`, carrying the kind of
+//!   failure; the handshake is bounded by `connect_timeout_ms`, and running
+//!   out of it is the `Timeout` kind.
 
 use super::error::ClientError;
 use crate::compat::prelude::*;
@@ -70,9 +73,24 @@ use iec61850_hal::time::TokioTimer;
 use tokio::net::TcpStream;
 
 #[cfg(feature = "tls")]
+use super::error::TlsFailureKind;
+#[cfg(feature = "tls")]
 use iec61850_tls::{TlsConnector, TlsError, TlsStream};
 #[cfg(feature = "tls")]
 use rustls::pki_types::ServerName;
+
+/// Classifies a failed client handshake.
+#[cfg(feature = "tls")]
+fn tls_failure_kind(e: &TlsError) -> TlsFailureKind {
+    match e {
+        TlsError::Verification(_) => TlsFailureKind::Verification,
+        TlsError::VersionUnsupported(_) => TlsFailureKind::VersionUnsupported,
+        TlsError::CipherUnsupported(_) => TlsFailureKind::CipherUnsupported,
+        TlsError::Handshake(rustls::Error::AlertReceived(_)) => TlsFailureKind::AlertReceived,
+        TlsError::Io(_) => TlsFailureKind::Io,
+        _ => TlsFailureKind::Other,
+    }
+}
 
 // Constants
 
@@ -400,7 +418,8 @@ impl MmsConnection<TcpStream, TokioTimer> {
     ///
     /// The TLS handshake is inserted after the TCP connection, and every later step
     /// is identical to the plaintext path. On failure the connection is left
-    /// `Closed`.
+    /// `Closed`; a failed handshake, or one that does not complete within
+    /// `connect_timeout_ms`, returns `ClientError::TlsHandshake`.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,
@@ -435,10 +454,20 @@ impl MmsConnection<TcpStream, TokioTimer> {
         let _ = tcp.set_nodelay(true);
 
         // Step 0b: TLS handshake
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e: TlsError| ClientError::IsoError(format!("TLS handshake: {e}")))?;
+        let tls_stream = with_timeout(
+            &self.timer,
+            connect_dur,
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| ClientError::TlsHandshake {
+            kind: TlsFailureKind::Timeout,
+            message: format!("the handshake did not complete within {timeout_ms} ms"),
+        })?
+        .map_err(|e: TlsError| ClientError::TlsHandshake {
+            kind: tls_failure_kind(&e),
+            message: e.to_string(),
+        })?;
         debug!("tls handshake complete");
 
         // Step 1+2: COTP CR/CC

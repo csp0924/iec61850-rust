@@ -12,6 +12,7 @@
 //! - `ConnectionLost`: the peer closed the transport or aborted the association
 //! - `ReleasedByPeer`: the peer released the association
 //! - `Transport`: the transport failed, with the cause it reported
+//! - `TlsHandshake`: the TLS handshake failed, with the kind of failure
 //! - `IsoError`: a lower ISO layer failed to parse
 //! - `ServiceError`: the peer answered with a confirmed error PDU
 //! - `DataAccessError`: a read or write reported a data access error
@@ -56,6 +57,46 @@ pub fn session_refused_message(
         text.push_str(&format!("; transport disconnect: {disconnect}"));
     }
     text
+}
+
+/// Why a TLS handshake failed.
+///
+/// Defined whether or not the `tls` feature is enabled, so a caller can match
+/// on it in code built either way; without the feature no handshake runs and
+/// no value is produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TlsFailureKind {
+    /// The peer certificate was rejected, by chain validation or any other
+    /// verification step, or the peer presented none where one is required.
+    Verification,
+    /// The peer ended the handshake with a fatal alert.
+    AlertReceived,
+    /// The two sides allow no TLS version in common.
+    VersionUnsupported,
+    /// The two sides allow no cipher suite or key exchange group in common.
+    CipherUnsupported,
+    /// The handshake did not complete within the connect timeout.
+    Timeout,
+    /// The transport failed during the handshake with no TLS error behind it,
+    /// for example the TCP connection closed.
+    Io,
+    /// Any other TLS failure.
+    Other,
+}
+
+impl core::fmt::Display for TlsFailureKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            TlsFailureKind::Verification => "certificate verification failed",
+            TlsFailureKind::AlertReceived => "fatal alert received",
+            TlsFailureKind::VersionUnsupported => "no TLS version in common",
+            TlsFailureKind::CipherUnsupported => "no cipher suite in common",
+            TlsFailureKind::Timeout => "timed out",
+            TlsFailureKind::Io => "transport failed",
+            TlsFailureKind::Other => "TLS error",
+        })
+    }
 }
 
 /// Errors raised by MMS client operations.
@@ -129,6 +170,18 @@ pub enum ClientError {
     /// operating system message of a refused TCP connection.
     #[error("transport error: {0}")]
     Transport(TransportError),
+
+    /// The TLS handshake failed; the connection is closed.
+    ///
+    /// `kind` classifies the failure and `message` is the text of the TLS
+    /// error.
+    #[error("TLS handshake failed: {message}")]
+    TlsHandshake {
+        /// What made the handshake fail.
+        kind: TlsFailureKind,
+        /// Text of the TLS error.
+        message: String,
+    },
 
     /// A protocol error in the COTP, Session, Presentation or ACSE layer.
     #[error("iso protocol error: {0}")]

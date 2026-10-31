@@ -233,6 +233,13 @@ impl IedConnection<TcpStream, TokioTimer> {
     /// `addr` is the server address; MMS over TLS is normally reached on port
     /// 3782 rather than 102. `connector` carries the IEC 62351-3 cipher suite
     /// selection, and `server_name` is used for SNI and certificate validation.
+    ///
+    /// # Errors
+    ///
+    /// A failed handshake returns [`ClientError::TlsHandshake`], whose
+    /// [`TlsFailureKind`](crate::TlsFailureKind) tells why; the handshake is
+    /// bounded by the connect timeout of the MMS client. A failure after the
+    /// handshake returns the error of that step.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &self,

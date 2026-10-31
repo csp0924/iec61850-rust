@@ -119,7 +119,7 @@ pub use iec61850_mms::{ApTitle, ApTitleError, IsoConnectionParameters};
 // Re-exported so that the return type of
 // `IedConnection::get_variable_specification` can be named without depending
 // on `iec61850-mms` directly.
-pub use iec61850_mms::{StructComponent, TypeSpecification};
+pub use iec61850_mms::{StructComponent, TlsFailureKind, TypeSpecification};
 #[cfg(feature = "reporting")]
 pub use journal::{
     parse_journal_ref, wire_entry_to_client, ClientJournalEntry, ClientJournalEntryData,

@@ -44,7 +44,7 @@ pub mod services;
 #[cfg(feature = "std")]
 pub use blocking::BlockingMmsClient;
 pub use connection::{ConnectionState, MmsConnection};
-pub use error::ClientError;
+pub use error::{ClientError, TlsFailureKind};
 pub use services::MmsValue;
 
 use crate::compat::prelude::*;
@@ -219,7 +219,9 @@ impl MmsClient<TcpStream, TokioTimer> {
     ///
     /// `addr` is the server address, `connector` a `TlsConnector` already configured
     /// with the IEC 62351-3 cipher suites, and `server_name` the name used for SNI
-    /// and certificate validation.
+    /// and certificate validation. A failed handshake, or one that does not
+    /// complete within the connect timeout, returns `ClientError::TlsHandshake`
+    /// with its [`TlsFailureKind`].
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
         &mut self,
