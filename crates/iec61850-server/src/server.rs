@@ -2184,8 +2184,8 @@ mod tests {
     }
 
     /// A server whose `TESTLD0/GGIO1$SP$Set` holds the two Int32 leaves `a`
-    /// and `b`, with the data set `LLN0$dsSet` naming the data object, the
-    /// MMS view and the value lock of `b`.
+    /// and `b`, each raising a data change, with the data set `LLN0$dsSet`
+    /// naming the data object, the MMS view and the value lock of `b`.
     fn server_with_a_data_object_data_set() -> (
         IedServer,
         crate::reporting::Dataset,
@@ -2199,7 +2199,7 @@ mod tests {
                 name,
                 FC::Sp,
                 DataAttributeType::Int32,
-                TrgOps::NONE,
+                TrgOps::DCHG,
                 MmsValue::Integer(0),
             ))
         };
@@ -2385,10 +2385,15 @@ mod tests {
 
     /// A read handler may call `update_*` and `lock_data_model` while an
     /// integrity snapshot and a write are waiting, on a Read of the attribute
-    /// and on a GetDataSetValues of a data set holding it: the handler runs
-    /// while the read holds no value lock, so the snapshot, which takes the
-    /// value lock under the engine lock, the write queued for the value lock
-    /// and the handler waiting for the engine lock cannot wait on each other.
+    /// and on a GetDataSetValues of a data set holding it.
+    ///
+    /// The handler's update raises a data change, so it takes the engine lock,
+    /// and its `lock_data_model` waits for the periodic gate the tick holds.
+    /// The tick holds the gate and the engine lock and takes the value lock
+    /// for its snapshot; the write is queued for the value lock, which keeps
+    /// new readers out. A handler run under the value lock would close the
+    /// cycle; run while the read holds no value lock, the three cannot wait
+    /// on each other.
     #[test]
     fn a_read_handler_may_update_the_model_while_a_snapshot_and_a_write_wait() {
         for data_set in [false, true] {
@@ -2488,8 +2493,12 @@ mod tests {
 
         let engine = server.reporting_engine();
         let tick = std::thread::spawn({
+            let server = server.clone();
             let engine = Arc::clone(&engine);
-            move || engine.lock().unwrap().tick_at(now, 0)
+            move || {
+                let _gate = server.periodic_gate();
+                engine.lock().unwrap().tick_at(now, 0)
+            }
         });
         wait_until("the tick", || {
             tick.is_finished() || engine.try_lock().is_err()
