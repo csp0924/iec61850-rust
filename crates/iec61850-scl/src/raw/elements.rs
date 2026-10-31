@@ -17,10 +17,10 @@ use crate::error::SourceSpan;
 // SCL Header, reduced to the fields the parser needs
 // ------------------------------------------------------------------------
 
-/// The `<Header>` element.
+/// The `<Header>` element: the identification of the SCL file.
 ///
-/// The parser does not read `<Header>` and never constructs this type; see
-/// [`RawScl::header`](crate::raw::RawScl::header).
+/// Only the attributes are kept; the `<Text>` and `<History>` children are
+/// not read.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Header {
@@ -32,6 +32,8 @@ pub struct Header {
     pub revision: Option<String>,
     /// The `toolID` attribute, naming the tool that produced the file.
     pub tool_id: Option<String>,
+    /// The `nameStructure` attribute.
+    pub name_structure: Option<String>,
 }
 
 // ------------------------------------------------------------------------

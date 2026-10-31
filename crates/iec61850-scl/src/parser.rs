@@ -25,7 +25,7 @@ use quick_xml::reader::Reader;
 use crate::attrs::{optional, parse_optional, parse_required, required};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    OptionFieldsBits, RawAccessPoint, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
+    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
     RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType, RawEnumValue, RawFcda,
     RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode,
     RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawVal,
@@ -337,10 +337,31 @@ fn handle_start(
             );
             state.enter_skip(name.clone());
         }
-        // Direct children of <SCL> that are skipped without a warning.
+        // The Header carries attributes only as far as the model is
+        // concerned; its Text and History children are skipped.
         "Header" => {
-            // Enter skip mode. The subtree is not parsed, but the path is kept
-            // so element_path stays accurate.
+            if parent_tag.as_deref() != Some("SCL") {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::Xml("`<Header>` must be a direct child of `<SCL>`".into()),
+                ));
+            }
+            if result.header.is_some() {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::Xml("`<SCL>` may hold at most one `<Header>`".into()),
+                ));
+            }
+            let path = state.path_str();
+            result.header = Some(Header {
+                id: required(start.attributes(), "id", span, &path)?,
+                version: optional(start.attributes(), "version"),
+                revision: optional(start.attributes(), "revision"),
+                tool_id: optional(start.attributes(), "toolID"),
+                name_structure: optional(start.attributes(), "nameStructure"),
+            });
             state.enter_skip(name.clone());
         }
         // The DataTypeTemplates container

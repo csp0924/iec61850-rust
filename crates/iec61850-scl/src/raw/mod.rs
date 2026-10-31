@@ -19,8 +19,7 @@ pub use elements::*;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct RawScl {
-    /// The `<Header>` element. The parser skips `<Header>`, so this is
-    /// always `None`.
+    /// The `<Header>` element, `None` when the file has none.
     pub header: Option<Header>,
     /// Every `<IED>` element, in document order.
     pub ieds: Vec<RawIed>,
