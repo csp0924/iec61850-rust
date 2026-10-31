@@ -37,9 +37,9 @@ use iec61850_model::{
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
     DataTypeTemplates, OptionFieldsBits, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
-    RawDataSet, RawDoDef, RawDoType, RawFcda, RawGseControl, RawLNodeType, RawLogControl,
-    RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl,
-    RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
+    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawLNodeType,
+    RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawSampledValueControl,
+    RawScl, RawSdoDef, RawSettingControl, RawVal, TriggerOptionsBits,
 };
 
 /// Builds the runtime model of one IED. Called by
@@ -245,7 +245,8 @@ fn build_do(
 }
 
 /// Expands a DOType into a [`DataObject`], including every data attribute
-/// below it and, recursively, every sub-object.
+/// below it and, recursively, every sub-object, in the order the DOType
+/// declares them (IEC 61850-6 §9.5.3, IEC 61850-8-1 §7.3.1).
 ///
 /// # Errors
 ///
@@ -260,29 +261,32 @@ fn expand_do_type(
 ) -> Result<DataObject, SclParseError> {
     let mut do_b = DataObjectBuilder::scalar(do_name);
 
-    // Data attributes first; an FC=SE attribute is followed by its FC=SG view.
-    for raw_da in &dot.das {
-        let da = build_da(
-            raw_da,
-            dtt,
-            &format!("{}/DA[name=\"{}\"]", parent_path, raw_da.name),
-        )?;
-        let view = derives_setting_view(raw_da, dot).then(|| setting_view(&da));
-        do_b = do_b.add_da_node(da);
-        if let Some(view) = view {
-            do_b = do_b.add_da_node(view);
+    // Children in declaration order; an FC=SE attribute is followed by its
+    // FC=SG view.
+    for child in &dot.children {
+        match child {
+            RawDoTypeChild::Da(raw_da) => {
+                let da = build_da(
+                    raw_da,
+                    dtt,
+                    &format!("{}/DA[name=\"{}\"]", parent_path, raw_da.name),
+                )?;
+                let view = derives_setting_view(raw_da, dot).then(|| setting_view(&da));
+                do_b = do_b.add_da_node(da);
+                if let Some(view) = view {
+                    do_b = do_b.add_da_node(view);
+                }
+            }
+            RawDoTypeChild::Sdo(raw_sdo) => {
+                let sdo = build_sdo(
+                    raw_sdo,
+                    dtt,
+                    &format!("{}/SDO[name=\"{}\"]", parent_path, raw_sdo.name),
+                    lnt,
+                )?;
+                do_b = do_b.add_sub_do(sdo);
+            }
         }
-    }
-
-    // Then the sub-objects
-    for raw_sdo in &dot.sdos {
-        let sdo = build_sdo(
-            raw_sdo,
-            dtt,
-            &format!("{}/SDO[name=\"{}\"]", parent_path, raw_sdo.name),
-            lnt,
-        )?;
-        do_b = do_b.add_sub_do(sdo);
     }
 
     do_b.build().map_err(|e| {
@@ -318,11 +322,7 @@ fn build_sdo(
 /// Also used by the build-script path through [`crate::__build_internals`].
 #[doc(hidden)]
 pub fn derives_setting_view(raw_da: &RawDaDef, dot: &RawDoType) -> bool {
-    raw_da.fc == "SE"
-        && !dot
-            .das
-            .iter()
-            .any(|d| d.name == raw_da.name && d.fc == "SG")
+    raw_da.fc == "SE" && !dot.das().any(|d| d.name == raw_da.name && d.fc == "SG")
 }
 
 /// Builds the FC=SG view of an FC=SE data attribute: the same name, type and
@@ -991,7 +991,7 @@ fn apply_instances_at_do(
         match inst {
             RawDataInstance::Sdi(sdi) => {
                 // Two possibilities: a sub-object, or a constructed attribute.
-                if let Some(sdo) = dot.sdos.iter().find(|s| s.name == sdi.name) {
+                if let Some(sdo) = dot.sdos().find(|s| s.name == sdi.name) {
                     let sub_dot = dtt
                         .do_types
                         .get(&sdo.do_type_ref)
@@ -1008,7 +1008,7 @@ fn apply_instances_at_do(
                     };
                     let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
                     apply_instances_at_do(&sdi.children, sub_dobj, sub_dot, dtt, &path)?;
-                } else if let Some(da_def) = dot.das.iter().find(|d| d.name == sdi.name) {
+                } else if let Some(da_def) = dot.das().find(|d| d.name == sdi.name) {
                     if da_def.b_type != "Struct" {
                         tracing::warn!(
                             "SDI name=\"{}\" resolves to a DA that is not a Struct (bType=\"{}\"), skipping",
@@ -1048,7 +1048,7 @@ fn apply_instances_at_do(
                 }
             }
             RawDataInstance::Dai(dai) => {
-                let da_def = match dot.das.iter().find(|d| d.name == dai.name) {
+                let da_def = match dot.das().find(|d| d.name == dai.name) {
                     Some(d) => d,
                     None => {
                         tracing::warn!(

@@ -5,11 +5,13 @@
 //! time with one built by code generation. Comparing the trees directly is
 //! awkward, because every value sits behind an `Arc<RwLock<_>>`.
 //!
-//! Ordering is stable at every level, so a difference in SCL document order
-//! cannot change the output: logical devices sort by `inst`, logical nodes by
-//! `(prefix, class, inst)`, data objects and their children by `name`, data
-//! sets and control blocks by `name`, and data set entries by the whole tuple
-//! `(ld_inst, ln_name, fc, do_path, array_index, component)`.
+//! Ordering is stable at every level. Where the order carries no meaning it is
+//! sorted, so a difference in SCL document order cannot change the output:
+//! logical devices sort by `inst`, logical nodes by `(prefix, class, inst)`,
+//! and data sets and control blocks by `name`. Where the order is the member
+//! order on the wire it is kept as the model holds it: the data objects of a
+//! logical node, the children of a data object, the sub-attributes of a data
+//! attribute, and the entries of a data set.
 //!
 //! The summary covers structure and schema only. It is plain text, so it can
 //! be grepped and diffed; there is no binary form and no hash.
@@ -28,8 +30,8 @@ use std::fmt::Write;
 /// Produces a canonical, deterministic text summary of `model`.
 ///
 /// Two structurally equivalent models yield the same string, however each was
-/// built. Every orderable key is sorted once, so SCL document order does not
-/// affect the result.
+/// built. Keys whose order carries no meaning are sorted, so SCL document
+/// order affects only the member orders the wire preserves.
 ///
 /// See the module documentation for the ordering rules.
 pub fn summarize_model(model: &IedModel) -> String {
@@ -84,10 +86,8 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
         if ln.sgcb.is_some() { "yes" } else { "no" },
     );
 
-    // DOs
-    let mut dos: Vec<&DataObject> = ln.dos.iter().collect();
-    dos.sort_by(|a, b| a.name.cmp(&b.name));
-    for d in dos {
+    // DOs, in model order
+    for d in &ln.dos {
         write_do(out, d, 6);
     }
 
@@ -175,20 +175,11 @@ fn write_do(out: &mut String, d: &DataObject, indent: usize) {
         d.children.len(),
     );
 
-    let mut children: Vec<&DoChild> = d.children.iter().collect();
-    children.sort_by(|a, b| child_key(a).cmp(child_key(b)));
-    for c in children {
+    for c in &d.children {
         match c {
             DoChild::Da(da) => write_da(out, da, indent + 2),
             DoChild::SubDo(sd) => write_do(out, sd, indent + 2),
         }
-    }
-}
-
-fn child_key(c: &DoChild) -> &str {
-    match c {
-        DoChild::Da(da) => da.name.as_str(),
-        DoChild::SubDo(sd) => sd.name.as_str(),
     }
 }
 
@@ -206,9 +197,7 @@ fn write_da(out: &mut String, da: &DataAttribute, indent: usize) {
         canonical_value(&snapshot),
     );
 
-    let mut children: Vec<&DataAttribute> = da.children.iter().collect();
-    children.sort_by(|a, b| a.name.cmp(&b.name));
-    for c in children {
+    for c in &da.children {
         write_da(out, c, indent + 2);
     }
 }

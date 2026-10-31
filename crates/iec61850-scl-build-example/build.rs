@@ -18,4 +18,9 @@ fn main() {
         .out_file("settings_model.rs")
         .compile()
         .expect("iec61850-scl-build: compile settings.icd failed");
+
+    iec61850_scl_build::compile_icd("scl/schema.icd")
+        .out_file("schema_model.rs")
+        .compile()
+        .expect("iec61850-scl-build: compile schema.icd failed");
 }

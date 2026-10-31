@@ -26,10 +26,10 @@ use crate::attrs::{optional, parse_optional, parse_required, required};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
     OptionFieldsBits, RawAccessPoint, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance,
-    RawDataSet, RawDoDef, RawDoType, RawDoi, RawEnumType, RawEnumValue, RawFcda, RawGseControl,
-    RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock,
-    RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawVal, SmvOptsBits,
-    TriggerOptionsBits,
+    RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType, RawEnumValue, RawFcda,
+    RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode,
+    RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawVal,
+    SmvOptsBits, TriggerOptionsBits,
 };
 
 /// Parses an SCL XML string into the stage 1 raw AST.
@@ -476,7 +476,7 @@ fn handle_start(
             }
             let sdo = build_sdo_def(start, span, &state.path_str())?;
             if let Some(dot) = state.cur_dotype.as_mut() {
-                dot.sdos.push(sdo);
+                dot.children.push(RawDoTypeChild::Sdo(sdo));
             }
         }
         "DA" => {
@@ -1125,7 +1125,7 @@ fn handle_end(
         }
         "DA" => {
             if let (Some(da), Some(dot)) = (state.cur_da.take(), state.cur_dotype.as_mut()) {
-                dot.das.push(da);
+                dot.children.push(RawDoTypeChild::Da(da));
             }
         }
         "BDA" => {
@@ -1474,8 +1474,7 @@ fn build_do_type(
     Ok(RawDoType {
         id,
         cdc,
-        das: Vec::new(),
-        sdos: Vec::new(),
+        children: Vec::new(),
         span,
     })
 }
@@ -2572,17 +2571,19 @@ mod tests {
             .get("ENC_Mod")
             .expect("ENC_Mod present");
         assert_eq!(dot.cdc, "ENC");
-        assert_eq!(dot.das.len(), 2);
-        assert_eq!(dot.das[0].name, "stVal");
-        assert_eq!(dot.das[0].fc, "ST");
-        assert_eq!(dot.das[0].b_type, "Enum");
-        assert_eq!(dot.das[0].type_ref.as_deref(), Some("ModEnum"));
-        assert!(dot.das[0].trg_ops.data_change);
-        assert_eq!(dot.das[1].name, "ctlModel");
-        assert_eq!(dot.das[1].default_value.as_deref(), Some("status-only"));
-        assert_eq!(dot.sdos.len(), 1);
-        assert_eq!(dot.sdos[0].name, "origin");
-        assert_eq!(dot.sdos[0].do_type_ref, "OrgType");
+        let das: Vec<_> = dot.das().collect();
+        let sdos: Vec<_> = dot.sdos().collect();
+        assert_eq!(das.len(), 2);
+        assert_eq!(das[0].name, "stVal");
+        assert_eq!(das[0].fc, "ST");
+        assert_eq!(das[0].b_type, "Enum");
+        assert_eq!(das[0].type_ref.as_deref(), Some("ModEnum"));
+        assert!(das[0].trg_ops.data_change);
+        assert_eq!(das[1].name, "ctlModel");
+        assert_eq!(das[1].default_value.as_deref(), Some("status-only"));
+        assert_eq!(sdos.len(), 1);
+        assert_eq!(sdos[0].name, "origin");
+        assert_eq!(sdos[0].do_type_ref, "OrgType");
     }
 
     /// A `<DAType>` with two levels of nested `<BDA>`.
@@ -2704,7 +2705,7 @@ mod tests {
 </SCL>"#;
         let raw = parse(xml).expect("parse must succeed");
         let dot = &raw.data_type_templates.do_types["ENC_T"];
-        assert_eq!(dot.das[0].fc, "MX");
+        assert_eq!(dot.das().next().unwrap().fc, "MX");
     }
 
     /// A duplicate EnumType id yields DuplicateIdentifier.

@@ -118,7 +118,7 @@ impl ResolvedScl {
 
         // Sub-object and data attribute type references inside each DOType
         for (dot_id, dot) in &dtt.do_types {
-            for sdo in &dot.sdos {
+            for sdo in dot.sdos() {
                 if !dtt.do_types.contains_key(&sdo.do_type_ref) {
                     let path = format!(
                         "SCL/DataTypeTemplates/DOType[id=\"{}\"]/SDO[name=\"{}\"]",
@@ -135,7 +135,7 @@ impl ResolvedScl {
                     .with_attribute("type"));
                 }
             }
-            for da in &dot.das {
+            for da in dot.das() {
                 check_attr_type_ref(
                     &da.b_type,
                     da.type_ref.as_deref(),
@@ -244,10 +244,9 @@ fn check_do_type_cycles(dtt: &crate::raw::DataTypeTemplates) -> Result<(), SclPa
                 stack.pop();
                 continue;
             };
-            let sdos = dot.sdos.as_slice();
-            let Some(sdo) = sdos.get(index) else {
-                let below = sdos
-                    .iter()
+            let Some(sdo) = dot.sdos().nth(index) else {
+                let below = dot
+                    .sdos()
                     .filter_map(|s| height.get(s.do_type_ref.as_str()))
                     .max()
                     .copied()

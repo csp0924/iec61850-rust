@@ -519,12 +519,41 @@ pub struct RawDoType {
     pub id: String,
     /// The `cdc` attribute, naming the common data class.
     pub cdc: String,
-    /// The `<DA>` children.
-    pub das: Vec<RawDaDef>,
-    /// The `<SDO>` children.
-    pub sdos: Vec<RawSdoDef>,
+    /// The `<DA>` and `<SDO>` children, in document order.
+    ///
+    /// IEC 61850-6 §9.5.3 declares them as an `xs:choice`, so the two kinds
+    /// may interleave, and the order is the member order of the data object
+    /// on the wire (IEC 61850-8-1 §7.3.1).
+    pub children: Vec<RawDoTypeChild>,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
+}
+
+impl RawDoType {
+    /// Iterates the `<DA>` children in document order.
+    pub fn das(&self) -> impl Iterator<Item = &RawDaDef> {
+        self.children.iter().filter_map(|c| match c {
+            RawDoTypeChild::Da(da) => Some(da),
+            RawDoTypeChild::Sdo(_) => None,
+        })
+    }
+
+    /// Iterates the `<SDO>` children in document order.
+    pub fn sdos(&self) -> impl Iterator<Item = &RawSdoDef> {
+        self.children.iter().filter_map(|c| match c {
+            RawDoTypeChild::Sdo(sdo) => Some(sdo),
+            RawDoTypeChild::Da(_) => None,
+        })
+    }
+}
+
+/// A child of a `<DOType>`: a `<DA>` or an `<SDO>`.
+#[derive(Debug, Clone)]
+pub enum RawDoTypeChild {
+    /// A `<DA>` declaration.
+    Da(RawDaDef),
+    /// An `<SDO>` declaration.
+    Sdo(RawSdoDef),
 }
 
 /// An `<SDO>` declaration inside a `<DOType>`.

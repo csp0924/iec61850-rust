@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
+  <Header id="schema"/>
+  <IED name="Schema">
+    <AccessPoint name="AP1">
+      <Server>
+        <Authentication/>
+        <LDevice inst="LD0">
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+            <DataSet name="dsSeq">
+              <FCDA ldInst="LD0" lnClass="MSQI" lnInst="1" doName="SeqA" fc="MX"/>
+            </DataSet>
+            <ReportControl name="brcbSeq" datSet="dsSeq" buffered="true" confRev="1">
+              <TrgOps dchg="true" period="true"/>
+              <RptEnabled max="3"/>
+            </ReportControl>
+            <LogControl name="lcbSeq" datSet="dsSeq" logName="Log" reasonCode="false" intgPd="2000">
+              <TrgOps dchg="true" period="true" gi="true"/>
+            </LogControl>
+          </LN0>
+          <LN lnClass="MSQI" inst="1" lnType="MSQI_T">
+            <DOI name="SeqA">
+              <SDI name="c2"><SDI name="cVal"><SDI name="mag"><DAI name="f"><Val>2.5</Val></DAI></SDI></SDI></SDI>
+              <DAI name="seqT"><Val>-3</Val></DAI>
+            </DOI>
+          </LN>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <LNodeType id="MSQI_T" lnClass="MSQI">
+      <DO name="SeqA" type="SEQ_T"/>
+      <DO name="Raw" type="RAW_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+    </DOType>
+    <DOType id="SEQ_T" cdc="SEQ">
+      <SDO name="c1" type="CMV_T"/>
+      <DA name="q" fc="MX" bType="Quality" qchg="true"/>
+      <SDO name="c2" type="CMV_T"/>
+      <SDO name="c3" type="CMV_T"/>
+      <DA name="seqT" fc="MX" bType="INT24"/>
+    </DOType>
+    <DOType id="CMV_T" cdc="CMV">
+      <DA name="cVal" fc="MX" bType="Struct" type="Vector_T"/>
+    </DOType>
+    <DOType id="RAW_T" cdc="SPS">
+      <DA name="i24" fc="ST" bType="INT24"><Val>-8388608</Val></DA>
+      <SDO name="sub" type="ENC_T"/>
+      <DA name="oct6" fc="ST" bType="Octet6"><Val>AQIDBAUG</Val></DA>
+      <DA name="oct16" fc="ST" bType="Octet16"/>
+      <DA name="svOpts" fc="ST" bType="SvOptFlds"/>
+      <DA name="logOpts" fc="ST" bType="LogOptFlds"/>
+    </DOType>
+    <DAType id="Vector_T">
+      <BDA name="mag" bType="Struct" type="AV_T"/>
+    </DAType>
+    <DAType id="AV_T">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+  </DataTypeTemplates>
+</SCL>

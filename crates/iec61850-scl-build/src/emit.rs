@@ -34,8 +34,9 @@ use iec61850_scl::__build_internals::{
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
-    RawDoType, RawFcda, RawGseControl, RawIed, RawLogControl, RawLogicalDevice, RawLogicalNode,
-    RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawSettingControl,
+    RawDoType, RawDoTypeChild, RawFcda, RawGseControl, RawIed, RawLogControl, RawLogicalDevice,
+    RawLogicalNode, RawReportControlBlock, RawSampledValueControl, RawScl, RawSdi, RawSdoDef,
+    RawSettingControl,
 };
 use iec61850_scl::ResolvedScl;
 
@@ -342,37 +343,37 @@ fn emit_do_type_expansion(
 ) -> Result<TokenStream, CompileError> {
     let name_lit = name;
 
-    // An FC=SE attribute is followed by its FC=SG view, as on the runtime path.
-    let da_stmts = dot
-        .das
+    // Children in declaration order; an FC=SE attribute is followed by its
+    // FC=SG view, as on the runtime path.
+    let child_stmts = dot
+        .children
         .iter()
-        .map(|da| {
-            let expr = emit_da_expr(da, dtt)?;
-            Ok(if derives_setting_view(da, dot) {
-                quote! {
-                    {
-                        let __se = #expr;
-                        let __sg = ::iec61850_scl::__rt::setting_view(&__se);
-                        __do = __do.add_da_node(__se).add_da_node(__sg);
+        .map(|child| match child {
+            RawDoTypeChild::Da(da) => {
+                let expr = emit_da_expr(da, dtt)?;
+                Ok(if derives_setting_view(da, dot) {
+                    quote! {
+                        {
+                            let __se = #expr;
+                            let __sg = ::iec61850_scl::__rt::setting_view(&__se);
+                            __do = __do.add_da_node(__se).add_da_node(__sg);
+                        }
                     }
-                }
-            } else {
-                quote! { __do = __do.add_da_node(#expr); }
-            })
+                } else {
+                    quote! { __do = __do.add_da_node(#expr); }
+                })
+            }
+            RawDoTypeChild::Sdo(sdo) => {
+                let expr = emit_sdo_expr(sdo, dtt)?;
+                Ok(quote! { __do = __do.add_sub_do(#expr); })
+            }
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-
-    let sdo_exprs = dot
-        .sdos
-        .iter()
-        .map(|sdo| emit_sdo_expr(sdo, dtt))
-        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
         {
             let mut __do = DataObjectBuilder::scalar(#name_lit);
-            #( #da_stmts )*
-            #( __do = __do.add_sub_do(#sdo_exprs); )*
+            #( #child_stmts )*
             __do.build().expect("codegen: DataObjectBuilder::build failed")
         }
     })
@@ -902,7 +903,7 @@ fn emit_instances_at_do(
                 handle_sdi_at_do(sdi, dot, dtt, parent_path, base_path, out)?;
             }
             RawDataInstance::Dai(dai) => {
-                let da_def = match dot.das.iter().find(|d| d.name == dai.name) {
+                let da_def = match dot.das().find(|d| d.name == dai.name) {
                     Some(d) => d,
                     None => {
                         tracing::warn!(
@@ -952,7 +953,7 @@ fn handle_sdi_at_do(
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     // Two possibilities: a sub-DO, or a constructed DA with bType=Struct.
-    if let Some(sdo) = dot.sdos.iter().find(|s| s.name == sdi.name) {
+    if let Some(sdo) = dot.sdos().find(|s| s.name == sdi.name) {
         let sub_dot = dtt.do_types.get(&sdo.do_type_ref).ok_or_else(|| {
             CompileError::Emit(format!(
                 "SDO type_ref `{}` is absent from do_types; the resolve stage should have rejected it",
@@ -963,7 +964,7 @@ fn handle_sdi_at_do(
         base_path.push(sdi.name.clone());
         emit_instances_at_do(&sdi.children, sub_dot, dtt, &path, base_path, out)?;
         base_path.pop();
-    } else if let Some(da_def) = dot.das.iter().find(|d| d.name == sdi.name) {
+    } else if let Some(da_def) = dot.das().find(|d| d.name == sdi.name) {
         if da_def.b_type != "Struct" {
             tracing::warn!(
                 target: "iec61850-scl-build",
