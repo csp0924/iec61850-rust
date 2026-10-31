@@ -12,6 +12,7 @@ use thiserror::Error;
 /// entries are all reported as errors instead of being repaired silently, so a
 /// subscriber never acts on a partially reconstructed data set.
 #[derive(Debug, Error, PartialEq, Clone)]
+#[non_exhaustive]
 pub enum GooseError {
     /// Unknown Data tag byte.
     #[error("unknown data tag 0x{0:02x}")]

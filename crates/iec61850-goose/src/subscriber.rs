@@ -36,6 +36,7 @@ pub const DEFAULT_OBSERVER_MAX_STREAMS: usize = 64;
 /// The snapshot is immutable and owned, so a listener can hold it across
 /// threads after the receiver has moved on.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GooseSubscriberState {
     /// GoCB object reference.
     pub gocb_ref: String,
@@ -77,6 +78,7 @@ pub struct GooseSubscriberState {
 
 /// Event delivered to a subscriber's listener.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GooseEvent {
     /// A new stNum, meaning the publisher reported a data change.
     ///

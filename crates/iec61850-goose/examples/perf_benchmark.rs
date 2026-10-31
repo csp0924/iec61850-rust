@@ -122,12 +122,14 @@ fn bench_retrans_jitter() -> Vec<Duration> {
     // Sampling runs in the steady retransmission phase, past the exponential
     // back-off, with the interval shortened to 1 ms so a run takes seconds.
     use iec61850_goose::publisher::RetransIntervals;
-    publisher.set_retrans_intervals(RetransIntervals {
-        t1: Duration::from_millis(1),
-        t2: Duration::from_millis(1),
-        t3: Duration::from_millis(1),
-        t4: Duration::from_millis(1),
-        tmax: Duration::from_millis(1),
+    publisher.set_retrans_intervals({
+        let mut retrans_intervals = RetransIntervals::default();
+        retrans_intervals.t1 = Duration::from_millis(1);
+        retrans_intervals.t2 = Duration::from_millis(1);
+        retrans_intervals.t3 = Duration::from_millis(1);
+        retrans_intervals.t4 = Duration::from_millis(1);
+        retrans_intervals.tmax = Duration::from_millis(1);
+        retrans_intervals
     });
 
     let mut samples = Vec::with_capacity(JITTER_SAMPLES);

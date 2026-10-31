@@ -89,6 +89,7 @@ pub struct VlanTag {
 /// Ethernet and GOOSE header: MAC addresses, optional VLAN tag, EtherType,
 /// APPID, and Length.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GooseFrameHeader {
     /// Destination MAC address.
     pub dst_mac: [u8; 6],
@@ -101,6 +102,21 @@ pub struct GooseFrameHeader {
     /// Length from the APPID field through the end of the PDU, including the
     /// 8 header bytes themselves.
     pub length: u16,
+}
+
+impl GooseFrameHeader {
+    /// Creates a header without a VLAN tag.
+    ///
+    /// `length` is 0; [`GooseFrame::encode`] recomputes it from the PDU.
+    pub fn new(dst_mac: [u8; 6], src_mac: [u8; 6], app_id: u16) -> Self {
+        Self {
+            dst_mac,
+            src_mac,
+            vlan: None,
+            app_id,
+            length: 0,
+        }
+    }
 }
 
 /// A complete GOOSE Ethernet frame: header plus PDU payload bytes.

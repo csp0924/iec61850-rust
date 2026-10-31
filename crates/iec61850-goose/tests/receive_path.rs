@@ -16,20 +16,12 @@ use log_capture::warnings_containing;
 const DST: [u8; 6] = [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01];
 
 fn pdu(gocb: &str, st: u32, sq: u32) -> GoosePdu {
-    GoosePdu {
-        gocb_ref: gocb.into(),
-        time_allowed_to_live: 2000,
-        dat_set: "LD/LLN0$ds".into(),
-        go_id: Some("id".into()),
-        t: [0; 8],
-        st_num: st,
-        sq_num: sq,
-        simulation: false,
-        conf_rev: 1,
-        nds_com: false,
-        num_dataset_entries: 1,
-        all_data: vec![MmsValue::Boolean(true)],
-    }
+    let mut pdu = GoosePdu::new(gocb, "LD/LLN0$ds", vec![MmsValue::Boolean(true)]);
+    pdu.go_id = Some("id".into());
+    pdu.st_num = st;
+    pdu.sq_num = sq;
+    pdu.num_dataset_entries = 1;
+    pdu
 }
 
 fn pdu_bytes(p: &GoosePdu) -> Vec<u8> {
@@ -39,13 +31,7 @@ fn pdu_bytes(p: &GoosePdu) -> Vec<u8> {
 }
 
 fn frame_from_pdu_bytes(pdu_bytes: Vec<u8>, app_id: u16) -> Vec<u8> {
-    let header = GooseFrameHeader {
-        dst_mac: DST,
-        src_mac: [0, 0x50, 0xc2, 0, 0, 1],
-        vlan: None,
-        app_id,
-        length: 0,
-    };
+    let header = GooseFrameHeader::new(DST, [0, 0x50, 0xc2, 0, 0, 1], app_id);
     let mut out = BytesMut::new();
     GooseFrame::new(header, pdu_bytes).encode(&mut out).unwrap();
     out.to_vec()
@@ -215,6 +201,7 @@ fn recording(builder: GooseSubscriberBuilder) -> (GooseSubscriber, Arc<Mutex<Vec
                     Seen::Retx(state.gocb_ref.clone(), state.st_num, state.state_valid)
                 }
                 GooseEvent::Expired { last_state } => Seen::Expired(last_state.gocb_ref.clone()),
+                _ => return,
             };
             s.lock().unwrap().push(item);
         })
@@ -377,10 +364,9 @@ fn dst_mac_filter_holds_alongside_an_observer() {
     );
 }
 fn pdu_rev(gocb: &str, st: u32, sq: u32, conf_rev: u32) -> GoosePdu {
-    GoosePdu {
-        conf_rev,
-        ..pdu(gocb, st, sq)
-    }
+    let mut goose_pdu = pdu(gocb, st, sq);
+    goose_pdu.conf_rev = conf_rev;
+    goose_pdu
 }
 
 #[test]

@@ -35,6 +35,7 @@ pub const GOOSE_MAX_FRAME_SIZE: usize = 1518;
 ///     .with_src_mac([0x00, 0x50, 0xc2, 0x12, 0x34, 0x56]);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommParameters {
     /// Application identifier; GOOSE conventionally uses 0x0000-0x3FFF.
     pub app_id: u16,
@@ -86,6 +87,7 @@ impl CommParameters {
 /// T3 = 16 ms, T4 = 32 ms after an event, and Tmax = 1000 ms in the steady
 /// state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RetransIntervals {
     /// Interval before the first retransmission after an event.
     pub t1: Duration,
@@ -116,6 +118,7 @@ impl Default for RetransIntervals {
 /// Each publication advances T1 to T2 to T3 to T4 to Stable and then stays at
 /// Stable; `increase_st_num` resets the phase to T1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetransPhase {
     /// First publication after an event; the next interval is T1.
     T1,
@@ -502,6 +505,7 @@ impl GoosePublisher {
 
 /// Describes a publication that `tick` reports as due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PublishAction {
     /// Scheduled time of this publication, from which the caller can measure
     /// jitter against the actual send.

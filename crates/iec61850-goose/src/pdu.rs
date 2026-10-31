@@ -99,6 +99,7 @@ const GOOSE_DATA_MAX_DEPTH: u8 = 8;
 /// `all_data` is a `Vec` so that data set entries index in constant time on the
 /// receive path.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GoosePdu {
     /// `[0x80]` gocbRef, the GoCB object reference.
     pub gocb_ref: String,
@@ -536,6 +537,37 @@ pub fn decode_all_data_bytes(bytes: &[u8]) -> Result<Vec<MmsValue>, GooseError> 
 }
 
 impl GoosePdu {
+    /// Creates a PDU for the control block `gocb_ref` carrying `all_data` as
+    /// the values of the data set `dat_set`.
+    ///
+    /// `num_dataset_entries` is the length of `all_data`. The other fields
+    /// take the values of the first frame a freshly configured publisher
+    /// sends: `time_allowed_to_live` is 2000 ms (twice the default Tmax of
+    /// [`RetransIntervals`](crate::RetransIntervals)), `go_id` is `None` so
+    /// `gocb_ref` is encoded in its place, `t` is all zero, `st_num` is 1,
+    /// `sq_num` is 0, `conf_rev` is 1, and `simulation` and `nds_com` are
+    /// `false`.
+    pub fn new(
+        gocb_ref: impl Into<String>,
+        dat_set: impl Into<String>,
+        all_data: Vec<MmsValue>,
+    ) -> Self {
+        Self {
+            gocb_ref: gocb_ref.into(),
+            time_allowed_to_live: 2000,
+            dat_set: dat_set.into(),
+            go_id: None,
+            t: [0; 8],
+            st_num: 1,
+            sq_num: 0,
+            simulation: false,
+            conf_rev: 1,
+            nds_com: false,
+            num_dataset_entries: all_data.len() as u32,
+            all_data,
+        }
+    }
+
     /// BER encodes the PDU into `buf` and returns the number of bytes written.
     ///
     /// goID is always emitted; when `go_id` is `None` the encoder writes

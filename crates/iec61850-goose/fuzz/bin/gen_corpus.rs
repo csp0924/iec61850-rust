@@ -50,20 +50,15 @@ fn encode_pdu(pdu: &GoosePdu) -> Vec<u8> {
 }
 
 fn make_pdu_basic() -> GoosePdu {
-    GoosePdu {
-        gocb_ref: "demoIED/LLN0$GO$gcb".to_string(),
-        time_allowed_to_live: 1000,
-        dat_set: "demoIED/LLN0$DS".to_string(),
-        go_id: Some("gid".to_string()),
-        t: [0u8; 8],
-        st_num: 1,
-        sq_num: 0,
-        simulation: false,
-        conf_rev: 1,
-        nds_com: false,
-        num_dataset_entries: 1,
-        all_data: vec![MmsValue::Boolean(true)],
-    }
+    let mut pdu = GoosePdu::new(
+        "demoIED/LLN0$GO$gcb".to_string(),
+        "demoIED/LLN0$DS".to_string(),
+        vec![MmsValue::Boolean(true)],
+    );
+    pdu.time_allowed_to_live = 1000;
+    pdu.go_id = Some("gid".to_string());
+    pdu.num_dataset_entries = 1;
+    pdu
 }
 
 fn make_pdu_mixed_types() -> GoosePdu {
@@ -122,13 +117,13 @@ fn make_pdu_simulation_true() -> GoosePdu {
 // -- Frame builders --
 
 fn make_frame(pdu_bytes: Vec<u8>, vlan: Option<VlanTag>) -> Vec<u8> {
-    let header = GooseFrameHeader {
-        dst_mac: [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01],
-        src_mac: [0x02, 0, 0, 0, 0, 1],
-        vlan,
-        app_id: 0x1000,
-        length: (pdu_bytes.len() + 8) as u16,
-    };
+    let mut header = GooseFrameHeader::new(
+        [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01],
+        [0x02, 0, 0, 0, 0, 1],
+        0x1000,
+    );
+    header.vlan = vlan;
+    header.length = (pdu_bytes.len() + 8) as u16;
     let frame = GooseFrame::new(header, pdu_bytes);
     let mut buf = BytesMut::new();
     frame.encode(&mut buf).expect("frame encode");
@@ -288,7 +283,11 @@ fn main() {
         "inner_length_overflow.bin",
         &poison_inner_length_overflow(),
     );
-    write_seed(&pdu_dir, "truncated_outer_tlv.bin", &poison_truncated_outer_tlv());
+    write_seed(
+        &pdu_dir,
+        "truncated_outer_tlv.bin",
+        &poison_truncated_outer_tlv(),
+    );
     write_seed(
         &pdu_dir,
         "indefinite_length.bin",
@@ -357,11 +356,7 @@ fn main() {
         "frame_length_overflow.bin",
         &poison_frame_length_overflow(),
     );
-    write_seed(
-        &frame_dir,
-        "frame_too_short.bin",
-        &poison_frame_too_short(),
-    );
+    write_seed(&frame_dir, "frame_too_short.bin", &poison_frame_too_short());
     write_seed(
         &frame_dir,
         "frame_wrong_ether_type.bin",
