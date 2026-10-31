@@ -21,11 +21,6 @@ use crate::time::NtpTimestamp;
 pub struct SntpServerConfig {
     /// Stratum, 1 for a primary reference. Defaults to 1.
     pub stratum: u8,
-    /// Poll interval as log2 seconds. Defaults to 6, that is 64 seconds.
-    ///
-    /// Has no effect on a reply, which copies the poll field of its request
-    /// (RFC 4330 section 5).
-    pub poll: i8,
     /// Precision as log2 seconds. Defaults to -20, roughly microseconds.
     pub precision: i8,
     /// Root delay, an NTP short in fixed point. Defaults to 0.
@@ -41,7 +36,6 @@ impl Default for SntpServerConfig {
     fn default() -> Self {
         Self {
             stratum: 1,
-            poll: 6,
             precision: -20,
             root_delay: 0,
             root_dispersion: 0,
