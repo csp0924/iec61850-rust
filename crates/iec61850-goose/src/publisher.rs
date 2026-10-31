@@ -494,6 +494,9 @@ impl GoosePublisher {
 
     /// Encodes one GOOSE frame and returns the complete Ethernet bytes.
     ///
+    /// The PDU is BER-encoded on every call, and the PDU buffer and the
+    /// returned frame are allocated; only the frame header is prebuilt.
+    ///
     /// The current sqNum is encoded and then incremented, the retransmission
     /// phase advances, and the next publication is scheduled one interval
     /// ahead. A data change is not detected here; call `increase_st_num` for

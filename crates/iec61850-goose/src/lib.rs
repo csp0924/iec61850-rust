@@ -1,9 +1,11 @@
 //! GOOSE publisher, subscriber, and receiver per IEC 61850-8-1.
 //!
 //! GOOSE runs directly over Ethernet L2 (EtherType 0x88B8) and does not use
-//! the MMS stack. The hot path avoids allocation: the publisher prebuilds the
-//! Ethernet and GOOSE frame header once, and the subscriber borrows slices out
-//! of the received frame instead of copying them.
+//! the MMS stack. The publisher prebuilds the Ethernet and GOOSE frame header
+//! once and BER-encodes the PDU afresh for every publication, allocating the
+//! PDU buffer and the returned frame. The receiver decodes each frame into
+//! owned values: the PDU is copied out of the receive buffer, and every
+//! subscriber that accepts it gets its own state snapshot.
 //!
 //! `pdu` encodes and decodes the IECGoosePdu, `frame` the Ethernet, VLAN, and
 //! GOOSE header layers, `publisher` the state machine and retransmission
