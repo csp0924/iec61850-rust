@@ -1,11 +1,13 @@
 //! `ControlObject`: the per-data-object control state.
 //!
 //! One instance per controllable data object, holding the state machine of
-//! IEC 61850-7-2 control, the application handlers, and the selection timer.
+//! IEC 61850-7-2 control, the selection timer, and the selection change handler.
 //!
 //! The mutable state sits behind a `Mutex`, so several tasks may drive the same
-//! object; handlers are held as `Arc<dyn Trait>`. A select timeout is driven by a
-//! timer task rather than polled from a main loop.
+//! object. A selection expires on a timer task of the current tokio runtime,
+//! whose clock a test can pause; without a runtime it expires when the next
+//! request finds its timeout elapsed. Every change of the selection of a
+//! select-before-operate object is reported to the selection change handler.
 
 use super::handler::{SelectStateChangedHandler, SelectStateChangedReason};
 use super::model::{
@@ -15,7 +17,8 @@ use super::state::ControlState;
 use crate::error::ServerError;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ControlObjectConfig
@@ -106,8 +109,16 @@ struct ControlObjectInner {
     /// Connection holding the selection, or 0 when none does.
     owner_conn_id: u64,
 
-    /// When the object was selected, for the timeout.
+    /// When the object last entered the ready state, for the select timeout.
     select_time: Option<Instant>,
+
+    /// Counts the entries into the ready state; a select timer deselects only
+    /// the period it was armed for.
+    ready_period: u64,
+
+    /// Whether the connection holding the selection closed while a command
+    /// executed, which ends the selection once the command finishes.
+    owner_lost: bool,
 }
 
 impl ControlObjectInner {
@@ -117,6 +128,52 @@ impl ControlObjectInner {
             last_oper_params: None,
             owner_conn_id: 0,
             select_time: None,
+            ready_period: 0,
+            owner_lost: false,
+        }
+    }
+
+    /// Enters the ready state for `conn_id` and returns the new ready period.
+    fn enter_ready(&mut self, conn_id: u64) -> u64 {
+        self.state = ControlState::Ready;
+        self.owner_conn_id = conn_id;
+        self.select_time = Some(Instant::now());
+        self.ready_period = self.ready_period.wrapping_add(1);
+        self.ready_period
+    }
+
+    /// Returns to the unselected state and returns the connection that held the
+    /// object.
+    fn clear(&mut self) -> u64 {
+        let owner = self.owner_conn_id;
+        self.state = ControlState::Unselected;
+        self.owner_conn_id = 0;
+        self.select_time = None;
+        self.last_oper_params = None;
+        self.owner_lost = false;
+        owner
+    }
+}
+
+/// A change of the selection to report once the state lock is released.
+struct SelectionChange {
+    conn_id: u64,
+    is_selected: bool,
+    reason: SelectStateChangedReason,
+    t: [u8; 8],
+    origin: OriginValue,
+    ctl_num: u8,
+}
+
+impl SelectionChange {
+    fn ended(conn_id: u64, reason: SelectStateChangedReason) -> Self {
+        Self {
+            conn_id,
+            is_selected: false,
+            reason,
+            t: [0u8; 8],
+            origin: OriginValue::default(),
+            ctl_num: 0,
         }
     }
 }
@@ -197,13 +254,21 @@ impl ControlObject {
         }
     }
 
+    fn is_sbo(&self) -> bool {
+        matches!(
+            self.config.ctl_model,
+            ControlModel::SboNormal | ControlModel::SboEnhanced
+        )
+    }
+
     // ─── Select and deselect ─────────────────────────────────────────────
 
     /// Selects the object for a connection, moving it from unselected to ready.
     ///
     /// Returns `Ok(true)` when the object is now selected, `Ok(false)` when the
     /// request was refused because the object is already selected, by this or
-    /// another connection, or the state does not allow a select.
+    /// another connection, or the state does not allow a select. A successful
+    /// select starts the select timeout and reports `Selected`.
     ///
     /// # Errors
     ///
@@ -216,14 +281,22 @@ impl ControlObject {
 
         match g.state {
             ControlState::Unselected => {
-                g.state = ControlState::Ready;
-                g.owner_conn_id = conn_id;
-                g.select_time = Some(Instant::now());
+                let period = g.enter_ready(conn_id);
+                drop(g);
                 tracing::debug!(
                     name = %self.config.name,
                     conn_id,
                     "select accepted, object is now ready"
                 );
+                self.arm_select_timer(period);
+                self.notify(SelectionChange {
+                    conn_id,
+                    is_selected: true,
+                    reason: SelectStateChangedReason::Selected,
+                    t: [0u8; 8],
+                    origin: OriginValue::default(),
+                    ctl_num: 0,
+                });
                 Ok(true)
             }
             ControlState::Ready => {
@@ -248,10 +321,12 @@ impl ControlObject {
         }
     }
 
-    /// Deselects the object, on Cancel, timeout, or a lost connection.
+    /// Deselects a selected object, on Cancel, timeout, or a lost connection,
+    /// and reports `reason`.
     ///
-    /// The deselection happens only when `conn_id` holds the selection, or when
-    /// `unconditional` is set. Returns whether the object was deselected.
+    /// The deselection happens only when the object is selected and `conn_id`
+    /// holds the selection, or `unconditional` is set. An object executing a
+    /// command is not deselected. Returns whether the object was deselected.
     ///
     /// # Errors
     ///
@@ -266,8 +341,10 @@ impl ControlObject {
             ServerError::Protocol("ControlObject Mutex poisoned on unselect".into())
         })?;
 
-        let can_unselect = unconditional || g.owner_conn_id == conn_id;
-        if !can_unselect {
+        if g.state != ControlState::Ready {
+            return Ok(false);
+        }
+        if !unconditional && g.owner_conn_id != conn_id {
             tracing::warn!(
                 name = %self.config.name,
                 owner = g.owner_conn_id,
@@ -277,61 +354,77 @@ impl ControlObject {
             return Ok(false);
         }
 
-        g.state = ControlState::Unselected;
-        g.owner_conn_id = 0;
-        g.select_time = None;
-        g.last_oper_params = None;
-        tracing::debug!(name = %self.config.name, ?reason, "SBO unselected");
+        let owner = g.clear();
         drop(g);
-
-        self.notify_select_state_changed(
-            conn_id,
-            false,
-            reason,
-            [0u8; 8],
-            OriginValue::default(),
-            0,
-        );
-
+        tracing::debug!(name = %self.config.name, ?reason, "SBO unselected");
+        self.notify(SelectionChange::ended(owner, reason));
         Ok(true)
     }
 
-    /// Deselects the object when its select timeout has elapsed; called from a
-    /// timer task.
+    /// Deselects the object when its select timeout has elapsed.
     ///
-    /// Returns whether the timeout fired. A configured timeout of 0 never fires.
+    /// A timer task does this on its own; a request calls it first so that a
+    /// selection made without a tokio runtime also expires. Returns whether the
+    /// timeout fired. A configured timeout of 0 never fires.
     pub fn check_sbo_timeout(&self) -> bool {
         let timeout_ms = self.config.sbo_timeout_ms;
         if timeout_ms == 0 {
             return false;
         }
+        let period = match self.inner.lock() {
+            Ok(g) => match (g.state, g.select_time) {
+                (ControlState::Ready, Some(t))
+                    if t.elapsed() >= Duration::from_millis(u64::from(timeout_ms)) =>
+                {
+                    g.ready_period
+                }
+                _ => return false,
+            },
+            Err(_) => return false,
+        };
+        self.expire_selection(period)
+    }
 
-        let (conn_id, timed_out) = {
-            let g = match self.inner.lock() {
+    /// Starts the timer that ends the ready period `period` once the select
+    /// timeout elapses, when a tokio runtime is available.
+    fn arm_select_timer(&self, period: u64) {
+        let timeout_ms = self.config.sbo_timeout_ms;
+        if timeout_ms == 0 {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let obj = self.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
+            obj.expire_selection(period);
+        });
+    }
+
+    /// Deselects the object when it is still in the ready period `period`, the
+    /// end of its select timeout, and reports `Timeout`.
+    fn expire_selection(&self, period: u64) -> bool {
+        let owner = {
+            let mut g = match self.inner.lock() {
                 Ok(g) => g,
                 Err(_) => return false,
             };
-            if g.state != ControlState::Ready {
+            if g.state != ControlState::Ready || g.ready_period != period {
                 return false;
             }
-            let timed_out = g
-                .select_time
-                .map(|t| t.elapsed() > Duration::from_millis(timeout_ms as u64))
-                .unwrap_or(false);
-            (g.owner_conn_id, timed_out)
+            g.clear()
         };
-
-        if timed_out {
-            tracing::warn!(
-                name = %self.config.name,
-                timeout_ms,
-                "select timeout elapsed, deselecting"
-            );
-            let _ = self.try_unselect(conn_id, SelectStateChangedReason::Timeout, true);
-            true
-        } else {
-            false
-        }
+        tracing::warn!(
+            name = %self.config.name,
+            timeout_ms = self.config.sbo_timeout_ms,
+            "select timeout elapsed, deselecting"
+        );
+        self.notify(SelectionChange::ended(
+            owner,
+            SelectStateChangedReason::Timeout,
+        ));
+        true
     }
 
     // ─── Operate ─────────────────────────────────────────────────────────
@@ -341,7 +434,8 @@ impl ControlObject {
     /// Returns `Ok(Some(Accepted))` when the command may proceed, and
     /// `Ok(Some(Denied(cause)))` when it is refused, for example because the
     /// connection does not hold the selection, the state does not allow it, or the
-    /// parameters do not match the preceding select.
+    /// parameters do not match the preceding select. Parameters that differ from
+    /// those of the SelectWithValue also end the selection.
     ///
     /// # Errors
     ///
@@ -376,132 +470,106 @@ impl ControlObject {
             )));
         }
 
-        match self.config.ctl_model {
-            ControlModel::DirectNormal | ControlModel::DirectEnhanced => {
-                // Direct control: unselected counts as ready.
-                if !matches!(g.state, ControlState::Unselected | ControlState::Ready) {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        state = ?g.state,
-                        "operate refused: direct control requires an idle object"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::CommandAlreadyInExecution,
-                    )));
-                }
-                g.state = ControlState::WaitForExecution;
-                g.owner_conn_id = conn_id;
-                g.last_oper_params = Some(params.clone());
-                Ok(Some(OperateBeginResult::Accepted))
+        if !self.is_sbo() {
+            // Direct control is idle in the unselected state.
+            if g.state != ControlState::Unselected {
+                tracing::warn!(
+                    name = %self.config.name,
+                    state = ?g.state,
+                    "operate refused: direct control requires an idle object"
+                );
+                return Ok(Some(OperateBeginResult::Denied(
+                    ControlAddCause::CommandAlreadyInExecution,
+                )));
             }
-
-            ControlModel::SboNormal => {
-                // Select-before-operate: the object must be selected by this
-                // connection.
-                if g.state != ControlState::Ready {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        state = ?g.state,
-                        "operate refused: the object is not selected"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::ObjectNotSelected,
-                    )));
-                }
-                if g.owner_conn_id != conn_id {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        owner = g.owner_conn_id,
-                        requester = conn_id,
-                        "operate refused: the selection is held by another connection"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::LockedByOtherClient,
-                    )));
-                }
-                g.state = ControlState::WaitForExecution;
-                g.last_oper_params = Some(params.clone());
-                Ok(Some(OperateBeginResult::Accepted))
-            }
-
-            ControlModel::SboEnhanced => {
-                // Enhanced security additionally requires the parameters to match
-                // those of the SBOw.
-                if g.state != ControlState::Ready {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        state = ?g.state,
-                        "operate refused: the object is not selected"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::ObjectNotSelected,
-                    )));
-                }
-                if g.owner_conn_id != conn_id {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        owner = g.owner_conn_id,
-                        requester = conn_id,
-                        "operate refused: the selection is held by another connection"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::LockedByOtherClient,
-                    )));
-                }
-                // The Operate parameters must equal those of the select.
-                if let Some(ref sbow_params) = g.last_oper_params {
-                    if !params_consistent(params, sbow_params) {
-                        tracing::warn!(
-                            name = %self.config.name,
-                            "operate refused: parameters differ from the preceding SBOw"
-                        );
-                        g.state = ControlState::Unselected;
-                        g.owner_conn_id = 0;
-                        g.last_oper_params = None;
-                        return Ok(Some(OperateBeginResult::Denied(
-                            ControlAddCause::InconsistentParameters,
-                        )));
-                    }
-                } else {
-                    tracing::warn!(
-                        name = %self.config.name,
-                        "operate refused: no SBOw was recorded for this object"
-                    );
-                    return Ok(Some(OperateBeginResult::Denied(
-                        ControlAddCause::ObjectNotSelected,
-                    )));
-                }
-                g.state = ControlState::WaitForExecution;
-                g.last_oper_params = Some(params.clone());
-                Ok(Some(OperateBeginResult::Accepted))
-            }
-
-            ControlModel::StatusOnly => unreachable!(),
+            g.state = ControlState::WaitForExecution;
+            g.owner_conn_id = conn_id;
+            g.last_oper_params = Some(params.clone());
+            return Ok(Some(OperateBeginResult::Accepted));
         }
+
+        // Select-before-operate: the object must be selected by this connection.
+        if g.state != ControlState::Ready {
+            tracing::warn!(
+                name = %self.config.name,
+                state = ?g.state,
+                "operate refused: the object is not selected"
+            );
+            return Ok(Some(OperateBeginResult::Denied(
+                ControlAddCause::ObjectNotSelected,
+            )));
+        }
+        if g.owner_conn_id != conn_id {
+            tracing::warn!(
+                name = %self.config.name,
+                owner = g.owner_conn_id,
+                requester = conn_id,
+                "operate refused: the selection is held by another connection"
+            );
+            return Ok(Some(OperateBeginResult::Denied(
+                ControlAddCause::LockedByOtherClient,
+            )));
+        }
+        if self.config.ctl_model == ControlModel::SboEnhanced {
+            // Enhanced security requires the parameters of the SelectWithValue.
+            let consistent = g
+                .last_oper_params
+                .as_ref()
+                .is_some_and(|sbow| params_consistent(params, sbow));
+            if !consistent {
+                tracing::warn!(
+                    name = %self.config.name,
+                    "operate refused: parameters differ from the preceding SBOw"
+                );
+                let owner = g.clear();
+                drop(g);
+                self.notify(SelectionChange::ended(
+                    owner,
+                    SelectStateChangedReason::OperateRefused,
+                ));
+                return Ok(Some(OperateBeginResult::Denied(
+                    ControlAddCause::InconsistentParameters,
+                )));
+            }
+        }
+        g.state = ControlState::WaitForExecution;
+        g.last_oper_params = Some(params.clone());
+        Ok(Some(OperateBeginResult::Accepted))
     }
 
     /// Completes an Operate, returning to ready or unselected according to the
     /// select class.
+    ///
+    /// An operate-many selection returns to ready and restarts its select
+    /// timeout; an operate-once selection ends and reports `OperateDone`, or
+    /// `Disconnected` when the connection holding it closed during the command.
     pub fn finish_operate(&self) {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        let is_sbo = matches!(
-            self.config.ctl_model,
-            ControlModel::SboNormal | ControlModel::SboEnhanced
-        );
-        if is_sbo && self.config.sbo_class == SboClass::OperateMany {
-            // A many-operate selection stays selected.
-            g.state = ControlState::Ready;
-            g.select_time = Some(Instant::now()); // refresh the select timeout
-        } else {
-            // A once-only selection, and direct control, return to unselected.
-            g.state = ControlState::Unselected;
-            g.owner_conn_id = 0;
-            g.last_oper_params = None;
-            g.select_time = None;
+        if !g.state.is_executing() {
+            return;
         }
+        if !self.is_sbo() {
+            g.clear();
+            return;
+        }
+        if self.config.sbo_class == SboClass::OperateMany && !g.owner_lost {
+            let owner = g.owner_conn_id;
+            let period = g.enter_ready(owner);
+            drop(g);
+            self.arm_select_timer(period);
+            return;
+        }
+        let reason = if g.owner_lost {
+            SelectStateChangedReason::Disconnected
+        } else {
+            SelectStateChangedReason::OperateDone
+        };
+        let owner = g.clear();
+        drop(g);
+        self.notify(SelectionChange::ended(owner, reason));
     }
 
     /// Moves the object from awaiting the dynamic check to executing the command.
@@ -513,13 +581,23 @@ impl ControlObject {
         }
     }
 
-    /// Returns the object to unselected after a refused check or a failed command.
+    /// Returns the object to unselected after a refused check or a failed
+    /// command; a select-before-operate object reports `OperateRefused`.
     pub fn abort_to_unselected(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.state = ControlState::Unselected;
-            g.owner_conn_id = 0;
-            g.last_oper_params = None;
-            g.select_time = None;
+        self.abort(SelectStateChangedReason::OperateRefused);
+    }
+
+    /// Returns the object to unselected and, when it held a selection of a
+    /// select-before-operate model, reports `reason`.
+    pub(crate) fn abort(&self, reason: SelectStateChangedReason) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        let held = g.state != ControlState::Unselected;
+        let owner = g.clear();
+        drop(g);
+        if held && self.is_sbo() {
+            self.notify(SelectionChange::ended(owner, reason));
         }
     }
 
@@ -542,7 +620,8 @@ impl ControlObject {
     /// A selected object refuses with `ObjectAlreadySelected`, whichever
     /// connection holds the selection, an executing one with
     /// `CommandAlreadyInExecution`, and a malformed origin is refused with
-    /// `InconsistentParameters`.
+    /// `InconsistentParameters`. A successful select starts the select timeout
+    /// and reports `Selected`.
     pub(crate) fn sbow_select(
         &self,
         conn_id: u64,
@@ -575,11 +654,19 @@ impl ControlObject {
             return Ok(Err(ControlAddCause::InconsistentParameters));
         }
 
-        g.state = ControlState::Ready;
-        g.owner_conn_id = conn_id;
-        g.select_time = Some(Instant::now());
+        let period = g.enter_ready(conn_id);
         g.last_oper_params = Some(params.clone());
+        drop(g);
         tracing::debug!(name = %self.config.name, conn_id, "select-with-value accepted");
+        self.arm_select_timer(period);
+        self.notify(SelectionChange {
+            conn_id,
+            is_selected: true,
+            reason: SelectStateChangedReason::Selected,
+            t: params.t,
+            origin: params.origin.clone(),
+            ctl_num: params.ctl_num,
+        });
         Ok(Ok(()))
     }
 
@@ -589,12 +676,13 @@ impl ControlObject {
     ///
     /// An executing command is not cancellable and is refused with
     /// `CommandAlreadyInExecution`. A selected object is deselected when the
-    /// request comes from the connection that holds it. An idle object of a
-    /// direct control model has no selection to cancel and refuses with
-    /// `NotSupported`, per IEC 61850-7-2 Table 47; canceling an unselected
-    /// select-before-operate object succeeds and does nothing.
+    /// request comes from the connection that holds it, and reports
+    /// `Canceled`. An idle object of a direct control model has no selection to
+    /// cancel and refuses with `NotSupported`, per IEC 61850-7-2 Table 47;
+    /// canceling an unselected select-before-operate object succeeds and does
+    /// nothing.
     pub fn try_cancel(&self, conn_id: u64) -> CancelResult {
-        let g = match self.inner.lock() {
+        let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return CancelResult::Denied(ControlAddCause::Unknown),
         };
@@ -608,7 +696,7 @@ impl ControlObject {
             return CancelResult::Denied(ControlAddCause::CommandAlreadyInExecution);
         }
 
-        if matches!(g.state, ControlState::Ready) {
+        if g.state == ControlState::Ready {
             if g.owner_conn_id != conn_id {
                 tracing::warn!(
                     name = %self.config.name,
@@ -618,15 +706,17 @@ impl ControlObject {
                 );
                 return CancelResult::Denied(ControlAddCause::LockedByOtherClient);
             }
+            let owner = g.clear();
             drop(g);
-            let _ = self.try_unselect(conn_id, SelectStateChangedReason::Canceled, false);
+            tracing::debug!(name = %self.config.name, "selection canceled");
+            self.notify(SelectionChange::ended(
+                owner,
+                SelectStateChangedReason::Canceled,
+            ));
             return CancelResult::Accepted;
         }
 
-        if matches!(
-            self.config.ctl_model,
-            ControlModel::DirectNormal | ControlModel::DirectEnhanced
-        ) {
+        if !self.is_sbo() {
             tracing::warn!(
                 name = %self.config.name,
                 "cancel refused: direct control has no selection to cancel"
@@ -640,33 +730,37 @@ impl ControlObject {
 
     // ─── Connection loss ─────────────────────────────────────────────────
 
-    /// Deselects the object when the connection holding its selection is lost.
+    /// Ends the selection held by a connection that has closed.
     ///
-    /// Nothing happens unless `conn_id` holds the selection and the object is
-    /// selected.
+    /// A selected object is deselected at once and reports `Disconnected`. A
+    /// command already executing for that connection runs to its end, after
+    /// which the selection ends as well. Nothing happens for an object
+    /// `conn_id` does not hold.
     pub fn on_connection_closed(&self, conn_id: u64) {
-        let g = match self.inner.lock() {
+        let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        if g.owner_conn_id != conn_id || g.state != ControlState::Ready {
+        if g.owner_conn_id != conn_id {
             return;
         }
-        drop(g);
-        let _ = self.try_unselect(conn_id, SelectStateChangedReason::Disconnected, true);
+        match g.state {
+            ControlState::Ready => {
+                let owner = g.clear();
+                drop(g);
+                self.notify(SelectionChange::ended(
+                    owner,
+                    SelectStateChangedReason::Disconnected,
+                ));
+            }
+            ControlState::WaitForExecution | ControlState::Operate => g.owner_lost = true,
+            ControlState::Unselected => {}
+        }
     }
 
     // ─── Select state notification ───────────────────────────────────────
 
-    fn notify_select_state_changed(
-        &self,
-        conn_id: u64,
-        is_selected: bool,
-        reason: SelectStateChangedReason,
-        t: [u8; 8],
-        origin: OriginValue,
-        ctl_num: u8,
-    ) {
+    fn notify(&self, change: SelectionChange) {
         let handler = self
             .select_state_handler
             .lock()
@@ -674,16 +768,16 @@ impl ControlObject {
             .and_then(|g| g.clone());
         if let Some(h) = handler {
             let action = ControlAction::new(
-                ctl_num,
-                origin,
-                t,
+                change.ctl_num,
+                change.origin,
+                change.t,
                 false,
                 false,
                 false,
-                is_selected,
-                conn_id,
+                change.is_selected,
+                change.conn_id,
             );
-            h.on_select_state_changed(&action, is_selected, reason);
+            h.on_select_state_changed(&action, change.is_selected, change.reason);
         }
     }
 
@@ -917,23 +1011,204 @@ mod tests {
         assert_eq!(obj.state(), ControlState::Unselected);
     }
 
-    // ── The select timeout deselects the object ──────────────────────────
+    // ── The select timeout without a runtime ─────────────────────────────
 
     #[test]
-    fn sbo_timeout_auto_unselect() {
-        use std::thread;
-
+    fn a_select_timeout_of_zero_never_fires() {
         let mut config = make_config(ControlModel::SboNormal);
-        config.sbo_timeout_ms = 50; // 50ms timeout
+        config.sbo_timeout_ms = 0;
         let obj = ControlObject::new(config);
-
         assert!(obj.try_select(1).unwrap());
+        assert!(!obj.check_sbo_timeout(), "a timeout of 0 never fires");
         assert_eq!(obj.state(), ControlState::Ready);
+    }
 
-        thread::sleep(Duration::from_millis(100)); // longer than the timeout
-        let timed_out = obj.check_sbo_timeout();
-        assert!(timed_out, "the select timeout must fire");
+    // ── Selection changes and the select timer ───────────────────────────
+
+    type Changes = tokio::sync::mpsc::UnboundedReceiver<(SelectStateChangedReason, u64, u8)>;
+
+    /// Records every selection change: its reason, connection, and ctlNum.
+    struct ChangeLog(tokio::sync::mpsc::UnboundedSender<(SelectStateChangedReason, u64, u8)>);
+
+    impl SelectStateChangedHandler for ChangeLog {
+        fn on_select_state_changed(
+            &self,
+            action: &ControlAction,
+            is_selected: bool,
+            reason: SelectStateChangedReason,
+        ) {
+            assert_eq!(is_selected, reason == SelectStateChangedReason::Selected);
+            let _ = self.0.send((reason, action.conn_id, action.ctl_num()));
+        }
+    }
+
+    fn observed(config: ControlObjectConfig) -> (ControlObject, Changes) {
+        let obj = ControlObject::new(config);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        obj.set_select_state_handler(Arc::new(ChangeLog(tx)));
+        (obj, rx)
+    }
+
+    /// Returns the next change, or `None` when none comes within an hour of the
+    /// paused clock.
+    async fn next(rx: &mut Changes) -> Option<(SelectStateChangedReason, u64, u8)> {
+        tokio::time::timeout(Duration::from_secs(3600), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn drained(rx: &mut Changes) -> Vec<SelectStateChangedReason> {
+        let mut out = Vec::new();
+        while let Ok((reason, _, _)) = rx.try_recv() {
+            out.push(reason);
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_timeout_deselects_exactly_at_the_limit() {
+        let mut config = make_config(ControlModel::SboNormal);
+        config.sbo_timeout_ms = 100;
+        let (obj, mut rx) = observed(config);
+        let started = Instant::now();
+        assert!(obj.try_select(7).unwrap());
+        assert_eq!(
+            next(&mut rx).await,
+            Some((SelectStateChangedReason::Selected, 7, 0))
+        );
+        assert_eq!(
+            next(&mut rx).await,
+            Some((SelectStateChangedReason::Timeout, 7, 0))
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
         assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_selection_is_not_ended_by_the_timer_of_the_previous_one() {
+        let mut config = make_config(ControlModel::SboNormal);
+        config.sbo_timeout_ms = 100;
+        let (obj, mut rx) = observed(config);
+        let started = Instant::now();
+        assert!(obj.try_select(1).unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(obj.try_cancel(1), CancelResult::Accepted);
+        assert!(obj.try_select(1).unwrap());
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                SelectStateChangedReason::Selected,
+                SelectStateChangedReason::Canceled,
+                SelectStateChangedReason::Selected
+            ]
+        );
+        assert_eq!(
+            next(&mut rx).await,
+            Some((SelectStateChangedReason::Timeout, 1, 0))
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operate_many_restarts_the_select_timeout() {
+        let mut config = make_config(ControlModel::SboNormal);
+        config.sbo_timeout_ms = 100;
+        config.sbo_class = SboClass::OperateMany;
+        let (obj, mut rx) = observed(config);
+        let started = Instant::now();
+        assert!(obj.try_select(1).unwrap());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let params = make_oper_params(MmsValue::Boolean(true));
+        assert_eq!(
+            obj.begin_operate(1, &params).unwrap(),
+            Some(OperateBeginResult::Accepted)
+        );
+        obj.finish_operate();
+        assert_eq!(obj.state(), ControlState::Ready);
+        assert_eq!(drained(&mut rx), vec![SelectStateChangedReason::Selected]);
+        assert_eq!(
+            next(&mut rx).await,
+            Some((SelectStateChangedReason::Timeout, 1, 0))
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(160));
+    }
+
+    #[tokio::test]
+    async fn every_selection_change_is_reported() {
+        let (obj, mut rx) = observed(make_config(ControlModel::SboNormal));
+        let params = make_oper_params(MmsValue::Boolean(true));
+
+        // Cancel.
+        assert!(obj.try_select(1).unwrap());
+        assert_eq!(obj.try_cancel(1), CancelResult::Accepted);
+        // An operate-once command.
+        assert!(obj.try_select(1).unwrap());
+        obj.begin_operate(1, &params).unwrap();
+        obj.finish_operate();
+        // A lost connection while selected, and while executing.
+        assert!(obj.try_select(1).unwrap());
+        obj.on_connection_closed(1);
+        assert!(obj.try_select(2).unwrap());
+        obj.begin_operate(2, &params).unwrap();
+        obj.on_connection_closed(2);
+        assert_eq!(obj.state(), ControlState::WaitForExecution);
+        obj.finish_operate();
+        // A refused Operate.
+        assert!(obj.try_select(3).unwrap());
+        obj.begin_operate(3, &params).unwrap();
+        obj.abort_to_unselected();
+
+        use SelectStateChangedReason as R;
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                R::Selected,
+                R::Canceled,
+                R::Selected,
+                R::OperateDone,
+                R::Selected,
+                R::Disconnected,
+                R::Selected,
+                R::Disconnected,
+                R::Selected,
+                R::OperateRefused,
+            ]
+        );
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[tokio::test]
+    async fn select_with_value_reports_its_parameters_and_a_mismatch() {
+        let (obj, mut rx) = observed(make_config(ControlModel::SboEnhanced));
+        let params = make_oper_params(MmsValue::Boolean(true));
+        assert_eq!(obj.sbow_select(4, &params).unwrap(), Ok(()));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((SelectStateChangedReason::Selected, 4, params.ctl_num))
+        );
+        let other = make_oper_params(MmsValue::Boolean(false));
+        assert_eq!(
+            obj.begin_operate(4, &other).unwrap(),
+            Some(OperateBeginResult::Denied(
+                ControlAddCause::InconsistentParameters
+            ))
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((SelectStateChangedReason::OperateRefused, 4, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_control_reports_no_selection_change() {
+        let (obj, mut rx) = observed(make_config(ControlModel::DirectEnhanced));
+        let params = make_oper_params(MmsValue::Boolean(true));
+        obj.begin_operate(1, &params).unwrap();
+        obj.finish_operate();
+        obj.begin_operate(1, &params).unwrap();
+        obj.abort_to_unselected();
+        assert!(drained(&mut rx).is_empty());
     }
 
     // ── A selected object refuses a second select ────────────────────────

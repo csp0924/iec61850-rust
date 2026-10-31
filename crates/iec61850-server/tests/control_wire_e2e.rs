@@ -27,7 +27,8 @@ use iec61850_server::control::handler::{OperateFuture, WaitForExecFuture};
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysFailOperateHandler, AlwaysSuccessOperateHandler, CheckHandler,
     ControlAction, ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig,
-    ControlObjectEntry, ControlState, WaitForExecutionHandler,
+    ControlObjectEntry, ControlState, SelectStateChangedHandler, SelectStateChangedReason,
+    WaitForExecutionHandler,
 };
 use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
 use tokio::sync::Notify;
@@ -1060,6 +1061,97 @@ async fn cancel_of_an_idle_direct_object_is_not_supported() {
         let lae = last_appl_error_only(queued_report(&mut a).await);
         assert_last_appl_error(&lae, &format!("{DOMAIN}/{item}"), ctl_num, 1);
     }
+    h.stop().await;
+}
+
+// ── End of a selection ─────────────────────────────────────────────────────
+
+/// Forwards every selection change reason to a channel.
+struct Selections(tokio::sync::mpsc::UnboundedSender<SelectStateChangedReason>);
+
+impl SelectStateChangedHandler for Selections {
+    fn on_select_state_changed(
+        &self,
+        _a: &ControlAction,
+        _selected: bool,
+        reason: SelectStateChangedReason,
+    ) {
+        let _ = self.0.send(reason);
+    }
+}
+
+fn observe(obj: &ControlObject) -> tokio::sync::mpsc::UnboundedReceiver<SelectStateChangedReason> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    obj.set_select_state_handler(Arc::new(Selections(tx)));
+    rx
+}
+
+async fn next_change(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SelectStateChangedReason>,
+) -> SelectStateChangedReason {
+    tokio::time::timeout(WAIT, rx.recv())
+        .await
+        .expect("a selection change")
+        .expect("the handler is installed")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operate_after_the_select_timeout_is_refused() {
+    let s = server();
+    let obj = ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO2", "GGIO1", DOMAIN, ControlModel::SboNormal);
+        config.sbo_timeout_ms = 20;
+        config
+    });
+    let mut changes = observe(&obj);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.read(DOMAIN, "GGIO1$CO$SPCSO2$SBO").await.expect("select");
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Selected
+    );
+    // The timer ends the selection with no request arriving.
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Timeout
+    );
+    assert_eq!(obj.state(), ControlState::Unselected);
+
+    let r = a
+        .write(DOMAIN, "GGIO1$CO$SPCSO2$Oper", oper(on(), 91))
+        .await;
+    assert_eq!(denied(r), DataAccessError::ObjectAccessDenied);
+    let lae = last_appl_error_only(queued_report(&mut a).await);
+    assert_last_appl_error(&lae, &format!("{DOMAIN}/GGIO1$CO$SPCSO2$Oper"), 91, 18);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_association_ends_its_selection() {
+    let s = server();
+    let obj = object("SPCSO4", ControlModel::SboEnhanced);
+    let mut changes = observe(&obj);
+    register(&s, obj.clone(), Arc::new(AlwaysSuccessOperateHandler));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    a.write(DOMAIN, "GGIO1$CO$SPCSO4$SBOw", oper(on(), 92))
+        .await
+        .expect("select");
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Selected
+    );
+    a.abort().await.expect("abort");
+    assert_eq!(
+        next_change(&mut changes).await,
+        SelectStateChangedReason::Disconnected
+    );
+    assert_eq!(obj.state(), ControlState::Unselected);
     h.stop().await;
 }
 

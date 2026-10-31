@@ -135,9 +135,10 @@ async fn sbo_normal_double_select_different_conn_fails() {
     assert_eq!(obj.state(), ControlState::Ready);
 }
 
-// The select timeout unselects the object on its own.
+// The select timeout unselects the object on its own, on the paused clock of
+// the runtime.
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sbo_normal_timeout_auto_unselect() {
     let obj = make_obj(50); // 50ms timeout
     let check_h: Arc<dyn CheckHandler> = Arc::new(AlwaysAcceptCheckHandler);
@@ -145,10 +146,9 @@ async fn sbo_normal_timeout_auto_unselect() {
     handle_read_sbo(&obj, 1, Some(&check_h));
     assert_eq!(obj.state(), ControlState::Ready);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let timed_out = obj.check_sbo_timeout();
-    assert!(timed_out, "the select must time out after 50ms");
+    tokio::time::sleep(Duration::from_millis(49)).await;
+    assert_eq!(obj.state(), ControlState::Ready, "not before the timeout");
+    tokio::time::sleep(Duration::from_millis(51)).await;
     assert_eq!(
         obj.state(),
         ControlState::Unselected,

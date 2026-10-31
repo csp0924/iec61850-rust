@@ -97,7 +97,11 @@ pub trait ControlHandler: Send + Sync {
 
 /// Notified when a select-before-operate object is selected or deselected.
 ///
-/// Implements the select state notification of IEC 61850-7-2.
+/// Every change of the selection is reported, once, after the state has
+/// changed: a select, a Cancel, the select timeout, a lost connection, the end
+/// of an operate-once command, and an Operate refused in a way that ends the
+/// selection. The server does not write `stSeld`; an application that models it
+/// updates it from here, per the selected state of IEC 61850-7-3.
 pub trait SelectStateChangedHandler: Send + Sync {
     /// Reports that the selection state changed.
     fn on_select_state_changed(
@@ -122,6 +126,9 @@ pub enum SelectStateChangedReason {
     Disconnected,
     /// A once-only selection was consumed by a completed Operate.
     OperateDone,
+    /// An Operate refused by the checks, or one whose parameters differ from
+    /// those of the SelectWithValue, ended the selection.
+    OperateRefused,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
