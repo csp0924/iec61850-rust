@@ -17,11 +17,20 @@
             <LogControl name="lcbSeq" datSet="dsSeq" logName="Log" reasonCode="false" intgPd="2000">
               <TrgOps dchg="true" period="true" gi="true"/>
             </LogControl>
+            <SettingControl numOfSGs="2" actSG="1"/>
           </LN0>
           <LN lnClass="MSQI" inst="1" lnType="MSQI_T">
             <DOI name="SeqA">
               <SDI name="c2"><SDI name="cVal"><SDI name="mag"><DAI name="f"><Val>2.5</Val></DAI></SDI></SDI></SDI>
               <DAI name="seqT"><Val>-3</Val></DAI>
+            </DOI>
+          </LN>
+          <LN lnClass="PTOC" inst="1" lnType="PTOC_T">
+            <DOI name="StrVal">
+              <SDI name="setMag"><DAI name="f"><Val sGroup="1">1.5</Val><Val sGroup="2">2.5</Val></DAI></SDI>
+            </DOI>
+            <DOI name="OpDlTmms">
+              <DAI name="setVal"><Val>100</Val><Val sGroup="2">200</Val></DAI>
             </DOI>
           </LN>
         </LDevice>
@@ -36,6 +45,17 @@
       <DO name="SeqA" type="SEQ_T"/>
       <DO name="Raw" type="RAW_T"/>
     </LNodeType>
+    <LNodeType id="PTOC_T" lnClass="PTOC">
+      <DO name="StrVal" type="ASG_SE"/>
+      <DO name="OpDlTmms" type="ING_BOTH"/>
+    </LNodeType>
+    <DOType id="ASG_SE" cdc="ASG">
+      <DA name="setMag" fc="SE" bType="Struct" type="AV_T"/>
+    </DOType>
+    <DOType id="ING_BOTH" cdc="ING">
+      <DA name="setVal" fc="SG" bType="INT32"/>
+      <DA name="setVal" fc="SE" bType="INT32"/>
+    </DOType>
     <DOType id="ENC_T" cdc="ENC">
       <DA name="stVal" fc="ST" bType="BOOLEAN"/>
     </DOType>

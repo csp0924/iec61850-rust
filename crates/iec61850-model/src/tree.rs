@@ -421,6 +421,14 @@ pub struct DataAttribute {
     /// `GetVariableAccessAttributes` enumerates the type specification, which
     /// some client tools depend on.
     pub children: Vec<DataAttribute>,
+    /// The initial value of each setting group, as `(group, value)` pairs in
+    /// ascending group order with no group repeated.
+    ///
+    /// Filled from the `<Val sGroup="n">` elements of an SCL instance
+    /// (IEC 61850-6 §9.5.4.4), which is meaningful on an FC=SG or FC=SE leaf.
+    /// Empty when no value names a group; [`value`](Self::value) then applies
+    /// to every group. Groups are numbered from 1.
+    pub sgroup_values: Vec<(u8, MmsValue)>,
 }
 
 impl DataAttribute {
@@ -440,6 +448,7 @@ impl DataAttribute {
             trg_ops,
             value: Arc::new(RwLock::new(initial)),
             children: Vec::new(),
+            sgroup_values: Vec::new(),
         }
     }
 
@@ -462,6 +471,7 @@ impl DataAttribute {
             trg_ops,
             value,
             children: Vec::new(),
+            sgroup_values: Vec::new(),
         }
     }
 
@@ -476,6 +486,7 @@ impl DataAttribute {
             trg_ops: TrgOps::NONE,
             value: Arc::new(RwLock::new(MmsValue::Structure(Vec::new()))),
             children,
+            sgroup_values: Vec::new(),
         }
     }
 
@@ -518,6 +529,15 @@ impl DataAttribute {
     /// Finds a direct sub-attribute by name, one level only.
     pub fn child_by_name(&self, name: &str) -> Option<&DataAttribute> {
         self.children.iter().find(|c| c.name == name)
+    }
+
+    /// Returns the initial value of setting group `group`, when one was
+    /// declared for it; see [`sgroup_values`](Self::sgroup_values).
+    pub fn sgroup_value(&self, group: u8) -> Option<&MmsValue> {
+        self.sgroup_values
+            .binary_search_by_key(&group, |(g, _)| *g)
+            .ok()
+            .map(|i| &self.sgroup_values[i].1)
     }
 }
 
@@ -948,8 +968,14 @@ mod tests {
             _ => None,
         };
         assert_eq!(fc_of(spt.child_by_name("setVal", None)), Some(FC::Sg));
-        assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Se))), Some(FC::Se));
-        assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Sg))), Some(FC::Sg));
+        assert_eq!(
+            fc_of(spt.child_by_name("setVal", Some(FC::Se))),
+            Some(FC::Se)
+        );
+        assert_eq!(
+            fc_of(spt.child_by_name("setVal", Some(FC::Sg))),
+            Some(FC::Sg)
+        );
         assert_eq!(fc_of(spt.child_by_name("setVal", Some(FC::Cf))), None);
 
         let ln = LogicalNode {
@@ -993,6 +1019,22 @@ mod tests {
             Some(MmsValue::Integer(1))
         );
         assert_eq!(value(m.node_by_object_ref(&with_fc(Some(FC::St)))), None);
+    }
+
+    #[test]
+    fn sgroup_value_looks_up_by_group() {
+        let mut attr = da(
+            "setVal",
+            FC::Sg,
+            DataAttributeType::Int32,
+            TrgOps::NONE,
+            MmsValue::Integer(0),
+        );
+        assert_eq!(attr.sgroup_value(1), None);
+        attr.sgroup_values = vec![(1, MmsValue::Integer(10)), (3, MmsValue::Integer(30))];
+        assert_eq!(attr.sgroup_value(1), Some(&MmsValue::Integer(10)));
+        assert_eq!(attr.sgroup_value(2), None);
+        assert_eq!(attr.sgroup_value(3), Some(&MmsValue::Integer(30)));
     }
 
     // store and snapshot

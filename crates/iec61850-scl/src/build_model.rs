@@ -29,7 +29,7 @@ use iec61850_model::{
         SvControlBlock,
     },
     fc::FC,
-    tree::{DataAttribute, DataObject, DataSet, DataSetEntry, IedModel},
+    tree::{DataAttribute, DataObject, DataSet, DataSetEntry, DoChild, IedModel},
     types::{DataAttributeType, TrgOps},
     value::MmsValue,
 };
@@ -124,9 +124,10 @@ fn build_ld(
         ld_b = ld_b.with_ld_name(name.clone());
     }
     let domain = ld_domain_name(raw_ld, ied_name);
+    let num_of_sgs = ld_num_of_sgs(raw_ld);
 
     for raw_ln in &raw_ld.logical_nodes {
-        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain)?;
+        let ln = build_ln(raw_ln, dtt, &raw_ld.inst, &domain, num_of_sgs)?;
         ld_b = ld_b.add_ln(ln);
     }
 
@@ -141,11 +142,25 @@ fn build_ld(
     })
 }
 
+/// Returns the `numOfSGs` of the `<SettingControl>` of a logical device, if
+/// its LN0 has one.
+///
+/// Also used by the build-script path, so a generated model checks the same
+/// setting group numbers.
+pub fn ld_num_of_sgs(raw_ld: &RawLogicalDevice) -> Option<u32> {
+    raw_ld
+        .logical_nodes
+        .iter()
+        .find_map(|ln| ln.setting_control.as_ref())
+        .map(|sc| sc.num_of_sgs)
+}
+
 fn build_ln(
     raw_ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
     domain: &str,
+    num_of_sgs: Option<u32>,
 ) -> Result<iec61850_model::LogicalNode, SclParseError> {
     // Stage 2 has already checked that ln_type_ref resolves, so `expect` here
     // states an invariant rather than a hope.
@@ -200,7 +215,7 @@ fn build_ln(
         ln_b = ln_b.set_sgcb(build_sgcb(raw_sgcb, raw_ln, ld_inst)?);
     }
 
-    let ln = ln_b.build().map_err(|e| {
+    let mut ln = ln_b.build().map_err(|e| {
         SclParseError::at(
             raw_ln.span,
             format!(
@@ -213,9 +228,8 @@ fn build_ln(
         )
     })?;
 
-    // The DOI, SDI and DAI overrides are applied after the build, writing
-    // through the `Arc<RwLock<MmsValue>>` the model holds.
-    apply_doi_overrides(&ln, raw_ln, dtt, ld_inst)?;
+    // The DOI, SDI and DAI overrides are applied to the built logical node.
+    apply_doi_overrides(&mut ln, raw_ln, dtt, ld_inst, num_of_sgs)?;
 
     Ok(ln)
 }
@@ -341,7 +355,10 @@ pub fn setting_view(da: &DataAttribute) -> DataAttribute {
         view.trg_ops = da.trg_ops;
         view
     } else {
-        DataAttribute::new(da.name.clone(), FC::Sg, da.ty, da.trg_ops, da.snapshot())
+        let mut view =
+            DataAttribute::new(da.name.clone(), FC::Sg, da.ty, da.trg_ops, da.snapshot());
+        view.sgroup_values = da.sgroup_values.clone();
+        view
     }
 }
 
@@ -905,31 +922,36 @@ fn build_sgcb(
 // DOI, SDI and DAI default-value overrides
 // -----------------------------------------------------------------------------
 
-/// Applies the `<DAI>` values under `raw_ln.doi`, parsing each `<Val>` into an
-/// [`MmsValue`] and writing it through the target attribute's
-/// `Arc<RwLock<MmsValue>>`.
+/// Applies the `<DAI>` values under `raw_ln.doi` to the built logical node,
+/// parsing each `<Val>` into an [`MmsValue`].
 ///
 /// The walk runs over the runtime model and the raw DataTypeTemplates tree in
 /// parallel, because a runtime [`DataAttribute`] does not carry the enumeration
 /// type or the type reference the value needs to be parsed.
 ///
+/// A `<DAI>` or `<SDI>` naming a data attribute reaches every data attribute
+/// of that name directly below the data object: the FC=SE and FC=SG
+/// attributes of one setting share a name, whether the DOType declares both or
+/// the FC=SG one is derived from an FC=SE declaration, and both take the
+/// value.
+///
 /// A `<DOI>`, `<SDI>` or `<DAI>` naming something the model does not contain is
-/// logged and skipped: the model is already built, and failing the whole file
-/// over one stray override would be disproportionate. Where several values
-/// carry a setting group, the one without a group is applied, or the first one
-/// otherwise.
+/// logged and skipped: failing the whole file over one stray override would be
+/// disproportionate. See [`dai_values`] for how the `<Val>` elements of one
+/// `<DAI>` are split between the value and the setting groups; `num_of_sgs` is
+/// the `numOfSGs` of the logical device's `<SettingControl>`, if it has one.
 ///
 /// # Errors
 ///
 /// [`ErrorKind::SemanticConflict`] when a `<DAI>` lands on a constructed
-/// attribute, where an `<SDI>` is required, and
-/// [`ErrorKind::AttributeValueInvalid`] when a value does not parse as the
-/// target type.
+/// attribute, where an `<SDI>` is required, and whatever [`dai_values`]
+/// reports.
 fn apply_doi_overrides(
-    ln: &iec61850_model::LogicalNode,
+    ln: &mut iec61850_model::LogicalNode,
     raw_ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
+    num_of_sgs: Option<u32>,
 ) -> Result<(), SclParseError> {
     let lnt = dtt
         .ln_node_types
@@ -953,7 +975,7 @@ fn apply_doi_overrides(
             .do_types
             .get(&raw_do_def.do_type_ref)
             .expect("the data object type_ref was checked in stage 2");
-        let dobj = match ln.do_by_name(&raw_doi.name) {
+        let dobj = match ln.dos.iter_mut().find(|d| d.name == raw_doi.name) {
             Some(d) => d,
             None => {
                 tracing::warn!(
@@ -963,13 +985,35 @@ fn apply_doi_overrides(
                 continue;
             }
         };
-        let path = format!(
-            "SCL/.../LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/DOI[name=\"{}\"]",
-            ld_inst, raw_ln.ln_class, raw_ln.inst, raw_doi.name
-        );
-        apply_instances_at_do(&raw_doi.children, dobj, dot, dtt, &path)?;
+        let ctx = InstanceContext {
+            dtt,
+            num_of_sgs,
+            path: format!(
+                "SCL/.../LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/DOI[name=\"{}\"]",
+                ld_inst, raw_ln.ln_class, raw_ln.inst, raw_doi.name
+            ),
+        };
+        apply_instances_at_do(&raw_doi.children, dobj, dot, &ctx)?;
     }
     Ok(())
+}
+
+/// What the instance walk carries down: the type tables, the setting group
+/// count of the logical device, and the element path of the current level.
+struct InstanceContext<'a> {
+    dtt: &'a DataTypeTemplates,
+    num_of_sgs: Option<u32>,
+    path: String,
+}
+
+impl InstanceContext<'_> {
+    fn child(&self, element: &str, name: &str) -> Self {
+        Self {
+            dtt: self.dtt,
+            num_of_sgs: self.num_of_sgs,
+            path: format!("{}/{element}[name=\"{name}\"]", self.path),
+        }
+    }
 }
 
 /// Applies the `<SDI>` and `<DAI>` children below a data object and its DOType.
@@ -979,10 +1023,9 @@ fn apply_doi_overrides(
 /// Whatever [`apply_dai_value`] reports.
 fn apply_instances_at_do(
     children: &[RawDataInstance],
-    dobj: &DataObject,
+    dobj: &mut DataObject,
     dot: &RawDoType,
-    dtt: &DataTypeTemplates,
-    parent_path: &str,
+    ctx: &InstanceContext<'_>,
 ) -> Result<(), SclParseError> {
     for inst in children {
         if skip_indexed_instance(inst) {
@@ -992,22 +1035,28 @@ fn apply_instances_at_do(
             RawDataInstance::Sdi(sdi) => {
                 // Two possibilities: a sub-object, or a constructed attribute.
                 if let Some(sdo) = dot.sdos().find(|s| s.name == sdi.name) {
-                    let sub_dot = dtt
+                    let sub_dot = ctx
+                        .dtt
                         .do_types
                         .get(&sdo.do_type_ref)
                         .expect("the sub-object type_ref was checked in stage 2");
-                    let sub_dobj = match dobj.child_by_name(&sdi.name, None) {
-                        Some(iec61850_model::tree::DoChild::SubDo(sd)) => sd,
-                        _ => {
-                            tracing::warn!(
-                                "SDI name=\"{}\" expects a sub-DataObject that the built model does not have, skipping",
-                                sdi.name
-                            );
-                            continue;
-                        }
+                    let sub_dobj = dobj.children.iter_mut().find_map(|c| match c {
+                        DoChild::SubDo(sd) if sd.name == sdi.name => Some(sd),
+                        _ => None,
+                    });
+                    let Some(sub_dobj) = sub_dobj else {
+                        tracing::warn!(
+                            "SDI name=\"{}\" expects a sub-DataObject that the built model does not have, skipping",
+                            sdi.name
+                        );
+                        continue;
                     };
-                    let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-                    apply_instances_at_do(&sdi.children, sub_dobj, sub_dot, dtt, &path)?;
+                    apply_instances_at_do(
+                        &sdi.children,
+                        sub_dobj,
+                        sub_dot,
+                        &ctx.child("SDI", &sdi.name),
+                    )?;
                 } else if let Some(da_def) = dot.das().find(|d| d.name == sdi.name) {
                     if da_def.b_type != "Struct" {
                         tracing::warn!(
@@ -1018,26 +1067,22 @@ fn apply_instances_at_do(
                         continue;
                     }
                     let type_id = da_def.type_ref.as_deref().expect("checked in stage 2");
-                    let dat_def = dtt
+                    let dat_def = ctx
+                        .dtt
                         .da_types
                         .get(type_id)
                         .expect("the DA type_ref was checked in stage 2");
-                    let da = match dobj.child_by_name(&sdi.name, None) {
-                        Some(iec61850_model::tree::DoChild::Da(d)) => d,
-                        _ => {
-                            tracing::warn!(
-                                "SDI name=\"{}\" expects a constructed DA that the built model does not have, skipping",
-                                sdi.name
-                            );
-                            continue;
-                        }
-                    };
-                    let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-                    apply_instances_at_da(&sdi.children, da, dat_def, dtt, &path)?;
-                    if derives_setting_view(da_def, dot) {
-                        if let Some(view) = setting_view_of(dobj, &sdi.name) {
-                            apply_instances_at_da(&sdi.children, view, dat_def, dtt, &path)?;
-                        }
+                    let sub_ctx = ctx.child("SDI", &sdi.name);
+                    let mut found = false;
+                    for da in attributes_named(dobj, &sdi.name) {
+                        found = true;
+                        apply_instances_at_da(&sdi.children, da, dat_def, &sub_ctx)?;
+                    }
+                    if !found {
+                        tracing::warn!(
+                            "SDI name=\"{}\" expects a constructed DA that the built model does not have, skipping",
+                            sdi.name
+                        );
                     }
                 } else {
                     tracing::warn!(
@@ -1059,31 +1104,23 @@ fn apply_instances_at_do(
                         continue;
                     }
                 };
-                let da = match dobj.child_by_name(&dai.name, None) {
-                    Some(iec61850_model::tree::DoChild::Da(d)) => d,
-                    _ => {
-                        tracing::warn!(
-                            "DAI name=\"{}\" expects a leaf DA that the built model does not have, skipping",
-                            dai.name
-                        );
-                        continue;
-                    }
-                };
-                let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
-                let view = if derives_setting_view(da_def, dot) {
-                    setting_view_of(dobj, &dai.name)
-                } else {
-                    None
-                };
-                for target in std::iter::once(da).chain(view) {
+                let sub_ctx = ctx.child("DAI", &dai.name);
+                let mut found = false;
+                for da in attributes_named(dobj, &dai.name) {
+                    found = true;
                     apply_dai_value(
                         dai,
-                        target,
+                        da,
                         da_def.b_type.as_str(),
                         da_def.type_ref.as_deref(),
-                        dtt,
-                        &path,
+                        &sub_ctx,
                     )?;
+                }
+                if !found {
+                    tracing::warn!(
+                        "DAI name=\"{}\" expects a leaf DA that the built model does not have, skipping",
+                        dai.name
+                    );
                 }
             }
         }
@@ -1091,9 +1128,16 @@ fn apply_instances_at_do(
     Ok(())
 }
 
-/// Finds the FC=SG data attribute named `name` directly below `dobj`.
-fn setting_view_of<'a>(dobj: &'a DataObject, name: &str) -> Option<&'a DataAttribute> {
-    dobj.children_with_fc(FC::Sg).find(|da| da.name == name)
+/// Iterates the data attributes named `name` directly below `dobj`: one, or
+/// the FC=SE and FC=SG attributes of a setting.
+fn attributes_named<'a>(
+    dobj: &'a mut DataObject,
+    name: &'a str,
+) -> impl Iterator<Item = &'a mut DataAttribute> {
+    dobj.children.iter_mut().filter_map(move |c| match c {
+        DoChild::Da(da) if da.name == name => Some(da),
+        _ => None,
+    })
 }
 
 /// Applies the `<SDI>` and `<DAI>` children below a constructed attribute and
@@ -1104,10 +1148,9 @@ fn setting_view_of<'a>(dobj: &'a DataObject, name: &str) -> Option<&'a DataAttri
 /// Whatever [`apply_dai_value`] reports.
 fn apply_instances_at_da(
     children: &[RawDataInstance],
-    da: &DataAttribute,
+    da: &mut DataAttribute,
     dat: &RawDaType,
-    dtt: &DataTypeTemplates,
-    parent_path: &str,
+    ctx: &InstanceContext<'_>,
 ) -> Result<(), SclParseError> {
     for inst in children {
         if skip_indexed_instance(inst) {
@@ -1135,22 +1178,24 @@ fn apply_instances_at_da(
                     continue;
                 }
                 let type_id = bda_def.type_ref.as_deref().expect("checked in stage 2");
-                let sub_dat = dtt
+                let sub_dat = ctx
+                    .dtt
                     .da_types
                     .get(type_id)
                     .expect("the BDA type_ref was checked in stage 2");
-                let sub_da = match da.child_by_name(&sdi.name) {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(
-                            "SDI name=\"{}\" has no matching BDA in the built model, skipping",
-                            sdi.name
-                        );
-                        continue;
-                    }
+                let Some(sub_da) = da.children.iter_mut().find(|c| c.name == sdi.name) else {
+                    tracing::warn!(
+                        "SDI name=\"{}\" has no matching BDA in the built model, skipping",
+                        sdi.name
+                    );
+                    continue;
                 };
-                let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
-                apply_instances_at_da(&sdi.children, sub_da, sub_dat, dtt, &path)?;
+                apply_instances_at_da(
+                    &sdi.children,
+                    sub_da,
+                    sub_dat,
+                    &ctx.child("SDI", &sdi.name),
+                )?;
             }
             RawDataInstance::Dai(dai) => {
                 let bda_def = match dat.bdas.iter().find(|b| b.name == dai.name) {
@@ -1164,24 +1209,19 @@ fn apply_instances_at_da(
                         continue;
                     }
                 };
-                let sub_da = match da.child_by_name(&dai.name) {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(
-                            "DAI name=\"{}\" has no matching BDA in the built model, skipping",
-                            dai.name
-                        );
-                        continue;
-                    }
+                let Some(sub_da) = da.children.iter_mut().find(|c| c.name == dai.name) else {
+                    tracing::warn!(
+                        "DAI name=\"{}\" has no matching BDA in the built model, skipping",
+                        dai.name
+                    );
+                    continue;
                 };
-                let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
                 apply_dai_value(
                     dai,
                     sub_da,
                     bda_def.b_type.as_str(),
                     bda_def.type_ref.as_deref(),
-                    dtt,
-                    &path,
+                    &ctx.child("DAI", &dai.name),
                 )?;
             }
         }
@@ -1189,24 +1229,21 @@ fn apply_instances_at_da(
     Ok(())
 }
 
-/// Parses the values of one `<DAI>` and writes the result into the attribute's
-/// `Arc<RwLock<MmsValue>>`.
-///
-/// The value without a setting group is applied; if every value carries one,
-/// the first is applied and a warning is emitted.
+/// Parses the values of one `<DAI>` into the attribute: its value and, from
+/// the values carrying `sGroup`, its setting group values. See
+/// [`dai_values`].
 ///
 /// # Errors
 ///
 /// [`ErrorKind::SemanticConflict`] when the target attribute is constructed,
-/// where an `<SDI>` is required instead, and
-/// [`ErrorKind::AttributeValueInvalid`] when the value does not parse.
+/// where an `<SDI>` is required instead, and whatever [`dai_values`]
+/// reports.
 fn apply_dai_value(
     dai: &RawDai,
-    da: &DataAttribute,
+    da: &mut DataAttribute,
     b_type: &str,
     type_ref: Option<&str>,
-    dtt: &DataTypeTemplates,
-    path: &str,
+    ctx: &InstanceContext<'_>,
 ) -> Result<(), SclParseError> {
     if dai.values.is_empty() {
         // No Val child: the DAI only declares valKind or valImport and
@@ -1216,19 +1253,103 @@ fn apply_dai_value(
     if b_type == "Struct" {
         return Err(SclParseError::at(
             dai.span,
-            path.to_string(),
+            ctx.path.clone(),
             ErrorKind::SemanticConflict {
                 detail: "the DAI resolves to a constructed DA (bType=Struct); an SDI is required to descend into it"
                     .to_string(),
             },
         ));
     }
-
-    let val = pick_val_for_no_sgroup(&dai.values);
-    let parsed = parse_val_for_b_type(val, b_type, type_ref, dtt, dai.span, path)?;
-    let mut guard = da.value.write().expect("MmsValue lock poisoned");
-    *guard = parsed;
+    let (value, sgroup_values) =
+        dai_values(dai, b_type, type_ref, ctx.dtt, ctx.num_of_sgs, &ctx.path)?;
+    da.store(value);
+    da.sgroup_values = sgroup_values;
     Ok(())
+}
+
+/// Parses the `<Val>` elements of one `<DAI>` into the attribute's value and
+/// its setting group values (IEC 61850-6 §9.5.4.4).
+///
+/// The value is the `<Val>` without `sGroup`, which applies to every group;
+/// when every `<Val>` carries one, the first is used and a warning is
+/// emitted. Each `<Val sGroup="n">` becomes the value of group `n`, returned
+/// in ascending group order. Groups are numbered from 1; with `num_of_sgs`,
+/// the `numOfSGs` of the logical device's `<SettingControl>`, a group must not
+/// exceed it, and without one a group value is kept with a warning.
+///
+/// Also used by the build-script path, so a generated model takes the same
+/// values.
+///
+/// # Errors
+///
+/// [`ErrorKind::AttributeValueInvalid`] when a value does not parse or a group
+/// number is 0, above 255 or above `num_of_sgs`, and
+/// [`ErrorKind::SemanticConflict`] when two values name the same group.
+pub fn dai_values(
+    dai: &RawDai,
+    b_type: &str,
+    type_ref: Option<&str>,
+    dtt: &DataTypeTemplates,
+    num_of_sgs: Option<u32>,
+    path: &str,
+) -> Result<(MmsValue, Vec<(u8, MmsValue)>), SclParseError> {
+    let limit = num_of_sgs.unwrap_or(255).min(255);
+    let mut sgroup_values: Vec<(u8, MmsValue)> = Vec::new();
+    for val in &dai.values {
+        let Some(group) = val.s_group else {
+            continue;
+        };
+        let group = match u8::try_from(group) {
+            Ok(g) if g >= 1 && u32::from(g) <= limit => g,
+            _ => {
+                return Err(SclParseError::at(
+                    val.span,
+                    format!("{path}/Val"),
+                    ErrorKind::AttributeValueInvalid {
+                        name: "sGroup".to_string(),
+                        expected_type: format!("u32 (1..={limit}, a setting group)"),
+                        raw_value: group.to_string(),
+                        cause: num_of_sgs
+                            .map(|n| format!("the SettingControl declares numOfSGs={n}")),
+                    },
+                )
+                .with_attribute("sGroup"));
+            }
+        };
+        let parsed = parse_val_for_b_type(val, b_type, type_ref, dtt, val.span, path)?;
+        match sgroup_values.binary_search_by_key(&group, |(g, _)| *g) {
+            Ok(_) => {
+                return Err(SclParseError::at(
+                    val.span,
+                    format!("{path}/Val"),
+                    ErrorKind::SemanticConflict {
+                        detail: format!("two values of this DAI name setting group {group}"),
+                    },
+                )
+                .with_attribute("sGroup"));
+            }
+            Err(at) => sgroup_values.insert(at, (group, parsed)),
+        }
+    }
+    if !sgroup_values.is_empty() && num_of_sgs.is_none() {
+        tracing::warn!(
+            path,
+            "the DAI names setting groups but the logical device has no SettingControl"
+        );
+    }
+    let plain = dai.values.iter().find(|v| v.s_group.is_none());
+    let val = match plain {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                path,
+                "every `<Val>` of this DAI carries a setting group; its value starts at the first one"
+            );
+            &dai.values[0]
+        }
+    };
+    let value = parse_val_for_b_type(val, b_type, type_ref, dtt, val.span, path)?;
+    Ok((value, sgroup_values))
 }
 
 /// Reports whether an `<SDI>` or `<DAI>` addresses an array element, through
@@ -1258,79 +1379,58 @@ pub fn skip_indexed_instance(inst: &RawDataInstance) -> bool {
     }
 }
 
-/// Finds the leaf data attribute that an instance path names below a logical
-/// node: `do_name` names the data object, and each name of `path` names a
-/// sub-object, a data attribute or a nested attribute below the previous
-/// node, the last one being the leaf.
+/// Calls `apply` on every data attribute that an instance path names below a
+/// logical node: `do_name` names the data object, and each name of `path`
+/// names a sub-object, a data attribute or a nested attribute below the
+/// previous node, the last one being the target.
 ///
-/// Returns `None` when a name does not resolve or the path ends at a data
-/// object. The code a build script generates applies its `<DAI>` values
-/// through this lookup, so a value under a sub-object or a constructed
-/// attribute lands where the runtime path writes it.
+/// The name of the first data attribute on the path reaches every data
+/// attribute of that name below its data object, so the FC=SE and FC=SG
+/// attributes of one setting both take the value. Nothing is called when a
+/// name does not resolve or the path ends at a data object. The code a build
+/// script generates applies its `<DAI>` values through this walk, so a value
+/// lands where the runtime path writes it.
 #[doc(hidden)]
-pub fn instance_target<'a>(
-    ln: &'a iec61850_model::LogicalNode,
+pub fn apply_to_instance(
+    ln: &mut iec61850_model::LogicalNode,
     do_name: &str,
     path: &[&str],
-) -> Option<&'a DataAttribute> {
-    let mut dobj = ln.do_by_name(do_name)?;
-    let mut da: Option<&DataAttribute> = None;
-    for name in path {
-        da = Some(match da {
-            None => match dobj.child_by_name(name, None)? {
-                iec61850_model::tree::DoChild::SubDo(s) => {
-                    dobj = s;
-                    continue;
-                }
-                iec61850_model::tree::DoChild::Da(a) => a,
-            },
-            Some(a) => a.child_by_name(name)?,
-        });
+    mut apply: impl FnMut(&mut DataAttribute),
+) {
+    let Some(mut dobj) = ln.dos.iter_mut().find(|d| d.name == do_name) else {
+        return;
+    };
+    for (i, name) in path.iter().enumerate() {
+        let sub_object = dobj
+            .children
+            .iter()
+            .position(|c| matches!(c, DoChild::SubDo(sd) if sd.name == *name));
+        if let Some(at) = sub_object {
+            dobj = match &mut dobj.children[at] {
+                DoChild::SubDo(sd) => sd,
+                DoChild::Da(_) => return,
+            };
+            continue;
+        }
+        let rest = &path[i + 1..];
+        for da in attributes_named(dobj, name) {
+            if let Some(target) = descend_attribute(da, rest) {
+                apply(target);
+            }
+        }
+        return;
     }
-    da
 }
 
-/// Finds, as [`instance_target`] does, the leaf that an instance path names,
-/// except that the data attribute named right below the data object, or below
-/// its sub-objects, is the one under FC=SG.
-///
-/// The code a build script generates applies the `<DAI>` values of an FC=SE
-/// attribute through this lookup to its FC=SG view as well.
-#[doc(hidden)]
-pub fn setting_view_target<'a>(
-    ln: &'a iec61850_model::LogicalNode,
-    do_name: &str,
+/// Follows `path` through the sub-attributes of `da`.
+fn descend_attribute<'a>(
+    mut da: &'a mut DataAttribute,
     path: &[&str],
-) -> Option<&'a DataAttribute> {
-    let mut dobj = ln.do_by_name(do_name)?;
-    let mut da: Option<&DataAttribute> = None;
+) -> Option<&'a mut DataAttribute> {
     for name in path {
-        da = Some(match da {
-            None => match dobj.child_by_name(name, None)? {
-                iec61850_model::tree::DoChild::SubDo(s) => {
-                    dobj = s;
-                    continue;
-                }
-                iec61850_model::tree::DoChild::Da(_) => setting_view_of(dobj, name)?,
-            },
-            Some(a) => a.child_by_name(name)?,
-        });
+        da = da.children.iter_mut().find(|c| c.name == *name)?;
     }
-    da
-}
-
-/// Picks the value to apply out of several `<Val>` elements: the one without a
-/// setting group, or the first one with a warning.
-///
-/// Also used by the build-script path through [`crate::__build_internals`], so
-/// a DAI string is parsed once while the build script runs and emitted as a
-/// literal, leaving no string parsing in the user's run time.
-pub fn pick_val_for_no_sgroup(values: &[RawVal]) -> &RawVal {
-    if let Some(v) = values.iter().find(|v| v.s_group.is_none()) {
-        return v;
-    }
-    tracing::warn!("every `<Val>` of this DAI carries a setting group; applying the first one");
-    &values[0]
+    Some(da)
 }
 
 /// Parses an SCL `<Val>` string into an [`MmsValue`], according to the target

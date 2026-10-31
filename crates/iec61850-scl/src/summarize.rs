@@ -187,9 +187,13 @@ fn write_da(out: &mut String, da: &DataAttribute, indent: usize) {
     let pad = " ".repeat(indent);
     // Snapshot the value behind the lock, then render it canonically.
     let snapshot = da.snapshot();
+    let mut sgroups = String::new();
+    for (group, value) in &da.sgroup_values {
+        let _ = write!(sgroups, " sg{group}={}", canonical_value(value));
+    }
     let _ = writeln!(
         out,
-        "{pad}DA name={} fc={} ty={} trg=0x{:02x} val={}",
+        "{pad}DA name={} fc={} ty={} trg=0x{:02x} val={}{sgroups}",
         da.name,
         da.fc.as_str(),
         da.ty.type_name(),

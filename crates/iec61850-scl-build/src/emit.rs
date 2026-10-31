@@ -28,9 +28,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__build_internals::{
-    attribute_type, derives_setting_view, fcda_do_path, gse_control_go_id, ld_domain_name,
-    parse_fc, parse_val_for_b_type, pick_val_for_no_sgroup, report_instances,
-    skip_indexed_instance, template_initial_value, warn_count_not_modeled, MmsValue,
+    attribute_type, dai_values, derives_setting_view, fcda_do_path, gse_control_go_id,
+    ld_domain_name, ld_num_of_sgs, parse_fc, report_instances, skip_indexed_instance,
+    template_initial_value, warn_count_not_modeled, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef,
@@ -157,7 +157,7 @@ fn emit_ied_fn(
         /// Generated IED model.
         // Outer `#[allow]`: the function reaches the user crate through
         // `include!()`, which rejects inner attributes.
-        #[allow(non_snake_case, clippy::all, dead_code)]
+        #[allow(non_snake_case, clippy::all, dead_code, unused_mut)]
         pub fn #fn_name() -> IedModel {
             let mut __m = IedModelBuilder::new(#ied_name_lit);
             #(
@@ -214,9 +214,10 @@ fn emit_ld_expr(
         });
     }
 
+    let num_of_sgs = ld_num_of_sgs(ld);
     let ln_exprs = lns
         .iter()
-        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, cfg))
+        .map(|ln| emit_ln_expr(ln, dtt, &ld.inst, &domain, num_of_sgs, cfg))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(quote! {
@@ -242,6 +243,7 @@ fn emit_ln_expr(
     dtt: &DataTypeTemplates,
     ld_inst: &str,
     domain: &str,
+    num_of_sgs: Option<u32>,
     cfg: &CompileBuilder,
 ) -> Result<TokenStream, CompileError> {
     let prefix_lit = ln.prefix.as_deref().unwrap_or("");
@@ -300,8 +302,8 @@ fn emit_ln_expr(
         None => None,
     };
 
-    // DOI overrides mutate the `Arc<RwLock<MmsValue>>` after `ln.build()`.
-    let override_stmts = emit_doi_overrides(ln, dtt, ld_inst)?;
+    // DOI overrides are applied to the logical node after `ln.build()`.
+    let override_stmts = emit_doi_overrides(ln, dtt, ld_inst, num_of_sgs)?;
 
     Ok(quote! {
         {
@@ -313,7 +315,7 @@ fn emit_ln_expr(
             #( __ln = __ln.add_svcb(#svcb_exprs); )*
             #( __ln = __ln.add_lcb(#lcb_exprs); )*
             #sgcb_apply
-            let __ln = __ln.build().expect("codegen: LogicalNodeBuilder::build failed");
+            let mut __ln = __ln.build().expect("codegen: LogicalNodeBuilder::build failed");
             #( #override_stmts )*
             __ln
         }
@@ -762,37 +764,38 @@ fn emit_sgcb_expr(
 // 7. DOI / SDI / DAI overrides
 // -----------------------------------------------------------------------------
 
-/// One `<DAI>` value: the path from the logical node, the data object name
-/// first, and the parsed value.
+/// One `<DAI>`: the path from the logical node, the data object name first,
+/// the parsed value, and the parsed value of each setting group.
 #[derive(Debug, Clone, PartialEq)]
 struct DaiOverride {
     path: Vec<String>,
     value: MmsValue,
-    /// Whether the value also goes to the FC=SG view of the attribute.
-    setting_view: bool,
+    sgroup_values: Vec<(u8, MmsValue)>,
 }
 
 /// Emits the statements that apply every DAI value under `RawLogicalNode.doi`
 /// to the built logical node `__ln`.
 ///
 /// DAI strings are parsed while the build script runs, through the runtime
-/// `parse_val_for_b_type` helper, and the result is emitted as a literal by
+/// `dai_values` helper, and the result is emitted as a literal by
 /// `emit_mms_value`, so the user's run time performs no string parsing. Each
-/// statement finds its attribute through `__rt::instance_target`, which walks
-/// sub-objects, data attributes and nested attributes alike; a path that does
-/// not resolve is skipped, as on the runtime path.
+/// statement reaches its attributes through `apply_to_instance`, which walks
+/// sub-objects, data attributes and nested attributes alike and reaches both
+/// attributes of an FC=SE and FC=SG setting; a path that does not resolve is
+/// skipped, as on the runtime path.
 fn emit_doi_overrides(
     ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
+    num_of_sgs: Option<u32>,
 ) -> Result<Vec<TokenStream>, CompileError> {
-    Ok(collect_doi_overrides(ln, dtt, ld_inst)?
+    Ok(collect_doi_overrides(ln, dtt, ld_inst, num_of_sgs)?
         .iter()
         .map(emit_dai_override)
         .collect())
 }
 
-/// Emits the lookup and the write of one DAI value.
+/// Emits the write of one DAI value into every attribute its path reaches.
 fn emit_dai_override(o: &DaiOverride) -> TokenStream {
     let (do_name, rest) = match o.path.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
@@ -800,26 +803,23 @@ fn emit_dai_override(o: &DaiOverride) -> TokenStream {
     };
     let names: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     let value_tok = emit_mms_value(&o.value);
-    let assign = |lookup: TokenStream| {
+    let sgroups = (!o.sgroup_values.is_empty()).then(|| {
+        let groups = o.sgroup_values.iter().map(|(g, _)| *g);
+        let values = o.sgroup_values.iter().map(|(_, v)| emit_mms_value(v));
         quote! {
-            if let ::std::option::Option::Some(__da) =
-                ::iec61850_scl::__rt::#lookup(&__ln, #do_name, &[ #( #names ),* ])
-            {
-                *__da
-                    .value
-                    .write()
-                    .expect("codegen: MmsValue lock poisoned during DAI override")
-                    = #value_tok;
-            }
+            __da.sgroup_values = ::std::vec![ #( (#groups, #values) ),* ];
         }
-    };
-    let primary = assign(quote! { instance_target });
-    let view = o
-        .setting_view
-        .then(|| assign(quote! { setting_view_target }));
+    });
     quote! {
-        #primary
-        #view
+        ::iec61850_scl::__rt::apply_to_instance(
+            &mut __ln,
+            #do_name,
+            &[ #( #names ),* ],
+            |__da| {
+                __da.store(#value_tok);
+                #sgroups
+            },
+        );
     }
 }
 
@@ -832,6 +832,7 @@ fn collect_doi_overrides(
     ln: &RawLogicalNode,
     dtt: &DataTypeTemplates,
     ld_inst: &str,
+    num_of_sgs: Option<u32>,
 ) -> Result<Vec<DaiOverride>, CompileError> {
     let lnt = dtt.ln_node_types.get(&ln.ln_type_ref).ok_or_else(|| {
         CompileError::Emit(format!(
@@ -867,10 +868,11 @@ fn collect_doi_overrides(
         // path_segments is the path from the logical node down to the data
         // attribute: the DO name first, then the SDI and DAI names.
         let mut base_path: Vec<String> = vec![raw_doi.name.clone()];
+        let ctx = EmitContext { dtt, num_of_sgs };
         emit_instances_at_do(
             &raw_doi.children,
             dot,
-            dtt,
+            &ctx,
             &path_prefix,
             &mut base_path,
             &mut out,
@@ -878,6 +880,13 @@ fn collect_doi_overrides(
     }
 
     Ok(out)
+}
+
+/// What the instance walk carries down: the type tables and the setting group
+/// count of the logical device.
+struct EmitContext<'a> {
+    dtt: &'a DataTypeTemplates,
+    num_of_sgs: Option<u32>,
 }
 
 /// Flattens the SDI and DAI children of a DOType or DAType container into emit
@@ -889,7 +898,7 @@ fn collect_doi_overrides(
 fn emit_instances_at_do(
     children: &[RawDataInstance],
     dot: &RawDoType,
-    dtt: &DataTypeTemplates,
+    ctx: &EmitContext<'_>,
     parent_path: &str,
     base_path: &mut Vec<String>,
     out: &mut Vec<DaiOverride>,
@@ -900,7 +909,7 @@ fn emit_instances_at_do(
         }
         match inst {
             RawDataInstance::Sdi(sdi) => {
-                handle_sdi_at_do(sdi, dot, dtt, parent_path, base_path, out)?;
+                handle_sdi_at_do(sdi, dot, ctx, parent_path, base_path, out)?;
             }
             RawDataInstance::Dai(dai) => {
                 let da_def = match dot.das().find(|d| d.name == dai.name) {
@@ -917,19 +926,15 @@ fn emit_instances_at_do(
                 };
                 let path = format!("{}/DAI[name=\"{}\"]", parent_path, dai.name);
                 base_path.push(dai.name.clone());
-                let first = out.len();
                 emit_dai_assignment(
                     dai,
                     da_def.b_type.as_str(),
                     da_def.type_ref.as_deref(),
-                    dtt,
+                    ctx,
                     &path,
                     base_path,
                     out,
                 )?;
-                if derives_setting_view(da_def, dot) {
-                    mark_setting_view(&mut out[first..]);
-                }
                 base_path.pop();
             }
         }
@@ -937,24 +942,17 @@ fn emit_instances_at_do(
     Ok(())
 }
 
-/// Marks overrides that also apply to the FC=SG view of their attribute.
-fn mark_setting_view(overrides: &mut [DaiOverride]) {
-    for o in overrides {
-        o.setting_view = true;
-    }
-}
-
 fn handle_sdi_at_do(
     sdi: &RawSdi,
     dot: &RawDoType,
-    dtt: &DataTypeTemplates,
+    ctx: &EmitContext<'_>,
     parent_path: &str,
     base_path: &mut Vec<String>,
     out: &mut Vec<DaiOverride>,
 ) -> Result<(), CompileError> {
     // Two possibilities: a sub-DO, or a constructed DA with bType=Struct.
     if let Some(sdo) = dot.sdos().find(|s| s.name == sdi.name) {
-        let sub_dot = dtt.do_types.get(&sdo.do_type_ref).ok_or_else(|| {
+        let sub_dot = ctx.dtt.do_types.get(&sdo.do_type_ref).ok_or_else(|| {
             CompileError::Emit(format!(
                 "SDO type_ref `{}` is absent from do_types; the resolve stage should have rejected it",
                 sdo.do_type_ref
@@ -962,7 +960,7 @@ fn handle_sdi_at_do(
         })?;
         let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
         base_path.push(sdi.name.clone());
-        emit_instances_at_do(&sdi.children, sub_dot, dtt, &path, base_path, out)?;
+        emit_instances_at_do(&sdi.children, sub_dot, ctx, &path, base_path, out)?;
         base_path.pop();
     } else if let Some(da_def) = dot.das().find(|d| d.name == sdi.name) {
         if da_def.b_type != "Struct" {
@@ -980,7 +978,7 @@ fn handle_sdi_at_do(
                 da_def.name
             ))
         })?;
-        let dat = dtt.da_types.get(type_id).ok_or_else(|| {
+        let dat = ctx.dtt.da_types.get(type_id).ok_or_else(|| {
             CompileError::Emit(format!(
                 "DA type_ref `{}` is absent from da_types; the resolve stage should have rejected it",
                 type_id
@@ -988,11 +986,7 @@ fn handle_sdi_at_do(
         })?;
         let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
         base_path.push(sdi.name.clone());
-        let first = out.len();
-        emit_instances_at_da(&sdi.children, dat, dtt, &path, base_path, out)?;
-        if derives_setting_view(da_def, dot) {
-            mark_setting_view(&mut out[first..]);
-        }
+        emit_instances_at_da(&sdi.children, dat, ctx, &path, base_path, out)?;
         base_path.pop();
     } else {
         tracing::warn!(
@@ -1008,7 +1002,7 @@ fn handle_sdi_at_do(
 fn emit_instances_at_da(
     children: &[RawDataInstance],
     dat: &RawDaType,
-    dtt: &DataTypeTemplates,
+    ctx: &EmitContext<'_>,
     parent_path: &str,
     base_path: &mut Vec<String>,
     out: &mut Vec<DaiOverride>,
@@ -1046,7 +1040,7 @@ fn emit_instances_at_da(
                         bda_def.name
                     ))
                 })?;
-                let sub_dat = dtt.da_types.get(type_id).ok_or_else(|| {
+                let sub_dat = ctx.dtt.da_types.get(type_id).ok_or_else(|| {
                     CompileError::Emit(format!(
                         "BDA type_ref `{}` is absent from da_types; the resolve stage should have rejected it",
                         type_id
@@ -1054,7 +1048,7 @@ fn emit_instances_at_da(
                 })?;
                 let path = format!("{}/SDI[name=\"{}\"]", parent_path, sdi.name);
                 base_path.push(sdi.name.clone());
-                emit_instances_at_da(&sdi.children, sub_dat, dtt, &path, base_path, out)?;
+                emit_instances_at_da(&sdi.children, sub_dat, ctx, &path, base_path, out)?;
                 base_path.pop();
             }
             RawDataInstance::Dai(dai) => {
@@ -1076,7 +1070,7 @@ fn emit_instances_at_da(
                     dai,
                     bda_def.b_type.as_str(),
                     bda_def.type_ref.as_deref(),
-                    dtt,
+                    ctx,
                     &path,
                     base_path,
                     out,
@@ -1094,7 +1088,7 @@ fn emit_dai_assignment(
     dai: &RawDai,
     b_type: &str,
     type_ref: Option<&str>,
-    dtt: &DataTypeTemplates,
+    ctx: &EmitContext<'_>,
     path: &str,
     base_path: &[String],
     out: &mut Vec<DaiOverride>,
@@ -1110,11 +1104,10 @@ fn emit_dai_assignment(
             path
         )));
     }
-    let val = pick_val_for_no_sgroup(&dai.values);
-    let parsed: MmsValue = parse_val_for_b_type(val, b_type, type_ref, dtt, dai.span, path)
+    let (value, sgroup_values) = dai_values(dai, b_type, type_ref, ctx.dtt, ctx.num_of_sgs, path)
         .map_err(|e| {
-            CompileError::Emit(format!("failed to parse the DAI value at {}: {}", path, e))
-        })?;
+        CompileError::Emit(format!("failed to parse the DAI value at {}: {}", path, e))
+    })?;
     if base_path.is_empty() {
         return Err(CompileError::Emit(format!(
             "{}: the DAI override path is empty",
@@ -1123,8 +1116,8 @@ fn emit_dai_assignment(
     }
     out.push(DaiOverride {
         path: base_path.to_vec(),
-        value: parsed,
-        setting_view: false,
+        value,
+        sgroup_values,
     });
     Ok(())
 }
@@ -1506,7 +1499,7 @@ mod tests {
   </DataTypeTemplates>
 </SCL>"#;
         let resolved = parse_scl(xml).unwrap().resolve().unwrap();
-        let runtime = resolved.build_model("IED1").unwrap();
+        let mut runtime = resolved.build_model("IED1").unwrap();
         let raw = resolved.raw();
         let ld = &raw.ieds[0].access_points[0]
             .server
@@ -1518,7 +1511,8 @@ mod tests {
             .iter()
             .find(|l| l.ln_class == "GGIO")
             .unwrap();
-        let overrides = collect_doi_overrides(raw_ln, &raw.data_type_templates, "LD0").unwrap();
+        let overrides =
+            collect_doi_overrides(raw_ln, &raw.data_type_templates, "LD0", None).unwrap();
         let paths: Vec<String> = overrides.iter().map(|o| o.path.join(".")).collect();
         assert_eq!(
             paths,
@@ -1530,18 +1524,27 @@ mod tests {
                 "Har.phsA.db",
             ]
         );
-        let ln = runtime
-            .ld_by_inst("LD0")
-            .unwrap()
-            .ln_by_name("GGIO3")
+        let ln = runtime.lds[0]
+            .lns
+            .iter_mut()
+            .find(|ln| ln.class == "GGIO")
             .unwrap();
         let emitted = emit_file(&resolved, &cfg()).unwrap().to_string();
         for o in &overrides {
             let names: Vec<&str> = o.path[1..].iter().map(|s| s.as_str()).collect();
-            let da = iec61850_scl::__rt::instance_target(ln, &o.path[0], &names)
-                .unwrap_or_else(|| panic!("{:?} does not resolve", o.path));
-            assert_eq!(da.snapshot(), o.value, "{:?}", o.path);
-            assert_ne!(da.snapshot(), MmsValue::default_for(da.ty), "{:?}", o.path);
+            let mut held = Vec::new();
+            iec61850_scl::__rt::apply_to_instance(ln, &o.path[0], &names, |da| {
+                held.push((da.snapshot(), MmsValue::default_for(da.ty)));
+            });
+            assert_eq!(
+                held.len(),
+                1,
+                "{:?} does not resolve to one attribute",
+                o.path
+            );
+            let (value, default) = &held[0];
+            assert_eq!(value, &o.value, "{:?}", o.path);
+            assert_ne!(value, default, "{:?}", o.path);
             assert!(
                 emitted.contains(&emit_dai_override(o).to_string()),
                 "{:?} is not emitted",

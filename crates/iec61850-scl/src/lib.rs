@@ -85,7 +85,7 @@ pub mod __rt {
     pub use iec61850_model::types::{DataAttributeType, TrgOps};
     pub use iec61850_model::value::MmsValue;
 
-    pub use crate::build_model::{instance_target, setting_view, setting_view_target};
+    pub use crate::build_model::{apply_to_instance, setting_view};
 }
 
 /// Codegen-only helper re-exports, giving a build script the same lookup
@@ -97,10 +97,11 @@ pub mod __rt {
 #[doc(hidden)]
 pub mod __build_internals {
     pub use crate::build_model::{
-        attribute_type, b_type_to_dat, derives_setting_view, fcda_do_path, gse_control_go_id,
-        ld_domain_name, log_trg_ops_to_model, opt_fields_to_model, parse_fc, parse_val_for_b_type,
-        pick_val_for_no_sgroup, report_instances, report_trg_ops_to_model, skip_indexed_instance,
-        template_initial_value, trg_ops_to_model, warn_count_not_modeled,
+        attribute_type, b_type_to_dat, dai_values, derives_setting_view, fcda_do_path,
+        gse_control_go_id, ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model,
+        opt_fields_to_model, parse_fc, parse_val_for_b_type, report_instances,
+        report_trg_ops_to_model, skip_indexed_instance, template_initial_value, trg_ops_to_model,
+        warn_count_not_modeled,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};

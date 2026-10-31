@@ -1,7 +1,8 @@
 //! The model `build.rs` generates from `scl/schema.icd` matches the one the
 //! runtime path builds from the same file: the member order of data objects
 //! whose DOType interleaves sub-objects and attributes, the basic types of
-//! IEC 61850-6 §9.5.4.2, and the report and log control block schema.
+//! IEC 61850-6 §9.5.4.2, the report and log control block schema, and the
+//! setting group values of settings declared under FC=SE, FC=SG or both.
 
 // The generated file brings `DataObject`, `DoChild`, `IedModel` and
 // `DataAttributeType` into scope.
@@ -70,4 +71,31 @@ fn generated_control_blocks_carry_the_schema() {
     assert!(lcb.log_ena);
     assert!(!lcb.reason_code);
     assert_eq!(lcb.intg_pd_ms, 2000);
+}
+
+#[test]
+fn generated_settings_carry_every_group_value() {
+    let generated = build_Schema_model();
+    let ln = generated.lds[0].ln_by_name("PTOC1").expect("PTOC1");
+    let setting = |do_name: &str, name: &str, fc: FC| match ln
+        .do_by_name(do_name)
+        .expect("data object")
+        .child_by_name(name, Some(fc))
+    {
+        Some(iec61850_scl::__rt::DoChild::Da(da)) => da,
+        other => panic!("{do_name}.{name}[{fc}]: {other:?}"),
+    };
+    for fc in [FC::Se, FC::Sg] {
+        let op = setting("OpDlTmms", "setVal", fc);
+        assert_eq!(op.snapshot(), MmsValue::Integer(100), "{fc}");
+        assert_eq!(op.sgroup_values, [(2, MmsValue::Integer(200))], "{fc}");
+        let f = setting("StrVal", "setMag", fc)
+            .child_by_name("f")
+            .expect("f");
+        assert_eq!(
+            f.sgroup_values,
+            [(1, MmsValue::Float32(1.5)), (2, MmsValue::Float32(2.5))],
+            "{fc}"
+        );
+    }
 }
