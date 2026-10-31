@@ -7,10 +7,7 @@
 //! object; handlers are held as `Arc<dyn Trait>`. A select timeout is driven by a
 //! timer task rather than polled from a main loop.
 
-use super::handler::{
-    CheckHandler, ControlHandler, SelectStateChangedHandler, SelectStateChangedReason,
-    WaitForExecutionHandler,
-};
+use super::handler::{SelectStateChangedHandler, SelectStateChangedReason};
 use super::model::{
     ControlAction, ControlAddCause, ControlModel, OperParams, OriginValue, SboClass,
 };
@@ -153,17 +150,6 @@ pub struct ControlObject {
     /// Time limit of an executing command in milliseconds, 0 for none.
     oper_timeout_ms: Arc<AtomicU32>,
 
-    // Application handlers.
-    /// Static check handler stored by `set_check_handler`. The control services
-    /// do not consult it; they call the handlers of the `ControlObjectEntry`.
-    pub check_handler: Arc<Mutex<Option<Arc<dyn CheckHandler>>>>,
-    /// Dynamic check handler stored by `set_wait_for_exec_handler`. The control
-    /// services do not consult it; they call the handlers of the
-    /// `ControlObjectEntry`.
-    pub wait_for_exec_handler: Arc<Mutex<Option<Arc<dyn WaitForExecutionHandler>>>>,
-    /// Control handler stored by `set_operate_handler`. The control services do
-    /// not consult it; they call the handlers of the `ControlObjectEntry`.
-    pub operate_handler: Arc<Mutex<Option<Arc<dyn ControlHandler>>>>,
     /// Selection change handler, installed by `set_select_state_handler`.
     pub select_state_handler: Arc<Mutex<Option<Arc<dyn SelectStateChangedHandler>>>>,
 }
@@ -185,9 +171,6 @@ impl ControlObject {
             config: Arc::new(config),
             inner: Arc::new(Mutex::new(ControlObjectInner::new())),
             oper_timeout_ms: Arc::new(AtomicU32::new(0)),
-            check_handler: Arc::new(Mutex::new(None)),
-            wait_for_exec_handler: Arc::new(Mutex::new(None)),
-            operate_handler: Arc::new(Mutex::new(None)),
             select_state_handler: Arc::new(Mutex::new(None)),
         }
     }
@@ -217,52 +200,6 @@ impl ControlObject {
     /// of this handle shares the setting.
     pub fn set_oper_timeout_ms(&self, timeout_ms: u32) {
         self.oper_timeout_ms.store(timeout_ms, Ordering::Relaxed);
-    }
-
-    /// Stores a check handler on the object, which has no effect.
-    ///
-    /// The control services do not call it. Install the handler on the
-    /// `ControlObjectEntry` with `with_check` instead. The first call logs a
-    /// warning.
-    pub fn set_check_handler(&self, h: Arc<dyn CheckHandler>) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("ControlObject::set_check_handler has no effect; install the handler with ControlObjectEntry::with_check")
-        });
-        if let Ok(mut g) = self.check_handler.lock() {
-            *g = Some(h);
-        }
-    }
-
-    /// Stores a wait-for-execution handler on the object, which has no effect.
-    ///
-    /// The control services do not call it. Install the handler on the
-    /// `ControlObjectEntry` with `with_wait` instead. The first call logs a
-    /// warning.
-    pub fn set_wait_for_exec_handler(&self, h: Arc<dyn WaitForExecutionHandler>) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("ControlObject::set_wait_for_exec_handler has no effect; install the handler with ControlObjectEntry::with_wait")
-        });
-        if let Ok(mut g) = self.wait_for_exec_handler.lock() {
-            *g = Some(h);
-        }
-    }
-
-    /// Stores a control handler on the object, which has no effect.
-    ///
-    /// The control services do not call it. Install the handler on the
-    /// `ControlObjectEntry` with `with_operate` instead; an object whose entry
-    /// has no control handler refuses every Operate with `NotSupported`. The
-    /// first call logs a warning.
-    pub fn set_operate_handler(&self, h: Arc<dyn ControlHandler>) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("ControlObject::set_operate_handler has no effect; install the handler with ControlObjectEntry::with_operate")
-        });
-        if let Ok(mut g) = self.operate_handler.lock() {
-            *g = Some(h);
-        }
     }
 
     /// Installs the select state changed handler.

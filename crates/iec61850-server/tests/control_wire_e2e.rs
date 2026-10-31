@@ -776,14 +776,15 @@ async fn an_object_the_model_does_not_declare_is_checked_against_the_service_str
     h.stop().await;
 }
 
-// ── Handlers installed on the object ────────────────────────────────────────
+// ── An object without a control handler ────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn object_without_a_control_handler_refuses_operate_with_not_supported() {
     let s = server();
-    let obj = object("SPCSO1", ControlModel::DirectNormal);
-    obj.set_operate_handler(Arc::new(AlwaysSuccessOperateHandler));
-    s.control_objects().register(ControlObjectEntry::new(obj));
+    s.control_objects().register(ControlObjectEntry::new(object(
+        "SPCSO1",
+        ControlModel::DirectNormal,
+    )));
     let h = start(&s).await;
     let mut a = connect(&h).await;
 

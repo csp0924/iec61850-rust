@@ -15,13 +15,11 @@ use iec61850_model::MmsValue;
 
 /// Additional cause reported for a control request.
 ///
-/// A callback sets it, and it is carried in the LastApplError data attribute. The
-/// discriminants are the wire integers of IEC 61850-7-2 and must not be
-/// renumbered.
+/// A handler returns it to refuse or fail a command, and it is carried in the
+/// LastApplError data attribute. The discriminants are the wire integers of
+/// IEC 61850-7-2 and must not be renumbered.
 ///
-/// `Unknown = 0` is the default a control action starts with. `None = 25` means
-/// "no additional cause", which a callback sets explicitly once an operation has
-/// succeeded.
+/// `Unknown = 0` is the default. `None = 25` means "no additional cause".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 #[non_exhaustive]
@@ -236,10 +234,6 @@ pub struct ControlAction {
     /// Activation time in milliseconds for a time-activated command; 0 when the
     /// command is not time-activated.
     ctl_time_ms: u64,
-    /// Additional cause, set by a callback.
-    add_cause: ControlAddCause,
-    /// Error code, set by a callback.
-    error_code: ControlLastApplError,
     /// Connection that issued this control request, or 0 when there is none. Used
     /// when assembling LastApplError and CommandTermination.
     #[allow(dead_code)]
@@ -269,9 +263,6 @@ impl ControlAction {
             interlock_check,
             is_select,
             ctl_time_ms,
-            // Unknown is the initial add cause.
-            add_cause: ControlAddCause::Unknown,
-            error_code: ControlLastApplError::NoError,
             conn_id,
         }
     }
@@ -315,43 +306,6 @@ impl ControlAction {
     /// time-activated.
     pub fn ctl_time_ms(&self) -> u64 {
         self.ctl_time_ms
-    }
-
-    /// Records an additional cause on the action, which has no effect.
-    ///
-    /// The value is not reported to the client. A handler receives
-    /// `&ControlAction` and reports its cause through the `ControlAddCause` it
-    /// returns. The first call logs a warning.
-    pub fn set_add_cause(&mut self, cause: ControlAddCause) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("ControlAction::set_add_cause has no effect; a handler reports its cause through the ControlAddCause it returns")
-        });
-        self.add_cause = cause;
-    }
-
-    /// Records an error code on the action, which has no effect.
-    ///
-    /// The value is not reported to the client, whose LastApplError the server
-    /// assembles. The first call logs a warning.
-    pub fn set_error(&mut self, error: ControlLastApplError) {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!("ControlAction::set_error has no effect; the LastApplError a client receives is assembled by the server")
-        });
-        self.error_code = error;
-    }
-
-    /// Returns the additional cause, for assembling LastApplError.
-    #[allow(dead_code)]
-    pub(crate) fn add_cause(&self) -> ControlAddCause {
-        self.add_cause
-    }
-
-    /// Returns the error code, for assembling LastApplError.
-    #[allow(dead_code)]
-    pub(crate) fn error_code(&self) -> ControlLastApplError {
-        self.error_code
     }
 }
 
@@ -717,25 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn control_action_new_defaults_add_cause_unknown() {
-        // A control action starts at Unknown(0), not None(25).
-        let action = ControlAction::new(
-            1,
-            OriginValue::default(),
-            [0u8; 8],
-            false,
-            false,
-            false,
-            false,
-            0,
-            0,
-        );
-        assert_eq!(action.add_cause(), ControlAddCause::Unknown);
-        assert_eq!(action.add_cause() as i32, 0);
-        assert_eq!(action.error_code(), ControlLastApplError::NoError);
-    }
-
-    #[test]
     fn control_add_cause_wire_values_match_iec61850() {
         // The wire integers of IEC 61850-7-2 must not drift.
         // Regression test for Diff #1 in docs/protocol-map/control/regressions.md
@@ -773,8 +708,8 @@ mod tests {
     }
 
     #[test]
-    fn control_action_set_add_cause() {
-        let mut action = ControlAction::new(
+    fn control_action_accessors() {
+        let action = ControlAction::new(
             2,
             OriginValue::default(),
             [0u8; 8],
@@ -785,11 +720,11 @@ mod tests {
             0,
             42,
         );
-        action.set_add_cause(ControlAddCause::BlockedByInterlocking);
-        assert_eq!(action.add_cause(), ControlAddCause::BlockedByInterlocking);
         assert_eq!(action.ctl_num(), 2);
         assert!(action.test());
         assert!(action.interlock_check());
+        assert!(!action.synchro_check());
+        assert!(!action.is_select());
     }
 
     fn six_element_oper(ctl_num: MmsValue, t: MmsValue, check: MmsValue) -> MmsValue {
