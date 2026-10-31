@@ -115,9 +115,7 @@ fn register_lcb(
     enable: bool,
 ) {
     let lc = LogControl::new(format!("{DOM}/{LCB_ITEM}"), block).with_storage(storage);
-    if enable {
-        lc.set_log_ena(true).unwrap();
-    }
+    lc.set_log_ena(enable).unwrap();
     srv.register_log_control(DOM, LCB_ITEM, Arc::new(lc));
 }
 
@@ -377,10 +375,13 @@ async fn the_journal_a_logref_names_is_readable() {
         storage.clone(),
         true,
     );
-    // No LogRef configured: the default `<LD>/<LN>$GeneralLog` applies.
+    // No LogRef configured: the default `<LD>/<LN>$GeneralLog` applies. The
+    // block stays disabled, so its journal is readable and empty.
     let general = LogControl::new(
         format!("{DOM}/GGIO1$LG$gen"),
-        LogControlBlock::new("gen").with_dataset(DATA_SET),
+        LogControlBlock::new("gen")
+            .with_dataset(DATA_SET)
+            .with_default_enabled(false),
     )
     .with_storage(Arc::new(InMemoryLogStorage::new()));
     srv.register_log_control(DOM, "GGIO1$LG$gen", Arc::new(general));
@@ -461,6 +462,32 @@ async fn get_name_list_lists_the_journals_of_a_domain() {
         !variables.iter().any(|n| n == EVENT_LOG),
         "a journal is not a named variable"
     );
+    c.disconnect().await.ok();
+    h.stop().await;
+}
+
+/// A control block whose definition leaves LogEna at its default and names a
+/// data set is enabled once its storage is bound, and logs from the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_lcb_left_at_its_configured_log_ena_logs_from_the_start() {
+    let m = model();
+    let srv = server(m.clone());
+    register_data_set(&srv, &m);
+    let storage: Arc<dyn LogStorage> = Arc::new(InMemoryLogStorage::new());
+    let block = lcb(TriggerOptions::DATA_CHANGED);
+    assert!(block.default_enabled);
+    let lc = LogControl::new(format!("{DOM}/{LCB_ITEM}"), block).with_storage(storage.clone());
+    srv.register_log_control(DOM, LCB_ITEM, Arc::new(lc));
+    let h = srv.start().await.unwrap();
+
+    srv.update_boolean(ggio_da(&m, 0, 0), true).unwrap();
+
+    let mut c = client(h.bound_addr.port()).await;
+    let log_ena = c.read(DOM, &format!("{LCB_ITEM}$LogEna")).await.unwrap();
+    assert_eq!(log_ena, MmsData::Boolean(true));
+    let resp = read_all(&mut c, EVENT_LOG).await;
+    assert_eq!(resp.entries.len(), 1);
+    assert_eq!(resp.entries[0].variables[0].data_ref, ST_VAL_REF);
     c.disconnect().await.ok();
     h.stop().await;
 }

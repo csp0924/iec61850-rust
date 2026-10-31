@@ -319,16 +319,13 @@ async fn a_listed_log_control_block_is_readable() {
         other => panic!("expected a structure, got {other:?}"),
     }
 
-    // LogEna starts false: enabling is a separate write, and the control block
-    // is constructed disabled whatever its configured default.
+    // The block names a data set, has storage and leaves LogEna at its
+    // configured default, so it starts enabled.
     let log_ena = conn
         .read_boolean(&format!("{LCB_REF}.LogEna"), FC::Lg)
         .await
         .expect("LogEna must be readable");
-    assert!(
-        !log_ena,
-        "a freshly registered control block is not enabled"
-    );
+    assert!(log_ena, "the configured LogEna enables the control block");
 
     let dat_set = conn
         .read_string(&format!("{LCB_REF}.DatSet"), FC::Lg)

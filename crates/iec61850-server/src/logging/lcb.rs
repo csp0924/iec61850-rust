@@ -18,6 +18,9 @@
 //!         |   storage != None)                 |
 //!         +------------ → ENABLED              +-- → NOT_ENABLED
 //! ```
+//!
+//! A control block whose definition sets LogEna starts in ENABLED as soon as
+//! it has both a data set and a storage backend.
 
 use super::storage::{EntryId, LogEntryVisitor, LogStorage, LogStorageError};
 use crate::flags::TriggerOptions;
@@ -61,11 +64,12 @@ pub struct LogControlBlock {
     pub trg_ops: TriggerOptions,
     /// Integrity period, in milliseconds.
     pub intg_period_ms: u32,
-    /// Configured LogEna; defaults to true.
+    /// Configured LogEna; defaults to true, as the `logEna` attribute of an SCL
+    /// `LogControl` does.
     ///
-    /// The value has no effect today: `LogControl::new` starts every control block
-    /// disabled regardless, because enabling also requires a data set and a bound
-    /// storage backend.
+    /// When true, the runtime control block starts enabled once it has both a
+    /// data set and a storage backend, which `LogControl::with_storage`
+    /// completes; when false, it starts disabled until LogEna is written.
     pub default_enabled: bool,
     /// Whether an entry carries its reason code.
     pub include_reason_code: bool,
@@ -106,6 +110,12 @@ impl LogControlBlock {
     /// Sets the integrity period, in milliseconds.
     pub fn with_intg_pd_ms(mut self, ms: u32) -> Self {
         self.intg_period_ms = ms;
+        self
+    }
+
+    /// Sets the configured LogEna.
+    pub fn with_default_enabled(mut self, on: bool) -> Self {
+        self.default_enabled = on;
         self
     }
 }
@@ -154,18 +164,12 @@ pub struct LogControlState {
 }
 
 impl LogControl {
-    /// Creates a runtime control block with no storage bound; until one is bound a
-    /// trigger writes nothing and logs a warning.
+    /// Creates a runtime control block with no storage bound. It starts
+    /// disabled, since enabling requires a storage backend; `with_storage`
+    /// enables it when the definition sets LogEna and names a data set.
     pub fn new(mms_path: impl Into<String>, lcb: LogControlBlock) -> Self {
         let state = LogControlState {
-            log_ena: if lcb.default_enabled {
-                // A control block always starts disabled. Enabling requires both a
-                // data set and a storage backend, so `set_storage` comes first and
-                // `set_log_ena` after it.
-                LogState::NotEnabled
-            } else {
-                LogState::NotEnabled
-            },
+            log_ena: LogState::NotEnabled,
             log_ref: lcb.log_ref.clone(),
             data_set: lcb.dataset_name.clone(),
             trg_ops: lcb.trg_ops,
@@ -180,8 +184,20 @@ impl LogControl {
     }
 
     /// Binds the storage backend.
+    ///
+    /// A control block whose definition sets LogEna and that names a data set is
+    /// enabled here, as a server enables such a control block at start-up
+    /// (IEC 61850-7-2 LogEna; IEC 61850-6 `LogControl`).
     pub fn with_storage(mut self, storage: Arc<dyn LogStorage>) -> Self {
         self.storage = Some(storage);
+        let default_enabled = self.lcb.default_enabled;
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if default_enabled && state.data_set.is_some() {
+            state.log_ena = LogState::Enabled;
+        }
         self
     }
 
@@ -307,18 +323,45 @@ mod tests {
     use crate::logging::storage::{CollectingVisitor, InMemoryLogStorage};
     use iec61850_model::MmsValue;
 
+    /// A control block with a data set and storage whose definition clears
+    /// LogEna, so it starts disabled.
     fn make_lcb_with_storage() -> LogControl {
         let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
         let lcb = LogControlBlock::new("lcb01")
             .with_dataset("MMXU1$ds1")
             .with_log_ref("IED1LD0/MMXU1$GeneralLog")
-            .with_trg_ops(TriggerOptions::DATA_CHANGED);
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_default_enabled(false);
         LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb).with_storage(storage)
     }
 
     fn write_one(lc: &LogControl, time_ms: u64, value: MmsValue) -> Option<EntryId> {
         lc.write_entry(time_ms, &[("ref1".to_string(), value)], 0x02)
             .unwrap()
+    }
+
+    #[test]
+    fn configured_log_ena_enables_once_data_set_and_storage_are_bound() {
+        let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
+        let lcb = LogControlBlock::new("lcb01").with_dataset("MMXU1$ds1");
+        assert!(lcb.default_enabled, "LogEna defaults to true, as in SCL");
+        let lc = LogControl::new("IED1LD0/MMXU1$LG$lcb01", lcb);
+        assert!(!lc.is_enabled(), "no storage is bound yet");
+        let lc = lc.with_storage(storage);
+        assert!(lc.is_enabled());
+    }
+
+    #[test]
+    fn configured_log_ena_needs_a_data_set() {
+        let storage = Arc::new(InMemoryLogStorage::new()) as Arc<dyn LogStorage>;
+        let lc = LogControl::new("IED1LD0/MMXU1$LG$lcb01", LogControlBlock::new("lcb01"))
+            .with_storage(storage);
+        assert!(!lc.is_enabled());
+    }
+
+    #[test]
+    fn cleared_log_ena_starts_disabled() {
+        assert!(!make_lcb_with_storage().is_enabled());
     }
 
     #[test]

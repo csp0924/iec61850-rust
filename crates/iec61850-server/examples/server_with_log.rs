@@ -109,10 +109,6 @@ fn register_seeded_lcb(
         .with_dataset("LLN0$evlogds")
         .with_log_ref(lcb_path)
         .with_trg_ops(TriggerOptions::DATA_CHANGED);
-    let lc = LogControl::new(lcb_path, block).with_storage(storage.clone());
-    lc.set_log_ena(true)
-        .map_err(|e| format!("set_log_ena failed: {e}"))?;
-
     let data_ref = format!("{domain}/GGIO1$ST$Ind1$stVal");
     for i in 0..ENTRY_COUNT {
         let time_ms = BASE_TIME_MS + (i as u64) * TIME_STEP_MS;
@@ -124,6 +120,9 @@ fn register_seeded_lcb(
             REASON_DATA_CHANGE,
         )?;
     }
+    // The block names a data set and leaves LogEna at its default, so it is
+    // enabled as soon as its storage is bound.
+    let lc = LogControl::new(lcb_path, block).with_storage(storage);
 
     server.register_log_control(domain, LCB_ITEM, Arc::new(lc));
     Ok(())
