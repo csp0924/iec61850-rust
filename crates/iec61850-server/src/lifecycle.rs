@@ -1150,10 +1150,7 @@ where
             let echoed = echoed_oper(oper_value);
             let last_err = LastApplErrorRef {
                 ctl_obj: format!("{}/{}", domain_id, item_id),
-                error: crate::control::dispatch::termination_error_code(
-                    echoed.test,
-                    echoed.time_activated,
-                ) as i32,
+                error: crate::control::dispatch::termination_error_code(echoed.test) as i32,
                 origin: echoed.origin,
                 ctl_num: echoed.ctl_num,
                 add_cause: cause_to_i32(*add_cause),
@@ -1200,7 +1197,6 @@ struct EchoedOper {
     origin: OriginRef,
     ctl_num: u8,
     test: bool,
-    time_activated: bool,
 }
 
 /// Decodes the Oper structure a command termination echoes; a structure that
@@ -1221,7 +1217,6 @@ fn echoed_oper(oper_value: &[u8]) -> EchoedOper {
             },
             ctl_num: p.ctl_num,
             test: p.test,
-            time_activated: p.oper_tm_ms != 0,
         },
         None => {
             tracing::warn!("command termination: the echoed Oper structure did not decode");

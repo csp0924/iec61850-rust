@@ -213,7 +213,6 @@ mod tests {
             false,
             false,
             0,
-            0,
         )
     }
 

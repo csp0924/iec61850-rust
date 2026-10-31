@@ -486,17 +486,18 @@ pub(crate) fn last_appl_error_code(refusal: Refusal) -> ControlLastApplError {
 /// CommandTermination, which ends a command that failed after its Operate was
 /// answered positively.
 ///
-/// A failed test command, one whose `Test` is set, carries `Timeout Test Not
-/// OK` when it was time activated and `Operator Test Not OK` otherwise, per
-/// IEC 61850-8-1. Any other command carries `No Error`, since its failure is
-/// the outcome its add cause describes.
+/// A failed operate test command, one whose `Test` is set, carries `Operator
+/// Test Not OK`, per IEC 61850-8-1 §20.11. Any other command carries `No
+/// Error`, since its failure is the outcome its add cause describes. A
+/// time-activated command is never admitted, so `Timeout Test Not OK` does not
+/// occur.
 // Only the connection loop of the integrated server sends a CommandTermination.
 #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
-pub(crate) fn termination_error_code(test: bool, time_activated: bool) -> ControlLastApplError {
-    match (test, time_activated) {
-        (true, true) => ControlLastApplError::TimeoutTestNotOk,
-        (true, false) => ControlLastApplError::OperatorTestNotOk,
-        (false, _) => ControlLastApplError::NoError,
+pub(crate) fn termination_error_code(test: bool) -> ControlLastApplError {
+    if test {
+        ControlLastApplError::OperatorTestNotOk
+    } else {
+        ControlLastApplError::NoError
     }
 }
 
@@ -537,24 +538,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_test_commands_carry_the_test_error_codes() {
+    fn failed_test_commands_carry_operator_test_not_ok() {
+        assert_eq!(termination_error_code(false), ControlLastApplError::NoError);
         assert_eq!(
-            termination_error_code(false, false),
-            ControlLastApplError::NoError
-        );
-        assert_eq!(
-            termination_error_code(false, true),
-            ControlLastApplError::NoError
-        );
-        assert_eq!(
-            termination_error_code(true, false) as i32,
+            termination_error_code(true) as i32,
             3,
             "Operator Test Not OK"
-        );
-        assert_eq!(
-            termination_error_code(true, true) as i32,
-            2,
-            "Timeout Test Not OK"
         );
     }
 }

@@ -358,7 +358,6 @@ pub fn handle_read_sbo(
         false,
         false,
         true,
-        0,
         conn_id,
     );
 
@@ -462,7 +461,6 @@ pub(crate) fn select_with_value(
         params.synchro_check,
         params.interlock_check,
         true, // this is a select
-        0,
         conn_id,
     );
 
@@ -509,7 +507,8 @@ pub(crate) fn select_with_value(
 ///
 /// An Operate refused by the admission checks or by the dynamic check returns
 /// the cause of the refusal and sends no CommandTermination. An object without a
-/// control handler refuses every Operate with `NotSupported`. Otherwise the
+/// control handler, and an Operate carrying an activation time other than 0,
+/// are refused with `NotSupported`. Otherwise the
 /// command runs, and with enhanced security it ends with a CommandTermination,
 /// positive or negative, through `ct_sink`; the result is the outcome of the
 /// command.
@@ -573,6 +572,10 @@ pub(crate) struct AcceptedOperate {
 /// Admits an Operate whose parameters have been parsed: the state machine, the
 /// parameter checks, and the static check handler.
 ///
+/// An Operate carrying an activation time `operTm` other than 0, a
+/// TimeActivatedOperate, is refused with `NotSupported`; an `operTm` of 0 is
+/// an immediate Operate.
+///
 /// `raw_value` is the Oper structure as the client sent it, which a
 /// CommandTermination echoes back.
 ///
@@ -601,6 +604,16 @@ pub(crate) fn admit_operate(
         return Err(Refusal::by_check(ControlAddCause::NotSupported));
     };
 
+    // TimeActivatedOperate is not supported; the object is left as it was.
+    if params.oper_tm_ms != 0 {
+        tracing::warn!(
+            name = %obj.config.name,
+            oper_tm_ms = params.oper_tm_ms,
+            "operate refused: time-activated operate is not supported"
+        );
+        return Err(Refusal::by_check(ControlAddCause::NotSupported));
+    }
+
     // Admit the request: state machine and parameter checks.
     match obj.begin_operate(conn_id, &params) {
         Ok(Some(OperateBeginResult::Accepted)) => {}
@@ -620,7 +633,6 @@ pub(crate) fn admit_operate(
         params.synchro_check,
         params.interlock_check,
         false, // this is an operate, not a select
-        params.oper_tm_ms,
         conn_id,
     );
 

@@ -108,16 +108,6 @@ struct ControlObjectInner {
 
     /// When the object was selected, for the timeout.
     select_time: Option<Instant>,
-
-    /// Activation time in milliseconds for a time-activated command; 0 when the
-    /// command is not time-activated.
-    #[allow(dead_code)]
-    activate_time_ms: u64,
-
-    /// Invoke id of a response deferred by a time-activated command or an
-    /// asynchronous select.
-    #[allow(dead_code)]
-    pending_invoke_id: u32,
 }
 
 impl ControlObjectInner {
@@ -127,8 +117,6 @@ impl ControlObjectInner {
             last_oper_params: None,
             owner_conn_id: 0,
             select_time: None,
-            activate_time_ms: 0,
-            pending_invoke_id: 0,
         }
     }
 }
@@ -601,13 +589,12 @@ impl ControlObject {
 
     // ─── Cancel ──────────────────────────────────────────────────────────
 
-    /// Cancels a selection or a pending time-activated command.
+    /// Cancels a selection.
     ///
     /// An executing command is not cancellable and is refused with
     /// `CommandAlreadyInExecution`. A selected object is deselected when the
-    /// request comes from the connection that holds it. A pending time-activated
-    /// command is discarded. Canceling an unselected object succeeds and does
-    /// nothing.
+    /// request comes from the connection that holds it. Canceling an unselected
+    /// object succeeds and does nothing.
     pub fn try_cancel(&self, conn_id: u64) -> CancelResult {
         let g = match self.inner.lock() {
             Ok(g) => g,
@@ -621,12 +608,6 @@ impl ControlObject {
                 "cancel refused: a command is executing"
             );
             return CancelResult::Denied(ControlAddCause::CommandAlreadyInExecution);
-        }
-
-        if g.state == ControlState::WaitForActivationTime {
-            drop(g);
-            self.abort_to_unselected();
-            return CancelResult::Accepted;
         }
 
         if matches!(g.state, ControlState::Ready) {
@@ -691,7 +672,6 @@ impl ControlObject {
                 false,
                 false,
                 is_selected,
-                0,
                 conn_id,
             );
             h.on_select_state_changed(&action, is_selected, reason);

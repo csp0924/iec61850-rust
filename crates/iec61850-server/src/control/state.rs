@@ -1,17 +1,13 @@
 //! The control object state machine.
 //!
-//! Six states cover both control models of IEC 61850-7-2:
+//! Four states cover the control models of IEC 61850-7-2:
 //!
 //! ```text
-//! Unselected           - idle for select-before-operate; also the starting point
-//!                        for direct control
-//! Ready                - idle for direct control; selected for select-before-operate,
-//!                        waiting for Operate
-//! WaitForActivationTime - a time-activated Operate was accepted and is waiting for
-//!                        its activation time
-//! WaitForExecution     - awaiting the wait-for-execution handler
-//! Operate              - awaiting the operate handler
-//! WaitForSelect        - awaiting an asynchronous select check
+//! Unselected       - idle for select-before-operate; also the idle state of
+//!                    direct control
+//! Ready            - selected for select-before-operate, waiting for Operate
+//! WaitForExecution - awaiting the wait-for-execution handler
+//! Operate          - awaiting the operate handler
 //! ```
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,29 +16,21 @@
 
 /// State of one control object.
 ///
-/// The discriminants are assigned explicitly and 3 is left unused, so the
-/// remaining values keep their established numbering.
+/// The discriminants are assigned explicitly; 2 and 3 are unused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlState {
     /// Idle for select-before-operate; also the initial state for direct control.
     #[default]
     Unselected = 0,
 
-    /// Idle for direct control; selected and awaiting Operate for
-    /// select-before-operate.
+    /// Selected and awaiting Operate, for select-before-operate.
     Ready = 1,
 
-    /// A time-activated Operate passed the check handler and is waiting for `operTm`.
-    WaitForActivationTime = 2,
-
-    /// Awaiting the wait-for-execution handler. The value 3 is unused.
+    /// Awaiting the wait-for-execution handler.
     WaitForExecution = 4,
 
     /// Awaiting the operate handler.
     Operate = 5,
-
-    /// Awaiting an asynchronous select check, when the check handler needs time.
-    WaitForSelect = 6,
 }
 
 impl ControlState {
@@ -125,7 +113,6 @@ mod tests {
         assert!(ControlState::Operate.is_executing());
         assert!(!ControlState::Ready.is_executing());
         assert!(!ControlState::Unselected.is_executing());
-        assert!(!ControlState::WaitForActivationTime.is_executing());
     }
 
     #[test]

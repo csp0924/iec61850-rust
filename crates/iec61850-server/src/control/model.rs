@@ -234,9 +234,6 @@ pub struct ControlAction {
     interlock_check: bool,
     /// Whether this is a select rather than an Operate.
     is_select: bool,
-    /// Activation time in milliseconds for a time-activated command; 0 when the
-    /// command is not time-activated.
-    ctl_time_ms: u64,
     /// Connection that issued this control request, or 0 when there is none. Used
     /// when assembling LastApplError and CommandTermination.
     #[allow(dead_code)]
@@ -254,7 +251,6 @@ impl ControlAction {
         synchro_check: bool,
         interlock_check: bool,
         is_select: bool,
-        ctl_time_ms: u64,
         conn_id: u64,
     ) -> Self {
         Self {
@@ -265,7 +261,6 @@ impl ControlAction {
             synchro_check,
             interlock_check,
             is_select,
-            ctl_time_ms,
             conn_id,
         }
     }
@@ -304,12 +299,6 @@ impl ControlAction {
     pub fn is_select(&self) -> bool {
         self.is_select
     }
-
-    /// Returns the activation time in milliseconds; 0 when the command is not
-    /// time-activated.
-    pub fn ctl_time_ms(&self) -> u64 {
-        self.ctl_time_ms
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,8 +319,9 @@ pub use iec61850_model::ControlModel;
 pub struct OperParams {
     /// Control value, element 0.
     pub ctl_val: MmsValue,
-    /// Activation time in milliseconds; present only in the seven-element form,
-    /// where it is element 1. Zero means the command is not time-activated.
+    /// Activation time `operTm` in milliseconds; present only in the
+    /// seven-element form, where it is element 1. Zero means the command is not
+    /// time-activated; the server refuses an Operate with any other value.
     pub oper_tm_ms: u64,
     /// Origin, element 1 or 2.
     pub origin: OriginValue,
@@ -732,7 +722,6 @@ mod tests {
             false,
             true,
             false,
-            0,
             42,
         );
         assert_eq!(action.ctl_num(), 2);
