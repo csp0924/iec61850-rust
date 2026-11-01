@@ -1090,3 +1090,41 @@ fn blocking_client_covers_list_reads_reports_and_abort() {
     assert_eq!(c.state(), ConnectionState::Closed);
     assert_eq!(rt.block_on(peer).unwrap(), SessionIndication::Abort);
 }
+
+#[test]
+fn async_client_taken_from_a_blocking_client_keeps_its_association() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (l, port) = rt.block_on(listener());
+    let peer = rt.spawn(async move {
+        let mut peer = accept(&l, Aare::Accept).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(true)]).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        peer
+    });
+
+    let mut c = iec61850_mms::mms::client::BlockingMmsClient::from_builder(
+        MmsClientBuilder::new().request_timeout_ms(3_000),
+    )
+    .unwrap();
+    c.connect("127.0.0.1", port).unwrap();
+    assert!(matches!(
+        c.read("LD0", "GGIO1$ST$Ind1$stVal").unwrap(),
+        iec61850_mms::mms::client::MmsValue::Boolean(true)
+    ));
+    let (mut client, client_rt) = c.into_parts();
+    assert_eq!(client.state(), ConnectionState::Connected);
+    let value = client_rt
+        .block_on(client.read("LD0", "GGIO1$ST$Ind2$stVal"))
+        .expect("read on the runtime the association was built on");
+    assert!(matches!(
+        value,
+        iec61850_mms::mms::client::MmsValue::Boolean(false)
+    ));
+    drop(rt.block_on(peer).unwrap());
+}

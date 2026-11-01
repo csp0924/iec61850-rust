@@ -69,9 +69,17 @@ impl BlockingMmsClient {
         })
     }
 
-    /// Returns the wrapped async client.
-    pub fn into_inner(self) -> MmsClient {
-        self.inner
+    /// Splits the wrapper into the async client and the runtime that drives it.
+    ///
+    /// The socket and timers of an established association belong to the
+    /// returned runtime, so the client's futures must run on it, for example
+    /// with `rt.block_on(client.read(..))`. Once that runtime is dropped the
+    /// association can no longer be used. A client that has not connected yet
+    /// carries no such binding. Like the wrapper, the returned runtime must not
+    /// be dropped or blocked on from within an async runtime; see the module
+    /// documentation.
+    pub fn into_parts(self) -> (MmsClient, tokio::runtime::Runtime) {
+        (self.inner, self.rt)
     }
 
     // Association management
