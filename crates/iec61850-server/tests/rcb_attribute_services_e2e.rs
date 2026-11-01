@@ -638,6 +638,36 @@ async fn brcb_entry_id_and_purge_buf_refused_while_enabled() {
     );
 }
 
+/// PurgeBuf discards an event the BRCB still holds inside its buffer time:
+/// after the purge only the events raised later are reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_purge_discards_an_event_inside_the_buffer_time() {
+    let f = start_with(BufferedReportControl::new(
+        BRCB_PATH,
+        brcb_config().with_buf_tm_ms(600_000),
+    ))
+    .await;
+    let mut mms = f.connect().await;
+    f.set_st_val(2);
+    write_brcb(&mut mms, "PurgeBuf", MmsData::Boolean(true))
+        .await
+        .expect("purge");
+    // Each retrigger of stVal buffers the window it closes, at once.
+    f.set_st_val(1);
+    f.set_st_val(3);
+    wait_for_buffered_entry(&mut mms).await;
+
+    write_brcb(&mut mms, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("enable");
+    let first = next_report(&mut mms).await;
+    assert_eq!(
+        first.data_values,
+        [dbpos(1)],
+        "the value set before the purge is not reported"
+    );
+}
+
 /// A BRCB on the SQLite backend reports each buffered entry with the values it
 /// was enqueued with, and exposes its newest buffered entry: the EntryID and
 /// TimeofEntry read while it is disabled belong to the last report it then

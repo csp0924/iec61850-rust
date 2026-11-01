@@ -21,6 +21,7 @@ use crate::connection::ConnectionId;
 use crate::flags::{OptFlds, TriggerOptions};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -655,6 +656,9 @@ pub struct BufferedReportControl {
     pub state: std::sync::Mutex<BrcbState>,
     /// Report buffer backend.
     pub report_buffer: std::sync::Mutex<Box<dyn ReportBufferBackend>>,
+    /// How many times the PurgeBuf procedure has run; advanced under the
+    /// buffer lock.
+    purges: AtomicU64,
 }
 
 impl BufferedReportControl {
@@ -685,6 +689,7 @@ impl BufferedReportControl {
             state: std::sync::Mutex::new(state),
             report_buffer: std::sync::Mutex::new(backend),
             brcb,
+            purges: AtomicU64::new(0),
         }
     }
 
@@ -842,7 +847,8 @@ impl BufferedReportControl {
     ///
     /// PurgeBuf is writable only while `RptEna` is false, per IEC 61850-8-1
     /// Table 72. Writing false then has no effect; writing true purges the report
-    /// buffer. Returns the number of entries removed.
+    /// buffer, together with the events still inside the buffer time. Returns
+    /// the number of entries removed from the buffer.
     ///
     /// # Errors
     ///
@@ -877,12 +883,17 @@ impl BufferedReportControl {
     /// a GetBRCBValues that follows exposes the all-zero EntryID of the empty
     /// buffer. Returns the number of entries removed.
     ///
+    /// Events the reporting engine still holds in a buffer-time window are
+    /// discarded too: the procedure advances [`purge_count`](Self::purge_count),
+    /// and a window opened at an earlier count is never enqueued.
+    ///
     /// The caller holds neither lock; the buffer lock and the state lock are
     /// taken one after the other.
     fn run_purge_buf_procedure(&self) -> Result<usize, crate::error::ServerError> {
         let purged = {
             let mut buf = self.lock_buffer()?;
             buf.set_formatted_through(None);
+            self.purges.fetch_add(1, Ordering::AcqRel);
             buf.purge()
         };
         let mut state = self.lock_state()?;
@@ -972,6 +983,61 @@ impl BufferedReportControl {
             state.on_enqueue(&entry);
         }
         Ok((entry_id, evicted))
+    }
+
+    /// Returns how many times the PurgeBuf procedure has run on this control
+    /// block, by a PurgeBuf write or by a configuration change that purges.
+    pub(crate) fn purge_count(&self) -> u64 {
+        self.purges.load(Ordering::Acquire)
+    }
+
+    /// Enqueues the entry of a buffer-time window that was opened when
+    /// [`purge_count`](Self::purge_count) read `opened_at`.
+    ///
+    /// Returns `Ok(None)` and enqueues nothing when a purge has run since: the
+    /// events of the window were discarded with the buffer, per the PurgeBuf
+    /// procedure of IEC 61850-7-2. The count is compared under the buffer lock
+    /// the purge takes, so the entry lands either before the purge, which then
+    /// removes it, or not at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError::InvalidModel` when the state or buffer mutex is
+    /// poisoned.
+    pub(crate) fn enqueue_window_entry(
+        &self,
+        opened_at: u64,
+        first_trigger_ms: u64,
+        snapshot: EnqueuedSnapshot,
+    ) -> Result<Option<(EntryId, bool)>, crate::error::ServerError> {
+        if self.purge_count() != opened_at {
+            return Ok(None);
+        }
+        let entry_id = {
+            let mut state = self.lock_state()?;
+            state.allocate_entry_id(first_trigger_ms)
+        };
+        let entry = Arc::new(ReportEntry::with_snapshot(
+            entry_id,
+            first_trigger_ms,
+            false,
+            false,
+            Arc::new(snapshot),
+        ));
+        let evicted = {
+            let mut buf = self.lock_buffer()?;
+            // A purge since the check above leaves the EntryID just allocated
+            // unused; later identifiers still increase.
+            if self.purge_count() != opened_at {
+                return Ok(None);
+            }
+            buf.push(entry.clone())
+        };
+        {
+            let mut state = self.lock_state()?;
+            state.on_enqueue(&entry);
+        }
+        Ok(Some((entry_id, evicted)))
     }
 
     // ─── EntryID resynchronization ───────────────────────────────────────────

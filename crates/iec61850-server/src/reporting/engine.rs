@@ -279,8 +279,14 @@ enum Resumed {
 /// buffer time expires, or a member already in the window triggers again, the
 /// accumulated inclusion flags and snapshot are frozen into one buffer entry,
 /// which is then flushed.
+///
+/// A purge of the control block discards the events of an open window with
+/// the buffer, per the PurgeBuf procedure of IEC 61850-7-2: a window opened
+/// before the purge is never enqueued, and a trigger after it opens a new one.
 #[derive(Debug)]
 struct BrcbBufTmPending {
+    /// `BufferedReportControl::purge_count` when the window opened.
+    purges: u64,
     /// Millisecond timestamp of the first trigger, used as the entry time.
     first_trigger_ms: u64,
     /// Instant at which the buffer time expires, compared against in `tick`.
@@ -832,7 +838,8 @@ impl ReportingEngine {
     /// 4. coalesce by buffer time: `buf_tm_ms == 0` enqueues an entry immediately,
     ///    otherwise the trigger accumulates in `brcb_buftm_pending` until `tick`
     ///    finds it due; a member that triggers again inside the window enqueues
-    ///    the accumulated entry at once and opens the next window;
+    ///    the accumulated entry at once and opens the next window, and a purge
+    ///    of the control block discards the window;
     /// 5. enqueue through `enqueue_entry_with_snapshot`, which freezes the data set
     ///    values and inclusion flags into the entry, so the send path never reads
     ///    live values.
@@ -877,12 +884,9 @@ impl ReportingEngine {
         };
         for (mms_path, p) in due_paths {
             if let Some(brcb_arc) = self.brcbs.get(&mms_path) {
-                if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(
-                    p.first_trigger_ms,
-                    false,
-                    false,
-                    p.snapshot,
-                ) {
+                if let Err(e) =
+                    brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
+                {
                     tracing::warn!(
                         mms_path = %mms_path,
                         error = ?e,
@@ -2269,11 +2273,16 @@ impl ReportingEngine {
             return;
         }
 
+        let purges = brcb_arc.purge_count();
         let completed = {
             let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
                 tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
                 return;
             };
+            // A window opened before a purge holds only discarded events.
+            if pending.get(mms_path).is_some_and(|p| p.purges != purges) {
+                pending.remove(mms_path);
+            }
             // A batch member already in the open window closes it first, so the
             // window keeps the values from before the batch.
             let retriggered = pending.get(mms_path).is_some_and(|p| {
@@ -2292,6 +2301,7 @@ impl ReportingEngine {
             let entry = pending
                 .entry(mms_path.clone())
                 .or_insert_with(|| BrcbBufTmPending {
+                    purges,
                     first_trigger_ms: now_ms,
                     due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
                     snapshot: EnqueuedSnapshot::new(ds.len()),
@@ -2300,8 +2310,7 @@ impl ReportingEngine {
             completed
         };
         if let Some(p) = completed {
-            if let Err(e) =
-                brcb_arc.enqueue_entry_with_snapshot(p.first_trigger_ms, false, false, p.snapshot)
+            if let Err(e) = brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
             {
                 tracing::warn!(
                     mms_path = %mms_path,
@@ -2395,11 +2404,16 @@ impl ReportingEngine {
         }
 
         // Buffer time set: accumulate until tick finds the window expired.
+        let purges = brcb_arc.purge_count();
         let completed = {
             let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
                 tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
                 return;
             };
+            // A window opened before a purge holds only discarded events.
+            if pending.get(&mms_path).is_some_and(|p| p.purges != purges) {
+                pending.remove(&mms_path);
+            }
             // A member that triggers again inside the window closes it: the
             // accumulated entry is buffered at once and the new trigger opens
             // the next window, per the BufTm rules of IEC 61850-7-2.
@@ -2419,6 +2433,7 @@ impl ReportingEngine {
             let entry = pending
                 .entry(mms_path.clone())
                 .or_insert_with(|| BrcbBufTmPending {
+                    purges,
                     first_trigger_ms: now_ms,
                     due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
                     snapshot: EnqueuedSnapshot::new(ds_len),
@@ -2433,8 +2448,7 @@ impl ReportingEngine {
                 attr_ref = %attr_ref,
                 "buffer-time bypass: member retriggered inside the buffer window, buffering the entry now"
             );
-            if let Err(e) =
-                brcb_arc.enqueue_entry_with_snapshot(p.first_trigger_ms, false, false, p.snapshot)
+            if let Err(e) = brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
             {
                 tracing::warn!(
                     mms_path = %mms_path,
@@ -4137,6 +4151,117 @@ mod tests {
         let snap = entries[1].snapshot.as_ref().expect("snapshot");
         assert_eq!(snap.values[0], Some(MmsValue::Integer(1)));
         assert_eq!(entries[1].time_of_entry_ms, 1_010);
+    }
+
+    /// The values of every entry in the buffer of `brcb`, member by member.
+    fn buffered_values(
+        brcb: &crate::reporting::brcb::BufferedReportControl,
+    ) -> Vec<Vec<Option<MmsValue>>> {
+        brcb.lock_buffer()
+            .unwrap()
+            .iter_entries()
+            .iter()
+            .map(|e| e.snapshot.as_ref().expect("snapshot").values.clone())
+            .collect()
+    }
+
+    #[test]
+    fn brcb_purge_discards_the_open_buffer_time_window() {
+        let (eng, _sink, brcb, attr) =
+            brcb_engine(600_000, TriggerOptions::DATA_CHANGED, OptFlds::SEQ_NUM);
+        brcb.state.lock().unwrap().rpt_ena = false;
+        let flag = InclusionFlag::VALUE_CHANGED;
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(2), flag, 1_000);
+        brcb.handle_purge_buf_write(true).unwrap();
+        eng.tick_brcb(Instant::now() + Duration::from_secs(601), 602_000);
+        assert!(
+            buffered_values(&brcb).is_empty(),
+            "the purge discards the event still inside the buffer time"
+        );
+    }
+
+    #[test]
+    fn brcb_purge_buf_false_keeps_the_open_buffer_time_window() {
+        let (eng, _sink, brcb, attr) =
+            brcb_engine(600_000, TriggerOptions::DATA_CHANGED, OptFlds::SEQ_NUM);
+        brcb.state.lock().unwrap().rpt_ena = false;
+        let flag = InclusionFlag::VALUE_CHANGED;
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(2), flag, 1_000);
+        brcb.handle_purge_buf_write(false).unwrap();
+        eng.tick_brcb(Instant::now() + Duration::from_secs(601), 602_000);
+        assert_eq!(
+            buffered_values(&brcb),
+            [[Some(MmsValue::Integer(2))]],
+            "writing PurgeBuf = FALSE purges nothing"
+        );
+    }
+
+    #[test]
+    fn brcb_purging_configuration_change_discards_the_open_window() {
+        use crate::reporting::brcb::BrcbConfigField;
+        let (eng, _sink, brcb, attr) =
+            brcb_engine(600_000, TriggerOptions::DATA_CHANGED, OptFlds::SEQ_NUM);
+        brcb.state.lock().unwrap().rpt_ena = false;
+        let flag = InclusionFlag::VALUE_CHANGED;
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(2), flag, 1_000);
+        brcb.set_config_field(BrcbConfigField::BufTmMs(500_000))
+            .unwrap();
+        // The same member again: the window it would close holds only the
+        // purged event, so nothing is buffered and the new value waits.
+        eng.on_brcb_value_updated(&attr, MmsValue::Integer(1), flag, 2_000);
+        assert!(buffered_values(&brcb).is_empty());
+        eng.tick_brcb(Instant::now() + Duration::from_secs(501), 502_000);
+        let entries = brcb.lock_buffer().unwrap().iter_entries();
+        assert_eq!(entries.len(), 1, "the event raised after the purge");
+        let snap = entries[0].snapshot.as_ref().expect("snapshot");
+        assert_eq!(snap.values, [Some(MmsValue::Integer(1))]);
+        assert_eq!(entries[0].time_of_entry_ms, 2_000);
+    }
+
+    #[test]
+    fn brcb_window_opened_before_a_purge_keeps_only_later_members() {
+        use crate::reporting::brcb::{Brcb, BufferedReportControl};
+        // One update at a time, then the same updates as batches.
+        for batched in [false, true] {
+            let mut eng = ReportingEngine::new_null();
+            let a = "IED1LD0/GGIO1$ST$Ind1$stVal".to_string();
+            let b = "IED1LD0/GGIO1$ST$Ind2$stVal".to_string();
+            let ds = make_ds(vec![
+                (a.as_str(), MmsValue::Integer(0)),
+                (b.as_str(), MmsValue::Integer(0)),
+            ]);
+            let brcb = Brcb::new("brcb01", "GGIO1$ds1")
+                .with_trg_ops(TriggerOptions::DATA_CHANGED)
+                .with_buf_tm_ms(600_000);
+            let path = "IED1LD0/GGIO1$BR$brcb01";
+            eng.register_brcb_with_dataset(BufferedReportControl::new(path, brcb), ds)
+                .unwrap();
+            let brcb = eng.get_brcb(path).unwrap();
+            let flag = InclusionFlag::VALUE_CHANGED;
+            let update = |attr: &String, v: i64, now_ms: u64| {
+                if batched {
+                    eng.on_values_updated(&[(attr.clone(), MmsValue::Integer(v), flag)], now_ms);
+                } else {
+                    eng.on_brcb_value_updated(attr, MmsValue::Integer(v), flag, now_ms);
+                }
+            };
+
+            update(&a, 2, 1_000);
+            brcb.handle_purge_buf_write(true).unwrap();
+            update(&b, 7, 2_000);
+            eng.tick_brcb(Instant::now() + Duration::from_secs(601), 602_000);
+
+            let entries = brcb.lock_buffer().unwrap().iter_entries();
+            assert_eq!(entries.len(), 1, "batched: {batched}");
+            let snap = entries[0].snapshot.as_ref().expect("snapshot");
+            assert!(
+                !snap.inclusion_flags[0].has_trigger(),
+                "the member raised before the purge is not reported (batched: {batched})"
+            );
+            assert!(snap.inclusion_flags[1].has_trigger());
+            assert_eq!(snap.values[1], Some(MmsValue::Integer(7)));
+            assert_eq!(entries[0].time_of_entry_ms, 2_000, "the window opens anew");
+        }
     }
 
     /// The reason-for-inclusion BIT_STRING(6) of one member.
