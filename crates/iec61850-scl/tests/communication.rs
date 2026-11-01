@@ -409,25 +409,35 @@ fn an_invalid_address_of_another_ied_does_not_fail_this_one() {
     );
 }
 
-/// `MinTime` and `MaxTime` take whole milliseconds and the fixed unit and
+/// `MinTime` and `MaxTime` take any `xs:decimal` number of milliseconds,
+/// rounded to the nearest whole millisecond, and the fixed unit and
 /// multiplier of `tDurationInMilliSec`.
 #[test]
-fn min_and_max_time_are_whole_milliseconds() {
+fn min_and_max_time_round_to_whole_milliseconds() {
     let gse = |min: &str| {
         ied1_ap(&format!(
             r#"<GSE ldInst="LD0" cbName="gcb1">{min}<MaxTime>5000</MaxTime></GSE>"#
         ))
     };
-    let model = build(&gse("<MinTime>4.000</MinTime>"), "IED1");
-    assert_eq!(
-        model.gse_address("LD0", "gcb1").and_then(|g| g.min_time_ms),
-        Some(4)
-    );
+    let min_time = |min: &str| {
+        build(&gse(min), "IED1")
+            .gse_address("LD0", "gcb1")
+            .and_then(|g| g.min_time_ms)
+    };
+    assert_eq!(min_time("<MinTime>4.000</MinTime>"), Some(4));
+    assert_eq!(min_time("<MinTime>4.4</MinTime>"), Some(4));
+    assert_eq!(min_time("<MinTime>4.5</MinTime>"), Some(5));
+    assert_eq!(min_time("<MinTime>+.7</MinTime>"), Some(1));
+    // xs:decimal collapses white space, the spelled-out kind included.
+    assert_eq!(min_time("<MinTime>\n      12\n    </MinTime>"), Some(12));
+    assert_eq!(min_time("<MinTime>&#32;7.6&#10;&#9;</MinTime>"), Some(8));
+    assert_eq!(min_time("<MinTime><![CDATA[ 9 ]]></MinTime>"), Some(9));
     for bad in [
-        "<MinTime>4.5</MinTime>",
         "<MinTime>-4</MinTime>",
         "<MinTime>4ms</MinTime>",
+        "<MinTime>.</MinTime>",
         "<MinTime>4294967296</MinTime>",
+        "<MinTime>4294967295.5</MinTime>",
         r#"<MinTime unit="ms">4</MinTime>"#,
         r#"<MinTime multiplier="k">4</MinTime>"#,
         "<MinTime>4</MinTime><MinTime>5</MinTime>",

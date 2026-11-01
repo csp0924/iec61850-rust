@@ -1549,20 +1549,29 @@ fn handle_end(
             state.text_target = TextTarget::None;
             let text = std::mem::take(&mut state.comm_text);
             if let Some((is_min, d_span, path)) = state.cur_duration.take() {
-                let ms = parse_duration_ms(&text).ok_or_else(|| {
+                let (ms, rounded) = parse_duration_ms(&text).ok_or_else(|| {
                     SclParseError::at(
                         d_span,
-                        path,
+                        path.clone(),
                         ErrorKind::AttributeValueInvalid {
                             name: name.clone(),
                             expected_type:
-                                "a whole number of milliseconds from 0 to 4294967295 (tDurationInMilliSec)"
+                                "a decimal number of milliseconds from 0 to 4294967295 (tDurationInMilliSec)"
                                     .to_string(),
                             raw_value: text.clone(),
                             cause: None,
                         },
                     )
                 })?;
+                if rounded {
+                    tracing::warn!(
+                        target: "iec61850_scl::parser",
+                        line = d_span.line,
+                        col = d_span.col,
+                        "`<{name}>` {text} ms rounded to {ms} ms; the GOOSE control block \
+                         carries whole milliseconds",
+                    );
+                }
                 if let Some(gse) = state.cur_gse.as_mut() {
                     if is_min {
                         gse.min_time_ms = Some(ms);
@@ -1635,12 +1644,16 @@ fn handle_text(state: &mut ParserState<'_>, raw: &str) {
 }
 
 /// Parses the text of a `tDurationInMilliSec`, an `xs:decimal` number of
-/// milliseconds, into a whole number of milliseconds.
+/// milliseconds, into whole milliseconds, and returns whether a fraction was
+/// rounded away.
 ///
-/// A fraction is accepted only when it is zero, since the GOOSE control block
-/// carries `MinTime` and `MaxTime` as whole milliseconds; a negative value, or
-/// one above `u32::MAX`, is refused.
-fn parse_duration_ms(text: &str) -> Option<u32> {
+/// Leading and trailing white space is dropped first, as the `collapse`
+/// white space facet of `xs:decimal` requires. The GOOSE control block carries
+/// `MinTime` and `MaxTime` as whole milliseconds, so a fraction is rounded to
+/// the nearest millisecond, a half upwards. A negative value, a value that is
+/// not a decimal number, and one that rounds above `u32::MAX` are refused.
+fn parse_duration_ms(text: &str) -> Option<(u32, bool)> {
+    let text = text.trim_matches([' ', '\t', '\r', '\n']);
     let unsigned = text.strip_prefix('+').unwrap_or(text);
     let (whole, fraction) = match unsigned.split_once('.') {
         Some((w, f)) => (w, f),
@@ -1649,13 +1662,19 @@ fn parse_duration_ms(text: &str) -> Option<u32> {
     if whole.is_empty() && fraction.is_empty() {
         return None;
     }
-    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b == b'0') {
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if whole.is_empty() {
-        return Some(0);
+    let mut ms: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let rounded = fraction.bytes().any(|b| b != b'0');
+    if fraction.as_bytes().first().is_some_and(|b| *b >= b'5') {
+        ms += 1;
     }
-    whole.parse().ok()
+    u32::try_from(ms).ok().map(|ms| (ms, rounded))
 }
 
 /// Attaches an SDI or a DAI to the innermost open parent: the topmost SDI when
