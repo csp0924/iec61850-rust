@@ -528,7 +528,9 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// Presentation CPA, ACSE AARE and the MMS Initiate response.
     ///
     /// The TCP connection and the COTP CR and CC share one deadline of
-    /// `connect_timeout_ms`.
+    /// `connect_timeout_ms`. An association still established, over TCP or
+    /// TLS, is closed first without a release; every later service reaches the
+    /// new peer.
     ///
     /// # Errors
     ///
@@ -577,8 +579,9 @@ impl MmsConnection<TcpStream, TokioTimer> {
     ///
     /// The TLS handshake is inserted after the TCP connection, and every later step
     /// is identical to the plaintext path. The TCP connection, the handshake and
-    /// the COTP CR and CC share one deadline of `connect_timeout_ms`. On failure
-    /// the connection is left `Closed`. A failed handshake returns
+    /// the COTP CR and CC share one deadline of `connect_timeout_ms`. An
+    /// association still established, over TCP or TLS, is closed first without
+    /// a release. On failure the connection is left `Closed`. A failed handshake returns
     /// `ClientError::TlsHandshake`, and so does running out of the deadline
     /// during the handshake, with the `Timeout` kind; running out of it during
     /// the TCP connection or the COTP handshake returns `ConnectTimeout`.
@@ -797,8 +800,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// Session, Presentation, ACSE and MMS Initiate negotiation happen here.
     ///
     /// `connect` and `connect_tls` establish their own transport and COTP
-    /// connection under one deadline and then run the same negotiation. On
-    /// failure the connection is left `Closed`.
+    /// connection under one deadline and then run the same negotiation. An
+    /// association still established, over any transport, is closed first
+    /// without a release. On failure the connection is left `Closed`.
     ///
     /// The COTP CR and CC are bounded by `connect_timeout_ms`.
     ///
@@ -904,8 +908,27 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         }
     }
 
-    /// Clears the per-association queues before a new association starts.
+    /// Drops everything an earlier association left behind before a new one
+    /// starts: both transports, the Session, Presentation and ACSE states, the
+    /// negotiated parameters and the per-association queues.
+    ///
+    /// An association still established is closed without a release, as by
+    /// [`Self::close_raw`], so nothing of it can carry over to the new one.
     fn reset_association_state(&mut self) {
+        if self.state == ConnectionState::Connected {
+            warn!("a new association replaces an established one, closing it without a release");
+        }
+        self.cotp = None;
+        #[cfg(feature = "tls")]
+        {
+            self.cotp_tls = None;
+        }
+        self.session = IsoSession::new();
+        self.presentation = IsoPresentation::new();
+        self.acse = AcseConnection::new(None);
+        self.negotiated_max_pdu_size = DEFAULT_MAX_PDU_SIZE as usize;
+        self.negotiated_max_calling = DEFAULT_MAX_SERV_OUTSTANDING_CALLING;
+        self.negotiated_max_called = DEFAULT_MAX_SERV_OUTSTANDING_CALLED;
         self.pending_unconfirmed.clear();
         self.abandoned_invoke_ids.clear();
     }

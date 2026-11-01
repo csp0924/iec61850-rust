@@ -217,6 +217,9 @@ impl IedConnection<TcpStream, TokioTimer> {
     }
 
     /// Establishes the ISO and MMS association with a server.
+    ///
+    /// An association still established, over TCP or TLS, is closed first
+    /// without a release, and every later service reaches the new server.
     pub async fn connect(&self, host: &str, port: u16) -> Result<(), ClientError> {
         let mut client = self.mms_client.lock().await;
         client.connect(host, port).await?;
@@ -228,7 +231,8 @@ impl IedConnection<TcpStream, TokioTimer> {
     /// Establishes a TLS-protected ISO and MMS association.
     ///
     /// Once the TLS handshake completes, the usual COTP, Session, Presentation,
-    /// ACSE and MMS Initiate sequence runs over it.
+    /// ACSE and MMS Initiate sequence runs over it. As with `connect`, an
+    /// association still established is closed first without a release.
     ///
     /// `addr` is the server address; MMS over TLS is normally reached on port
     /// 3782 rather than 102. `connector` carries the IEC 62351-3 cipher suite

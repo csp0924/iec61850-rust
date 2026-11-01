@@ -209,7 +209,8 @@ impl MmsClient<TcpStream, TokioTimer> {
     /// Establishes an ISO and MMS association over a new TCP connection.
     ///
     /// The sequence is TCP, COTP CR and CC, Session CN and AC, Presentation CP and
-    /// CPA, ACSE AARQ and AARE, then the MMS Initiate exchange.
+    /// CPA, ACSE AARQ and AARE, then the MMS Initiate exchange. An association
+    /// still established, over TCP or TLS, is closed first without a release.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         self.conn.connect(host, port).await
     }
@@ -217,7 +218,8 @@ impl MmsClient<TcpStream, TokioTimer> {
     /// Establishes an ISO and MMS association over TLS.
     ///
     /// The sequence adds a TLS handshake after the TCP connection and is otherwise
-    /// identical to the plaintext path.
+    /// identical to the plaintext path, including closing an association still
+    /// established first.
     ///
     /// `addr` is the server address, `connector` a `TlsConnector` already configured
     /// with the IEC 62351-3 cipher suites, and `server_name` the name used for SNI
