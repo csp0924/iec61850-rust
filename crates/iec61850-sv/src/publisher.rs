@@ -37,11 +37,12 @@ use std::num::NonZeroU16;
 
 use bytes::BytesMut;
 use iec61850_asn1::encode_length;
+use iec61850_model::comm::Address;
 
 use crate::error::SvError;
 use crate::frame::{
-    VlanTag, RESERVED1_SIMULATE, SV_APP_HEADER_SIZE, SV_DEFAULT_APPID, SV_DEFAULT_DST_MAC,
-    SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
+    VlanPriority, VlanTag, RESERVED1_SIMULATE, SV_APP_HEADER_SIZE, SV_DEFAULT_APPID,
+    SV_DEFAULT_DST_MAC, SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
 };
 use crate::pdu::{SmpSynch, MAX_ASDU_PER_FRAME, SV_STRING_MAX_LEN};
 use crate::utc_time::UtcTime;
@@ -196,6 +197,32 @@ impl SvPublisherBuilder {
     /// Removes the 802.1Q tag, so frames are sent untagged.
     pub fn without_vlan(mut self) -> Self {
         self.vlan = None;
+        self
+    }
+
+    /// Applies the parameters an SCL `<SMV>` `<Address>` gives the stream
+    /// (IEC 61850-9-2 Clause 11, Table 19).
+    ///
+    /// A `MAC-Address` sets the destination and an `APPID` the APPID; one that
+    /// is missing leaves the value the builder holds, by default
+    /// `SV_DEFAULT_DST_MAC` and 0x4000 (IEC 61850-9-2 §5.3.3.4.2). The frames
+    /// carry the 802.1Q tag: a missing `VLAN-ID` is 0 and a missing
+    /// `VLAN-PRIORITY` is 4 (IEC 61850-9-2 Table 7).
+    pub fn with_address(mut self, address: &Address) -> Self {
+        if let Some(mac) = address.mac_address() {
+            self.dst_mac = mac;
+        }
+        if let Some(app_id) = address.app_id() {
+            self.app_id = app_id;
+        }
+        let default = VlanTag::default();
+        self.vlan = Some(VlanTag {
+            priority: address
+                .vlan_priority()
+                .and_then(|p| VlanPriority::new(p).ok())
+                .unwrap_or(default.priority),
+            vlan_id: address.vlan_id().unwrap_or(default.vlan_id),
+        });
         self
     }
 
@@ -1258,5 +1285,47 @@ mod tests {
         }
         let pdu = decode_sav_pdu(&pub_.frame_bytes()[SV_HEADER_NO_VLAN..]).unwrap();
         assert_eq!(pdu.asdus[0].smp_cnt, 50);
+    }
+
+    fn header_of(builder: SvPublisherBuilder) -> crate::frame::SvFrameHeader {
+        let mut builder = builder;
+        builder
+            .add_asdu("TESTLD/LLN0$SV$sv1", None::<String>, 1, 8)
+            .unwrap();
+        let p = builder.setup_complete().unwrap();
+        crate::frame::SvFrame::decode(p.frame_bytes())
+            .expect("decode")
+            .header
+    }
+
+    #[test]
+    fn the_scl_address_sets_destination_appid_and_tag() {
+        let mut address = Address::new();
+        for (t, v) in [
+            ("MAC-Address", "01-0C-CD-04-00-01"),
+            ("APPID", "4001"),
+            ("VLAN-ID", "005"),
+            ("VLAN-PRIORITY", "6"),
+        ] {
+            address.push(t, v).unwrap();
+        }
+        let header = header_of(SvPublisherBuilder::new(SRC_MAC).with_address(&address));
+        assert_eq!(header.dst_mac, [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x01]);
+        assert_eq!(header.app_id, 0x4001);
+        assert_eq!(
+            header.vlan,
+            Some(VlanTag {
+                priority: VlanPriority::new(6).unwrap(),
+                vlan_id: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_address_parameters_keep_the_defaults() {
+        let header = header_of(SvPublisherBuilder::new(SRC_MAC).with_address(&Address::new()));
+        assert_eq!(header.dst_mac, SV_DEFAULT_DST_MAC);
+        assert_eq!(header.app_id, SV_DEFAULT_APPID);
+        assert_eq!(header.vlan, Some(VlanTag::default()));
     }
 }
