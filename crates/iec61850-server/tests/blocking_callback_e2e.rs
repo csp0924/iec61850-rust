@@ -3,11 +3,13 @@
 //! Each test installs one callback that, once entered, waits on a gate the
 //! test holds closed, and makes the server reach it: a read handler, a write
 //! handler, the selection change handler on a select, the select timeout, the
-//! end of a command and the loss of an association, and a log storage written
-//! by the integrity period. While the callback is held, another association
-//! must read and write and a new association must be accepted; the callback
-//! is still held when they finish, so they cannot have waited for it. Opening
-//! the gate then completes whatever the callback held up.
+//! end of a command, a refusing dynamic check, an abandoned command and the
+//! loss of an association, and a log storage written by the integrity period
+//! or by the data-change of a client write. While the callback is held,
+//! another association must read and write and a new association must be
+//! accepted; the callback is still held when they finish, so they cannot have
+//! waited for it. Opening the gate then completes whatever the callback held
+//! up.
 //!
 //! Two calls into the server do not wait for a held callback either:
 //! `IedServer::block_requests`, also when a handler makes it, and registering a
@@ -56,6 +58,8 @@ const GATED_WRITE: &str = "GGIO1$SP$Lim$setVal";
 const PROBE_READ: &str = "GGIO1$ST$Ind2$stVal";
 /// Written by the other association.
 const PROBE_WRITE: &str = "GGIO1$SP$SetPt$setVal";
+/// Logged on data-change.
+const WATCHED: &str = "GGIO1$SP$Watch$setVal";
 
 /// Turns a stalled server into a failure; never a condition for passing.
 const STALL: Duration = Duration::from_secs(30);
@@ -321,7 +325,8 @@ fn leaf(do_name: &str, da_name: &str, fc: FC, ty: DataAttributeType, v: MmsValue
     )
 }
 
-/// `GGIO1` with two boolean status points, two integer settings and
+/// `GGIO1` with two boolean status points, three integer settings, one of
+/// them `Watch.setVal` raising data-change, and
 /// `SPCSO2`, an SPC under normal-security select-before-operate with
 /// `stSeld` and the select timeout `sbo_timeout_ms`.
 fn build_model(sbo_timeout_ms: u64) -> Arc<IedModel> {
@@ -367,6 +372,16 @@ fn build_model(sbo_timeout_ms: u64) -> Arc<IedModel> {
             FC::Sp,
             DataAttributeType::Int32,
             MmsValue::Integer(0),
+        ))
+        .add_do(DataObject::new(
+            "Watch",
+            vec![DoChild::Da(DataAttribute::new(
+                "setVal",
+                FC::Sp,
+                DataAttributeType::Int32,
+                TrgOps::DCHG,
+                MmsValue::Integer(0),
+            ))],
         ))
         .add_do(spc)
         .build()
@@ -1017,4 +1032,69 @@ async fn registering_a_control_does_not_wait_for_a_held_selection_handler() {
     gate.open();
     drop(lost);
     running.stop();
+}
+
+/// A log storage that blocks while it writes the entry a data-change of a
+/// client write raises: another association writes and reads attributes that
+/// raise nothing, and a new association is accepted, meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_log_storage_on_a_data_change_leaves_the_server_serving() {
+    let server = build_server(30_000);
+    let gate = Arc::new(Gate::default());
+    let _opener = gate.opener();
+    let storage = Arc::new(GatedLog {
+        gate: gate.clone(),
+        inner: InMemoryLogStorage::new(),
+    });
+
+    let member = server
+        .model()
+        .ld_by_domain(DOMAIN)
+        .and_then(|ld| ld.ln_by_name("GGIO1"))
+        .and_then(|ln| ln.do_by_name("Watch"))
+        .and_then(|d| match d.child_by_name("setVal", Some(FC::Sp)) {
+            Some(DoChild::Da(da)) => Some(Arc::clone(&da.value)),
+            _ => None,
+        })
+        .expect("Watch.setVal");
+    let mut ds = Dataset::new("LLN0$dsWatch");
+    ds.push(DatasetEntry::new(format!("{DOMAIN}/{WATCHED}"), member));
+    server.register_dataset(DOMAIN, ds);
+    let block = LogControlBlock::new("lcbWatch")
+        .with_dataset("LLN0$dsWatch")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED)
+        .with_log_ref(format!("{DOMAIN}/LLN0$WatchLog"))
+        .with_default_enabled(true);
+    server.register_log_control(
+        DOMAIN,
+        "LLN0$LG$lcbWatch",
+        Arc::new(
+            LogControl::new(format!("{DOMAIN}/LLN0$LG$lcbWatch"), block)
+                .with_storage(storage.clone() as Arc<dyn LogStorage>),
+        ),
+    );
+
+    let running = ServerThread::start(&server, Flavor::CurrentThread);
+    let mut other = connect(running.port).await;
+    let mut writer = connect(running.port).await;
+    let held_write = tokio::spawn(async move {
+        writer.write(DOMAIN, WATCHED, MmsData::Integer(3)).await?;
+        writer.read(DOMAIN, WATCHED).await
+    });
+    gate.wait_entered().await;
+
+    serve_others(running.port, &mut other).await;
+    assert!(
+        !held_write.is_finished(),
+        "the write waits for its log entry"
+    );
+    assert_eq!(gate.entered(), 1, "the entry is still held");
+
+    gate.open();
+    assert_eq!(
+        held_write.await.unwrap().expect("held write"),
+        MmsData::Integer(3)
+    );
+    running.stop();
+    assert_eq!(storage.count(), 1, "the held entry is written");
 }
