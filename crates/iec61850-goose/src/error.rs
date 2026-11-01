@@ -89,6 +89,11 @@ pub enum GooseError {
     #[error("vlan priority {0} out of range 0-7")]
     VlanPriorityOutOfRange(u8),
 
+    /// An address lacks a parameter the publication cannot do without, named
+    /// by its SCL `<P>` type.
+    #[error("the address has no `{0}` parameter")]
+    MissingAddressParameter(&'static str),
+
     /// The encode buffer cannot hold the PDU.
     #[error("pdu buffer overflow")]
     PduOverflow,

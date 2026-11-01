@@ -20,6 +20,7 @@ use iec61850_goose::publisher::{CommParameters, GoosePublisher};
 use iec61850_goose::{GooseEvent, GooseReceiver, GooseSubscriberBuilder, GooseSubscriberState};
 use iec61850_hal::ethernet::linux::AfPacketSocket;
 use iec61850_hal::ethernet::{EthernetConfig, EthernetSink};
+use iec61850_model::comm::Address;
 use iec61850_model::MmsValue;
 
 /// Opens the sending and the receiving end of the veth pair.
@@ -187,4 +188,40 @@ fn published_frame_arrives_with_vlan_tag_and_interface_source() {
     let got = state.vlan.expect("the vlan tag was lost on receive");
     assert_eq!(got.vlan_id, 100);
     assert_eq!(got.priority.value(), 4);
+}
+
+#[test]
+#[ignore = "needs CAP_NET_RAW and a veth pair named in IEC61850_VETH"]
+fn scl_address_parameters_reach_the_subscriber() {
+    let (mut tx, rx) = veth_pair();
+    let (handle, states) = listen(
+        rx,
+        GooseSubscriberBuilder::new()
+            .gocb_ref("LD/LLN0$GO$vscl")
+            .app_id(0x3a07),
+    );
+
+    let mut address = Address::new();
+    for (t, v) in [
+        ("MAC-Address", "01-0C-CD-01-00-07"),
+        ("APPID", "3A07"),
+        ("VLAN-ID", "07B"),
+        ("VLAN-PRIORITY", "6"),
+    ] {
+        address.push(t, v).expect("valid parameter");
+    }
+    let comm = CommParameters::from_address(&address).expect("complete address");
+    let mut publisher =
+        GoosePublisher::new(comm, "LD/LLN0$GO$vscl", None, "LD/LLN0$ds", 1).unwrap();
+    tx.send(&publisher.publish(&[MmsValue::Boolean(true)]).unwrap())
+        .expect("send");
+
+    let state = states
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the publication was not received");
+    handle.stop_and_join();
+    assert_eq!(state.gocb_ref, "LD/LLN0$GO$vscl");
+    let tag = state.vlan.expect("the vlan tag was lost");
+    assert_eq!(tag.vlan_id, 0x07b);
+    assert_eq!(tag.priority.value(), 6);
 }

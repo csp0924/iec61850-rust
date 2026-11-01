@@ -18,6 +18,7 @@
 
 use bytes::{Bytes, BytesMut};
 use core::time::Duration;
+use iec61850_model::comm::{Address, GseAddress};
 use iec61850_model::utc_time::UtcTime;
 use iec61850_model::MmsValue;
 use std::panic::AssertUnwindSafe;
@@ -77,6 +78,35 @@ impl CommParameters {
         }
     }
 
+    /// Creates the parameters an SCL `<GSE>` `<Address>` gives a layer 2
+    /// GOOSE publication (IEC 61850-8-1 §25.3.2 Table 163).
+    ///
+    /// The `MAC-Address` is the destination. A missing `APPID` is 0x0000, the
+    /// value that marks a missing configuration (IEC 61850-8-1 Annex C.2.5). The
+    /// frames always carry the 802.1Q tag (Annex C.2.2): a missing `VLAN-ID`
+    /// is 0 (Annex C.2.4) and a missing `VLAN-PRIORITY` is 4 (Table C.1). No
+    /// source MAC override is set.
+    ///
+    /// # Errors
+    ///
+    /// [`GooseError::MissingAddressParameter`] when the address has no
+    /// `MAC-Address`, as an address for GOOSE over UDP/IP has none.
+    pub fn from_address(address: &Address) -> Result<Self, GooseError> {
+        let dst_mac = address
+            .mac_address()
+            .ok_or(GooseError::MissingAddressParameter("MAC-Address"))?;
+        let mut comm = Self::new(address.app_id().unwrap_or(0), dst_mac);
+        let default = VlanTag::default();
+        comm.vlan = Some(VlanTag {
+            priority: match address.vlan_priority() {
+                Some(p) => VlanPriority::new(p)?,
+                None => default.priority,
+            },
+            vlan_id: address.vlan_id().unwrap_or(default.vlan_id),
+        });
+        Ok(comm)
+    }
+
     /// Sets the 802.1Q VLAN tag.
     pub fn with_vlan(mut self, vlan: VlanTag) -> Self {
         self.vlan = Some(vlan);
@@ -133,6 +163,41 @@ impl Default for RetransIntervals {
             t4: Duration::from_millis(32),
             tmax: Duration::from_millis(1000),
         }
+    }
+}
+
+impl RetransIntervals {
+    /// Creates the intervals of a publication whose `MinTime` is `min` and
+    /// whose `MaxTime` is `max`.
+    ///
+    /// T1 is `min` and Tmax is `max`; T2, T3 and T4 double from T1 and stop at
+    /// Tmax, so every repetition interval lies between the two (IEC 61850-8-1
+    /// §18.1.2.5.1). A `max` below `min` is raised to `min`, and both are at
+    /// least 1 ms, so the publisher never schedules a zero interval.
+    pub fn from_min_max(min: Duration, max: Duration) -> Self {
+        let t1 = min.max(Duration::from_millis(1));
+        let tmax = max.max(t1);
+        let step = |n: u32| t1.saturating_mul(1 << n).min(tmax);
+        Self {
+            t1,
+            t2: step(1),
+            t3: step(2),
+            t4: step(3),
+            tmax,
+        }
+    }
+
+    /// Creates the intervals the `MinTime` and `MaxTime` of an SCL `<GSE>`
+    /// configure, as [`from_min_max`](Self::from_min_max) does; one the
+    /// element leaves out takes its value in [`Default`], 4 ms or 1000 ms.
+    pub fn from_gse(gse: &GseAddress) -> Self {
+        let default = Self::default();
+        Self::from_min_max(
+            gse.min_time_ms
+                .map_or(default.t1, |ms| Duration::from_millis(ms.into())),
+            gse.max_time_ms
+                .map_or(default.tmax, |ms| Duration::from_millis(ms.into())),
+        )
     }
 }
 
@@ -1295,6 +1360,98 @@ mod tests {
         let now = Instant::now();
         let action = p.tick(now).unwrap();
         assert!(action.at <= now);
+    }
+
+    fn address(params: &[(&str, &str)]) -> Address {
+        let mut a = Address::new();
+        for (t, v) in params {
+            a.push(*t, *v).expect("valid parameter");
+        }
+        a
+    }
+
+    #[test]
+    fn comm_parameters_follow_the_scl_address() {
+        let comm = CommParameters::from_address(&address(&[
+            ("MAC-Address", "01-0C-CD-01-00-05"),
+            ("APPID", "3A01"),
+            ("VLAN-ID", "07B"),
+            ("VLAN-PRIORITY", "6"),
+        ]))
+        .expect("complete address");
+        assert_eq!(
+            comm,
+            CommParameters::new(0x3a01, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05]).with_vlan(VlanTag {
+                priority: VlanPriority::new(6).unwrap(),
+                vlan_id: 0x07b,
+            })
+        );
+        assert_eq!(comm.src_mac, None);
+    }
+
+    #[test]
+    fn missing_address_parameters_take_the_defaults_of_annex_c() {
+        let comm = CommParameters::from_address(&address(&[("MAC-Address", "01-0C-CD-01-00-06")]))
+            .expect("a MAC address is enough");
+        assert_eq!(comm.app_id, 0);
+        assert_eq!(comm.vlan, Some(VlanTag::default()));
+
+        let comm = CommParameters::from_address(&address(&[
+            ("MAC-Address", "01-0C-CD-01-00-06"),
+            ("VLAN-PRIORITY", "2"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            comm.vlan.map(|v| (v.priority.value(), v.vlan_id)),
+            Some((2, 0))
+        );
+    }
+
+    #[test]
+    fn an_address_without_mac_gives_no_parameters() {
+        assert!(matches!(
+            CommParameters::from_address(&address(&[("APPID", "0001"), ("IP", "239.0.0.1")])),
+            Err(GooseError::MissingAddressParameter("MAC-Address"))
+        ));
+    }
+
+    #[test]
+    fn retransmission_doubles_from_min_time_up_to_max_time() {
+        let ms = Duration::from_millis;
+        let r = RetransIntervals::from_min_max(ms(8), ms(2000));
+        assert_eq!(
+            [r.t1, r.t2, r.t3, r.t4, r.tmax],
+            [ms(8), ms(16), ms(32), ms(64), ms(2000)]
+        );
+        let r = RetransIntervals::from_min_max(ms(500), ms(1000));
+        assert_eq!(
+            [r.t1, r.t2, r.t3, r.t4, r.tmax],
+            [ms(500), ms(1000), ms(1000), ms(1000), ms(1000)]
+        );
+        let r = RetransIntervals::from_min_max(ms(0), ms(0));
+        assert_eq!([r.t1, r.tmax], [ms(1), ms(1)], "never a zero interval");
+        let r = RetransIntervals::from_min_max(ms(50), ms(20));
+        assert_eq!([r.t1, r.t4, r.tmax], [ms(50), ms(50), ms(50)]);
+        assert_eq!(
+            RetransIntervals::from_min_max(ms(4), ms(1000)),
+            RetransIntervals::default()
+        );
+    }
+
+    #[test]
+    fn retransmission_follows_the_gse_times() {
+        let ms = Duration::from_millis;
+        let mut gse = GseAddress::new(Address::new());
+        assert_eq!(
+            RetransIntervals::from_gse(&gse),
+            RetransIntervals::default()
+        );
+        gse.min_time_ms = Some(10);
+        assert_eq!(RetransIntervals::from_gse(&gse).t1, ms(10));
+        assert_eq!(RetransIntervals::from_gse(&gse).tmax, ms(1000));
+        gse.max_time_ms = Some(60_000);
+        let r = RetransIntervals::from_gse(&gse);
+        assert_eq!([r.t1, r.t4, r.tmax], [ms(10), ms(80), ms(60_000)]);
     }
 }
 
