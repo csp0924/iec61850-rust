@@ -5,9 +5,10 @@ use thiserror::Error;
 /// Sampled Values encode and decode errors.
 ///
 /// Decoding is strict: a malformed header length, an implausible ASDU count, a
-/// field whose length does not match its definition, and a value that reaches
-/// past its enclosing ASDU are all rejected instead of skipped, so a subscriber
-/// never publishes samples reconstructed from a damaged frame.
+/// field whose length does not match its definition, a refrTm that is not a
+/// valid UtcTime, and a value that reaches past its enclosing ASDU are all
+/// rejected instead of skipped, so a subscriber never publishes samples
+/// reconstructed from a damaged frame.
 #[derive(Debug, Error, PartialEq, Clone)]
 #[non_exhaustive]
 pub enum SvError {
@@ -84,6 +85,12 @@ pub enum SvError {
     /// match a stream on a shortened svID; the ASDU is rejected instead.
     #[error("svid length {0} exceeds the maximum of {max} bytes", max = crate::pdu::SV_STRING_MAX_LEN)]
     SvIdTooLong(usize),
+
+    /// refrTm is eight octets long but not a valid UtcTime: its TimeQuality
+    /// octet holds one of the TimeAccuracy codes IEC 61850-8-1 Table 36 defines
+    /// as invalid.
+    #[error("invalid refrtm: {0}")]
+    InvalidRefrTm(crate::utc_time::UtcTimeError),
 
     /// The datSet exceeds `SV_STRING_MAX_LEN`.
     ///

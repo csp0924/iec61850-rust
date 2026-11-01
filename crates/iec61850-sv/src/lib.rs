@@ -9,7 +9,8 @@
 //! VLAN, and SV header layers, `nine_two_le` the 9-2LE channel layout,
 //! `publisher` the frame template and hot-path setters, `publish_thread` a
 //! Linux publish loop, `subscriber` per-svID filtering and sample continuity,
-//! and `receiver` the typestate that owns the L2 source.
+//! `receiver` the typestate that owns the L2 source, and `utc_time` the
+//! refrTm timestamp.
 //!
 //! Not implemented here: SVCB management over MMS, R-SV over UDP, and the
 //! protection profile of 256 samples per cycle.
@@ -25,6 +26,7 @@ pub mod pdu;
 pub mod publisher;
 pub mod receiver;
 pub mod subscriber;
+pub mod utc_time;
 
 #[cfg(target_os = "linux")]
 pub mod publish_thread;
@@ -45,3 +47,6 @@ pub use pdu::{
 pub use publisher::{AsduHandle, EthernetSink, SvPublisher, SvPublisherBuilder, SV_MAX_FRAME_SIZE};
 pub use receiver::{Idle, Running, SvReceiver, SvReceiverHandle};
 pub use subscriber::{SvSubscriber, SvSubscriberAsdu, SvSubscriberBuilder};
+pub use utc_time::{
+    TimeAccuracy, TimeQuality, UtcTime, UtcTimeError, FRACTION_OF_SECOND_MAX, UTC_TIME_SIZE,
+};

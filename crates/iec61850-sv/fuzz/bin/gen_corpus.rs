@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use bytes::BytesMut;
 use iec61850_sv::frame::{SvFrame, SvFrameHeader, VlanPriority, VlanTag};
 use iec61850_sv::pdu::{encode_sav_pdu, Asdu, SavPdu, SmpMod, SmpSynch};
-use iec61850_sv::SV_DEFAULT_DST_MAC;
+use iec61850_sv::{UtcTime, SV_DEFAULT_DST_MAC};
 
 fn pdu_corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/sv_pdu_parse")
@@ -74,7 +74,7 @@ fn make_pdu_9_2_le() -> SavPdu {
     SavPdu::new(vec![{
         let mut asdu = Asdu::new("MUnn01".to_string(), 1234, vec![0x55u8; 64]);
         asdu.dat_set = Some("MUnn01/LLN0$dataset".to_string());
-        asdu.refr_tm = Some([0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0xA0]);
+        asdu.refr_tm = UtcTime::from_bytes([0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0xA0]).ok();
         asdu.smp_synch = SmpSynch::GlobalClock;
         asdu.smp_rate = Some(4000);
         asdu.smp_mod = Some(SmpMod::PerNominalPeriod);
@@ -91,7 +91,7 @@ fn make_pdu_all_optional() -> SavPdu {
         let mut asdu = Asdu::new("MUnn02".to_string(), 65534, vec![0xAA; 128]);
         asdu.dat_set = Some("ds2".to_string());
         asdu.conf_rev = 0xCAFEBABE;
-        asdu.refr_tm = Some([0xFF; 8]);
+        asdu.refr_tm = UtcTime::from_bytes([0xFF; 8]).ok();
         asdu.smp_synch = SmpSynch::LocalIdentified(100);
         asdu.smp_rate = Some(0xFFFF);
         asdu.smp_mod = Some(SmpMod::SamplesPerSecond);

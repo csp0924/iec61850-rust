@@ -37,6 +37,7 @@ use iec61850_model::Quality;
 use crate::error::SvError;
 use crate::nine_two_le::{NineTwoLE, SAMPLE_SIZE};
 use crate::pdu::{Asdu, SmpMod, SmpSynch};
+use crate::utc_time::UtcTime;
 
 /// Default number of streams a subscriber follows for smpCnt continuity.
 pub const DEFAULT_MAX_STREAMS: usize = 64;
@@ -55,8 +56,13 @@ pub struct SvSubscriberAsdu<'a> {
     pub smp_cnt: u16,
     /// Configuration revision.
     pub conf_rev: u32,
-    /// Raw refrTm bytes, when present.
-    pub refr_tm: Option<&'a [u8; 8]>,
+    /// refrTm, the refresh time of the buffer, when present.
+    ///
+    /// The decoder has checked that it is a valid UtcTime; how far it lies
+    /// from the local clock and what its TimeQuality means are left to the
+    /// listener. A value whose `clock_failure` flag is set is to be ignored
+    /// (IEC 61850-7-2 §6.1.2.9.3.3).
+    pub refr_tm: Option<UtcTime>,
     /// Synchronization state.
     pub smp_synch: SmpSynch,
     /// Sample rate, when present.
@@ -81,7 +87,7 @@ impl<'a> SvSubscriberAsdu<'a> {
             dat_set: asdu.dat_set.as_deref(),
             smp_cnt: asdu.smp_cnt,
             conf_rev: asdu.conf_rev,
-            refr_tm: asdu.refr_tm.as_ref(),
+            refr_tm: asdu.refr_tm,
             smp_synch: asdu.smp_synch,
             smp_rate: asdu.smp_rate,
             sample: &asdu.sample,
@@ -558,7 +564,9 @@ mod tests {
             dat_set: Some("IED1/LLN0$SV$ds".to_owned()),
             smp_cnt,
             conf_rev: 0xDEADBEEF,
-            refr_tm: Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            refr_tm: Some(
+                UtcTime::from_bytes([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]).unwrap(),
+            ),
             smp_synch: SmpSynch::LocalIdentified(10),
             smp_rate: Some(4000),
             sample: vec![0xABu8; 64],
@@ -577,8 +585,8 @@ mod tests {
         assert_eq!(view.smp_cnt, 42);
         assert_eq!(view.conf_rev, 0xDEADBEEF);
         assert_eq!(
-            view.refr_tm,
-            Some(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+            view.refr_tm.map(UtcTime::to_bytes),
+            Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
         );
         assert_eq!(view.smp_synch, SmpSynch::LocalIdentified(10));
         assert_eq!(view.smp_rate, Some(4000));

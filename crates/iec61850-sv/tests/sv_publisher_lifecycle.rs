@@ -2,8 +2,8 @@
 //! completing setup, writing fields, and decoding the resulting frame.
 
 use iec61850_sv::{
-    decode_sav_pdu, AsduHandle, SmpSynch, SvError, SvPublisher, SvPublisherBuilder, VlanPriority,
-    VlanTag, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN, SV_STRING_MAX_LEN,
+    decode_sav_pdu, AsduHandle, SmpSynch, SvError, SvPublisher, SvPublisherBuilder, UtcTime,
+    VlanPriority, VlanTag, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN, SV_STRING_MAX_LEN,
 };
 use std::num::NonZeroU16;
 
@@ -185,7 +185,7 @@ fn refr_tm_enable_and_set() {
     b.enable_refr_tm(h).unwrap();
     let mut p = b.setup_complete().unwrap();
 
-    let ts = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    let ts = UtcTime::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]).unwrap();
     p.set_refr_tm(h, ts).unwrap();
 
     let pdu = decode_pdu(&p);
@@ -265,7 +265,7 @@ fn gm_identity_not_enabled_returns_err() {
 #[test]
 fn refr_tm_not_enabled_returns_err() {
     let (mut p, h) = make_simple(8);
-    let result = p.set_refr_tm(h, [0u8; 8]);
+    let result = p.set_refr_tm(h, UtcTime::NULL);
     assert!(result.is_err());
 }
 

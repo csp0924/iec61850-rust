@@ -14,7 +14,15 @@
 //! field; and the subscriber checks the configured sample length and smpCnt
 //! continuity as it dispatches.
 //!
-//! TODO: refrTm plausibility is not validated at any layer.
+//! refrTm is checked by the PDU layer against its encoding: it must be eight
+//! octets and a valid [`UtcTime`](crate::utc_time::UtcTime), whose TimeAccuracy
+//! is not one of the codes IEC 61850-8-1 Table 36 defines as invalid. A frame
+//! whose refrTm fails either check is dropped like any other malformed frame:
+//! [`tick`](SvReceiver::tick) logs it and returns the error, and no ASDU of the
+//! frame reaches a listener. The value itself is not judged: its distance from
+//! the local clock, its progress between ASDUs, and its TimeQuality flags are
+//! handed to the listener in
+//! [`SvSubscriberAsdu::refr_tm`](crate::subscriber::SvSubscriberAsdu::refr_tm).
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

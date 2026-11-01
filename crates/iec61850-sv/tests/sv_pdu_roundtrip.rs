@@ -7,7 +7,7 @@ use iec61850_sv::pdu::{
     decode_sav_pdu, encode_sav_pdu, Asdu, SavPdu, SmpMod, SmpSynch, MAX_ASDU_PER_FRAME,
     SV_STRING_MAX_LEN,
 };
-use iec61850_sv::SvError;
+use iec61850_sv::{SvError, UtcTime};
 
 fn minimal_asdu(sv_id: &str, smp_cnt: u16) -> Asdu {
     Asdu::new(sv_id.to_owned(), smp_cnt, vec![0u8; 8])
@@ -51,7 +51,8 @@ fn full_optional_fields_roundtrip() {
         let mut asdu = Asdu::new("IED1/LLN0$SV$fullSV".to_owned(), 100, vec![0xABu8; 64]);
         asdu.dat_set = Some("IED1/LLN0$SV$testDS".to_owned());
         asdu.conf_rev = 0xABCDEF01;
-        asdu.refr_tm = Some([0x5F, 0xA1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD]);
+        asdu.refr_tm =
+            Some(UtcTime::from_bytes([0x5F, 0xA1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD]).unwrap());
         asdu.smp_synch = SmpSynch::GlobalClock;
         asdu.smp_rate = Some(4000);
         asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
@@ -63,7 +64,7 @@ fn full_optional_fields_roundtrip() {
     let a = &decoded.asdus[0];
     assert_eq!(a.dat_set, Some("IED1/LLN0$SV$testDS".to_owned()));
     assert_eq!(
-        a.refr_tm,
+        a.refr_tm.map(UtcTime::to_bytes),
         Some([0x5F, 0xA1, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD])
     );
     assert_eq!(a.smp_rate, Some(4000));

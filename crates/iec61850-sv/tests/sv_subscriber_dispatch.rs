@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use iec61850_model::Quality;
 use iec61850_sv::pdu::{Asdu, SmpMod, SmpSynch};
 use iec61850_sv::subscriber::{SvSubscriberAsdu, SvSubscriberBuilder};
-use iec61850_sv::{ChannelSample, NineTwoLE};
+use iec61850_sv::{ChannelSample, NineTwoLE, UtcTime};
 
 fn make_asdu(sv_id: &str, smp_cnt: u16, sample: Vec<u8>) -> Asdu {
     let mut asdu = Asdu::new(sv_id.to_owned(), smp_cnt, sample);
@@ -19,7 +19,8 @@ fn make_full_asdu(sv_id: &str, smp_cnt: u16) -> Asdu {
     let mut asdu = Asdu::new(sv_id.to_owned(), smp_cnt, vec![0x5Au8; 64]);
     asdu.dat_set = Some("IED1/LLN0$SV$ds".to_owned());
     asdu.conf_rev = 0x12345678;
-    asdu.refr_tm = Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]);
+    asdu.refr_tm =
+        Some(UtcTime::from_bytes([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]).unwrap());
     asdu.smp_synch = SmpSynch::LocalIdentified(7);
     asdu.smp_rate = Some(4000);
     asdu.smp_mod = Some(SmpMod::SamplesPerSecond);
@@ -156,8 +157,8 @@ fn asdu_view_all_getters_correct() {
     assert_eq!(view.smp_cnt, 77);
     assert_eq!(view.conf_rev, 0x12345678);
     assert_eq!(
-        view.refr_tm,
-        Some(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11])
+        view.refr_tm.map(UtcTime::to_bytes),
+        Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11])
     );
     assert_eq!(view.smp_synch, SmpSynch::LocalIdentified(7));
     assert_eq!(view.smp_rate, Some(4000));

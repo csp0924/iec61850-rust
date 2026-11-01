@@ -39,6 +39,7 @@ use bytes::BytesMut;
 use iec61850_asn1::{decode_length, encode_length};
 
 use crate::error::SvError;
+use crate::utc_time::{UtcTime, UTC_TIME_SIZE};
 
 /// Outer tag of the savPdu, `[APPLICATION 0] IMPLICIT SEQUENCE`. GOOSE uses
 /// `0x61` for the same position.
@@ -74,9 +75,6 @@ pub const MAX_ASDU_PER_FRAME: usize = 10;
 /// SCL types both as `tVisString129`, so a longer value is rejected rather
 /// than truncated and a subscriber never matches on a shortened reference.
 pub const SV_STRING_MAX_LEN: usize = 129;
-
-/// A UtcTime field is always 8 bytes.
-const UTC_TIME_SIZE: usize = 8;
 
 /// Sampling synchronization state, the one-byte smpSynch field.
 ///
@@ -178,8 +176,8 @@ pub struct Asdu {
     pub smp_cnt: u16,
     /// confRev, the configuration revision.
     pub conf_rev: u32,
-    /// refrTm, the refresh time as an 8-byte UtcTime; optional.
-    pub refr_tm: Option<[u8; UTC_TIME_SIZE]>,
+    /// refrTm, the refresh time of the buffer; optional.
+    pub refr_tm: Option<UtcTime>,
     /// smpSynch, the synchronization state.
     pub smp_synch: SmpSynch,
     /// smpRate, samples per period or per second depending on smpMod;
@@ -360,9 +358,9 @@ fn encode_asdu(asdu: &Asdu, buf: &mut BytesMut) -> Result<(), SvError> {
     buf.extend_from_slice(&[TAG_CONF_REV, 0x04]);
     buf.extend_from_slice(&asdu.conf_rev.to_be_bytes());
 
-    if let Some(ref tm) = asdu.refr_tm {
+    if let Some(tm) = asdu.refr_tm {
         buf.extend_from_slice(&[TAG_REFR_TM, 0x08]);
-        buf.extend_from_slice(tm);
+        buf.extend_from_slice(&tm.to_bytes());
     }
 
     buf.extend_from_slice(&[TAG_SMP_SYNCH, 0x01, asdu.smp_synch.to_byte()]);
@@ -405,7 +403,8 @@ fn encode_asdu(asdu: &Asdu, buf: &mut BytesMut) -> Result<(), SvError> {
 ///   with tag `0xA2` when it differs from the number of ASDUs in the sequence.
 /// - `DuplicateField` when noASDU or the sequence of ASDU appears twice.
 /// - `InvalidFieldLength`, `AsduFieldOutOfBounds`, `MissingRequiredField`,
-///   `SvIdTooLong`, `DatSetTooLong`, and `InvalidUtf8` from the ASDUs.
+///   `SvIdTooLong`, `DatSetTooLong`, `InvalidUtf8`, and `InvalidRefrTm` from
+///   the ASDUs.
 /// - `Asn1` when a BER length field is malformed.
 pub fn decode_sav_pdu(data: &[u8]) -> Result<SavPdu, SvError> {
     let mut pos = 0usize;
@@ -592,8 +591,8 @@ fn decode_asdu_sequence(data: &[u8]) -> Result<Vec<Asdu>, SvError> {
 /// # Errors
 ///
 /// Returns `AsduFieldOutOfBounds`, `InvalidFieldLength`, `InvalidUtf8`,
-/// `SvIdTooLong`, `DatSetTooLong`, or `MissingRequiredField` for a malformed
-/// or incomplete ASDU.
+/// `SvIdTooLong`, `DatSetTooLong`, `InvalidRefrTm`, or `MissingRequiredField`
+/// for a malformed or incomplete ASDU.
 fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
     let asdu_end = data.len();
     let mut pos = 0usize;
@@ -602,7 +601,7 @@ fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
     let mut dat_set: Option<String> = None;
     let mut smp_cnt: Option<u16> = None;
     let mut conf_rev: Option<u32> = None;
-    let mut refr_tm: Option<[u8; UTC_TIME_SIZE]> = None;
+    let mut refr_tm: Option<UtcTime> = None;
     let mut smp_synch: Option<SmpSynch> = None;
     let mut smp_rate: Option<u16> = None;
     let mut sample: Option<Vec<u8>> = None;
@@ -688,7 +687,7 @@ fn decode_asdu(data: &[u8]) -> Result<Asdu, SvError> {
                 }
                 let mut tm = [0u8; UTC_TIME_SIZE];
                 tm.copy_from_slice(value);
-                refr_tm = Some(tm);
+                refr_tm = Some(UtcTime::from_bytes(tm).map_err(SvError::InvalidRefrTm)?);
             }
             TAG_SMP_SYNCH => {
                 if field_len != 1 {
@@ -830,7 +829,9 @@ mod tests {
             dat_set: Some("IED1/LLN0$SV$testDS".to_owned()),
             smp_cnt: 100,
             conf_rev: 0xABCDEF01,
-            refr_tm: Some([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]),
+            refr_tm: Some(
+                UtcTime::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]).unwrap(),
+            ),
             smp_synch: SmpSynch::GlobalClock,
             smp_rate: Some(4000),
             sample: vec![0xABu8; 64],

@@ -17,7 +17,7 @@
 //!     .set_smp_cnt(h, u16)
 //!     .increase_smp_cnt(h)       wraps per the smpCnt limit
 //!     .set_smp_synch(h, SmpSynch)
-//!     .set_refr_tm(h, [u8; 8])
+//!     .set_refr_tm(h, UtcTime)
 //!     .set_gm_identity(h, [u8; 8])
 //!     .frame_bytes()             -> &[u8] for the caller to send
 //! ```
@@ -44,6 +44,7 @@ use crate::frame::{
     SV_ETHER_TYPE, SV_HEADER_NO_VLAN, SV_HEADER_WITH_VLAN,
 };
 use crate::pdu::{SmpSynch, MAX_ASDU_PER_FRAME, SV_STRING_MAX_LEN};
+use crate::utc_time::UtcTime;
 
 /// Maximum size of an Ethernet frame, excluding the frame check sequence.
 pub const SV_MAX_FRAME_SIZE: usize = 1518;
@@ -548,16 +549,19 @@ impl SvPublisher {
         Ok(())
     }
 
-    /// Sets the 8-byte refrTm value.
+    /// Sets the refrTm value.
+    ///
+    /// A `UtcTime` is always a valid encoding, so a subscriber of this crate
+    /// accepts every value written here.
     ///
     /// # Errors
     ///
     /// Returns `InvalidAsduHandle` for an unknown handle and
     /// `RefrTmNotEnabled` when the ASDU has no refrTm field.
-    pub fn set_refr_tm(&mut self, h: AsduHandle, ts: [u8; 8]) -> Result<(), SvError> {
+    pub fn set_refr_tm(&mut self, h: AsduHandle, ts: UtcTime) -> Result<(), SvError> {
         let tmpl = self.asdus.get(h.0).ok_or(SvError::InvalidAsduHandle(h.0))?;
         let off = tmpl.refr_tm_offset.ok_or(SvError::RefrTmNotEnabled)?;
-        self.buffer[off..][..8].copy_from_slice(&ts);
+        self.buffer[off..][..8].copy_from_slice(&ts.to_bytes());
         Ok(())
     }
 
@@ -1160,7 +1164,7 @@ mod tests {
         builder.enable_refr_tm(h).unwrap();
         let mut pub_ = builder.setup_complete().unwrap();
 
-        let ts = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let ts = UtcTime::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]).unwrap();
         pub_.set_refr_tm(h, ts).unwrap();
 
         let pdu = decode_sav_pdu(&pub_.frame_bytes()[SV_HEADER_NO_VLAN..]).unwrap();
@@ -1170,7 +1174,7 @@ mod tests {
     #[test]
     fn refr_tm_not_enabled_err() {
         let (mut pub_, h) = build_single_asdu_publisher(8);
-        let result = pub_.set_refr_tm(h, [0u8; 8]);
+        let result = pub_.set_refr_tm(h, UtcTime::NULL);
         assert!(matches!(result, Err(SvError::RefrTmNotEnabled)));
     }
 
