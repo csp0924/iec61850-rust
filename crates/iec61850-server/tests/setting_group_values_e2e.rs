@@ -22,8 +22,9 @@ use iec61850_mms::mms::MmsData;
 use iec61850_model::{DataAttribute, DoChild, IedModel, MmsValue, FC};
 use iec61850_server::connection::ConnectionId;
 use iec61850_server::{
-    Dataset, DatasetEntry, IedServer, IedServerConfig, OptFlds, Rcb, ReportControl, ServerHandle,
-    SettingGroupHandler, TriggerOptions, WriteAccessPolicies,
+    AttributeAccessHandler, Dataset, DatasetEntry, HandlerWriteOutcome, IedServer, IedServerConfig,
+    OptFlds, Rcb, ReportControl, ServerHandle, SettingGroupHandler, TriggerOptions,
+    WriteAccessPolicies, WriteContext,
 };
 
 const DOMAIN: &str = "ProtLD0";
@@ -284,6 +285,95 @@ async fn a_commit_the_handler_refuses_changes_nothing() {
         MmsData::Unsigned(1),
         "the edit session stays open"
     );
+    handle.stop().await;
+}
+
+/// Holds a write in its handler until the test releases it, telling the test
+/// once the write is held. The worker it holds hands its other tasks over, so
+/// the server keeps serving the other associations meanwhile.
+#[derive(Debug)]
+struct HoldWrite {
+    held: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl AttributeAccessHandler for HoldWrite {
+    fn on_write(&self, _ctx: &WriteContext<'_>, _value: &MmsValue) -> HandlerWriteOutcome {
+        let _ = self.held.send(());
+        tokio::task::block_in_place(|| {
+            let _ = self.release.lock().unwrap().recv();
+        });
+        HandlerWriteOutcome::Accept
+    }
+}
+
+/// A SetEditSGValue whose edit session expires while its handler runs is
+/// refused with temporarily-unavailable and stores nothing: the association
+/// that edits the group next reads and commits the values of the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_outliving_its_edit_session_stores_nothing() {
+    let server = build_server();
+    let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    server
+        .install_write_access_handler(
+            OP_DL_SE,
+            Arc::new(HoldWrite {
+                held: held_tx,
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .expect("handler");
+    let handle = server.start().await.expect("start");
+    let port = handle.bound_addr.port();
+    // The timeouts only guard against a hang.
+    let connect = || async move {
+        let mut c = MmsClientBuilder::new()
+            .connect_timeout_ms(30_000)
+            .request_timeout_ms(30_000)
+            .build();
+        c.connect("127.0.0.1", port).await.expect("connect");
+        c
+    };
+    let mut a = connect().await;
+    let mut b = connect().await;
+
+    sgcb(&mut a, "EditSG", 2).await;
+    let mut pending = tokio::spawn(async move {
+        let outcome = write(&mut a, OP_DL_SE, MmsData::Integer(999)).await;
+        (a, outcome)
+    });
+    tokio::select! {
+        held = held_rx.recv() => held.expect("the write reaches its handler"),
+        answered = &mut pending => panic!("answered before its handler ran: {:?}", answered.map(|(_, o)| o)),
+    }
+
+    let past_any_reservation = Instant::now() + Duration::from_secs(u64::from(u16::MAX) + 1);
+    let expired = server
+        .setting_groups()
+        .tick_reservations_at(past_any_reservation);
+    assert_eq!(
+        expired.len(),
+        1,
+        "the session of the first association expires"
+    );
+    sgcb(&mut b, "EditSG", 2).await;
+    assert_eq!(read(&mut b, OP_DL_SE).await, MmsData::Integer(200));
+
+    release_tx.send(()).expect("release the write");
+    let (_a, outcome) = pending.await.expect("join");
+    match outcome {
+        Err(ClientError::DataAccessError(DataAccessError::TemporarilyUnavailable)) => {}
+        other => panic!("expected temporarily-unavailable, got {other:?}"),
+    }
+    assert_eq!(
+        read(&mut b, OP_DL_SE).await,
+        MmsData::Integer(200),
+        "the edit buffer of the second session keeps the values of group 2"
+    );
+    commit(&mut b).await;
+    sgcb(&mut b, "ActSG", 2).await;
+    assert_eq!(read(&mut b, OP_DL_SG).await, MmsData::Integer(200));
     handle.stop().await;
 }
 

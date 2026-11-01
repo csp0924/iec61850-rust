@@ -15,6 +15,11 @@
 //! all; [`SettingGroupRegistry::tick_reservations`] releases expired sessions in
 //! the background as well.
 //!
+//! A write under functional constraint SE is admitted to the session its
+//! association holds and stores its values only while that same session is
+//! still open: a session that has ended, expired or been opened again since
+//! takes no value from it (IEC 61850-7-2 §16.3.3, §16.3.4).
+//!
 //! The runtime also holds the values of every setting group (IEC 61850-7-2
 //! §16). In the model the FC=SG data attribute of a setting is the active
 //! buffer and the FC=SE data attribute of the same name the edit buffer; the
@@ -51,7 +56,7 @@ use iec61850_mms::mms::pdu::common::{
 use iec61850_model::{DataAttribute, DataObject, DoChild, IedModel, MmsValue, FC};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,6 +181,34 @@ struct State {
     editing_conn: Option<ConnectionId>,
     /// When the edit session expires; `None` while no session is open.
     reservation_deadline: Option<Instant>,
+    /// Number of the latest edit session; every SelectEditSG that opens a
+    /// session, on the same group or another, takes the next one.
+    session: u64,
+}
+
+/// An edit session as a write found it open: the association holding it and
+/// the number of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EditSession {
+    conn_id: ConnectionId,
+    number: u64,
+}
+
+/// Keeps the edit session it was taken for open, unchanged, until dropped:
+/// opening, ending and expiring a session wait for it.
+pub(crate) struct EditSessionHold<'a> {
+    _state: RwLockReadGuard<'a, State>,
+}
+
+impl State {
+    /// Whether `session` is the open session and its reservation has not
+    /// passed at `now`.
+    fn is_current(&self, session: EditSession, now: Instant) -> bool {
+        self.edit_sg > 0
+            && self.editing_conn == Some(session.conn_id)
+            && self.session == session.number
+            && self.reservation_deadline.is_none_or(|d| now < d)
+    }
 }
 
 /// Values a read of the setting group control block reports.
@@ -229,6 +262,7 @@ impl SettingGroupRuntime {
                 last_act_tm_ms: now_ms,
                 editing_conn: None,
                 reservation_deadline: None,
+                session: 0,
             }),
             handler: RwLock::new(Arc::new(DefaultSettingGroupHandler)),
             settings: Mutex::new(Vec::new()),
@@ -409,6 +443,7 @@ impl SettingGroupRuntime {
                 }
                 g.edit_sg = new_edit_sg;
                 g.editing_conn = Some(conn_id);
+                g.session = g.session.wrapping_add(1);
                 let lifetime = Duration::from_secs(u64::from(self.default_resv_tms_s));
                 g.reservation_deadline = Instant::now().checked_add(lifetime);
                 self.prepare_load(&settings, Buffer::Edit, new_edit_sg)
@@ -530,16 +565,41 @@ impl SettingGroupRuntime {
     /// Reports whether the association owns an open edit session, that is
     /// whether a group is being edited and this association opened it. An
     /// expired session is released first.
-    ///
-    /// The Write service uses this to gate writes under functional constraint
-    /// SE.
     pub fn is_edit_session_owner(&self, conn_id: ConnectionId) -> bool {
+        self.edit_session_of(conn_id).is_some()
+    }
+
+    /// Returns the open edit session the association holds, or `None` when it
+    /// holds none. An expired session is released first.
+    ///
+    /// The Write service admits a write under functional constraint SE to the
+    /// session this returns, and stores its values under
+    /// [`hold_edit_session`](Self::hold_edit_session).
+    pub(crate) fn edit_session_of(&self, conn_id: ConnectionId) -> Option<EditSession> {
         self.expire_stale_session_if_any();
-        let g = match self.state.read() {
-            Ok(g) => *g,
-            Err(_) => return false,
-        };
-        g.edit_sg > 0 && g.editing_conn == Some(conn_id)
+        let g = self.state.read().ok()?;
+        (g.edit_sg > 0 && g.editing_conn == Some(conn_id)).then_some(EditSession {
+            conn_id,
+            number: g.session,
+        })
+    }
+
+    /// Keeps `session` open until the returned hold is dropped, or returns
+    /// `None` when it has ended, its reservation has passed, or a session has
+    /// been opened since, by its association or another.
+    ///
+    /// The hold takes the state lock for reading, after the value lock of the
+    /// served model; nothing that holds the state lock takes the value lock.
+    pub(crate) fn hold_edit_session(&self, session: EditSession) -> Option<EditSessionHold<'_>> {
+        let g = self.state.read().ok()?;
+        g.is_current(session, Instant::now())
+            .then_some(EditSessionHold { _state: g })
+    }
+
+    /// Whether the session state is locked, as a hold keeps it.
+    #[cfg(test)]
+    pub(crate) fn session_state_is_locked(&self) -> bool {
+        self.state.try_write().is_err()
     }
 
     /// Releases the edit session if its reservation has expired, returning the
@@ -550,8 +610,9 @@ impl SettingGroupRuntime {
     }
 
     /// [`SettingGroupRuntime::tick_reservation`] against a supplied instant of
-    /// the monotonic clock.
-    pub(crate) fn tick_reservation_at(&self, now: Instant) -> Option<ConnectionId> {
+    /// the monotonic clock, so an application or a test can drive the
+    /// reservation with clock readings of its own.
+    pub fn tick_reservation_at(&self, now: Instant) -> Option<ConnectionId> {
         let mut g = match self.state.write() {
             Ok(g) => g,
             Err(_) => return None,
@@ -878,8 +939,9 @@ impl SettingGroupRegistry {
     }
 
     /// [`SettingGroupRegistry::tick_reservations`] against a supplied instant of
-    /// the monotonic clock.
-    pub(crate) fn tick_reservations_at(&self, now: Instant) -> Vec<(String, ConnectionId)> {
+    /// the monotonic clock, so an application or a test can drive the
+    /// reservations with clock readings of its own.
+    pub fn tick_reservations_at(&self, now: Instant) -> Vec<(String, ConnectionId)> {
         let g = match self.inner.read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
@@ -1418,6 +1480,45 @@ mod tests {
         assert_eq!(rt.tick_reservation_at(future), None);
         let s = rt.snapshot();
         assert_eq!(s.edit_sg, 0);
+    }
+
+    /// A hold keeps every change of the session waiting until it is dropped,
+    /// and only the session it was found for, unexpired, can be held.
+    #[test]
+    fn a_hold_keeps_its_session_until_dropped() {
+        let rt = rt_three_sg();
+        rt.try_edit_sg(2, 100).unwrap();
+        let session = rt.edit_session_of(100).expect("conn 100 holds the session");
+        assert_eq!(rt.edit_session_of(200), None);
+
+        let hold = rt.hold_edit_session(session).expect("the session is open");
+        assert!(
+            rt.session_state_is_locked(),
+            "opening, ending and expiring a session wait for the hold"
+        );
+        drop(hold);
+        assert!(!rt.session_state_is_locked());
+
+        let past_the_reservation = Instant::now() + Duration::from_millis(60_001);
+        assert!(rt.state.read().unwrap().is_current(session, Instant::now()));
+        assert!(!rt
+            .state
+            .read()
+            .unwrap()
+            .is_current(session, past_the_reservation));
+
+        rt.try_edit_sg(3, 100).unwrap();
+        assert!(
+            rt.hold_edit_session(session).is_none(),
+            "a session opened again by the same association is another one"
+        );
+        let reopened = rt.edit_session_of(100).expect("conn 100 holds the session");
+        assert!(rt.hold_edit_session(reopened).is_some());
+        rt.try_edit_sg(0, 100).unwrap();
+        assert!(
+            rt.hold_edit_session(reopened).is_none(),
+            "a cancelled session"
+        );
     }
 
     #[test]

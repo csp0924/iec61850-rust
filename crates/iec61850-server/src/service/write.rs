@@ -80,7 +80,7 @@ use crate::service::convert::{bit_string_bytes, mms_data_to_mms_value, same_data
 use crate::service::read::{leading_segments, object_has_fc, Node};
 // Writing under FC SE belongs to the setting-group subsystem.
 #[cfg(feature = "setting-groups")]
-use crate::setting_groups::SettingGroupRegistry;
+use crate::setting_groups::{EditSession, SettingGroupRegistry, SettingGroupRuntime};
 use iec61850_mms::mms::pdu::common::{
     AlternateAccess, AlternateAccessSelector, DataAccessError, MmsData, ObjectName, WriteOutcome,
 };
@@ -272,6 +272,8 @@ pub(crate) fn handle_single_write_with_access(
                 alt_access,
                 data,
                 handler_registry,
+                #[cfg(feature = "setting-groups")]
+                None,
                 conn_id,
                 item_id,
             )
@@ -279,7 +281,7 @@ pub(crate) fn handle_single_write_with_access(
         #[cfg(feature = "setting-groups")]
         FcWriteRoute::SettingEdit => {
             // The policy bitmask comes first, then the edit-session gate of
-            // IEC 61850-7-2 §20.3.
+            // IEC 61850-7-2 §16.2.2.5.
             if !policies.is_allowed(FC::Se) {
                 tracing::warn!(
                     domain = domain,
@@ -312,7 +314,7 @@ pub(crate) fn handle_single_write_with_access(
                     return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
                 }
             };
-            if !rt.is_edit_session_owner(conn_id) {
+            let Some(session) = rt.edit_session_of(conn_id) else {
                 tracing::warn!(
                     domain = domain,
                     item_id = item_id,
@@ -320,7 +322,7 @@ pub(crate) fn handle_single_write_with_access(
                     "write: the caller does not hold the edit session, answering temporarily-unavailable to an SE write"
                 );
                 return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
-            }
+            };
             write_to_target(
                 ied_model,
                 mms_model,
@@ -331,6 +333,7 @@ pub(crate) fn handle_single_write_with_access(
                 alt_access,
                 data,
                 handler_registry,
+                Some((&*rt, session)),
                 conn_id,
                 item_id,
             )
@@ -340,6 +343,10 @@ pub(crate) fn handle_single_write_with_access(
 
 /// Resolves the target, checks the value, gives every handler concerned its
 /// say, and updates the cached values.
+///
+/// `edit_session`, given for a write under functional constraint SE, is the
+/// session the write was admitted to; the values are stored only while it is
+/// still open, and the write answers `TemporarilyUnavailable` otherwise.
 #[allow(clippy::too_many_arguments)]
 fn write_to_target(
     ied_model: &IedModel,
@@ -351,6 +358,7 @@ fn write_to_target(
     alt_access: Option<&AlternateAccess>,
     data: &MmsData,
     handler_registry: Option<&HandlerRegistry>,
+    #[cfg(feature = "setting-groups")] edit_session: Option<(&SettingGroupRuntime, EditSession)>,
     conn_id: u64,
     item_id: &str,
 ) -> WriteOutcome {
@@ -534,6 +542,25 @@ fn write_to_target(
     let mut written: Vec<WrittenLeaf> = Vec::with_capacity(updates.len());
     {
         let _values = crate::compat::rwlock_write(mms_model.value_lock());
+        // The edit session may have ended, expired or been opened again while
+        // the handlers ran; holding it keeps it from changing until the values
+        // are stored, so a session opened later loads its group over them.
+        #[cfg(feature = "setting-groups")]
+        let _session = match edit_session {
+            None => None,
+            Some((rt, session)) => match rt.hold_edit_session(session) {
+                Some(hold) => Some(hold),
+                None => {
+                    tracing::warn!(
+                        domain = domain,
+                        item_id = item_id,
+                        conn_id,
+                        "write: the edit session ended before the values were stored, answering temporarily-unavailable to an SE write"
+                    );
+                    return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
+                }
+            },
+        };
         for (leaf, new_value) in updates {
             match store_value(leaf, new_value.clone()) {
                 Ok(old) => written.push(WrittenLeaf {
@@ -1991,7 +2018,7 @@ mod tests {
         assert_eq!(
             result,
             WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable),
-            "a write under functional constraint SE needs an open edit session, per IEC 61850-7-2 §20.3"
+            "a write under functional constraint SE needs an open edit session, per IEC 61850-7-2 §16.2.2.5"
         );
     }
 
@@ -2055,6 +2082,139 @@ mod tests {
             &data,
         );
         assert_eq!(result, WriteOutcome::Success);
+    }
+
+    /// Holds a write in its handler until the test releases it, telling the
+    /// test once the write is held.
+    #[derive(Debug)]
+    struct HoldWrite {
+        held: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl crate::handler::AttributeAccessHandler for HoldWrite {
+        fn on_write(&self, _ctx: &WriteContext<'_>, _value: &MmsValue) -> HandlerWriteOutcome {
+            let _ = self.held.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv();
+            HandlerWriteOutcome::Accept
+        }
+    }
+
+    /// An SE write whose edit session expires while its handler runs stores
+    /// nothing and answers temporarily-unavailable, whether another
+    /// association or the same one opens the next session.
+    #[test]
+    fn an_se_write_stores_only_into_the_session_it_was_admitted_to() {
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SE$Setpoint$setVal".to_string(),
+        };
+        let past_any_reservation = std::time::Duration::from_secs(u64::from(u16::MAX) + 1);
+        for next_owner in [200, 100] {
+            let (model, mms_model, settings) = build_sg_test_model();
+            let mut policies = WriteAccessPolicies::default();
+            policies.set(FC::Se, true);
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let handlers = HandlerRegistry::new();
+            handlers
+                .install_write_access_handler(
+                    "GGIO1$SE$Setpoint$setVal",
+                    Arc::new(HoldWrite {
+                        held: std::sync::Mutex::new(held_tx),
+                        release: std::sync::Mutex::new(release_rx),
+                    }),
+                )
+                .unwrap();
+            let rt = settings.lookup("IED1LD0").unwrap();
+            rt.try_edit_sg(2, 100).expect("conn 100 opens a session");
+
+            let outcome = std::thread::scope(|s| {
+                let write = s.spawn(|| {
+                    handle_single_write(
+                        &model,
+                        &mms_model,
+                        &policies,
+                        Some(&handlers),
+                        Some(&settings),
+                        100,
+                        &name,
+                        &MmsData::Integer(999),
+                    )
+                });
+                held_rx.recv().expect("the write reaches its handler");
+                let expired =
+                    settings.tick_reservations_at(std::time::Instant::now() + past_any_reservation);
+                assert_eq!(expired, vec![("IED1LD0".to_string(), 100)]);
+                rt.try_edit_sg(3, next_owner)
+                    .expect("the next session opens");
+                release_tx.send(()).unwrap();
+                write.join().unwrap()
+            });
+            assert_eq!(
+                outcome,
+                WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable),
+                "next session opened by conn {next_owner}"
+            );
+            assert_eq!(
+                leaf_value(&model, "IED1LD0/GGIO1$SE$Setpoint$setVal"),
+                MmsValue::Integer(0),
+                "next session opened by conn {next_owner}"
+            );
+        }
+    }
+
+    /// An SE write holds its edit session from the check of the session until
+    /// its values are stored, so a session opened meanwhile loads its group
+    /// over them.
+    #[test]
+    fn an_se_write_holds_its_session_while_it_stores() {
+        let (model, mms_model, settings) = build_sg_test_model();
+        let mut policies = WriteAccessPolicies::default();
+        policies.set(FC::Se, true);
+        let rt = settings.lookup("IED1LD0").unwrap();
+        rt.try_edit_sg(2, 100).expect("conn 100 opens a session");
+        let r = iec61850_model::ObjectRef::parse_mms("IED1LD0/GGIO1$SE$Setpoint$setVal").unwrap();
+        let Some(iec61850_model::NodeRef::Da(leaf)) = model.node_by_object_ref(&r) else {
+            panic!("setVal");
+        };
+        let name = ObjectName::DomainSpecific {
+            domain_id: "IED1LD0".to_string(),
+            item_id: "GGIO1$SE$Setpoint$setVal".to_string(),
+        };
+
+        // The leaf is held, so the write stops at its store.
+        let leaf_guard = leaf.value.read().unwrap();
+        let outcome = std::thread::scope(|s| {
+            let write = s.spawn(|| {
+                handle_single_write(
+                    &model,
+                    &mms_model,
+                    &policies,
+                    None,
+                    Some(&settings),
+                    100,
+                    &name,
+                    &MmsData::Integer(7),
+                )
+            });
+            // The write takes the value lock only to store, and stops at the
+            // held leaf, so the session state stays locked from then on only
+            // if the write holds its session while it stores. The watchdog
+            // guards against a hang only.
+            let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !(mms_model.value_lock().try_read().is_err() && rt.session_state_is_locked()) {
+                assert!(
+                    std::time::Instant::now() < watchdog,
+                    "the write stores without holding its session"
+                );
+                std::thread::yield_now();
+            }
+            drop(leaf_guard);
+            write.join().unwrap()
+        });
+        assert_eq!(outcome, WriteOutcome::Success);
+        assert_eq!(leaf.snapshot(), MmsValue::Integer(7));
+        assert!(!rt.session_state_is_locked());
     }
 
     #[test]
