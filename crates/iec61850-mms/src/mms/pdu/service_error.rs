@@ -301,7 +301,9 @@ impl ErrorClass {
     /// `data` starts at the `0xa0` byte; the number of bytes consumed is returned.
     /// Lengths may use the short or the long form. The wrapper must hold
     /// exactly one primitive alternative, `[0]` through `[12]`, whose subcode
-    /// is a non-negative INTEGER no larger than 255.
+    /// is a non-negative INTEGER no larger than 255. A subcode carrying
+    /// redundant leading zero octets, a non-minimal INTEGER encoding, is
+    /// accepted.
     pub fn decode_explicit(data: &[u8]) -> Result<(Self, usize), MmsError> {
         let (tag, content, consumed) = split_tlv(data)?;
         if tag != 0xa0 {
