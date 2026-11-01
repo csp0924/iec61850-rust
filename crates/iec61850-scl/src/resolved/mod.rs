@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::build_model::{doi_children, instance_children};
+use crate::build_model::{derives_setting_view, doi_children, instance_children};
 use crate::error::{ErrorKind, SclParseError, SourceSpan, TypeKind};
 use crate::raw::{
     DataTypeTemplates, RawBda, RawCount, RawDataInstance, RawDoTypeChild, RawLogicalNode, RawScl,
@@ -28,7 +28,8 @@ pub const DEFAULT_MAX_EXPANDED_NODES: u64 = 1_000_000;
 pub struct ResolveOptions {
     /// The most model nodes, logical nodes, data objects and data attributes
     /// at every nesting level, that one IED, or one type of the
-    /// DataTypeTemplates, may expand to.
+    /// DataTypeTemplates, may expand to. Array elements count, and so does
+    /// the FC=SG view the model builder derives from an FC=SE attribute.
     ///
     /// A type referenced several times is expanded once per reference, so a
     /// few hundred lines of nested types can describe an exponential number of
@@ -105,9 +106,10 @@ impl ResolvedScl {
     /// referencing element. [`ErrorKind::SemanticConflict`] when structure or
     /// sub-object references form a cycle, nest deeper than 32 levels, or
     /// expand an IED or a type to more than
-    /// [`ResolveOptions::max_expanded_nodes`] nodes, array elements included,
-    /// when a `count` names no attribute of an integer bType in the same type
-    /// definition, or when the `<Val>` of that attribute is not a count.
+    /// [`ResolveOptions::max_expanded_nodes`] nodes, array elements and
+    /// derived FC=SG views included, when a `count` names no attribute of an
+    /// integer bType in the same type definition, or when the `<Val>` of that
+    /// attribute is not a count.
     pub fn from_raw_with(raw: RawScl, options: &ResolveOptions) -> Result<Self, SclParseError> {
         let mut raw = raw;
         resolve_counts(&mut raw.data_type_templates)?;
@@ -639,8 +641,9 @@ fn check_bda_recursive(
 ///
 /// Counts every logical node, data object, sub-object, data attribute and
 /// nested attribute the model builder would create, a type being counted once
-/// per reference to it and an array once per element, plus once for the array
-/// itself. Each type's count is computed once and shared, so the check is
+/// per reference to it, an array once per element, plus once for the array
+/// itself, and an FC=SE attribute once more for the FC=SG view derived from
+/// it. Each type's count is computed once and shared, so the check is
 /// linear in the size of the templates. An IED counts the arrays whose element
 /// count its instances give with those counts, read as the model builder
 /// reads them; a type alone counts them as scalars. An IED is rejected at the
@@ -781,7 +784,10 @@ impl ExpansionCounts {
                         )),
                         _ => 1,
                     };
-                    with_count(element, instance_count(da.count.as_ref(), values))
+                    with_setting_view(
+                        with_count(element, instance_count(da.count.as_ref(), values)),
+                        derives_setting_view(da, dot),
+                    )
                 }
                 RawDoTypeChild::Sdo(sdo) => with_count(
                     1u64.saturating_add(self.do_type_in(
@@ -930,7 +936,10 @@ impl ExpansionCounts {
                             }
                             _ => 1,
                         };
-                        with_elements(element, da.count.as_ref())
+                        with_setting_view(
+                            with_elements(element, da.count.as_ref()),
+                            derives_setting_view(da, dot),
+                        )
                     }
                     RawDoTypeChild::Sdo(sdo) => with_elements(
                         1u64.saturating_add(self.do_type(dtt, &sdo.do_type_ref)),
@@ -972,6 +981,16 @@ fn with_count(element: u64, count: Option<u32>) -> u64 {
     match count {
         Some(n) => 1u64.saturating_add(element.saturating_mul(u64::from(n))),
         None => element,
+    }
+}
+
+/// The node count of an attribute of `nodes` nodes, doubled when the model
+/// builder derives an FC=SG view of it, which has the same nodes.
+fn with_setting_view(nodes: u64, derives_view: bool) -> u64 {
+    if derives_view {
+        nodes.saturating_mul(2)
+    } else {
+        nodes
     }
 }
 

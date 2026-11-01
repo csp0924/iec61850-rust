@@ -258,3 +258,130 @@ fn instance_counts_add_up_against_the_limit_of_the_ied() {
         .build_model("IED1")
         .expect("build");
 }
+
+/// The number of model nodes of the IED `ied` of `xml` built under the
+/// default limit: every node but the logical devices, as stage 2 counts them.
+fn built_nodes(xml: &str, ied: &str) -> u64 {
+    let model = iec61850_scl::parse_scl(xml)
+        .expect("parse")
+        .resolve()
+        .expect("resolve")
+        .build_model(ied)
+        .expect("build");
+    let mut nodes = 0;
+    model.walk(|n| {
+        if !matches!(n, iec61850_model::ModelNode::Ld(_)) {
+            nodes += 1;
+        }
+    });
+    nodes
+}
+
+/// The FC=SG view the model builder derives from an FC=SE attribute counts
+/// against the limit: an FC=SE array of 10 structures of 2 floats is 31
+/// nodes, and its view another 31.
+#[test]
+fn derived_setting_views_count_against_the_limit() {
+    let xml = with_do_type(r#"<DA name="a" fc="SE" bType="Struct" type="P" count="10"/>"#);
+    // D_T: 31 + 31 = 62; LLN0: 1 + 62 = 63; the IED adds LLN0 itself: 64.
+    assert_eq!(built_nodes(&xml, "IED1"), 64);
+    let resolve = |max| {
+        iec61850_scl::parse_scl(&xml)
+            .expect("parse")
+            .resolve_with(&options(max))
+    };
+    let err = resolve(33).expect_err("64 nodes exceed a limit of 33");
+    assert!(
+        err.to_string()
+            .contains("DOType `D_T` expands to 62 model nodes, more than the limit of 33"),
+        "{err}"
+    );
+    let err = resolve(63).expect_err("64 nodes exceed a limit of 63");
+    assert!(
+        err.to_string()
+            .contains("IED `IED1` expands to at least 64 model nodes"),
+        "{err}"
+    );
+    resolve(64)
+        .expect("64 nodes fit a limit of 64")
+        .build_model("IED1")
+        .expect("build");
+}
+
+/// Stage 2 counts exactly the nodes the model builder makes: each file below
+/// resolves under a limit of the number of nodes its model has, and is
+/// rejected under one less. The files cover an FC=SE attribute with its
+/// derived view, one whose DOType declares the FC=SG attribute itself, an
+/// FC=SE attribute of a sub-object and of an array of sub-objects, an FC=SE
+/// array whose element count an instance gives, and the SCL files of the
+/// repository.
+#[test]
+fn the_limit_counts_the_nodes_the_model_builder_makes() {
+    let mut files: Vec<(String, String, &str)> = [
+        (
+            "derived view",
+            with_do_type(r#"<DA name="a" fc="SE" bType="Struct" type="P"/>"#),
+        ),
+        (
+            "declared view",
+            with_do_type(
+                r#"<DA name="a" fc="SE" bType="Struct" type="P"/><DA name="a" fc="SG" bType="Struct" type="P"/>"#,
+            ),
+        ),
+        (
+            "sub-object",
+            with_do_type(r#"<SDO name="s" type="S_T"/>"#).replace(
+                "<DAType id=\"P\">",
+                r#"<DOType id="S_T" cdc="ASG"><DA name="setMag" fc="SE" bType="Struct" type="P"/></DOType><DAType id="P">"#,
+            ),
+        ),
+        (
+            "array of sub-objects",
+            with_do_type(r#"<SDO name="s" type="S_T" count="3"/>"#).replace(
+                "<DAType id=\"P\">",
+                r#"<DOType id="S_T" cdc="ASG"><DA name="setMag" fc="SE" bType="Struct" type="P"/></DOType><DAType id="P">"#,
+            ),
+        ),
+        (
+            "instance count",
+            instance_counts(5).replace(
+                r#"<DA name="a" fc="ST" bType="INT32" count="n"/>"#,
+                r#"<DA name="a" fc="SE" bType="INT32" count="n"/>"#,
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(what, xml)| (what.to_string(), xml, "IED1"))
+    .collect();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    for (path, ied) in [
+        ("iec61850-scl-build-example/scl/arrays.icd", "Arrays"),
+        ("iec61850-scl-build-example/scl/demo.icd", "Demo"),
+        ("iec61850-scl-build-example/scl/schema.icd", "Schema"),
+        ("iec61850-scl-build-example/scl/settings.icd", "Settings"),
+        ("iec61850-server/examples/models/demo.cid", "DemoIED"),
+    ] {
+        let xml = std::fs::read_to_string(format!("{dir}/{path}"))
+            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        files.push((path.to_string(), xml, ied));
+    }
+    let mut miscounted = Vec::new();
+    for (what, xml, ied) in &files {
+        let nodes = built_nodes(xml, ied);
+        let resolve = |max| {
+            iec61850_scl::parse_scl(xml)
+                .expect("parse")
+                .resolve_with(&options(max))
+        };
+        if resolve(nodes).is_err() {
+            miscounted.push(format!("{what}: {nodes} nodes rejected under {nodes}"));
+        }
+        if resolve(nodes - 1).is_ok() {
+            miscounted.push(format!(
+                "{what}: {nodes} nodes accepted under {}",
+                nodes - 1
+            ));
+        }
+    }
+    assert!(miscounted.is_empty(), "{miscounted:#?}");
+}
