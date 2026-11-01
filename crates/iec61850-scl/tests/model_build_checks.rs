@@ -573,6 +573,12 @@ fn indexed_dai_and_sdi_are_skipped() {
 struct CountWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 impl tracing::Subscriber for CountWarnings {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }

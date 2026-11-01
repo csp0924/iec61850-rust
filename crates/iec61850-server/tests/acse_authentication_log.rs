@@ -62,6 +62,12 @@ impl tracing::field::Visit for Fields<'_> {
 }
 
 impl tracing::Subscriber for Recorder {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }

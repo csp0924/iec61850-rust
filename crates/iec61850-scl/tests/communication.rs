@@ -645,6 +645,12 @@ fn the_summary_lists_the_addressing() {
 fn warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     struct Collect(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
     impl tracing::Subscriber for Collect {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
