@@ -1,17 +1,22 @@
-//! `UtcTime`, the eight-octet timestamp that carries refrTm.
+//! `UtcTime`, the eight-octet encoding of a TimeStamp.
 //!
-//! refrTm is a TimeStamp (IEC 61850-7-2 §6.1.2.9) mapped onto the UtcTime
-//! encoding of IEC 61850-8-1 §8.1.3.7 and Annex F (IEC 61850-9-2 §8.5.2
-//! Table 14):
+//! A TimeStamp (IEC 61850-7-2 §6.1.2.9) is mapped onto the UtcTime encoding of
+//! IEC 61850-8-1 §8.1.3.7 and Annex F. It carries the `t` member of a GOOSE
+//! PDU (IEC 61850-8-1 §18.1.2.5 Table 88) and the refrTm member of a Sampled
+//! Values ASDU (IEC 61850-9-2 §8.5.2 Table 14):
 //!
 //! ```text
 //! octets 0..4   SecondSinceEpoch   u32 big-endian, seconds since 1970-01-01 UTC
 //! octets 4..7   FractionOfSecond   24 bits, value = fraction / 2^24 s
-//! octet  7      TimeQuality        bit 7 LeapSecondsKnown
-//!                                  bit 6 ClockFailure
-//!                                  bit 5 ClockNotSynchronized
-//!                                  bits 4..0 TimeAccuracy
+//! octet  7      TimeQuality        0x80 LeapSecondsKnown
+//!                                  0x40 ClockFailure
+//!                                  0x20 ClockNotSynchronized
+//!                                  0x1F TimeAccuracy
 //! ```
+//!
+//! IEC 61850-8-1 Table 36 numbers the TimeQuality bits from the most
+//! significant one: its bit 0 is the mask `0x80` above and its bits 3 to 7
+//! are the mask `0x1F`.
 //!
 //! A value of this type is always well formed. Every bit pattern is legal
 //! except the TimeAccuracy codes 25 through 30, which IEC 61850-8-1 Table 36
@@ -20,13 +25,13 @@
 //! is always below one second.
 //!
 //! What the encoding leaves to the application is not judged here: how far
-//! the time lies from the local clock, whether it advances between ASDUs, and
-//! the meaning of the quality flags. In particular IEC 61850-7-2
+//! the time lies from the local clock, whether it advances between messages,
+//! and the meaning of the quality flags. In particular IEC 61850-7-2
 //! §6.1.2.9.3.3 requires the time value to be ignored when ClockFailure is
 //! set; the flag is reported in [`TimeQuality::clock_failure`] and the value
 //! is still returned.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use thiserror::Error;
 
@@ -62,8 +67,8 @@ pub enum UtcTimeError {
 
     /// A TimeAccuracy that is not a valid code: 25 through 30, which
     /// IEC 61850-8-1 Table 36 defines as invalid, or a value that does not fit
-    /// the five-bit field. As a requested number of bits it is any value above
-    /// 24.
+    /// the five-bit field. From [`TimeAccuracy::bits`], a requested number of
+    /// bits above 24.
     #[error("time accuracy {0} is not a valid code")]
     InvalidTimeAccuracy(u8),
 }
@@ -375,6 +380,7 @@ mod tests {
     #[test]
     fn accuracy_codes() {
         assert_eq!(TimeAccuracy::bits(24).map(TimeAccuracy::code), Ok(24));
+        assert_eq!(TimeAccuracy::bits(24).unwrap().significant_bits(), Some(24));
         assert_eq!(
             TimeAccuracy::bits(25),
             Err(UtcTimeError::InvalidTimeAccuracy(25))
@@ -450,5 +456,12 @@ mod tests {
         assert!(UtcTime::NULL.is_null());
         assert_eq!(UtcTime::from_bytes([0; 8]), Ok(UtcTime::NULL));
         assert!(!UtcTime::new(0, 1, q(0)).unwrap().is_null());
+        // The NULL TimeStamp has every field zero, TimeQuality included.
+        assert!(!UtcTime::from_bytes([0, 0, 0, 0, 0, 0, 0, 0x8A])
+            .unwrap()
+            .is_null());
+        assert!(!UtcTime::new(1, 0, TimeQuality::from_byte(0).unwrap())
+            .unwrap()
+            .is_null());
     }
 }

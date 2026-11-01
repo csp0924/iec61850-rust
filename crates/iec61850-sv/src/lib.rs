@@ -9,8 +9,8 @@
 //! VLAN, and SV header layers, `nine_two_le` the 9-2LE channel layout,
 //! `publisher` the frame template and hot-path setters, `publish_thread` a
 //! Linux publish loop, `subscriber` per-svID filtering and sample continuity,
-//! `receiver` the typestate that owns the L2 source, and `utc_time` the
-//! refrTm timestamp.
+//! and `receiver` the typestate that owns the L2 source. `utc_time`, the
+//! refrTm timestamp, is the module of `iec61850-model` re-exported.
 //!
 //! Not implemented here: SVCB management over MMS, R-SV over UDP, and the
 //! protection profile of 256 samples per cycle.
@@ -26,7 +26,8 @@ pub mod pdu;
 pub mod publisher;
 pub mod receiver;
 pub mod subscriber;
-pub mod utc_time;
+
+pub use iec61850_model::utc_time;
 
 #[cfg(target_os = "linux")]
 pub mod publish_thread;

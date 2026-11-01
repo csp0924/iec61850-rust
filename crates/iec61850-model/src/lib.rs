@@ -89,6 +89,7 @@ pub mod fc;
 pub mod object_ref;
 pub mod tree;
 pub mod types;
+pub mod utc_time;
 pub mod value;
 
 pub use builder::{DataObjectBuilder, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder};
