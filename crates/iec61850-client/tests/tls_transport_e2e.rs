@@ -80,8 +80,8 @@ async fn refuse_once(listener: TcpListener, config: Arc<rustls::ServerConfig>) {
 enum AfterHandshake {
     /// Sends these bytes as they are, then reads until the client closes.
     Send(Vec<u8>),
-    /// Waits for the client's first bytes after the handshake and closes the
-    /// TCP connection with them unread, which resets it.
+    /// Waits for the client's first bytes after the handshake and resets the
+    /// TCP connection.
     Reset,
 }
 
@@ -120,7 +120,20 @@ async fn misbehave_once(
             while tcp.read(&mut buf).await.map(|n| n > 0).unwrap_or(false) {}
         }
         AfterHandshake::Reset => {
-            tcp.peek(&mut buf).await.expect("peek");
+            // The client's first bytes may have come with its Finished and been
+            // decrypted already; otherwise they are read until they decrypt.
+            let mut io = tls.process_new_packets().expect("records");
+            while io.plaintext_bytes_to_read() == 0 {
+                let n = tcp.read(&mut buf).await.expect("read");
+                assert!(n > 0, "the client closed before sending");
+                let mut input = &buf[..n];
+                while !input.is_empty() {
+                    tls.read_tls(&mut input).expect("read tls");
+                    io = tls.process_new_packets().expect("records");
+                }
+            }
+            // A zero linger time turns the close into a reset.
+            tcp.set_zero_linger().expect("zero linger");
             drop(tcp);
         }
     }
