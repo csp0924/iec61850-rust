@@ -191,11 +191,14 @@ impl IedServer {
     ///   in which a control block without `<GSE>` is disabled (IEC 61850-8-1
     ///   §25.3.2): without `goose_comm` it is registered
     ///   [without a destination](crate::goose_mapping::GoCBHandle::without_destination),
-    ///   so it stays disabled and publishes nothing. The publisher stamps
-    ///   `t`, the time of the last stNum change (IEC 61850-8-1 §18.1.2.5),
-    ///   from [`FromModelOptions::wall_clock`] with the
-    ///   [`time_quality`](crate::IedServerConfig::time_quality) of the server
-    ///   configuration: once at registration, and again on every
+    ///   so it stays disabled and publishes nothing. A `<GSE>` whose address
+    ///   has no `MAC-Address`, such as one for GOOSE over UDP/IP (IEC 61850-8-1
+    ///   §25.3.3 Table 164), gives no layer 2 destination: without
+    ///   `goose_comm` its control block is registered the same way, with a
+    ///   warning. The publisher stamps `t`, the time of the last stNum change
+    ///   (IEC 61850-8-1 §18.1.2.5), from [`FromModelOptions::wall_clock`]
+    ///   with the [`time_quality`](crate::IedServerConfig::time_quality) of
+    ///   the server configuration: once at registration, and again on every
     ///   `increase_st_num` and `reset`, a disabled control block included. A
     ///   system clock before the epoch, or a reading past the 32-bit
     ///   SecondSinceEpoch, is sent as the epoch with ClockFailure set.
@@ -223,9 +226,7 @@ impl IedServer {
     /// resolve, names an element past the end of its array, resolves to no attribute or to more
     /// than [`DatasetEntry::MAX_LEAVES`] attributes, when a
     /// control block names a data set of another logical device or one the
-    /// server does not hold, when a GOOSE control block names no data set, or
-    /// when, with no [`FromModelOptions::goose_comm`], the address of its
-    /// `<GSE>` has no `MAC-Address`.
+    /// server does not hold, or when a GOOSE control block names no data set.
     /// Nothing is registered when an error is returned. A control object
     /// already registered is left as it is, its handlers included.
     pub fn register_from_model_with(&self, options: &FromModelOptions) -> Result<FromModelSummary> {
@@ -249,6 +250,10 @@ impl IedServer {
                 self.require_data_set(&plan, key, || lcb.description())?;
             }
         }
+        // A connected access point of the IED makes the SCL a system
+        // configuration, in which a control block without <GSE> is disabled
+        // (IEC 61850-8-1 §25.3.2).
+        let system_configuration = !model.connected_aps.is_empty();
         let publishers = plan
             .gocbs
             .iter()
@@ -259,12 +264,24 @@ impl IedServer {
                         gocb.reference
                     ))
                 };
-                let comm = match (&options.goose_comm, &gocb.gse) {
-                    (Some(factory), _) => factory(&gocb.reference),
-                    (None, Some(gse)) => {
-                        CommParameters::from_address(&gse.address).map_err(invalid)?
-                    }
-                    (None, None) => CommParameters::new(0, DEFAULT_GOOSE_DESTINATION),
+                let placeholder = || CommParameters::new(0, DEFAULT_GOOSE_DESTINATION);
+                // Whether the control block has a destination: in a system
+                // configuration, one the SCL gives no layer 2 address is
+                // disabled unless the application supplies a destination.
+                let (comm, has_destination) = match (&options.goose_comm, &gocb.gse) {
+                    (Some(factory), _) => (factory(&gocb.reference), true),
+                    (None, Some(gse)) => match CommParameters::from_address(&gse.address) {
+                        Ok(comm) => (comm, true),
+                        Err(e) => {
+                            tracing::warn!(
+                                gocb = %gocb.reference,
+                                "the GSE of the GOOSE control block gives no layer 2 \
+                                 destination ({e}); it is registered disabled"
+                            );
+                            (placeholder(), false)
+                        }
+                    },
+                    (None, None) => (placeholder(), !system_configuration),
                 };
                 let go_id = Some(gocb.go_id.clone()).filter(|id| !id.is_empty());
                 let mut publisher = GoosePublisher::new(
@@ -278,7 +295,7 @@ impl IedServer {
                 if let Some(gse) = &gocb.gse {
                     publisher.set_retrans_intervals(RetransIntervals::from_gse(gse));
                 }
-                Ok(publisher)
+                Ok((publisher, has_destination))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -308,10 +325,7 @@ impl IedServer {
                 summary.urcbs += n;
             }
         }
-        // In a system configuration, a control block the SCL gives no <GSE>
-        // is disabled unless the application supplies a destination.
-        let disables = options.goose_comm.is_none() && !model.connected_aps.is_empty();
-        for (gocb, mut publisher) in plan.gocbs.iter().zip(publishers) {
+        for (gocb, (mut publisher, has_destination)) in plan.gocbs.iter().zip(publishers) {
             let clock = clock.clone();
             let source = move || goose_timestamp(clock(), time_quality);
             publisher.set_timestamp(source());
@@ -322,10 +336,10 @@ impl IedServer {
                 gocb.name.clone(),
                 Arc::new(Mutex::new(publisher)),
             );
-            let handle = if disables && gocb.gse.is_none() {
-                handle.without_destination()
-            } else {
+            let handle = if has_destination {
                 handle
+            } else {
+                handle.without_destination()
             };
             self.register_gocb(Arc::new(handle));
             summary.gocbs += 1;

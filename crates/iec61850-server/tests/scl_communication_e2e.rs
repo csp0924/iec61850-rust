@@ -20,7 +20,7 @@ use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::common::DataAccessError;
 use iec61850_mms::mms::MmsData;
 use iec61850_model::IedModel;
-use iec61850_server::{FromModelOptions, IedServer, IedServerConfig, ServerError};
+use iec61850_server::{FromModelOptions, IedServer, IedServerConfig};
 
 const DOMAIN: &str = "CommLD0";
 
@@ -356,21 +356,34 @@ fn the_comm_factory_takes_precedence_over_the_gse() {
     assert_eq!(publisher_settings(&server, "gcbSpare").0.app_id, 0x0042);
 }
 
-/// A `<GSE>` address without `MAC-Address` cannot give a layer 2 destination:
-/// the call fails and registers nothing.
-#[test]
-fn a_gse_without_mac_address_fails_the_registration() {
+/// A `<GSE>` address without `MAC-Address`, as one for GOOSE over UDP/IP,
+/// gives no layer 2 destination: its control block is registered disabled,
+/// and every other control block is registered as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gse_without_mac_address_disables_its_control_block() {
     let server = server(model(
-        r#"<GSE ldInst="LD0" cbName="gcbTrip"><Address><P type="APPID">3A01</P></Address></GSE>"#,
+        r#"<GSE ldInst="LD0" cbName="gcbTrip"><Address><P type="APPID">3A01</P><P type="IP">239.0.0.1</P></Address><MinTime>8</MinTime></GSE>"#,
     ));
-    match server.register_from_model() {
-        Err(ServerError::InvalidModel(why)) => {
-            assert!(
-                why.contains("gcbTrip") && why.contains("MAC-Address"),
-                "{why}"
-            )
-        }
-        other => panic!("{other:?}"),
+    let summary = server.register_from_model().expect("register_from_model");
+    assert_eq!(summary.gocbs, 2);
+    assert_eq!(summary.data_sets, 1);
+    let trip = server
+        .gocb_registry()
+        .find(DOMAIN, "LLN0", "gcbTrip")
+        .expect("gcbTrip is registered");
+    assert!(!trip.has_destination);
+    assert_eq!(
+        publisher_settings(&server, "gcbTrip").1.t1,
+        Duration::from_millis(8)
+    );
+
+    let handle = server.start().await.expect("start");
+    let mut c = connect(handle.bound_addr.port()).await;
+    let (addr, enable) = addr_and_enable(&mut c, "gcbTrip").await;
+    assert_eq!(addr, MmsData::OctetString(Vec::new()));
+    match enable {
+        Err(ClientError::DataAccessError(DataAccessError::TemporarilyUnavailable)) => {}
+        other => panic!("GoEna=TRUE without a layer 2 destination: {other:?}"),
     }
-    assert!(server.gocb_registry().is_empty());
+    handle.stop().await;
 }
