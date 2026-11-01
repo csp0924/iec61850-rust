@@ -7,6 +7,9 @@
 //! learned from the first report and fixed from then on: a later report of a
 //! different size is rejected instead of silently resizing the state.
 //!
+//! A report is checked in full before any of it is applied, so a rejected
+//! report leaves the state exactly as it was.
+//!
 //! A report split into segments is applied one segment at a time, as each
 //! segment arrives; the segments are not reassembled. Each segment carries its
 //! own inclusion bitstring naming the members it holds, so after a segment is
@@ -145,19 +148,13 @@ pub enum StateError {
 /// # Errors
 ///
 /// `DataSetSizeChanged` or `DataSetNameTooLong`, each also logged as a
-/// warning; the caller decides whether to drop the report.
+/// warning; the caller decides whether to drop the report. A rejected report
+/// leaves the state unchanged.
 pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<(), StateError> {
-    // Fix the data set size on the first report, then hold the caller to it.
+    // Every check runs before the state is touched.
     let dataset_size = parsed.inclusion_bits.len();
-    match state.dataset_size {
-        None => {
-            state.dataset_size = Some(dataset_size);
-            state.data_set_values = vec![None; dataset_size];
-            state.included = vec![false; dataset_size];
-            state.reasons = vec![ReasonForInclusion::empty(); dataset_size];
-            state.data_references = vec![None; dataset_size];
-        }
-        Some(prev) if prev != dataset_size => {
+    if let Some(prev) = state.dataset_size {
+        if prev != dataset_size {
             tracing::warn!(
                 rcb_ref = %state.rcb_reference,
                 prev,
@@ -169,7 +166,6 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
                 new: dataset_size,
             });
         }
-        Some(_) => {}
     }
 
     // An MMS object name is limited to 128 bytes.
@@ -182,6 +178,24 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
             );
             return Err(StateError::DataSetNameTooLong { len: name.len() });
         }
+    }
+
+    // The report carries one value per included member, in member order.
+    let included_count = parsed.inclusion_bits.iter().filter(|b| **b).count();
+    if parsed.data_values.len() < included_count {
+        return Err(StateError::DataSetSizeChanged {
+            prev: dataset_size,
+            new: parsed.data_values.len(),
+        });
+    }
+
+    // Fix the data set size on the first report.
+    if state.dataset_size.is_none() {
+        state.dataset_size = Some(dataset_size);
+        state.data_set_values = vec![None; dataset_size];
+        state.included = vec![false; dataset_size];
+        state.reasons = vec![ReasonForInclusion::empty(); dataset_size];
+        state.data_references = vec![None; dataset_size];
     }
 
     // Take ownership of the report's fields.
@@ -200,33 +214,27 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
         .iter_mut()
         .for_each(|r| *r = ReasonForInclusion::empty());
 
-    // The report carries one value per included member, in member order.
     // Members that are not included keep the value of the previous report.
-    let mut included_iter = 0usize;
     let has_data_ref = !parsed.data_references.is_empty();
     let has_reasons = !parsed.reasons.is_empty();
-    for (i, &included) in parsed.inclusion_bits.iter().enumerate() {
-        if !included {
-            continue;
-        }
-        let value = parsed.data_values.get(included_iter).cloned().ok_or(
-            StateError::DataSetSizeChanged {
-                prev: dataset_size,
-                new: parsed.data_values.len(),
-            },
-        )?;
+    let members = parsed
+        .inclusion_bits
+        .iter()
+        .enumerate()
+        .filter(|(_, &included)| included)
+        .map(|(i, _)| i);
+    for (k, (i, value)) in members.zip(parsed.data_values).enumerate() {
         state.data_set_values[i] = Some(value);
         if has_reasons {
-            if let Some(r) = parsed.reasons.get(included_iter) {
+            if let Some(r) = parsed.reasons.get(k) {
                 state.reasons[i] = *r;
             }
         }
         if has_data_ref {
-            if let Some(s) = parsed.data_references.get(included_iter) {
+            if let Some(s) = parsed.data_references.get(k) {
                 state.data_references[i] = Some(s.clone());
             }
         }
-        included_iter += 1;
     }
 
     Ok(())
@@ -466,6 +474,54 @@ mod tests {
             r,
             Err(StateError::DataSetNameTooLong { len: 129 })
         ));
+    }
+
+    #[test]
+    fn rejected_first_report_leaves_no_state() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        let mut parsed = make_parsed(
+            vec![true, true],
+            vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+            vec![],
+        );
+        parsed.data_set_name = Some("x".repeat(129));
+        assert!(apply_report(&mut s, parsed).is_err());
+        assert_eq!(s.dataset_size, None);
+        assert!(s.data_set_values.is_empty());
+
+        apply_report(
+            &mut s,
+            make_parsed(vec![true], vec![MmsValue::Integer(3)], vec![]),
+        )
+        .unwrap();
+        assert_eq!(s.dataset_size, Some(1));
+        assert_eq!(s.data_set_values, vec![Some(MmsValue::Integer(3))]);
+    }
+
+    #[test]
+    fn report_short_of_values_leaves_the_state_unchanged() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        let mut first = make_parsed(
+            vec![true, true],
+            vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+            vec![ReasonForInclusion::GI, ReasonForInclusion::GI],
+        );
+        first.seq_num = Some(1);
+        apply_report(&mut s, first).unwrap();
+        let before = format!("{s:?}");
+
+        // Two members included, one value carried.
+        let mut short = make_parsed(
+            vec![true, true],
+            vec![MmsValue::Integer(9)],
+            vec![ReasonForInclusion::DATA_CHANGE],
+        );
+        short.seq_num = Some(2);
+        assert!(matches!(
+            apply_report(&mut s, short),
+            Err(StateError::DataSetSizeChanged { prev: 2, new: 1 })
+        ));
+        assert_eq!(format!("{s:?}"), before);
     }
 
     #[test]

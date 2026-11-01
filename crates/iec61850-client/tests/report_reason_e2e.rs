@@ -8,7 +8,8 @@
 //!
 //! A scripted server sends a report whose ReasonCode is seven bits long, with
 //! bit 6 set, which a report does not define, and a report split into two
-//! segments, each delivered with its own inclusion.
+//! segments, each delivered with its own inclusion. It also sends a report
+//! that is rejected, which must leave the subscription as it was.
 
 mod support;
 
@@ -412,4 +413,86 @@ async fn segmented_report_is_delivered_per_segment_with_its_own_inclusion() {
         ]
     );
     assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_report_leaves_the_subscription_unchanged() {
+    const RPT_ID: &str = "rptRejected";
+    // A two-member report whose DatSet exceeds the MMS object-name limit,
+    // then a valid one-member report.
+    let rejected = information_report(&[
+        MmsData::VisibleString(RPT_ID.to_string()),
+        // OptFlds, ten bits: data-set-name is wire bit 4.
+        MmsData::BitString {
+            padding: 6,
+            data: vec![0x08, 0x00],
+        },
+        MmsData::VisibleString(format!("IED1LD0/LLN0${}", "d".repeat(121))),
+        MmsData::BitString {
+            padding: 6,
+            data: vec![0xc0],
+        },
+        MmsData::Integer(1),
+        MmsData::Integer(2),
+    ]);
+    let valid = information_report(&[
+        MmsData::VisibleString(RPT_ID.to_string()),
+        MmsData::BitString {
+            padding: 6,
+            data: vec![0x00, 0x00],
+        },
+        MmsData::BitString {
+            padding: 7,
+            data: vec![0x80],
+        },
+        MmsData::Integer(7),
+    ]);
+    let port = support::start(Arc::new(move |mms: &[u8], _seq: u32| {
+        let (invoke_id, _) = decode_confirmed_read_request(mms).ok()?;
+        let mut buf = BytesMut::new();
+        encode_confirmed_read_response(
+            invoke_id,
+            &ReadResponse {
+                variable_access_spec: None,
+                list_of_access_result: vec![AccessResult::Success(MmsData::Boolean(true))],
+            },
+            &mut buf,
+        );
+        Some(Plan {
+            reply: Some(buf.freeze()),
+            after: vec![rejected.clone(), valid.clone()],
+            ..Plan::default()
+        })
+    }))
+    .await;
+
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    let seen: Arc<Mutex<Vec<Arc<ClientReport>>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let cb: ReportCallback = Arc::new(move |snap: Arc<ClientReport>| {
+        sink.lock().unwrap().push(snap);
+    });
+    conn.install_report_handler(
+        Some(RPT_ID.to_string()),
+        "IED1LD0/LLN0$RP$urcbRejected",
+        None,
+        cb,
+    )
+    .await
+    .expect("install handler");
+    conn.read_object("IED1LD0/LLN0.Beh.stVal", iec61850_model::FC::St)
+        .await
+        .expect("read");
+
+    let report = wait_for_reports(&conn, &seen, 1).await;
+    assert_eq!(report.dataset_size, Some(1));
+    assert_eq!(report.data_set_values, vec![Some(MmsValue::Integer(7))]);
+    assert_eq!(report.data_set_name, None);
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
