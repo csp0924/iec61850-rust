@@ -273,6 +273,16 @@ impl<T, Tm> MmsClient<T, Tm> {
         self.conn.negotiated_max_pdu_size
     }
 
+    /// Returns the number of the current association, or of the most recent
+    /// one once it has ended; 0 before the first.
+    ///
+    /// Every association established gets a new number, so state learned from
+    /// the peer under one number, such as its device model, no longer applies
+    /// once the number has changed.
+    pub fn association_id(&self) -> u64 {
+        self.conn.association_id()
+    }
+
     /// Returns a flag that is `true` exactly while the association is established.
     ///
     /// Every call returns the same flag, which the client keeps current on every

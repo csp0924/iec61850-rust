@@ -1020,6 +1020,30 @@ async fn a_call_dropped_while_sending_closes_the_connection() {
     );
 }
 
+#[tokio::test]
+async fn each_association_gets_a_new_number() {
+    let mut c = client(3_000);
+    assert_eq!(c.association_id(), 0);
+
+    let (l, port) = listener().await;
+    let (r, first) = tokio::join!(c.connect("127.0.0.1", port), accept(&l, Aare::Accept));
+    r.expect("connect");
+    assert_eq!(c.association_id(), 1);
+
+    // the number stays with the association after it ends
+    drop(first);
+    let lost = c.read("LD0", "GGIO1$ST$Ind1$stVal").await;
+    assert!(
+        matches!(lost, Err(ClientError::ConnectionLost)),
+        "got {lost:?}"
+    );
+    assert_eq!(c.association_id(), 1);
+
+    let (r, _second) = tokio::join!(c.connect("127.0.0.1", port), accept(&l, Aare::Accept));
+    r.expect("reconnect");
+    assert_eq!(c.association_id(), 2);
+}
+
 fn list_entry(item: &str) -> iec61850_mms::mms::pdu::ListOfVariableEntry {
     iec61850_mms::mms::pdu::ObjectName::DomainSpecific {
         domain_id: "LD0".to_string(),

@@ -57,9 +57,10 @@ pub struct IedConnection<T = TcpStream, Tm = TokioTimer> {
     pub(crate) reports: Arc<crate::report::dispatch::ReportRegistry>,
     pub(crate) mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     pub(crate) is_connected: Arc<AtomicBool>,
-    /// Device model cache, keyed by logical device name. Populated lazily on
-    /// the first directory call and reused afterwards.
-    pub(crate) device_model: Arc<Mutex<Option<Arc<crate::directory::DeviceModel>>>>,
+    /// Device model cache, bound to the association it was read on. Populated
+    /// lazily on the first directory call and reused while that association
+    /// is the current one.
+    pub(crate) device_model: Arc<Mutex<Option<crate::directory::CachedModel>>>,
     /// Most names one GetNameList walk may collect.
     pub(crate) max_name_list_names: usize,
 }
@@ -71,7 +72,7 @@ pub struct IedConnection<T, Tm> {
     pub(crate) reports: Arc<crate::report::dispatch::ReportRegistry>,
     pub(crate) mms_client: Arc<Mutex<MmsClient<T, Tm>>>,
     pub(crate) is_connected: Arc<AtomicBool>,
-    pub(crate) device_model: Arc<Mutex<Option<Arc<crate::directory::DeviceModel>>>>,
+    pub(crate) device_model: Arc<Mutex<Option<crate::directory::CachedModel>>>,
     pub(crate) max_name_list_names: usize,
 }
 

@@ -345,6 +345,9 @@ pub struct MmsConnection<T = TcpStream, Tm = TokioTimer> {
     pending_unconfirmed: VecDeque<Bytes>,
     /// invokeIDs of requests that timed out, oldest first.
     abandoned_invoke_ids: VecDeque<u32>,
+    /// Number of the current or most recent association; see
+    /// [`Self::association_id`].
+    association_id: u64,
     /// Flag mirroring whether the state is `Connected`, shared with observers.
     connected_flag: Option<Arc<AtomicBool>>,
 }
@@ -381,6 +384,7 @@ pub struct MmsConnection<T, Tm> {
     pub max_pending_unconfirmed: usize,
     pending_unconfirmed: VecDeque<Bytes>,
     abandoned_invoke_ids: VecDeque<u32>,
+    association_id: u64,
     connected_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -417,6 +421,7 @@ impl<T, Tm> MmsConnection<T, Tm> {
             max_pending_unconfirmed: DEFAULT_MAX_PENDING_UNCONFIRMED,
             pending_unconfirmed: VecDeque::new(),
             abandoned_invoke_ids: VecDeque::new(),
+            association_id: 0,
             connected_flag: None,
         }
     }
@@ -427,6 +432,16 @@ impl<T, Tm> MmsConnection<T, Tm> {
     /// goes through `MmsClientBuilder`.
     pub fn set_iso_parameters(&mut self, params: IsoConnectionParameters) {
         self.iso_parameters = params;
+    }
+
+    /// Returns the number of the current association, or of the most recent
+    /// one once it has ended; 0 before the first.
+    ///
+    /// Every association established gets a new number, so state learned from
+    /// the peer under one number, such as its device model, no longer applies
+    /// once the number has changed.
+    pub fn association_id(&self) -> u64 {
+        self.association_id
     }
 
     /// Returns a flag that is `true` exactly while the state is `Connected`.
@@ -763,6 +778,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
         }
 
         self.cotp_tls = Some(cotp);
+        self.association_id = self.association_id.wrapping_add(1);
         self.set_state(ConnectionState::Connected);
         Ok(())
     }
@@ -867,6 +883,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         }
 
         self.cotp = Some(cotp);
+        self.association_id = self.association_id.wrapping_add(1);
         self.set_state(ConnectionState::Connected);
         Ok(())
     }

@@ -3,8 +3,9 @@
 //!
 //! The first directory call fetches the whole object tree with GetNameList
 //! over the domains and their named variables, and caches it on the
-//! connection; later calls answer from that cache. [`DeviceModel`] is that
-//! cache and `ensure_device_model` its lazy entry point.
+//! connection; later calls on the same association answer from that cache.
+//! A new association reads the tree again, since it may reach another server.
+//! [`DeviceModel`] is that cache and `ensure_device_model` its lazy entry point.
 //!
 //! Data sets and logs are the exception and always go to the server, because
 //! neither appears in the cached variable list.
@@ -165,9 +166,39 @@ async fn fetch_all_names<T: AsyncTransport, Tm: Timer>(
 
 // Lazy loading of the device model.
 
+/// A device model together with the association it was read on.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedModel {
+    /// [`MmsClient::association_id`](iec61850_mms::MmsClient::association_id)
+    /// of the association the model was read on.
+    pub(crate) association: u64,
+    pub(crate) model: Arc<DeviceModel>,
+}
+
 impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
+    /// Returns the number of the current or most recent association of the
+    /// MMS client.
+    async fn association_id(&self) -> u64 {
+        self.mms_client.lock().await.association_id()
+    }
+
+    /// Returns the cached model when it was read on the association `association`.
+    async fn model_of(&self, association: u64) -> Option<Arc<DeviceModel>> {
+        self.device_model
+            .lock()
+            .await
+            .as_ref()
+            .filter(|cached| cached.association == association)
+            .map(|cached| Arc::clone(&cached.model))
+    }
+
     /// Returns the cached device model, reading the whole object tree from the
-    /// server first if nothing is cached.
+    /// server first if nothing is cached for the current association.
+    ///
+    /// A model read on an earlier association is never returned, since a later
+    /// association may reach another server. When a new association replaces
+    /// the current one while the tree is being read, the names may mix both
+    /// servers, so the read starts over on the new association.
     ///
     /// The model read is returned directly rather than looked up again, so a
     /// concurrent `invalidate_device_model_cache` or `disconnect` cannot leave
@@ -175,27 +206,37 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     /// [`Self::get_device_model_from_server`] is the public way to force a
     /// refresh.
     pub(crate) async fn ensure_device_model(&self) -> Result<Arc<DeviceModel>, ClientError> {
-        if let Some(model) = self.device_model.lock().await.clone() {
+        loop {
+            let association = self.association_id().await;
+            if let Some(model) = self.model_of(association).await {
+                return Ok(model);
+            }
+            // The logical device names are the VMD-scope domains.
+            let ld_names = fetch_all_names(self, ObjectClass::Domain, None).await?;
+            let mut lds: Vec<IcLogicalDevice> = Vec::with_capacity(ld_names.len());
+            for ld_name in ld_names {
+                let vars =
+                    fetch_all_names(self, ObjectClass::NamedVariable, Some(ld_name.as_str()))
+                        .await?;
+                lds.push(IcLogicalDevice {
+                    name: ld_name,
+                    variables: vars,
+                });
+            }
+            if self.association_id().await != association {
+                continue;
+            }
+            // A concurrent caller may have filled the cache meanwhile; both results
+            // describe the same association, so the later write simply wins.
+            let model = Arc::new(DeviceModel {
+                logical_devices: lds,
+            });
+            *self.device_model.lock().await = Some(CachedModel {
+                association,
+                model: Arc::clone(&model),
+            });
             return Ok(model);
         }
-        // The logical device names are the VMD-scope domains.
-        let ld_names = fetch_all_names(self, ObjectClass::Domain, None).await?;
-        let mut lds: Vec<IcLogicalDevice> = Vec::with_capacity(ld_names.len());
-        for ld_name in ld_names {
-            let vars =
-                fetch_all_names(self, ObjectClass::NamedVariable, Some(ld_name.as_str())).await?;
-            lds.push(IcLogicalDevice {
-                name: ld_name,
-                variables: vars,
-            });
-        }
-        // A concurrent caller may have filled the cache meanwhile; both results
-        // describe the same server, so the later write simply wins.
-        let model = Arc::new(DeviceModel {
-            logical_devices: lds,
-        });
-        *self.device_model.lock().await = Some(Arc::clone(&model));
-        Ok(model)
     }
 
     /// Returns the variable list of one logical device from the device model,
@@ -214,9 +255,13 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
     }
 
     /// Returns a clone of the cached device model, or `None` if nothing has
-    /// been cached yet.
+    /// been cached for the current or most recent association.
+    ///
+    /// A model read on an earlier association is not returned once a new
+    /// association has been established, since it may describe another server.
     pub async fn cached_device_model(&self) -> Option<DeviceModel> {
-        self.device_model.lock().await.as_deref().cloned()
+        let association = self.association_id().await;
+        self.model_of(association).await.as_deref().cloned()
     }
 
     /// Drops the cached device model, so the next directory call re-reads it.
