@@ -9,8 +9,10 @@
 //! is still held when they finish, so they cannot have waited for it. Opening
 //! the gate then completes whatever the callback held up.
 //!
-//! `IedServer::block_requests` does not wait for a held callback either, also
-//! when a handler makes it.
+//! Two calls into the server do not wait for a held callback either:
+//! `IedServer::block_requests`, also when a handler makes it, and registering a
+//! control object while a selection change handler hears of a lost
+//! association.
 //!
 //! The server runs on a runtime of its own, on its own thread: a
 //! current-thread runtime, or a multi-thread runtime with one worker, where a
@@ -970,4 +972,49 @@ async fn a_blocked_log_storage_leaves_the_server_serving() {
     gate.open();
     running.stop();
     assert!(storage.count() >= 1, "the held entry is written");
+}
+
+/// Registering a control object returns while the selection change handler
+/// of a lost association is held: the release holds no lock of the registry
+/// while it reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registering_a_control_does_not_wait_for_a_held_selection_handler() {
+    let server = build_server(30_000);
+    let gate = Arc::new(Gate::default());
+    let _opener = gate.opener();
+    register_control(
+        &server,
+        Arc::new(GatedSelection {
+            gate: gate.clone(),
+            reason: SelectStateChangedReason::Disconnected,
+        }),
+    );
+    let running = ServerThread::start(&server, Flavor::CurrentThread);
+    let mut lost = connect(running.port).await;
+    select(&mut lost).await;
+    lost.close_raw();
+    gate.wait_entered().await;
+
+    let registered = tokio::time::timeout(
+        STALL,
+        tokio::task::spawn_blocking({
+            let registry = server.control_objects();
+            move || {
+                let entry = registry
+                    .lookup(DOMAIN, "GGIO1", "SPCSO2")
+                    .expect("registered");
+                registry.register(entry)
+            }
+        }),
+    )
+    .await;
+    assert!(
+        registered.is_ok(),
+        "registering waited for the held selection handler"
+    );
+    assert_eq!(gate.entered(), 1, "the change is still held");
+
+    gate.open();
+    drop(lost);
+    running.stop();
 }

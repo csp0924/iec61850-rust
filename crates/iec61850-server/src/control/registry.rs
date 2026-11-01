@@ -273,13 +273,16 @@ impl ControlObjectsRegistry {
     }
 
     /// Releases every selection held by a connection that has closed.
+    ///
+    /// The selection change handlers hear of each release with no lock of the
+    /// registry held, so they may register or look up control objects.
     pub fn release_connection(&self, conn_id: u64) {
-        let g = match self.inner.read() {
-            Ok(g) => g,
+        let objects: Vec<ControlObject> = match self.inner.read() {
+            Ok(g) => g.values().map(|entry| entry.object.clone()).collect(),
             Err(_) => return,
         };
-        for entry in g.values() {
-            entry.object.on_connection_closed(conn_id);
+        for object in objects {
+            object.on_connection_closed(conn_id);
         }
     }
 
