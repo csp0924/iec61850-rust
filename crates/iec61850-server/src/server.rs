@@ -344,25 +344,21 @@ impl IedServer {
             .load(Ordering::SeqCst)
     }
 
-    /// Marks one association for abort.
+    /// Marks the open association `id` for abort and returns whether there is
+    /// one; `false` means no open association has that id, as for one that
+    /// has already closed.
     ///
     /// The connection task picks the mark up on its next iteration, sends an
     /// ACSE A-ABORT wrapped in presentation user data, a session data TPDU, and
     /// a COTP data TPDU, and closes the socket. Sending the abort tells the
-    /// client what happened instead of leaving it to infer a bare close.
-    ///
-    /// Returns `Ok(false)`: the mark is set, but the abort has not been sent
-    /// yet when this returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidModel` when the association map lock is poisoned.
-    pub fn abort_connection(&self, id: ConnectionId) -> Result<bool> {
+    /// client what happened instead of leaving it to infer a bare close. The
+    /// abort may not have been sent yet when this returns.
+    pub fn abort_connection(&self, id: ConnectionId) -> bool {
         let g = self
             .inner
             .connections
             .read()
-            .map_err(|_| ServerError::InvalidModel("connections RwLock poisoned".into()))?;
+            .unwrap_or_else(PoisonError::into_inner);
         match g.get(&id) {
             Some(conn) => {
                 conn.request_abort();
@@ -370,11 +366,11 @@ impl IedServer {
                     conn_id = id,
                     "association marked for abort; the abort is sent by its connection task"
                 );
-                Ok(false)
+                true
             }
             None => {
                 tracing::warn!(conn_id = id, "no association with this id");
-                Ok(false)
+                false
             }
         }
     }
@@ -3290,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_connection_marks_flag_and_reports_not_yet_sent() {
+    fn abort_connection_marks_an_open_association_and_reports_it() {
         use iec61850_mms::mms::server::MmsServerConnection;
         let server = test_server();
         let c = ClientConnection::new(
@@ -3301,8 +3297,10 @@ mod tests {
         server.add_connection(c.clone());
         assert!(!c.abort_requested());
 
-        let sent = server.abort_connection(7).unwrap();
-        assert!(!sent, "the abort has not been sent when this returns");
+        assert!(
+            server.abort_connection(7),
+            "an open association has this id"
+        );
         assert!(
             c.abort_requested(),
             "the association must be marked for abort"
@@ -3312,9 +3310,8 @@ mod tests {
     #[test]
     fn abort_connection_unknown_id_returns_false() {
         let server = test_server();
-        let result = server.abort_connection(9999).unwrap();
         assert!(
-            !result,
+            !server.abort_connection(9999),
             "an unknown connection id must report nothing marked"
         );
     }

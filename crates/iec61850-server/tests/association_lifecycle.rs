@@ -6,7 +6,9 @@
 //! edit session must be released at once; and sockets that never associate,
 //! which count against the connection limit from accept and are closed once
 //! the association setup timeout runs out; and the data sets an association
-//! creates, which are limited per association and outlive it. The idle and
+//! creates, which are limited per association and outlive it; and an
+//! association `IedServer::abort_connection` aborts by its id, which reports
+//! whether an open association had that id. The idle and
 //! send timeouts, and the setup deadline at each stage of the setup, are
 //! covered on a paused clock in the `lifecycle` unit tests.
 //!
@@ -32,6 +34,7 @@ use iec61850_model::{
 use iec61850_server::control::{
     ControlModel, ControlObject, ControlObjectConfig, ControlObjectEntry, ControlState,
 };
+use iec61850_server::handler::{ReadContext, ReadHandler, ReadOutcome};
 use iec61850_server::reporting::rcb::Rcb;
 use iec61850_server::reporting::{Dataset, ReportControl};
 use iec61850_server::{IedServer, IedServerConfig, WriteAccessPolicies};
@@ -424,5 +427,69 @@ async fn data_set_limit_applies_per_association() {
         "a later association is not charged for the first one's data sets"
     );
     assert_eq!(server.dynamic_dataset_count(), 2);
+    handle.stop().await;
+}
+
+/// Records the id of the association that reads its attribute.
+#[derive(Debug, Default)]
+struct ConnIdRecorder(std::sync::Mutex<Option<u64>>);
+
+impl ReadHandler for ConnIdRecorder {
+    fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome {
+        *self.0.lock().unwrap() = Some(ctx.conn_id);
+        ReadOutcome::CacheMiss
+    }
+}
+
+/// `abort_connection` reports `true` for an open association and aborts it,
+/// and `false` for an id no open association has: one never used, and the
+/// aborted one once it has closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_connection_reports_whether_it_found_the_association() {
+    let (model, _vendor) = model_with_writable_vendor();
+    let server = build_server(model, IedServerConfig::default());
+    let recorder = Arc::new(ConnIdRecorder::default());
+    server
+        .handler_registry()
+        .install_read_handler("LLN0$DC$NamPlt$vendor", recorder.clone())
+        .unwrap();
+    let handle = server.start().await.expect("start");
+    let mut client = connect(handle.bound_addr.port()).await;
+    client
+        .read("TESTLD0", "LLN0$DC$NamPlt$vendor")
+        .await
+        .expect("read");
+    let id = recorder
+        .0
+        .lock()
+        .unwrap()
+        .expect("the read names its association");
+
+    assert!(
+        !server.abort_connection(id + 1000),
+        "no association has this id"
+    );
+    assert!(server.abort_connection(id), "the open association is found");
+
+    // The bound only turns an abort that never ends the association into a
+    // failure.
+    let closed = tokio::time::timeout(Duration::from_secs(30), async {
+        while server.connection_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the aborted association never closed");
+    assert!(
+        client
+            .read("TESTLD0", "LLN0$DC$NamPlt$vendor")
+            .await
+            .is_err(),
+        "the aborted association serves no request"
+    );
+    assert!(
+        !server.abort_connection(id),
+        "the aborted association has closed"
+    );
     handle.stop().await;
 }
