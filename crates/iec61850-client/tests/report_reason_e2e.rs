@@ -6,6 +6,11 @@
 //! report carries only `q`, so the subscription state keeps the previous
 //! `stVal` value but marks `stVal` as not included and gives it no reason.
 //!
+//! When the URCB is rebound to a data set of `Pos.t` and `Pos.q`, a report
+//! carrying only `q` keeps nothing of the previous data set: the first member
+//! has no value and no data reference until a report of the new data set
+//! carries it.
+//!
 //! A scripted server sends a report whose ReasonCode is seven bits long, with
 //! bit 6 set, which a report does not define, and a report split into two
 //! segments, each delivered with its own inclusion. It also sends a report
@@ -495,4 +500,106 @@ async fn rejected_report_leaves_the_subscription_unchanged() {
     assert_eq!(report.data_set_values, vec![Some(MmsValue::Integer(7))]);
     assert_eq!(report.data_set_name, None);
     assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebound_data_set_keeps_no_member_of_the_previous_one() {
+    const RCB: &str = "IED1LD0/LLN0$RP$urcbSwap";
+    let server = IedServer::builder()
+        .model(build_model())
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .build()
+        .expect("server build");
+    let model = server.model();
+    let st_val = resolve_da(&model, "IED1LD0/CSWI1.Pos.stVal");
+    let q = resolve_da(&model, "IED1LD0/CSWI1.Pos.q");
+    let t = resolve_da(&model, "IED1LD0/CSWI1.Pos.t");
+    let mut ds_st = Dataset::new("LLN0$dsSt");
+    ds_st.push(DatasetEntry::new(
+        "IED1LD0/CSWI1$ST$Pos$stVal",
+        Arc::clone(&st_val.value),
+    ));
+    ds_st.push(DatasetEntry::new(
+        "IED1LD0/CSWI1$ST$Pos$q",
+        Arc::clone(&q.value),
+    ));
+    let mut ds_t = Dataset::new("LLN0$dsT");
+    ds_t.push(DatasetEntry::new(
+        "IED1LD0/CSWI1$ST$Pos$t",
+        Arc::clone(&t.value),
+    ));
+    ds_t.push(DatasetEntry::new(
+        "IED1LD0/CSWI1$ST$Pos$q",
+        Arc::clone(&q.value),
+    ));
+    server.register_dataset("IED1LD0", ds_t);
+    let rcb = Rcb::new("urcbSwap", "LLN0$dsSt")
+        .with_trg_ops(TriggerOptions::DATA_CHANGED | TriggerOptions::QUALITY_CHANGED)
+        .with_opt_flds(OptFlds::DATA_SET | OptFlds::DATA_REFERENCE | OptFlds::CONF_REV)
+        .with_buf_tm_ms(10);
+    server
+        .register_urcb(ReportControl::new(RCB, rcb), ds_st)
+        .expect("register_urcb");
+    let handle = server.start().await.expect("server start");
+
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
+    let seen: Arc<Mutex<Vec<Arc<ClientReport>>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let cb: ReportCallback = Arc::new(move |snap: Arc<ClientReport>| {
+        sink.lock().unwrap().push(snap);
+    });
+    conn.install_report_handler(Some(RCB.to_string()), RCB, None, cb)
+        .await
+        .expect("install handler");
+    let mut rcb = RcbHandle::new(RCB).unwrap();
+    rcb.set_resv(true);
+    rcb.set_rpt_ena(true);
+    conn.set_rcb_values(&rcb, RcbWriteMask::RESV | RcbWriteMask::RPT_ENA, false)
+        .await
+        .expect("enable the control block");
+
+    server.update_bit_string_from_int(&st_val, 2).unwrap();
+    let first = wait_for_reports(&conn, &seen, 1).await;
+    assert_eq!(first.data_set_name.as_deref(), Some("IED1LD0/LLN0$dsSt"));
+    assert!(first.data_set_values[0].is_some());
+
+    rcb.set_rpt_ena(false);
+    conn.set_rcb_values(&rcb, RcbWriteMask::RPT_ENA, false)
+        .await
+        .expect("disable the control block");
+    rcb.set_data_set_reference("IED1LD0/LLN0$dsT");
+    rcb.set_rpt_ena(true);
+    conn.set_rcb_values(&rcb, RcbWriteMask::DAT_SET | RcbWriteMask::RPT_ENA, false)
+        .await
+        .expect("rebind the data set and enable");
+
+    server.update_bit_string(&q, &[0x60, 0x00], 3).unwrap();
+    let second = wait_for_reports(&conn, &seen, 2).await;
+    assert_eq!(second.data_set_name.as_deref(), Some("IED1LD0/LLN0$dsT"));
+    assert_ne!(second.conf_rev, first.conf_rev);
+    assert_eq!(second.included, vec![false, true]);
+    // Nothing of the `stVal` member of the previous data set is kept.
+    assert_eq!(second.data_set_values[0], None);
+    assert_eq!(second.data_references[0], None);
+    assert_eq!(
+        second.data_set_values[1],
+        Some(MmsValue::BitString {
+            padding: 3,
+            data: vec![0x60, 0x00],
+        })
+    );
+    assert_eq!(
+        second.data_references[1].as_deref(),
+        Some("IED1LD0/CSWI1$ST$Pos$q")
+    );
+
+    conn.disconnect().await.expect("disconnect");
 }

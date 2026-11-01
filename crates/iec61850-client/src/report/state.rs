@@ -7,6 +7,14 @@
 //! learned from the first report and fixed from then on: a later report of a
 //! different size is rejected instead of silently resizing the state.
 //!
+//! The kept values belong to one data set. A report whose DatSet or ConfRev
+//! differs from the one the kept values came with describes another data set,
+//! or another configuration of it (IEC 61850-7-2 counts a change of DatSet and
+//! a change of the members in ConfRev): the kept values and data references
+//! are discarded and the data set size is learned anew from that report. A
+//! report that carries neither DatSet nor ConfRev cannot be told apart from
+//! the previous ones and is held to the size they fixed.
+//!
 //! A report is checked in full before any of it is applied, so a rejected
 //! report leaves the state exactly as it was.
 //!
@@ -38,8 +46,8 @@ pub struct ClientReport {
     /// derived from the RCB reference by replacing '.' with '$'.
     pub rpt_id: Option<String>,
 
-    /// Number of data set members, fixed by the first report. `None` until one
-    /// arrives.
+    /// Number of data set members, fixed by the first report of the data set
+    /// the kept values belong to. `None` until one arrives.
     pub dataset_size: Option<usize>,
 
     // Owned snapshot of the most recent report.
@@ -79,6 +87,11 @@ pub struct ClientReport {
     /// One entry per data set member, holding the member's object reference
     /// when the report carried one.
     pub data_references: Vec<Option<String>>,
+
+    // The DatSet and ConfRev last carried by a report of the data set the kept
+    // values belong to.
+    members_data_set: Option<String>,
+    members_conf_rev: Option<u32>,
 }
 
 impl ClientReport {
@@ -99,6 +112,8 @@ impl ClientReport {
             included: Vec::new(),
             reasons: Vec::new(),
             data_references: Vec::new(),
+            members_data_set: None,
+            members_conf_rev: None,
         }
     }
 
@@ -143,7 +158,9 @@ pub enum StateError {
 ///
 /// Members the report omits keep their previous value and data reference and
 /// have their reason cleared; those it includes are replaced outright.
-/// `included` is replaced by the report's inclusion bitstring.
+/// `included` is replaced by the report's inclusion bitstring. A report of
+/// another data set, told by its DatSet or ConfRev, first discards the kept
+/// values and data references and fixes the data set size anew.
 ///
 /// # Errors
 ///
@@ -152,8 +169,15 @@ pub enum StateError {
 /// leaves the state unchanged.
 pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<(), StateError> {
     // Every check runs before the state is touched.
+    let other_data_set = differs(&state.members_data_set, &parsed.data_set_name)
+        || differs(&state.members_conf_rev, &parsed.conf_rev);
+    let fixed_size = if other_data_set {
+        None
+    } else {
+        state.dataset_size
+    };
     let dataset_size = parsed.inclusion_bits.len();
-    if let Some(prev) = state.dataset_size {
+    if let Some(prev) = fixed_size {
         if prev != dataset_size {
             tracing::warn!(
                 rcb_ref = %state.rcb_reference,
@@ -189,13 +213,30 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
         });
     }
 
-    // Fix the data set size on the first report.
-    if state.dataset_size.is_none() {
+    // Fix the data set size on the first report of a data set.
+    if fixed_size.is_none() {
+        if other_data_set {
+            tracing::debug!(
+                rcb_ref = %state.rcb_reference,
+                data_set = ?parsed.data_set_name,
+                conf_rev = ?parsed.conf_rev,
+                "report of another data set, discarding the kept members"
+            );
+            state.members_data_set = None;
+            state.members_conf_rev = None;
+        }
         state.dataset_size = Some(dataset_size);
         state.data_set_values = vec![None; dataset_size];
         state.included = vec![false; dataset_size];
         state.reasons = vec![ReasonForInclusion::empty(); dataset_size];
         state.data_references = vec![None; dataset_size];
+    }
+
+    if parsed.data_set_name.is_some() {
+        state.members_data_set.clone_from(&parsed.data_set_name);
+    }
+    if parsed.conf_rev.is_some() {
+        state.members_conf_rev = parsed.conf_rev;
     }
 
     // Take ownership of the report's fields.
@@ -238,6 +279,12 @@ pub fn apply_report(state: &mut ClientReport, parsed: ParsedReport) -> Result<()
     }
 
     Ok(())
+}
+
+/// Whether a report carries a value that differs from the kept one; a value
+/// missing on either side is no evidence of a change.
+fn differs<T: PartialEq>(kept: &Option<T>, carried: &Option<T>) -> bool {
+    matches!((kept, carried), (Some(k), Some(c)) if k != c)
 }
 
 #[cfg(test)]
@@ -522,6 +569,263 @@ mod tests {
             Err(StateError::DataSetSizeChanged { prev: 2, new: 1 })
         ));
         assert_eq!(format!("{s:?}"), before);
+    }
+
+    fn of_data_set(
+        name: Option<&str>,
+        conf_rev: Option<u32>,
+        inclusion: Vec<bool>,
+        values: Vec<MmsValue>,
+        refs: Vec<&str>,
+    ) -> ParsedReport {
+        let mut p = make_parsed(inclusion, values, vec![]);
+        p.data_set_name = name.map(str::to_string);
+        p.conf_rev = conf_rev;
+        p.data_references = refs.into_iter().map(str::to_string).collect();
+        p
+    }
+
+    #[test]
+    fn report_of_another_data_set_discards_the_kept_members() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec!["LD/X$ST$Pos$stVal", "LD/X$ST$Pos$q"],
+            ),
+        )
+        .unwrap();
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsB"),
+                Some(1),
+                vec![false, true],
+                vec![MmsValue::Integer(3)],
+                vec!["LD/X$ST$Pos$q"],
+            ),
+        )
+        .unwrap();
+        assert_eq!(s.data_set_values, vec![None, Some(MmsValue::Integer(3))]);
+        assert_eq!(
+            s.data_references,
+            vec![None, Some("LD/X$ST$Pos$q".to_string())]
+        );
+    }
+
+    #[test]
+    fn conf_rev_change_alone_discards_the_kept_members() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        // A report without DatSet still names the configuration by ConfRev.
+        apply_report(
+            &mut s,
+            of_data_set(
+                None,
+                Some(2),
+                vec![false, true],
+                vec![MmsValue::Integer(3)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(s.data_set_values, vec![None, Some(MmsValue::Integer(3))]);
+        // The same DatSet with the new ConfRev keeps them.
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(2),
+                vec![true, false],
+                vec![MmsValue::Integer(4)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            s.data_set_values,
+            vec![Some(MmsValue::Integer(4)), Some(MmsValue::Integer(3))]
+        );
+    }
+
+    #[test]
+    fn identity_is_learned_anew_after_a_data_set_change() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        // ConfRev 2 alone starts another configuration, whose DatSet is unknown.
+        apply_report(
+            &mut s,
+            of_data_set(
+                None,
+                Some(2),
+                vec![false, true],
+                vec![MmsValue::Integer(3)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        // The same configuration, now also carrying its DatSet, keeps member 1.
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsC"),
+                Some(2),
+                vec![true, false],
+                vec![MmsValue::Integer(4)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            s.data_set_values,
+            vec![Some(MmsValue::Integer(4)), Some(MmsValue::Integer(3))]
+        );
+    }
+
+    #[test]
+    fn another_data_set_fixes_its_own_size() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                None,
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsB"),
+                None,
+                vec![true],
+                vec![MmsValue::Integer(5)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(s.dataset_size, Some(1));
+        assert_eq!(s.data_set_values, vec![Some(MmsValue::Integer(5))]);
+        // A report of the new data set is held to its size.
+        assert!(matches!(
+            apply_report(
+                &mut s,
+                of_data_set(
+                    Some("LD/LLN0$dsB"),
+                    None,
+                    vec![true, true],
+                    vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                    vec![],
+                ),
+            ),
+            Err(StateError::DataSetSizeChanged { prev: 1, new: 2 })
+        ));
+    }
+
+    #[test]
+    fn report_without_identity_is_held_to_the_kept_data_set() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        apply_report(
+            &mut s,
+            of_data_set(
+                None,
+                None,
+                vec![false, true],
+                vec![MmsValue::Integer(3)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            s.data_set_values,
+            vec![Some(MmsValue::Integer(1)), Some(MmsValue::Integer(3))]
+        );
+        assert!(apply_report(
+            &mut s,
+            of_data_set(None, None, vec![true], vec![MmsValue::Integer(9)], vec![]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejected_report_of_another_data_set_keeps_the_members() {
+        let mut s = ClientReport::new("rcb".to_string(), None);
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![true, true],
+                vec![MmsValue::Integer(1), MmsValue::Integer(2)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        let before = format!("{s:?}");
+        // Another data set, three members included, one value carried.
+        let short = of_data_set(
+            Some("LD/LLN0$dsB"),
+            Some(2),
+            vec![true, true, true],
+            vec![MmsValue::Integer(9)],
+            vec![],
+        );
+        assert!(apply_report(&mut s, short).is_err());
+        assert_eq!(format!("{s:?}"), before);
+        // The next report of the kept data set still applies.
+        apply_report(
+            &mut s,
+            of_data_set(
+                Some("LD/LLN0$dsA"),
+                Some(1),
+                vec![false, true],
+                vec![MmsValue::Integer(3)],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            s.data_set_values,
+            vec![Some(MmsValue::Integer(1)), Some(MmsValue::Integer(3))]
+        );
     }
 
     #[test]
