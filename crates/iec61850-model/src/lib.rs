@@ -84,6 +84,7 @@ pub(crate) mod compat {
 pub mod builder;
 pub mod cb;
 pub mod cdc;
+pub mod comm;
 pub mod error;
 pub mod fc;
 pub mod object_ref;
@@ -98,6 +99,7 @@ pub use cb::{
     SvControlBlock,
 };
 pub use cdc::{CdcOptions, ControlOptions};
+pub use comm::{Address, AddressError, AddressParameter, ConnectedAccessPoint, GseAddress};
 pub use error::{ModelError, Result};
 pub use fc::FC;
 pub use object_ref::{ObjectRef, Segment, OBJECT_REF_MAX_LEN};

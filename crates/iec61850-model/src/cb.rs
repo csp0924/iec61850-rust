@@ -9,6 +9,7 @@
 //! containment IEC 61850-7-2 defines, instead of scanning a flat list and
 //! comparing each entry's parent.
 
+use crate::comm::{Address, GseAddress};
 use crate::compat::prelude::*;
 use crate::types::TrgOps;
 
@@ -130,6 +131,9 @@ pub struct GooseControlBlock {
     pub conf_rev: u32,
     /// The `goID`, the protocol-level identifier.
     pub go_id: String,
+    /// The addressing of the publication, from the SCL `<GSE>` that names this
+    /// control block; `None` when the SCL gives none.
+    pub gse: Option<GseAddress>,
 }
 
 impl GooseControlBlock {
@@ -148,6 +152,7 @@ impl GooseControlBlock {
             dataset_ref: dataset_ref.into(),
             conf_rev: 0,
             go_id: go_id.into(),
+            gse: None,
         }
     }
 }
@@ -166,6 +171,9 @@ pub struct SvControlBlock {
     pub sv_id: String,
     /// `true` for multicast, `false` for unicast.
     pub is_multicast: bool,
+    /// The address of the publication, from the `<Address>` of the SCL `<SMV>`
+    /// that names this control block; `None` when the SCL gives none.
+    pub smv: Option<Address>,
 }
 
 impl SvControlBlock {
@@ -186,6 +194,7 @@ impl SvControlBlock {
             conf_rev: 0,
             sv_id: sv_id.into(),
             is_multicast: true,
+            smv: None,
         }
     }
 }

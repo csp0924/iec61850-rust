@@ -43,6 +43,7 @@ use crate::cb::{
     GooseControlBlock, LogControlBlock, ReportControlBlock, SettingGroupControlBlock,
     SvControlBlock,
 };
+use crate::comm::ConnectedAccessPoint;
 use crate::compat::prelude::*;
 use crate::compat::HashSet;
 use crate::error::{ModelError, Result};
@@ -62,6 +63,7 @@ use crate::value::MmsValue;
 pub struct IedModelBuilder {
     ied_name: String,
     lds: Vec<LogicalDevice>,
+    connected_aps: Vec<ConnectedAccessPoint>,
 }
 
 impl IedModelBuilder {
@@ -70,7 +72,14 @@ impl IedModelBuilder {
         Self {
             ied_name: ied_name.into(),
             lds: Vec::new(),
+            connected_aps: Vec::new(),
         }
+    }
+
+    /// Adds the connection of an access point of the IED to a subnetwork.
+    pub fn add_connected_ap(mut self, ap: ConnectedAccessPoint) -> Self {
+        self.connected_aps.push(ap);
+        self
     }
 
     /// Adds a logical device.
@@ -150,7 +159,8 @@ impl IedModelBuilder {
         }
 
         // Every data set entry must resolve inside its own logical device.
-        let model_unchecked = IedModel::from_parts(self.ied_name.clone(), self.lds);
+        let model_unchecked =
+            IedModel::from_parts(self.ied_name.clone(), self.lds, self.connected_aps);
         validate_datasets(&model_unchecked)?;
         Ok(model_unchecked)
     }

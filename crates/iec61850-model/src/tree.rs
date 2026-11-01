@@ -18,6 +18,7 @@ use crate::cb::{
     GooseControlBlock, LogControlBlock, ReportControlBlock, SettingGroupControlBlock,
     SvControlBlock,
 };
+use crate::comm::{Address, ConnectedAccessPoint, GseAddress};
 use crate::compat::prelude::*;
 use crate::error::ModelError;
 use crate::fc::FC;
@@ -41,6 +42,13 @@ pub struct IedModel {
     pub ied_name: String,
     /// The logical devices, in the order the builder received them.
     pub lds: Vec<LogicalDevice>,
+    /// The connections of the access points of the IED to subnetworks, with
+    /// their server addresses, in the order the builder received them.
+    ///
+    /// They describe where the IED is configured to be reached; a server built
+    /// from the model binds nothing by itself, and choosing the address to
+    /// listen on stays with the application.
+    pub connected_aps: Vec<ConnectedAccessPoint>,
     /// Domain name to logical device index, built during `build`, so a lookup
     /// is constant time.
     domain_index: HashMap<String, usize>,
@@ -48,7 +56,11 @@ pub struct IedModel {
 
 impl IedModel {
     /// Called by the builder; outside code goes through `IedModelBuilder`.
-    pub(crate) fn from_parts(ied_name: String, lds: Vec<LogicalDevice>) -> Self {
+    pub(crate) fn from_parts(
+        ied_name: String,
+        lds: Vec<LogicalDevice>,
+        connected_aps: Vec<ConnectedAccessPoint>,
+    ) -> Self {
         let mut domain_index = HashMap::with_capacity(lds.len());
         for (i, ld) in lds.iter().enumerate() {
             domain_index.insert(ld.domain_name(&ied_name), i);
@@ -56,8 +68,47 @@ impl IedModel {
         Self {
             ied_name,
             lds,
+            connected_aps,
             domain_index,
         }
+    }
+
+    /// Returns the addressing of the GOOSE control block `cb_name` of the
+    /// `LLN0` of the logical device whose SCL `inst` is `ld_inst`, or `None`
+    /// when there is no such control block or it has no addressing.
+    pub fn gse_address(&self, ld_inst: &str, cb_name: &str) -> Option<&GseAddress> {
+        self.ld_by_inst(ld_inst)?
+            .lns
+            .first()?
+            .gocbs
+            .iter()
+            .find(|cb| cb.name == cb_name)?
+            .gse
+            .as_ref()
+    }
+
+    /// Returns the address of the sampled values control block `cb_name` of the
+    /// `LLN0` of the logical device whose SCL `inst` is `ld_inst`, or `None`
+    /// when there is no such control block or it has no address.
+    pub fn smv_address(&self, ld_inst: &str, cb_name: &str) -> Option<&Address> {
+        self.ld_by_inst(ld_inst)?
+            .lns
+            .first()?
+            .svcbs
+            .iter()
+            .find(|cb| cb.name == cb_name)?
+            .smv
+            .as_ref()
+    }
+
+    /// Returns the connections of the access point `ap_name` to subnetworks.
+    pub fn connected_ap<'a>(
+        &'a self,
+        ap_name: &'a str,
+    ) -> impl Iterator<Item = &'a ConnectedAccessPoint> + 'a {
+        self.connected_aps
+            .iter()
+            .filter(move |ap| ap.ap_name == ap_name)
     }
 
     /// Finds a logical device by its wire-level domain name, which is
@@ -936,7 +987,7 @@ mod tests {
             ld_name: None,
             lns: vec![lln0, ggio1],
         };
-        IedModel::from_parts("IED1".into(), vec![ld])
+        IedModel::from_parts("IED1".into(), vec![ld], Vec::new())
     }
 
     #[test]
@@ -970,7 +1021,7 @@ mod tests {
                 sgcb: None,
             }],
         };
-        let m = IedModel::from_parts("IED1".into(), vec![ld]);
+        let m = IedModel::from_parts("IED1".into(), vec![ld], Vec::new());
         assert!(m.ld_by_domain("FuncName").is_some());
         assert!(m.ld_by_domain("IED1Cfg").is_none()); // ld_name replaces it
     }
@@ -1090,7 +1141,7 @@ mod tests {
             ld_name: None,
             lns: vec![mmxu1],
         };
-        IedModel::from_parts("IED1".into(), vec![ld])
+        IedModel::from_parts("IED1".into(), vec![ld], Vec::new())
     }
 
     /// A reference may cross a sub-data-object on its way to a data attribute,
@@ -1251,7 +1302,7 @@ mod tests {
             ld_name: None,
             lns: vec![ln],
         };
-        let m = IedModel::from_parts("IED1".into(), vec![ld]);
+        let m = IedModel::from_parts("IED1".into(), vec![ld], Vec::new());
         let r = ObjectRef::parse_iec("IED1LD0/PTOC1.Spt.setVal").unwrap();
         let value = |n: Option<NodeRef<'_>>| match n {
             Some(NodeRef::Da(d)) => Some(d.snapshot()),
