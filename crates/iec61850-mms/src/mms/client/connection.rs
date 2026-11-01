@@ -499,6 +499,19 @@ impl<T, Tm> MmsConnection<T, Tm> {
         self.abandoned_invoke_ids.push_back(invoke_id);
     }
 
+    /// Remembers the invokeID of a request whose call was dropped while its
+    /// answer was awaited; the request stays outstanding at the peer, so it is
+    /// handled as one that timed out.
+    pub(crate) fn abandon_dropped_call(&mut self, invoke_id: u32) {
+        if self.state == ConnectionState::Connected {
+            warn!(
+                invoke_id,
+                "a call was dropped while its answer was awaited, abandoning the request"
+            );
+            self.abandon_invoke_id(invoke_id);
+        }
+    }
+
     /// Forgets `invoke_id` and reports whether it was an abandoned request.
     fn take_abandoned(&mut self, invoke_id: u32) -> bool {
         match self

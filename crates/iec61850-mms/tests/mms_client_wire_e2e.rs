@@ -837,6 +837,189 @@ async fn outstanding_limit_above_64_frees_a_slot_on_the_oldest_late_answer() {
     assert_eq!(id, u32::from(LIMIT) + 1);
 }
 
+/// Runs a client call together with the peer side of its exchange and returns
+/// both results.
+///
+/// The peer side sends the answer last, so it finishes first; a call that ends
+/// while the peer side still waits fails the test with its result instead of
+/// leaving the peer waiting forever.
+async fn exchange<C, P>(call: C, peer_side: P) -> (C::Output, P::Output)
+where
+    C: std::future::Future,
+    C::Output: std::fmt::Debug,
+    P: std::future::Future,
+{
+    let mut call = std::pin::pin!(call);
+    let mut peer_side = std::pin::pin!(peer_side);
+    tokio::select! {
+        biased;
+        p = &mut peer_side => (call.await, p),
+        c = &mut call => panic!("the call ended before the peer side: {c:?}"),
+    }
+}
+
+/// Starts a Read and drops it once the peer has received its request, the way
+/// an outer timeout cancels a call; returns the invokeID the peer saw.
+async fn read_dropped_after_sending(c: &mut MmsClient, peer: &mut Peer) -> u32 {
+    tokio::select! {
+        biased;
+        r = c.read("LD0", "GGIO1$ST$Ind1$stVal") => panic!("the read ended first: {r:?}"),
+        id = peer.recv_read() => id,
+    }
+}
+
+#[tokio::test]
+async fn calls_dropped_after_sending_leave_the_client_usable() {
+    let (mut c, mut peer) = connected().await;
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(read_dropped_after_sending(&mut c, &mut peer).await);
+    }
+    assert_eq!(held, vec![1, 2, 3, 4, 5]);
+
+    // the dropped requests hold every slot until their late answers arrive
+    let server = async {
+        for &id in &held {
+            peer.send_read_response(id, vec![boolean(true)]).await;
+        }
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        id
+    };
+    let (value, id) = exchange(c.read("LD0", "GGIO1$ST$Ind2$stVal"), server).await;
+    assert_eq!(value.unwrap(), MmsData::Boolean(false));
+    assert_eq!(id, 6);
+}
+
+#[tokio::test]
+async fn a_new_association_starts_with_every_slot_free() {
+    let (mut c, mut peer) = connected().await;
+    for _ in 0..5 {
+        read_dropped_after_sending(&mut c, &mut peer).await;
+    }
+
+    let (l, port) = listener().await;
+    let (r, mut fresh) = tokio::join!(c.connect("127.0.0.1", port), accept(&l, Aare::Accept));
+    r.expect("reconnect");
+    let server = async {
+        let id = fresh.recv_read().await;
+        fresh.send_read_response(id, vec![boolean(true)]).await;
+    };
+    let (value, ()) = exchange(c.read("LD0", "GGIO1$ST$Ind1$stVal"), server).await;
+    assert_eq!(value.unwrap(), MmsData::Boolean(true));
+}
+
+#[tokio::test]
+async fn a_call_dropped_before_sending_sends_nothing() {
+    let (mut c, mut peer) = connected_with_max_calling(3_000, 1).await;
+    let held = read_dropped_after_sending(&mut c, &mut peer).await;
+
+    // the one slot is held, so this read waits for a slot and is dropped unsent
+    tokio::select! {
+        biased;
+        r = c.read("LD0", "GGIO1$ST$Ind2$stVal") => panic!("the read ended first: {r:?}"),
+        () = std::future::ready(()) => {}
+    }
+
+    let server = async {
+        peer.send_read_response(held, vec![boolean(true)]).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        id
+    };
+    let (value, id) = exchange(c.read("LD0", "GGIO1$ST$Ind3$stVal"), server).await;
+    assert_eq!(value.unwrap(), MmsData::Boolean(false));
+    assert_eq!(id, held + 2, "the dropped read never reached the peer");
+}
+
+#[tokio::test]
+async fn refused_oversized_writes_hold_no_slot() {
+    let (l, port) = listener().await;
+    let mut c = MmsClientBuilder::new()
+        .connect_timeout_ms(3_000)
+        .request_timeout_ms(3_000)
+        .local_max_pdu_size(128)
+        .build();
+    let (r, mut peer) = tokio::join!(c.connect("127.0.0.1", port), accept(&l, Aare::Accept));
+    r.expect("connect");
+
+    // more refused sends than the outstanding limit of 5
+    for _ in 0..6 {
+        let refused = c
+            .write(
+                "LD0",
+                "GGIO1$ST$Ind1$stVal",
+                MmsData::VisibleString("x".repeat(512)),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ClientError::PduTooLarge { .. })),
+            "got {refused:?}"
+        );
+    }
+
+    let server = async {
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(true)]).await;
+        id
+    };
+    let (value, id) = exchange(c.read("LD0", "GGIO1$ST$Ind2$stVal"), server).await;
+    assert_eq!(value.unwrap(), MmsData::Boolean(true));
+    assert_eq!(id, 7);
+}
+
+/// A transport over TCP whose writes stop making progress once `stall` is set.
+struct StalledWrites {
+    tcp: TcpStream,
+    stall: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncTransport for StalledWrites {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        AsyncTransport::read(&mut self.tcp, buf).await
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+        if self.stall.load(std::sync::atomic::Ordering::Acquire) {
+            std::future::pending::<()>().await;
+        }
+        AsyncTransport::write_all(&mut self.tcp, buf).await
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        AsyncTransport::close(&mut self.tcp).await
+    }
+}
+
+#[tokio::test]
+async fn a_call_dropped_while_sending_closes_the_connection() {
+    let (l, port) = listener().await;
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = StalledWrites {
+        tcp: TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+        stall: stall.clone(),
+    };
+    let (c, _peer) = tokio::join!(
+        MmsClient::<StalledWrites, TokioTimer>::from_transport(transport),
+        accept(&l, Aare::Accept)
+    );
+    let mut c = c.expect("association");
+
+    // the request is stuck in the transport when the call is dropped
+    stall.store(true, std::sync::atomic::Ordering::Release);
+    tokio::select! {
+        biased;
+        r = c.read("LD0", "GGIO1$ST$Ind1$stVal") => panic!("the read ended first: {r:?}"),
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(c.state(), ConnectionState::Closed);
+    let next = c.read("LD0", "GGIO1$ST$Ind1$stVal").await;
+    assert!(
+        matches!(next, Err(ClientError::NotConnected { .. })),
+        "got {next:?}"
+    );
+}
+
 fn list_entry(item: &str) -> iec61850_mms::mms::pdu::ListOfVariableEntry {
     iec61850_mms::mms::pdu::ObjectName::DomainSpecific {
         domain_id: "LD0".to_string(),

@@ -135,32 +135,86 @@ fn strip_confirmed_wrapper(full: BytesMut) -> Result<Bytes, ClientError> {
 ///
 /// `full` is the complete ConfirmedRequestPdu, outer `0xa0` included. The
 /// request is sent only once it fits within the negotiated outstanding limit,
-/// counting the requests that timed out unanswered. The invokeID is released
-/// whatever the outcome.
+/// counting the requests that timed out unanswered.
+///
+/// The invokeID is released whatever the outcome, also when the caller drops
+/// the returned future; see [`CallGuard`] for what a dropped call leaves behind.
 async fn exchange<T: AsyncTransport, Tm: Timer>(
     conn: &mut MmsConnection<T, Tm>,
     alloc: &mut InvokeIdAllocator,
     invoke_id: u32,
     full: BytesMut,
 ) -> Result<MmsPdu, ClientError> {
-    let result = match strip_confirmed_wrapper(full) {
-        Ok(inner) => match send_within_limit(conn, MmsPdu::ConfirmedRequest(inner)).await {
-            Ok(()) => conn.recv_confirmed_response(invoke_id).await,
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(e),
+    let mut call = CallGuard {
+        conn,
+        alloc,
+        invoke_id,
+        stage: CallStage::Unsent,
     };
-    alloc.release(invoke_id);
-    result
+    let pdu = MmsPdu::ConfirmedRequest(strip_confirmed_wrapper(full)?);
+    call.conn.reserve_outstanding_slot().await?;
+    call.stage = CallStage::Sending;
+    let sent = call.conn.send_mms_pdu(&pdu).await;
+    // a failed send either wrote nothing or has already closed the connection
+    call.stage = if sent.is_ok() {
+        CallStage::Sent
+    } else {
+        CallStage::Finished
+    };
+    sent?;
+    let answer = call.conn.recv_confirmed_response(invoke_id).await;
+    call.stage = CallStage::Finished;
+    answer
 }
 
-/// Sends `pdu` once a slot within the negotiated outstanding limit is free.
-async fn send_within_limit<T: AsyncTransport, Tm: Timer>(
-    conn: &mut MmsConnection<T, Tm>,
-    pdu: MmsPdu,
-) -> Result<(), ClientError> {
-    conn.reserve_outstanding_slot().await?;
-    conn.send_mms_pdu(&pdu).await
+/// How far a confirmed call got, which decides what dropping it leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallStage {
+    /// The request has not been handed to the transport.
+    Unsent,
+    /// The request is being written to the transport.
+    Sending,
+    /// The request is on the wire and its answer is awaited.
+    Sent,
+    /// The call has returned its outcome.
+    Finished,
+}
+
+/// Holds the invokeID of one confirmed call and ends the call on every path,
+/// including the caller dropping the call's future, for instance on an outer
+/// timeout.
+///
+/// The invokeID always returns to the allocator. Beyond that, a call dropped
+/// - before its request was handed to the transport leaves nothing behind;
+/// - while its request was being written closes the connection, since part of
+///   the request may already be on the wire and the stream can no longer be
+///   framed;
+/// - while its answer was awaited leaves the request outstanding at the peer,
+///   so its invokeID is remembered as abandoned, as after a request timeout:
+///   it counts against the outstanding limit until its late answer arrives,
+///   and that answer is discarded.
+struct CallGuard<'a, T: AsyncTransport, Tm: Timer> {
+    conn: &'a mut MmsConnection<T, Tm>,
+    alloc: &'a mut InvokeIdAllocator,
+    invoke_id: u32,
+    stage: CallStage,
+}
+
+impl<T: AsyncTransport, Tm: Timer> Drop for CallGuard<'_, T, Tm> {
+    fn drop(&mut self) {
+        match self.stage {
+            CallStage::Sending => {
+                warn!(
+                    invoke_id = self.invoke_id,
+                    "a call was dropped while its request was being sent, closing the connection"
+                );
+                self.conn.close_raw();
+            }
+            CallStage::Sent => self.conn.abandon_dropped_call(self.invoke_id),
+            CallStage::Unsent | CallStage::Finished => {}
+        }
+        self.alloc.release(self.invoke_id);
+    }
 }
 
 // Service functions

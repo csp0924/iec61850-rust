@@ -212,6 +212,7 @@ impl MmsClient<TcpStream, TokioTimer> {
     /// CPA, ACSE AARQ and AARE, then the MMS Initiate exchange. An association
     /// still established, over TCP or TLS, is closed first without a release.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
+        self.alloc.clear();
         self.conn.connect(host, port).await
     }
 
@@ -239,6 +240,7 @@ impl MmsClient<TcpStream, TokioTimer> {
         connector: &iec61850_tls::TlsConnector,
         server_name: rustls::pki_types::ServerName<'static>,
     ) -> Result<(), ClientError> {
+        self.alloc.clear();
         self.conn.connect_tls(addr, connector, server_name).await
     }
 }
