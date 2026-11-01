@@ -1128,3 +1128,33 @@ fn async_client_taken_from_a_blocking_client_keeps_its_association() {
     ));
     drop(rt.block_on(peer).unwrap());
 }
+
+#[test]
+fn blocking_client_numbers_its_associations() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (l, port) = rt.block_on(listener());
+    let peer = rt.spawn(async move {
+        let mut first = accept(&l, Aare::Accept).await;
+        let (ind, _) = first.recv_spdu().await.expect("abort");
+        assert_eq!(ind, SessionIndication::Abort);
+        accept(&l, Aare::Accept).await
+    });
+
+    let mut c = iec61850_mms::mms::client::BlockingMmsClient::from_builder(
+        MmsClientBuilder::new().request_timeout_ms(3_000),
+    )
+    .unwrap();
+    assert_eq!(c.association_id(), 0);
+    c.connect("127.0.0.1", port).unwrap();
+    assert_eq!(c.association_id(), 1);
+    c.abort().unwrap();
+    // the number stays with the association after it ends
+    assert_eq!(c.association_id(), 1);
+    c.connect("127.0.0.1", port).unwrap();
+    assert_eq!(c.association_id(), 2);
+    let _second = rt.block_on(peer).unwrap();
+}

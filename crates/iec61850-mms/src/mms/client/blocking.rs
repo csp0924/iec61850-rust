@@ -147,6 +147,15 @@ impl BlockingMmsClient {
         self.inner.negotiated_max_pdu_size()
     }
 
+    /// Returns the number of the current association, or of the most recent
+    /// one once it has ended; 0 before the first.
+    ///
+    /// Every association established gets a new number; see
+    /// [`MmsClient::association_id`].
+    pub fn association_id(&self) -> u64 {
+        self.inner.association_id()
+    }
+
     /// Returns a flag that is `true` exactly while the association is
     /// established.
     pub fn connected_flag(&mut self) -> Arc<AtomicBool> {
