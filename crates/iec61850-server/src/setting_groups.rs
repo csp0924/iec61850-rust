@@ -196,6 +196,11 @@ pub(crate) struct EditSession {
 
 /// Keeps the edit session it was taken for open, unchanged, until dropped:
 /// opening, ending and expiring a session wait for it.
+///
+/// The hold is a read guard on the session state. While it is held, the
+/// thread holding it takes no lock on that state again, a read included, and
+/// calls no application callback; it only stores values, and drops the hold
+/// before anything else.
 pub(crate) struct EditSessionHold<'a> {
     _state: RwLockReadGuard<'a, State>,
 }
@@ -468,8 +473,9 @@ impl SettingGroupRuntime {
     ///
     /// Returns `ObjectValueInvalid` when the written value is not `true`, and
     /// `ObjectAccessDenied` when no session is open, when the session has
-    /// expired, when it belongs to another association, or when the handler
-    /// refuses.
+    /// expired, when it belongs to another association, when the handler
+    /// refuses, or when the session ends or is opened again while the handler
+    /// runs; a session opened again stays open.
     pub fn try_confirm_edit_sg(
         &self,
         cnf_edit_value: bool,
@@ -481,7 +487,7 @@ impl SettingGroupRuntime {
         }
         self.expire_stale_session_if_any();
 
-        let edit_sg = {
+        let (edit_sg, session) = {
             let g = self.state.read().map_err(|_| {
                 tracing::error!("setting group state lock is poisoned");
                 DataAccessError::HardwareFault
@@ -507,7 +513,7 @@ impl SettingGroupRuntime {
                     return Err(DataAccessError::ObjectAccessDenied);
                 }
             }
-            g.edit_sg
+            (g.edit_sg, g.session)
         };
 
         // The application may persist the values, so the callback runs without
@@ -528,8 +534,9 @@ impl SettingGroupRuntime {
                 tracing::error!("setting group state lock is poisoned");
                 DataAccessError::HardwareFault
             })?;
-            // The session may have ended while the callback ran.
-            if g.edit_sg != edit_sg || g.editing_conn != Some(conn_id) {
+            // The session may have ended, or been opened again by this same
+            // association, while the callback ran.
+            if g.edit_sg != edit_sg || g.editing_conn != Some(conn_id) || g.session != session {
                 tracing::warn!(
                     conn_id,
                     "confirm-edit-sg: the edit session ended before the commit"
@@ -2236,6 +2243,50 @@ mod tests {
             int(setting_da(&model, FC::Se)),
             20,
             "group 3 was not loaded"
+        );
+    }
+
+    /// A commit whose session expires while the handler runs, and which the
+    /// same association opens again meanwhile, commits nothing and leaves the
+    /// new session open.
+    #[test]
+    fn a_commit_outliving_its_session_leaves_the_reopened_one_open() {
+        struct ReopenedMeanwhile(std::sync::OnceLock<Arc<SettingGroupRuntime>>);
+        impl SettingGroupHandler for ReopenedMeanwhile {
+            fn confirm_edit_sg(&self, _: u8, conn_id: ConnectionId) -> bool {
+                let rt = self.0.get().expect("runtime");
+                let past_the_reservation =
+                    Instant::now() + Duration::from_secs(u64::from(u16::MAX) + 1);
+                assert_eq!(rt.tick_reservation_at(past_the_reservation), Some(conn_id));
+                rt.try_edit_sg(2, conn_id)
+                    .expect("the association opens group 2 again");
+                true
+            }
+        }
+        let model = settings_model();
+        let rt = settings_runtime(&model);
+        let handler = Arc::new(ReopenedMeanwhile(std::sync::OnceLock::new()));
+        assert!(handler.0.set(Arc::clone(&rt)).is_ok());
+        rt.install_handler(handler);
+        let edit = setting_da(&model, FC::Se);
+
+        rt.try_edit_sg(2, 100).unwrap();
+        edit.store(MmsValue::Integer(777));
+        assert_eq!(
+            rt.try_confirm_edit_sg(true, 100),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(rt.snapshot().edit_sg, 2, "the reopened session stays open");
+        assert!(rt.is_edit_session_owner(100));
+        assert_eq!(
+            int(edit),
+            20,
+            "the reopened session holds group 2 as loaded"
+        );
+        assert_eq!(
+            rt.group_value(2, edit),
+            Some(MmsValue::Integer(20)),
+            "the stale commit stores nothing into group 2"
         );
     }
 
