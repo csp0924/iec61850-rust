@@ -271,6 +271,12 @@ impl ConnectedAccessPoint {
 /// the NSAP must also hold an even number of characters (IEC 61850-8-1 §25.2
 /// Table 162). An extension type accepts any such string.
 ///
+/// Where the schema is narrower than the character rules of IEC 61850-8-1
+/// Table 162, the schema applies: an IPv6 address takes lower-case digits only,
+/// although the RFC 4291 notation the table cites is case-insensitive, and a
+/// port takes no leading zero, although the table only limits it to five
+/// digits.
+///
 /// # Errors
 ///
 /// [`AddressError::InvalidType`] or [`AddressError::InvalidValue`].
