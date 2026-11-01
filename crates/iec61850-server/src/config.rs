@@ -6,6 +6,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
+use iec61850_model::utc_time::{TimeAccuracy, TimeQuality};
+
 use crate::policy::WriteAccessPolicies;
 
 /// Start-up settings for [`crate::IedServer`].
@@ -59,8 +61,13 @@ pub struct IedServerConfig {
     /// `SP | SV | SE`.
     pub write_access_policies: WriteAccessPolicies,
 
-    /// Time quality carried by the `LActTm` timestamp of the setting group
-    /// control blocks; no other timestamp the server generates uses it.
+    /// TimeQuality of the timestamps the server generates: the `LActTm`
+    /// timestamp of the setting group control blocks and the GOOSE `t` of the
+    /// publishers [`register_from_model`](crate::IedServer::register_from_model)
+    /// creates.
+    ///
+    /// The default has leap seconds known, no clock failure, the clock
+    /// synchronized, and a TimeAccuracy of 10 bits.
     pub time_quality: TimeQuality,
 
     /// Vendor name returned by the Identify service. `None` selects the
@@ -85,7 +92,7 @@ impl Default for IedServerConfig {
             max_dynamic_datasets_per_association: 16,
             edition: Edition::Ed2,
             write_access_policies: WriteAccessPolicies::default(),
-            time_quality: TimeQuality::default(),
+            time_quality: DEFAULT_TIME_QUALITY,
             vendor_name: None,
             model_name: None,
             revision: None,
@@ -107,55 +114,17 @@ pub enum Edition {
     Ed2_1 = 2,
 }
 
-/// UTC time quality flags, encoded into the eighth byte of an IEC 61850 UTC
-/// timestamp (IEC 61850-7-2 §6.2.3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimeQuality {
-    /// `leapSecondsKnown`.
-    pub leap_seconds_known: bool,
-    /// `clockFailure`.
-    pub clock_failure: bool,
-    /// `clockNotSynchronized`.
-    pub clock_not_synchronized: bool,
-    /// `timeAccuracy`, in significant bits of fraction-of-second (0..=24).
-    pub time_accuracy: u8,
-}
-
-impl Default for TimeQuality {
-    /// Returns `leapSecondsKnown = true`, no clock failure, clock
-    /// synchronized, and `timeAccuracy = 10`.
-    fn default() -> Self {
-        Self {
-            leap_seconds_known: true,
-            clock_failure: false,
-            clock_not_synchronized: false,
-            time_accuracy: 10,
-        }
-    }
-}
-
-impl TimeQuality {
-    /// Encodes the flags into the timeQuality byte of an IEC 61850-7-2 UTC
-    /// timestamp.
-    ///
-    /// Bit 7 is `leapSecondsKnown`, bit 6 `clockFailure`, bit 5
-    /// `clockNotSynchronized`, and bits 0..4 hold `timeAccuracy`; an accuracy
-    /// above 31 is truncated to 0x1F.
-    pub fn to_byte(&self) -> u8 {
-        let mut b: u8 = 0;
-        if self.leap_seconds_known {
-            b |= 0x80;
-        }
-        if self.clock_failure {
-            b |= 0x40;
-        }
-        if self.clock_not_synchronized {
-            b |= 0x20;
-        }
-        b |= self.time_accuracy & 0x1F;
-        b
-    }
-}
+/// Default [`IedServerConfig::time_quality`]: leap seconds known, no clock
+/// failure, clock synchronized, and 10 significant bits of FractionOfSecond.
+pub(crate) const DEFAULT_TIME_QUALITY: TimeQuality = TimeQuality::new(
+    true,
+    false,
+    false,
+    match TimeAccuracy::bits(10) {
+        Ok(a) => a,
+        Err(_) => panic!("10 significant bits is a valid time accuracy"),
+    },
+);
 
 #[cfg(test)]
 mod tests {
@@ -168,21 +137,11 @@ mod tests {
 
     #[test]
     fn default_time_quality_is_known_leap_seconds_with_accuracy_10() {
-        let tq = TimeQuality::default();
+        let tq = IedServerConfig::default().time_quality;
         assert!(tq.leap_seconds_known);
         assert!(!tq.clock_failure);
         assert!(!tq.clock_not_synchronized);
-        assert_eq!(tq.time_accuracy, 10);
-    }
-
-    #[test]
-    fn time_quality_byte_layout() {
-        let tq = TimeQuality {
-            leap_seconds_known: true,
-            clock_failure: false,
-            clock_not_synchronized: false,
-            time_accuracy: 10,
-        };
+        assert_eq!(tq.time_accuracy.significant_bits(), Some(10));
         assert_eq!(tq.to_byte(), 0x80 | 10);
     }
 }

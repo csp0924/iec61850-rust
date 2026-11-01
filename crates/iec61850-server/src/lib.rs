@@ -80,7 +80,7 @@ pub mod service;
 #[cfg(feature = "setting-groups")]
 pub mod setting_groups;
 
-pub use config::{Edition, IedServerConfig, TimeQuality};
+pub use config::{Edition, IedServerConfig};
 #[cfg(any(
     feature = "full-server",
     feature = "reporting",
@@ -102,6 +102,7 @@ pub use handler::{
     AttributeAccessHandler, DenyAllReadHandler, HandlerRegistry, ReadContext, ReadHandler,
     ReadOutcome, SilentReadHandler, WriteContext, WriteOutcome as HandlerWriteOutcome,
 };
+pub use iec61850_model::utc_time::{TimeAccuracy, TimeQuality};
 #[cfg(feature = "full-server")]
 pub use lifecycle::ServerHandle;
 #[cfg(feature = "full-server")]

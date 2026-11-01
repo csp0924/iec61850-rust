@@ -38,7 +38,7 @@ use iec61850_server::logging::{LogControl, LogControlBlock};
 use iec61850_server::reporting::{Brcb, BufferedReportControl};
 use iec61850_server::{
     Dataset, DatasetEntry, IedServer, IedServerConfig, Rcb, ReportControl, ServerHandle,
-    TimeQuality,
+    TimeAccuracy, TimeQuality,
 };
 
 const DOM: &str = "IED1LD0";
@@ -558,14 +558,9 @@ async fn setting_group_control_block_is_only_in_lln0() {
 /// LActTm carries the time quality the server is configured with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn last_activation_time_carries_the_configured_time_quality() {
-    let quality = TimeQuality {
-        leap_seconds_known: false,
-        clock_failure: true,
-        clock_not_synchronized: true,
-        time_accuracy: 3,
-    };
+    let quality = TimeQuality::new(false, true, true, TimeAccuracy::bits(3).unwrap());
     for (config, expected) in [
-        (IedServerConfig::default(), TimeQuality::default().to_byte()),
+        (IedServerConfig::default(), 0x80 | 10),
         (
             {
                 let mut config = IedServerConfig::default();

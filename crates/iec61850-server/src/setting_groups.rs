@@ -842,12 +842,12 @@ impl Default for SettingGroupRegistry {
 }
 
 impl SettingGroupRegistry {
-    /// Returns an empty registry whose timestamps carry the default time
-    /// quality of [`TimeQuality`](crate::TimeQuality).
+    /// Returns an empty registry whose timestamps carry the default
+    /// [`IedServerConfig::time_quality`](crate::IedServerConfig::time_quality).
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            time_quality: crate::TimeQuality::default().to_byte(),
+            time_quality: crate::config::DEFAULT_TIME_QUALITY.to_byte(),
             writer: Arc::default(),
         }
     }
@@ -1863,12 +1863,8 @@ mod tests {
     #[cfg(feature = "full-server")]
     #[test]
     fn last_act_tm_carries_the_configured_time_quality() {
-        let quality = crate::TimeQuality {
-            leap_seconds_known: false,
-            clock_failure: false,
-            clock_not_synchronized: true,
-            time_accuracy: 7,
-        };
+        let quality =
+            crate::TimeQuality::new(false, false, true, crate::TimeAccuracy::bits(7).unwrap());
         let reg = registry_with_one(3, false).with_time_quality(quality);
         let AccessResult::Success(MmsData::UtcTime(t)) =
             handle_sgcb_read(&reg, "IED1LD0", "LLN0", SgcbField::LActTm)
@@ -1892,7 +1888,7 @@ mod tests {
         else {
             panic!("LActTm reads as a UTC time");
         };
-        assert_eq!(t[7], crate::TimeQuality::default().to_byte());
+        assert_eq!(t[7], crate::config::DEFAULT_TIME_QUALITY.to_byte());
     }
 
     #[test]
