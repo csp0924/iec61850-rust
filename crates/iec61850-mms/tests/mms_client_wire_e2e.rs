@@ -7,7 +7,7 @@
 //! a Conclude-ErrorPDU or a Session abort.
 
 use bytes::BytesMut;
-use iec61850_hal::time::TokioTimer;
+use iec61850_hal::time::{Timer, TokioTimer};
 use iec61850_hal::transport::{AsyncTransport, IoErrorKind, TransportError};
 use iec61850_mms::iso::acse::{encode_aare, AcseConnection, AcseIndication};
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions};
@@ -19,14 +19,20 @@ use iec61850_mms::iso::session::{
     encode_abort as sess_encode_abort, encode_accept, encode_data, encode_disconnect,
     encode_finish, IsoSession, SessionIndication,
 };
-use iec61850_mms::mms::client::{ClientError, ConnectionState, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::client::invoke_id::InvokeIdAllocator;
+use iec61850_mms::mms::client::services::read_variable;
+use iec61850_mms::mms::client::{
+    ClientError, ConnectionState, MmsClient, MmsClientBuilder, MmsConnection,
+};
 use iec61850_mms::mms::pdu::initiate::InitiateResponsePdu;
 use iec61850_mms::mms::pdu::{
     decode_confirmed_read_request, encode_confirmed_read_response, AccessResult, MmsData,
     ReadResponse,
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 /// The peer side of one association.
 struct Peer {
@@ -712,6 +718,123 @@ async fn initiate_request_proposes_the_configured_outstanding_limit() {
     };
     let (_, init) = tokio::join!(c.connect("127.0.0.1", port), probe);
     assert_eq!(init.proposed_max_serv_outstanding_calling, 3);
+}
+
+/// Real time after which a test driven by a granted timer gives up. It only
+/// turns a client stuck on a sleep that no grant ends into a failure; the
+/// outcome of a passing test never depends on it.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// A timer whose sleeps end only when the test grants an expiry.
+///
+/// Each granted permit ends exactly one sleep, whichever is waiting or starts
+/// next, so a timeout fires at the point the test chooses.
+#[derive(Clone)]
+struct GrantedTimer(Arc<Semaphore>);
+
+impl Timer for GrantedTimer {
+    async fn sleep(&self, _duration: Duration) {
+        self.0.acquire().await.expect("semaphore open").forget();
+    }
+}
+
+/// Associates a connection driven by a granted timer that proposes
+/// `max_calling`, with a peer that negotiates the same value.
+async fn associated_with_granted_timer(
+    max_calling: u16,
+) -> (MmsConnection<TcpStream, GrantedTimer>, Peer, Arc<Semaphore>) {
+    let (l, port) = listener().await;
+    let expiries = Arc::new(Semaphore::new(0));
+    let mut conn = MmsConnection::with_timer(GrantedTimer(expiries.clone()));
+    conn.local_max_outstanding = Some(max_calling);
+    let client = async {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        conn.connect_via(tcp).await
+    };
+    let (r, peer) = tokio::join!(client, accept(&l, Aare::AcceptWithMaxCalling(max_calling)));
+    r.expect("associate");
+    assert_eq!(conn.negotiated_max_calling, max_calling);
+    (conn, peer, expiries)
+}
+
+/// Sends `count` Reads the peer holds unanswered until each times out, and
+/// returns their invokeIDs in order.
+async fn hold_unanswered_reads(
+    conn: &mut MmsConnection<TcpStream, GrantedTimer>,
+    alloc: &mut InvokeIdAllocator,
+    peer: &mut Peer,
+    expiries: &Semaphore,
+    count: u16,
+) -> Vec<u32> {
+    let mut held = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let server = async {
+            let id = peer.recv_read().await;
+            expiries.add_permits(1);
+            id
+        };
+        let (r, id) = tokio::join!(
+            read_variable(conn, alloc, "LD0", "GGIO1$ST$Ind1$stVal"),
+            server
+        );
+        assert!(
+            matches!(r, Err(ClientError::ServiceTimeout { .. })),
+            "got {r:?}"
+        );
+        held.push(id);
+    }
+    held
+}
+
+#[tokio::test]
+async fn outstanding_limit_above_64_refuses_to_send_past_the_limit() {
+    const LIMIT: u16 = 65;
+    let (mut conn, mut peer, expiries) = associated_with_granted_timer(LIMIT).await;
+    let mut alloc = InvokeIdAllocator::new(5);
+    let held = hold_unanswered_reads(&mut conn, &mut alloc, &mut peer, &expiries, LIMIT).await;
+    assert_eq!(held, (1..=u32::from(LIMIT)).collect::<Vec<_>>());
+
+    // every slot is held, and no late answer arrives before the wait expires
+    expiries.add_permits(1);
+    let refused = read_variable(&mut conn, &mut alloc, "LD0", "GGIO1$ST$Ind2$stVal").await;
+    assert!(
+        matches!(refused, Err(ClientError::OutstandingCallLimit)),
+        "got {refused:?}"
+    );
+    assert_eq!(conn.state, ConnectionState::Connected);
+
+    // the next spdu the peer sees is the abort, so the refused read never left
+    let (r, next) = tokio::join!(conn.abort(), peer.recv_spdu());
+    r.expect("abort");
+    let (ind, _) = next.expect("an spdu");
+    assert_eq!(ind, SessionIndication::Abort);
+}
+
+#[tokio::test]
+async fn outstanding_limit_above_64_frees_a_slot_on_the_oldest_late_answer() {
+    const LIMIT: u16 = 65;
+    let (mut conn, mut peer, expiries) = associated_with_granted_timer(LIMIT).await;
+    let mut alloc = InvokeIdAllocator::new(5);
+    let held = hold_unanswered_reads(&mut conn, &mut alloc, &mut peer, &expiries, LIMIT).await;
+
+    // the late answer to the first request frees its slot for the next one
+    let server = async {
+        peer.send_read_response(held[0], vec![boolean(true)]).await;
+        let id = peer.recv_read().await;
+        peer.send_read_response(id, vec![boolean(false)]).await;
+        id
+    };
+    let exchange = async {
+        tokio::join!(
+            read_variable(&mut conn, &mut alloc, "LD0", "GGIO1$ST$Ind2$stVal"),
+            server
+        )
+    };
+    let (value, id) = tokio::time::timeout(HANG_GUARD, exchange)
+        .await
+        .expect("the client is still waiting for a slot the late answer should have freed");
+    assert_eq!(value.unwrap(), MmsData::Boolean(false));
+    assert_eq!(id, u32::from(LIMIT) + 1);
 }
 
 fn list_entry(item: &str) -> iec61850_mms::mms::pdu::ListOfVariableEntry {

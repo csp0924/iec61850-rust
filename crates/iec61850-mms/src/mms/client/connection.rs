@@ -236,8 +236,10 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 /// flight; see [`MmsConnection::max_pending_unconfirmed`].
 pub const DEFAULT_MAX_PENDING_UNCONFIRMED: usize = 1024;
 
-/// Number of timed-out invokeIDs remembered so that their late answers are
-/// recognized and discarded; the oldest is forgotten first.
+/// Minimum number of timed-out invokeIDs remembered so that their late answers
+/// are recognized and discarded; the oldest is forgotten first. A negotiated
+/// outstanding calling limit above it raises the ceiling to that limit, so every
+/// request that holds a slot stays counted.
 const MAX_ABANDONED_INVOKE_IDS: usize = 64;
 
 /// indirect-reference written into the AARQ user-information; MMS uses 3.
@@ -485,8 +487,13 @@ impl<T, Tm> MmsConnection<T, Tm> {
     }
 
     /// Remembers the invokeID of a request whose answer did not arrive in time.
+    ///
+    /// At most the larger of `MAX_ABANDONED_INVOKE_IDS` and
+    /// `negotiated_max_calling` invokeIDs are kept, so the count never falls
+    /// below the outstanding limit it is checked against.
     fn abandon_invoke_id(&mut self, invoke_id: u32) {
-        if self.abandoned_invoke_ids.len() >= MAX_ABANDONED_INVOKE_IDS {
+        let ceiling = MAX_ABANDONED_INVOKE_IDS.max(usize::from(self.negotiated_max_calling));
+        while self.abandoned_invoke_ids.len() >= ceiling {
             self.abandoned_invoke_ids.pop_front();
         }
         self.abandoned_invoke_ids.push_back(invoke_id);
@@ -1949,6 +1956,26 @@ mod tests {
         assert!(!conn.take_abandoned(1), "the oldest invokeid is forgotten");
         assert!(conn.take_abandoned(count), "the newest invokeid is kept");
         assert!(!conn.take_abandoned(count), "an invokeid is taken once");
+    }
+
+    #[test]
+    fn abandoned_invoke_ids_cover_a_negotiated_limit_above_the_minimum() {
+        let mut conn = MmsConnection::<TcpStream, TokioTimer>::new();
+        let limit = MAX_ABANDONED_INVOKE_IDS as u16 + 1;
+        conn.negotiated_max_calling = limit;
+        for id in 1..=u32::from(limit) {
+            conn.abandon_invoke_id(id);
+        }
+        assert_eq!(conn.abandoned_invoke_ids.len(), usize::from(limit));
+        assert!(conn.take_abandoned(1), "the oldest invokeid is kept");
+
+        conn.abandon_invoke_id(u32::from(limit) + 1);
+        conn.abandon_invoke_id(u32::from(limit) + 2);
+        assert_eq!(conn.abandoned_invoke_ids.len(), usize::from(limit));
+        assert!(
+            !conn.take_abandoned(2),
+            "past the limit the oldest is forgotten"
+        );
     }
 
     #[test]
