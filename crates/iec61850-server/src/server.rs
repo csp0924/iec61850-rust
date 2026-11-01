@@ -13,6 +13,7 @@
 //! raised together when the lock is released; the periodic report and log
 //! triggers wait for the release as well.
 
+use crate::authentication::AssociationAuthenticator;
 use crate::config::IedServerConfig;
 use crate::connection::{ClientConnection, ConnectionId};
 use crate::control::{ChannelCommandTermination, ControlObjectsRegistry};
@@ -158,6 +159,9 @@ struct IedServerInner {
     #[cfg(feature = "tls")]
     pub(crate) tls_acceptor: Option<TlsAcceptor>,
 
+    /// Decides on each association request; `None` accepts every one.
+    authenticator: RwLock<Option<Arc<dyn AssociationAuthenticator>>>,
+
     /// GOOSE control blocks, shared with the dispatcher, which exposes them
     /// through Read, Write, and GetNameList.
     gocb_registry: Arc<crate::goose_mapping::GoCBRegistry>,
@@ -209,8 +213,31 @@ impl IedServer {
             dispatcher: None,
             #[cfg(feature = "tls")]
             tls_acceptor: None,
+            authenticator: None,
             _state: PhantomData,
         }
+    }
+
+    /// Installs the authenticator that decides on each association request,
+    /// replacing any earlier one; `None` accepts every association.
+    ///
+    /// An association already established is not affected; the next AARQ is
+    /// decided by the authenticator installed when it arrives.
+    pub fn set_authenticator(&self, authenticator: Option<Arc<dyn AssociationAuthenticator>>) {
+        *self
+            .inner
+            .authenticator
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = authenticator;
+    }
+
+    /// Returns the authenticator that decides on each association request.
+    pub fn authenticator(&self) -> Option<Arc<dyn AssociationAuthenticator>> {
+        self.inner
+            .authenticator
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns the model, which is immutable and shared.
@@ -1788,6 +1815,8 @@ pub struct IedServerBuilder<S> {
     /// the connection task starts.
     #[cfg(feature = "tls")]
     tls_acceptor: Option<TlsAcceptor>,
+    /// Decides on each association request; `None` accepts every one.
+    authenticator: Option<Arc<dyn AssociationAuthenticator>>,
     _state: PhantomData<S>,
 }
 
@@ -1798,6 +1827,7 @@ impl<S> std::fmt::Debug for IedServerBuilder<S> {
             .field("config", &self.config)
             .field("bind_addr", &self.bind_addr)
             .field("dispatcher_set", &self.dispatcher.is_some())
+            .field("authenticator_set", &self.authenticator.is_some())
             .finish()
     }
 }
@@ -1812,6 +1842,7 @@ impl IedServerBuilder<NoModel> {
             dispatcher: self.dispatcher,
             #[cfg(feature = "tls")]
             tls_acceptor: self.tls_acceptor,
+            authenticator: self.authenticator,
             _state: PhantomData,
         }
     }
@@ -1827,6 +1858,7 @@ impl IedServerBuilder<HasModel> {
             dispatcher: self.dispatcher,
             #[cfg(feature = "tls")]
             tls_acceptor: self.tls_acceptor,
+            authenticator: self.authenticator,
             _state: PhantomData,
         }
     }
@@ -1843,6 +1875,14 @@ impl<S> IedServerBuilder<S> {
     /// otherwise construct.
     pub fn dispatcher(mut self, d: Arc<dyn MmsServiceDispatcher>) -> Self {
         self.dispatcher = Some(d);
+        self
+    }
+
+    /// Supplies the authenticator that decides on each association request;
+    /// see [`IedServer::set_authenticator`]. Without one every association is
+    /// accepted.
+    pub fn authenticator(mut self, authenticator: Arc<dyn AssociationAuthenticator>) -> Self {
+        self.authenticator = Some(authenticator);
         self
     }
 }
@@ -2016,6 +2056,7 @@ impl IedServerBuilder<Bound> {
                 dynamic_dataset_keys,
                 #[cfg(feature = "tls")]
                 tls_acceptor: self.tls_acceptor,
+                authenticator: RwLock::new(self.authenticator),
                 gocb_registry,
             }),
         };

@@ -38,6 +38,8 @@
 #[macro_use]
 extern crate alloc;
 
+#[cfg(feature = "full-server")]
+pub mod authentication;
 pub mod compat;
 pub mod config;
 // The bitflag types (TriggerOptions, OptFlds, InclusionFlag) sit at crate top
@@ -80,6 +82,11 @@ pub mod service;
 #[cfg(feature = "setting-groups")]
 pub mod setting_groups;
 
+#[cfg(feature = "full-server")]
+pub use authentication::{
+    AcseAuth, AcseServiceUserDiagnostic, AssociationAuthenticator, AssociationDecision,
+    AssociationRequest,
+};
 pub use config::{Edition, IedServerConfig};
 #[cfg(any(
     feature = "full-server",

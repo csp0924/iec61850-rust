@@ -25,11 +25,16 @@
 //!   CP without an acceptable ACSE and MMS context is answered with a Session
 //!   REFUSE carrying a Presentation CPR, provider rejection, before the socket
 //!   closes.
+//! - An installed `AssociationAuthenticator` decides on each AARQ before the
+//!   MMS Initiate is looked at; without one every AARQ is accepted.
 //! - An association the server refuses, for failed authentication, an AARQ
 //!   that carries no Initiate request or a refused Initiate, is answered with a
 //!   Session REFUSE carrying a Presentation CPR (user rejection) and an ACSE
-//!   AARE with a rejected result before the socket closes. The AARE of a
-//!   refused Initiate carries the Initiate-ErrorPDU as its user information.
+//!   AARE with a rejected result before the socket closes. The AARE of an
+//!   association the authenticator refuses carries the diagnostic it names
+//!   and, as its user information, an Initiate-ErrorPDU with access /
+//!   object-access-denied; the AARE of a refused Initiate carries the
+//!   Initiate-ErrorPDU of the refusal.
 //! - An abort sends an ACSE A-ABORT, wrapped in a Session abort and a COTP data
 //!   TPDU, before the socket closes. Its abort-source is acse-service-user when
 //!   the server decides to abort (the idle timeout, `abort_connection`,
@@ -60,8 +65,8 @@ use crate::ConnectionId;
 use bytes::{Bytes, BytesMut};
 use iec61850_mms::error::CotpError;
 use iec61850_mms::iso::acse::{
-    encode_aare, encode_abrt, encode_associate_failed, encode_rlre, AcseConnection, AcseError,
-    AcseIndication,
+    encode_aare, encode_aare_with_diagnostic, encode_abrt, encode_associate_failed, encode_rlre,
+    AcseConnection, AcseError, AcseIndication,
 };
 use iec61850_mms::iso::cotp::{CotpConnection, CotpOptions, DEFAULT_MAX_TSDU_SIZE};
 use iec61850_mms::iso::presentation::{
@@ -78,6 +83,8 @@ use iec61850_mms::mms::pdu::information_report::{
     encode_command_termination_negative, encode_command_termination_positive, LastApplErrorRef,
     OriginRef,
 };
+use iec61850_mms::mms::pdu::initiate::InitiateErrorPdu;
+use iec61850_mms::mms::pdu::service_error::{subcode, ErrorClass, ServiceError};
 use iec61850_mms::mms::pdu::write::{
     decode_confirmed_write_response, encode_confirmed_write_response, WriteResponse,
 };
@@ -89,10 +96,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
+use crate::authentication::{AcseServiceUserDiagnostic, AssociationDecision, AssociationRequest};
 use crate::connection::ClientConnection;
 
 /// Tag of the MMS Initiate-RequestPDU, the only PDU an AARQ may carry.
 const MMS_INITIATE_REQUEST_TAG: u8 = 0xa8;
+
+/// AARE result rejected-permanent.
+const AARE_REJECTED_PERMANENT: u32 = 1;
 
 /// CPR provider-reason reason-not-specified.
 const PROVIDER_REASON_NOT_SPECIFIED: u8 = 0;
@@ -334,6 +345,8 @@ enum ConnError {
     PresentationRejected,
     #[error("acse association failed: authentication was refused or the result was non-zero")]
     AcseAssociationFailed,
+    #[error("the authenticator refused the association: {0}")]
+    AuthenticationRefused(AcseServiceUserDiagnostic),
     #[error("unexpected acse indication {0:?}: only associate is accepted while associating")]
     UnexpectedAcseIndication(AcseIndication),
     #[error("initiate-request was refused; the association was rejected and the socket closed")]
@@ -432,7 +445,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let dispatcher = server.dispatcher();
-    let setup = establish_association(&server, stream, conn_id, dispatcher.as_ref());
+    let setup = establish_association(&server, stream, peer, conn_id, dispatcher.as_ref());
     let established = match tokio::time::timeout_at(setup_deadline, setup).await {
         Ok(established) => established?,
         Err(_) => {
@@ -460,6 +473,7 @@ struct Established<S> {
 async fn establish_association<S>(
     server: &IedServer,
     stream: S,
+    peer: std::net::SocketAddr,
     conn_id: ConnectionId,
     dispatcher: &dyn MmsServiceDispatcher,
 ) -> std::result::Result<Established<S>, ConnError>
@@ -528,6 +542,48 @@ where
                 "the first acse PDU is not an associate request, refusing"
             );
             return Err(ConnError::UnexpectedAcseIndication(other));
+        }
+    }
+
+    if let Some(authenticator) = server.authenticator() {
+        let request =
+            AssociationRequest::new(peer, acse.aarq_addressing(), acse.calling_authentication());
+        let mechanism = acse.calling_authentication().label();
+        match authenticator.authenticate(&request) {
+            AssociationDecision::Accept => {
+                tracing::debug!(
+                    conn_id,
+                    mechanism,
+                    "the authenticator accepted the association"
+                );
+            }
+            AssociationDecision::Reject(diagnostic) => {
+                tracing::warn!(
+                    conn_id,
+                    mechanism,
+                    %diagnostic,
+                    "the authenticator refused the association, sending a reject and closing the socket"
+                );
+                // The MMS environment is refused for a security restriction:
+                // the Initiate-ErrorPDU carries access / object-access-denied.
+                let access_denied = ErrorClass::Access(subcode::access::OBJECT_ACCESS_DENIED);
+                let mut initiate_error = BytesMut::new();
+                InitiateErrorPdu {
+                    service_error: ServiceError::new(access_denied),
+                }
+                .encode(&mut initiate_error);
+                send_association_reject(&mut cotp, &pres, |out| {
+                    encode_aare_with_diagnostic(
+                        AARE_REJECTED_PERMANENT,
+                        diagnostic,
+                        Some(&initiate_error),
+                        pres.mms_context_id.into(),
+                        out,
+                    )
+                })
+                .await?;
+                return Err(ConnError::AuthenticationRefused(diagnostic));
+            }
         }
     }
 

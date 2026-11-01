@@ -287,6 +287,14 @@ name = "iso_association_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "acse_authentication_e2e"
+required-features = ["full-server"]
+
+[[test]]
+name = "acse_authentication_log"
+required-features = ["full-server"]
+
+[[test]]
 name = "journal_query_e2e"
 required-features = ["full-server"]
 
