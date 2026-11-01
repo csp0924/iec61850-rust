@@ -23,6 +23,7 @@ use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_model::{
     ControlModel, IedModel, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, MmsValue,
 };
+use iec61850_server::control::handler::OperateFuture;
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, AlwaysFailOperateHandler,
     AlwaysSuccessOperateHandler, CheckHandler, ControlAddCause as ServerControlAddCause,
@@ -107,6 +108,39 @@ fn register_control_object_with_check(
         .with_wait(Arc::new(AlwaysAcceptWaitHandler) as Arc<dyn WaitForExecutionHandler>)
         .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>);
     server.control_objects().register(entry);
+}
+
+/// Registers a control object whose command never completes, so the operate
+/// timeout of `oper_timeout_ms` ends every command.
+fn register_never_done_object(
+    server: &IedServer,
+    do_name: &str,
+    ctl_model: ControlModel,
+    oper_timeout_ms: u32,
+) {
+    let obj = ControlObject::new({
+        let mut config = ControlObjectConfig::new(do_name, LN, DOMAIN, ctl_model);
+        config.oper_timeout_ms = oper_timeout_ms;
+        config
+    });
+    let entry = ControlObjectEntry::new(obj)
+        .with_check(Arc::new(AlwaysAcceptCheckHandler) as Arc<dyn CheckHandler>)
+        .with_wait(Arc::new(AlwaysAcceptWaitHandler) as Arc<dyn WaitForExecutionHandler>)
+        .with_operate(Arc::new(NeverDone) as Arc<dyn ControlHandler>);
+    server.control_objects().register(entry);
+}
+
+/// A control handler whose command never completes.
+struct NeverDone;
+impl ControlHandler for NeverDone {
+    fn operate<'a>(
+        &'a self,
+        _action: &'a iec61850_server::control::ControlAction,
+        _ctl_val: &'a MmsValue,
+        _test: bool,
+    ) -> OperateFuture<'a> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// A check handler that always answers BlockedByInterlocking.
@@ -293,6 +327,43 @@ async fn direct_enhanced_operate_failure_with_ct_negative() {
     assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCDE_FAIL$Oper"));
     assert_eq!(e.origin, operator());
     assert_eq!(e.ctl_num, 1);
+
+    let _ = conn.disconnect().await;
+    handle.stop().await;
+}
+
+// direct-enhanced, the command outlasts the operate timeout.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oper_timeout_ends_the_command_with_time_limit_over() {
+    let server = build_server();
+    register_never_done_object(&server, "SPCDE_TMO", ControlModel::DirectEnhanced, 20);
+    register_never_done_object(&server, "SPCDE_TMOT", ControlModel::DirectEnhanced, 20);
+
+    let handle = server.start().await.expect("start");
+    let port = handle.bound_addr.port();
+    let conn = make_connected_client(port).await;
+
+    // The command ends with a negative command termination whose add cause
+    // is Time-limit-over, an application error, so its Error is No Error
+    // (IEC 61850-8-1 §20.11).
+    let mut spc = make_control_handle(&conn, "SPCDE_TMO", ControlModel::DirectEnhanced);
+    spc.set_origin(operator());
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    assert_eq!(outcome.add_cause(), Some(ControlAddCause::TimeLimitOver));
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCDE_TMO$Oper"));
+    assert_eq!(e.error, ControlLastApplError::NoError);
+    assert_eq!(e.add_cause, ControlAddCause::TimeLimitOver);
+
+    // A test command that times out carries Operator Test Not OK instead.
+    let mut spc = make_control_handle(&conn, "SPCDE_TMOT", ControlModel::DirectEnhanced);
+    spc.set_origin(operator());
+    spc.set_test(true);
+    let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.error, ControlLastApplError::OperatorTestNotOk);
+    assert_eq!(e.add_cause, ControlAddCause::TimeLimitOver);
 
     let _ = conn.disconnect().await;
     handle.stop().await;
