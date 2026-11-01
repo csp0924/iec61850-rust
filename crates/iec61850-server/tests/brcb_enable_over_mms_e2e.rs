@@ -6,7 +6,9 @@
 //! from another. When the association ends the BRCB is disabled and keeps
 //! buffering, so a client that reconnects and enables it again receives the
 //! entries buffered in between, from after the last entry sent or from an
-//! `EntryID` it writes. Reports are received on a raw MMS association and decoded
+//! `EntryID` it writes. No write other than one to `ResvTms` reserves the BRCB:
+//! `ResvTms` stays 0 through configuration, enabling and the end of the
+//! association. Reports are received on a raw MMS association and decoded
 //! without client-side report state.
 
 use std::net::SocketAddr;
@@ -381,6 +383,54 @@ async fn brcb_reserved_over_mms_is_taken_back_by_its_owner() {
     let resumed = next_report(&mut second).await;
     assert_brcb_report(&resumed, dbpos(1));
     assert!(resumed.entry_id > sent.entry_id);
+}
+
+async fn brcb_resv_tms(mms: &mut MmsClient) -> MmsData {
+    mms.read(DOMAIN, "LLN0$BR$brcbPos$ResvTms")
+        .await
+        .expect("read ResvTms")
+}
+
+/// On a BRCB with `ResvTms` = 0, writes other than one to `ResvTms` reserve
+/// nothing (IEC 61850-7-2 §17.2.2.17): after configuration writes another client
+/// still configures it, enabling and disabling leave `ResvTms` at 0, and once
+/// the association that enabled it ends `ResvTms` reads 0 and another client
+/// takes the BRCB at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brcb_writes_other_than_resv_tms_do_not_reserve() {
+    let f = start(0).await;
+    let mut first = f.connect().await;
+    let mut other = f.connect().await;
+
+    write_brcb(&mut first, "IntgPd", MmsData::Unsigned(0))
+        .await
+        .expect("configure the brcb");
+    write_brcb(&mut first, "EntryID", MmsData::OctetString(vec![0; 8]))
+        .await
+        .expect("write EntryID");
+    assert_eq!(brcb_resv_tms(&mut other).await, MmsData::Integer(0));
+    write_brcb(&mut other, "IntgPd", MmsData::Unsigned(0))
+        .await
+        .expect("another client configures the unreserved brcb");
+
+    for enable in [true, false, true] {
+        write_brcb(&mut first, "RptEna", MmsData::Boolean(enable))
+            .await
+            .expect("write RptEna");
+        assert_eq!(brcb_resv_tms(&mut other).await, MmsData::Integer(0));
+    }
+
+    first.disconnect().await.expect("disconnect");
+    other.disconnect().await.expect("disconnect");
+    f.wait_for_no_connection().await;
+
+    let mut next = f.connect().await;
+    assert_eq!(brcb_resv_tms(&mut next).await, MmsData::Integer(0));
+    write_brcb(&mut next, "RptEna", MmsData::Boolean(true))
+        .await
+        .expect("another association enables the brcb at once");
+    f.set_st_val(2);
+    assert_brcb_report(&next_report(&mut next).await, dbpos(2));
 }
 
 fn assert_refused_with(result: Result<(), ClientError>, expected: DataAccessError) {

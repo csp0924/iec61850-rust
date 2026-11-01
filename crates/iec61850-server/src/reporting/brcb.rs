@@ -41,8 +41,9 @@ pub enum ResvTmsState {
     /// Pre-configured owner: never times out, and only a client whose address
     /// matches may take the control block.
     Preconfigured,
-    /// Unreserved: any client write reserves the control block implicitly for ten
-    /// seconds.
+    /// Unreserved: any client may write the control block, and no write other
+    /// than one to ResvTms reserves it. The client that enables it holds it until
+    /// it disables it or its association ends, with no reservation kept after.
     NotReserved,
     /// Reserved with a timeout; the value is the number of seconds remaining.
     WithTimeout(NonZeroU16),
@@ -86,15 +87,6 @@ impl ResvTmsState {
         !matches!(self, Self::NotReserved)
     }
 }
-
-/// Seconds of the implicit reservation defined by IEC 61850-7-2: a successful RCB
-/// write other than one to ResvTms reserves the control block for this long.
-///
-/// Nothing consumes this constant yet — no write path applies the implicit
-/// reservation — so it records the value the standard specifies rather than
-/// behavior this crate implements.
-// TODO: apply the implicit reservation on a successful RCB write.
-pub const RESV_TMS_IMPLICIT_VALUE_S: u16 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration writes: BrcbConfigField and ConfigChangeResult
