@@ -275,6 +275,10 @@ name = "goose_mapping_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "goose_timestamp_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "initiate_handshake"
 required-features = ["full-server"]
 

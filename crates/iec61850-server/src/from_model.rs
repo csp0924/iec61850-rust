@@ -13,8 +13,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iec61850_goose::{CommParameters, GoosePublisher};
+use iec61850_model::utc_time::{TimeQuality, UtcTime};
 use iec61850_model::{DataSetEntry, IedModel, LogicalDevice, LogicalNode};
 
 use crate::error::{Result, ServerError};
@@ -31,6 +33,13 @@ pub type LogStorageFactory = Arc<dyn Fn(&str) -> Arc<dyn LogStorage> + Send + Sy
 /// block, given its reference `<LD>/<LN>$GO$<name>`.
 pub type GooseCommFactory = Arc<dyn Fn(&str) -> CommParameters + Send + Sync>;
 
+/// Reads the wall clock as the time elapsed since 1970-01-01 00:00:00 UTC.
+///
+/// A GOOSE publisher calls it inside `increase_st_num` and `reset`, while
+/// the application holds the publisher lock, so it must return quickly and
+/// never block.
+pub type WallClock = Arc<dyn Fn() -> Duration + Send + Sync>;
+
 /// What [`IedServer::register_from_model_with`] needs beyond the model.
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -41,6 +50,10 @@ pub struct FromModelOptions {
     /// Gives the destination of each GOOSE publication; `None` gives every
     /// publisher APPID 0 and the destination `01-0C-CD-01-00-00`.
     pub goose_comm: Option<GooseCommFactory>,
+    /// Clock the GOOSE publishers registered from the model stamp `t` from;
+    /// `None` reads the system clock. A publisher registered through
+    /// [`register_gocb`](IedServer::register_gocb) is not given it.
+    pub wall_clock: Option<WallClock>,
 }
 
 impl std::fmt::Debug for FromModelOptions {
@@ -48,6 +61,7 @@ impl std::fmt::Debug for FromModelOptions {
         f.debug_struct("FromModelOptions")
             .field("log_storage", &self.log_storage.is_some())
             .field("goose_comm", &self.goose_comm.is_some())
+            .field("wall_clock", &self.wall_clock.is_some())
             .finish()
     }
 }
@@ -67,6 +81,18 @@ impl FromModelOptions {
     /// Sets the communication parameters of the GOOSE publishers.
     pub fn with_goose_comm(mut self, factory: GooseCommFactory) -> Self {
         self.goose_comm = Some(factory);
+        self
+    }
+
+    /// Sets the clock the GOOSE publishers registered from the model stamp
+    /// `t` from.
+    ///
+    /// It reaches only the publishers [`IedServer::register_from_model_with`]
+    /// creates; a publisher registered through
+    /// [`register_gocb`](IedServer::register_gocb) keeps whatever timestamp
+    /// handling the application gave it.
+    pub fn with_wall_clock(mut self, clock: WallClock) -> Self {
+        self.wall_clock = Some(clock);
         self
     }
 }
@@ -97,6 +123,29 @@ pub struct FromModelSummary {
 /// The default destination of a GOOSE publication, the first address of the
 /// GOOSE multicast range of IEC 61850-8-1 Annex B.
 const DEFAULT_GOOSE_DESTINATION: [u8; 6] = [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00];
+
+/// Reads a wall clock as the time since the epoch; `None` for a time before
+/// it.
+type EpochClock = Arc<dyn Fn() -> Option<Duration> + Send + Sync>;
+
+/// The time `now` lies after the epoch, or `None` when it lies before.
+fn since_epoch(now: SystemTime) -> Option<Duration> {
+    now.duration_since(UNIX_EPOCH).ok()
+}
+
+/// The GOOSE `t` for a wall clock reading. A reading the 32-bit
+/// SecondSinceEpoch cannot hold, before the epoch or past 2^32 - 1 seconds,
+/// gives the epoch with ClockFailure set, which tells a subscriber to ignore
+/// the value (IEC 61850-7-2 §6.1.2.9.3.3).
+fn goose_timestamp(since_epoch: Option<Duration>, quality: TimeQuality) -> UtcTime {
+    since_epoch
+        .and_then(|d| UtcTime::from_duration_since_epoch(d, quality).ok())
+        .unwrap_or_else(|| {
+            let mut failed = quality;
+            failed.clock_failure = true;
+            UtcTime::new(0, 0, failed).unwrap_or(UtcTime::NULL)
+        })
+}
 
 impl IedServer {
     /// Registers every control block the model declares, with the defaults of
@@ -129,7 +178,16 @@ impl IedServer {
     ///   [`gocb_registry`](Self::gocb_registry) and transmits its frames, and
     ///   [`FromModelOptions::goose_comm`] gives its destination, which the
     ///   model does not hold. `MinTime` and `MaxTime` are those of
-    ///   [`iec61850_goose::RetransIntervals::default`];
+    ///   [`iec61850_goose::RetransIntervals::default`]. The publisher stamps
+    ///   `t`, the time of the last stNum change (IEC 61850-8-1 §18.1.2.5),
+    ///   from [`FromModelOptions::wall_clock`] with the
+    ///   [`time_quality`](crate::IedServerConfig::time_quality) of the server
+    ///   configuration: once at registration, and again on every
+    ///   `increase_st_num` and `reset`. A system clock before the epoch, or a
+    ///   reading past the 32-bit SecondSinceEpoch, is sent as the epoch with
+    ///   ClockFailure set. `set_timestamp_source(None)` on the publisher
+    ///   removes the stamping; a publisher registered through
+    ///   [`register_gocb`](Self::register_gocb) is not stamped by the server;
     /// - each log control block, with its `DatSet`, `TrgOps`, `IntgPd`,
     ///   reason code setting and initial `LogEna`, writing to the log its
     ///   `LogRef` names; a bare log name is a log of `LLN0` of the same
@@ -200,6 +258,12 @@ impl IedServer {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let clock: EpochClock = match options.wall_clock.clone() {
+            Some(clock) => Arc::new(move || Some(clock())),
+            None => Arc::new(|| since_epoch(SystemTime::now())),
+        };
+        let time_quality = self.config().time_quality;
+
         let mut summary = FromModelSummary::default();
         for (domain, ds) in &plan.data_sets {
             self.register_dataset(domain.clone(), ds.clone());
@@ -220,7 +284,11 @@ impl IedServer {
                 summary.urcbs += n;
             }
         }
-        for (gocb, publisher) in plan.gocbs.iter().zip(publishers) {
+        for (gocb, mut publisher) in plan.gocbs.iter().zip(publishers) {
+            let clock = clock.clone();
+            let source = move || goose_timestamp(clock(), time_quality);
+            publisher.set_timestamp(source());
+            publisher.set_timestamp_source(Some(Box::new(source)));
             self.register_gocb(Arc::new(GoCBHandle::new(
                 gocb.domain.clone(),
                 gocb.ln_name.clone(),
@@ -608,6 +676,35 @@ fn member_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quality() -> TimeQuality {
+        TimeQuality::new(
+            true,
+            false,
+            false,
+            iec61850_model::utc_time::TimeAccuracy::bits(10).unwrap(),
+        )
+    }
+
+    /// A system clock before the epoch is marked as a clock failure, as a
+    /// reading past the 32-bit SecondSinceEpoch is.
+    #[test]
+    fn a_clock_before_the_epoch_is_a_clock_failure() {
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(since_epoch(before), None);
+        assert_eq!(since_epoch(UNIX_EPOCH), Some(Duration::ZERO));
+
+        for reading in [since_epoch(before), Some(Duration::from_secs(1 << 32))] {
+            let t = goose_timestamp(reading, quality());
+            assert!(t.time_quality().clock_failure, "{reading:?}");
+            assert_eq!(t.seconds_since_epoch(), 0);
+            assert!(!t.is_null());
+        }
+
+        let epoch = goose_timestamp(since_epoch(UNIX_EPOCH), quality());
+        assert!(!epoch.time_quality().clock_failure);
+        assert_eq!(epoch.time_quality(), quality());
+    }
     use iec61850_model::{cdc, IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, FC};
 
     /// A member whose logical device does not exist says so, apart from one

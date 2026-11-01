@@ -1,7 +1,7 @@
 //! The GOOSE `t` member as a UtcTime: a publisher timestamp travels through
 //! the receiver to a listener unchanged, a `t` that is not a valid UtcTime
-//! drops its frame, and values the encoding allows are delivered whatever
-//! their quality flags.
+//! drops its frame, values the encoding allows are delivered whatever their
+//! quality flags, and a timestamp source stamps `t` on every stNum change.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,7 +10,7 @@ use iec61850_goose::frame::GooseFrame;
 use iec61850_goose::publisher::{CommParameters, GoosePublisher};
 use iec61850_goose::{
     GooseError, GooseEvent, GoosePdu, GooseReceiver, GooseSubscriberBuilder, TimeAccuracy,
-    TimeQuality, UtcTime, UtcTimeError,
+    TimeQuality, TimestampSource, UtcTime, UtcTimeError,
 };
 use iec61850_model::MmsValue;
 
@@ -163,4 +163,79 @@ fn clock_flags_and_null_time_are_delivered_not_judged() {
     let failed = deliver(&frame_with_raw_t(cases[0]))[0].time_quality();
     assert!(failed.clock_failure);
     assert!(!failed.leap_seconds_known);
+}
+
+/// A clock that reads `secs` seconds since the epoch and counts its readings.
+fn counting_source(secs: Arc<Mutex<u32>>, reads: Arc<Mutex<u32>>) -> TimestampSource {
+    let tq = TimeQuality::new(true, false, false, TimeAccuracy::bits(10).unwrap());
+    Box::new(move || {
+        *reads.lock().unwrap() += 1;
+        UtcTime::new(*secs.lock().unwrap(), 0, tq).unwrap()
+    })
+}
+
+#[test]
+fn timestamp_source_stamps_t_on_every_st_num_change() {
+    let secs = Arc::new(Mutex::new(1_000));
+    let reads = Arc::new(Mutex::new(0));
+    let comm = CommParameters::new(0x1000, DST).without_vlan();
+    let mut p = GoosePublisher::new(comm, GOCB, None, "LD/LLN0$ds", 1).unwrap();
+    let data = [MmsValue::Boolean(true)];
+
+    p.set_timestamp_source(Some(counting_source(secs.clone(), reads.clone())));
+    assert!(p.has_timestamp_source());
+    assert_eq!(*reads.lock().unwrap(), 0, "installing reads no clock");
+    assert!(pdu_of(&p.publish(&data).unwrap()).unwrap().t.is_null());
+
+    *secs.lock().unwrap() = 2_000;
+    p.increase_st_num();
+    let first = pdu_of(&p.publish(&data).unwrap()).unwrap();
+    assert_eq!(first.st_num, 2);
+    assert_eq!(first.t.seconds_since_epoch(), 2_000);
+
+    // A retransmission keeps the time of the state change.
+    *secs.lock().unwrap() = 2_500;
+    let again = pdu_of(&p.publish(&data).unwrap()).unwrap();
+    assert_eq!((again.st_num, again.t), (2, first.t));
+    assert_eq!(*reads.lock().unwrap(), 1);
+
+    p.increase_st_num();
+    assert_eq!(p.timestamp().seconds_since_epoch(), 2_500);
+    *secs.lock().unwrap() = 3_000;
+    p.reset();
+    let after_reset = pdu_of(&p.publish(&data).unwrap()).unwrap();
+    assert_eq!(
+        (after_reset.st_num, after_reset.t.seconds_since_epoch()),
+        (1, 3_000)
+    );
+    assert_eq!(*reads.lock().unwrap(), 3);
+}
+
+#[test]
+fn without_a_timestamp_source_t_keeps_the_value_set() {
+    let comm = CommParameters::new(0x1000, DST).without_vlan();
+    let mut p = GoosePublisher::new(comm, GOCB, None, "LD/LLN0$ds", 1).unwrap();
+    let set = UtcTime::from_bytes(MARKER).unwrap();
+    p.set_timestamp(set);
+    p.increase_st_num();
+    p.reset();
+    assert!(!p.has_timestamp_source());
+    assert_eq!(
+        pdu_of(&p.publish(&[MmsValue::Boolean(true)]).unwrap())
+            .unwrap()
+            .t,
+        set
+    );
+
+    let secs = Arc::new(Mutex::new(9));
+    p.set_timestamp_source(Some(counting_source(secs, Arc::new(Mutex::new(0)))));
+    p.set_timestamp_source(None);
+    p.increase_st_num();
+    assert_eq!(p.timestamp(), set);
+}
+
+#[test]
+fn publisher_keeps_its_auto_traits() {
+    fn auto_traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    auto_traits::<GoosePublisher>();
 }

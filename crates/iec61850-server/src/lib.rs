@@ -92,7 +92,9 @@ pub use config::{Edition, IedServerConfig};
 pub use connection::{ClientConnection, ConnectionId};
 pub use error::{Result, ServerError};
 #[cfg(feature = "full-server")]
-pub use from_model::{FromModelOptions, FromModelSummary, GooseCommFactory, LogStorageFactory};
+pub use from_model::{
+    FromModelOptions, FromModelSummary, GooseCommFactory, LogStorageFactory, WallClock,
+};
 #[cfg(feature = "goose-mapping")]
 pub use goose_mapping::{
     apply_gocb_write, encode_gocb_da, encode_gocb_structure, parse_go_item_id, GoCBHandle,

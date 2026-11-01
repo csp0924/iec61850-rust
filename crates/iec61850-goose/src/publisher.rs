@@ -11,11 +11,16 @@
 //! `timeAllowedToLive = 2 x next_interval`. A data change is not detected
 //! automatically; the application calls `increase_st_num()` when the data set
 //! value changes, which avoids a deep `MmsValue` comparison per publication.
+//!
+//! The `t` member is the time of the last stNum change (IEC 61850-8-1
+//! §18.1.2.5). The caller either sets it with `set_timestamp`, or installs a
+//! [`TimestampSource`] that the publisher reads each time stNum changes.
 
 use bytes::{Bytes, BytesMut};
 use core::time::Duration;
 use iec61850_model::utc_time::UtcTime;
 use iec61850_model::MmsValue;
+use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
 use crate::error::GooseError;
@@ -174,6 +179,10 @@ impl RetransPhase {
     }
 }
 
+/// Clock the publisher reads for the `t` member each time stNum changes; see
+/// [`GoosePublisher::set_timestamp_source`].
+pub type TimestampSource = Box<dyn FnMut() -> UtcTime + Send + Sync>;
+
 /// GOOSE publisher holding stNum, sqNum, the retransmission phase, and the
 /// prebuilt frame template.
 ///
@@ -207,6 +216,10 @@ pub struct GoosePublisher {
     needs_commission: bool,
     /// Event timestamp, the `t` member of every publication.
     timestamp: UtcTime,
+    /// Clock read into `timestamp` whenever stNum changes. `AssertUnwindSafe`
+    /// keeps the publisher `UnwindSafe`; a source that panics leaves stNum
+    /// advanced and `timestamp` unchanged.
+    timestamp_source: Option<AssertUnwindSafe<TimestampSource>>,
     /// Caller override for timeAllowedToLive; `None` derives it from the phase.
     time_allowed_to_live_override: Option<u32>,
 
@@ -287,6 +300,7 @@ impl GoosePublisher {
             simulation: false,
             needs_commission: false,
             timestamp: UtcTime::NULL,
+            timestamp_source: None,
             time_allowed_to_live_override: None,
             comm,
             frame_header_bytes,
@@ -448,30 +462,63 @@ impl GoosePublisher {
     /// retransmission phase resets to T1 so the burst restarts.
     ///
     /// `stNum` wraps to 1 rather than 0, which subscribers read as an
-    /// uninitialized publisher.
+    /// uninitialized publisher. With a timestamp source installed, `t` takes
+    /// its reading; otherwise `t` keeps the value last set and no clock is
+    /// read.
     pub fn increase_st_num(&mut self) {
         let new_st = self.st_num.wrapping_add(1);
         self.st_num = if new_st == 0 { 1 } else { new_st };
         self.sq_num = 0;
         self.phase = RetransPhase::T1;
         self.next_publish_at = None;
-        // The timestamp is left to the caller through `set_timestamp`, so this
-        // path makes no clock syscall.
+        self.stamp_state_change();
     }
 
     /// Resets the publisher to stNum 1, sqNum 0, and phase T1.
+    ///
+    /// The reset is a stNum change: with a timestamp source installed, `t`
+    /// takes its reading.
     pub fn reset(&mut self) {
         self.st_num = 1;
         self.sq_num = 0;
         self.phase = RetransPhase::T1;
         self.next_publish_at = None;
+        self.stamp_state_change();
+    }
+
+    /// Installs, or with `None` removes, the clock read into `t` each time
+    /// stNum changes, through [`increase_st_num`](Self::increase_st_num) or
+    /// [`reset`](Self::reset).
+    ///
+    /// Installing a source does not read it; `t` keeps its value until the
+    /// next stNum change or [`set_timestamp`](Self::set_timestamp).
+    pub fn set_timestamp_source(&mut self, source: Option<TimestampSource>) {
+        self.timestamp_source = source.map(AssertUnwindSafe);
+    }
+
+    /// Returns whether a timestamp source is installed.
+    pub fn has_timestamp_source(&self) -> bool {
+        self.timestamp_source.is_some()
+    }
+
+    /// Returns the `t` member the next publication carries.
+    pub fn timestamp(&self) -> UtcTime {
+        self.timestamp
+    }
+
+    /// Reads the timestamp source, when one is installed, into `t`.
+    fn stamp_state_change(&mut self) {
+        if let Some(source) = self.timestamp_source.as_mut() {
+            self.timestamp = (source.0)();
+        }
     }
 
     /// Sets the event timestamp, the `t` member of every publication.
     ///
-    /// The value persists until it is set again, so a caller that never calls
-    /// this publishes the same timestamp on every frame, [`UtcTime::NULL`]
-    /// before the first call. A `UtcTime` is always a valid encoding, so a
+    /// The value persists until it is set again or, with a timestamp source
+    /// installed, until the next stNum change; a caller that does neither
+    /// publishes the same timestamp on every frame, [`UtcTime::NULL`] before
+    /// the first call. A `UtcTime` is always a valid encoding, so a
     /// subscriber of this crate accepts every value set here.
     pub fn set_timestamp(&mut self, ts: UtcTime) {
         self.timestamp = ts;

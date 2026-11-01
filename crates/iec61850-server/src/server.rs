@@ -1235,6 +1235,13 @@ impl IedServer {
     /// dispatcher shares the registry, so the block is served as soon as it is
     /// registered. Registering twice under one name replaces the earlier block
     /// and logs a warning.
+    ///
+    /// The server leaves the publisher as given: it installs no timestamp
+    /// source, so the application keeps `t` itself with
+    /// `GoosePublisher::set_timestamp` or `GoosePublisher::set_timestamp_source`.
+    /// Only the publishers
+    /// [`register_from_model_with`](Self::register_from_model_with) creates are
+    /// stamped from [`FromModelOptions::wall_clock`](crate::FromModelOptions::wall_clock).
     pub fn register_gocb(&self, handle: Arc<crate::goose_mapping::GoCBHandle>) {
         let inserted = self.inner.gocb_registry.register(handle);
         if !inserted {

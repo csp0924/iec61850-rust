@@ -27,7 +27,7 @@ pub use frame::{
 };
 pub use pdu::GoosePdu;
 pub use publisher::{
-    CommParameters, GoosePublisher, PublishAction, RetransIntervals, RetransPhase,
+    CommParameters, GoosePublisher, PublishAction, RetransIntervals, RetransPhase, TimestampSource,
     GOOSE_MAX_FRAME_SIZE,
 };
 pub use receiver::{GooseReceiver, GooseReceiverHandle, Idle, Running, SharedReceiver};
