@@ -170,7 +170,7 @@ fn the_section_is_read_into_the_raw_ast() {
     assert_eq!(w01.connected_aps.len(), 2);
     let ap = &w01.connected_aps[0];
     assert_eq!((ap.ied_name.as_str(), ap.ap_name.as_str()), ("IED1", "AP1"));
-    assert_eq!(ap.address.as_ref().map(|a| a.parameters().len()), Some(9));
+    assert_eq!(ap.address.as_ref().map(|a| a.parameters.len()), Some(9));
     let gse = &ap.gses[0];
     assert_eq!(
         (gse.ld_inst.as_str(), gse.cb_name.as_str()),
@@ -319,7 +319,7 @@ fn each_address_type_accepts_its_form_and_rejects_others() {
                 other => panic!("{p_type} `{value}`: {other:?}"),
             }
             assert!(
-                e.element_path.ends_with("GSE/Address/P"),
+                e.element_path.contains("/GSE[ldInst=") && e.element_path.ends_with("/Address/P"),
                 "{}",
                 e.element_path
             );
@@ -359,6 +359,53 @@ fn a_malformed_type_or_an_empty_value_is_refused() {
     assert!(
         matches!(&*e.kind, ErrorKind::MissingRequiredElement { name, .. } if name == "P"),
         "{e}"
+    );
+}
+
+/// An invalid address value fails only the model of the IED it belongs to:
+/// the file still parses and resolves, and another IED of it builds.
+#[test]
+fn an_invalid_address_of_another_ied_does_not_fail_this_one() {
+    let xml = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP1">
+        <GSE ldInst="LD0" cbName="gcb1">
+          <Address><P type="MAC-Address">01-0C-CD-01-00-01</P></Address>
+        </GSE>
+      </ConnectedAP>
+      <ConnectedAP iedName="IED2" apName="AP1">
+        <Address><P type="IP">10.0.0.256</P></Address>
+        <GSE ldInst="LD0" cbName="gcb1">
+          <Address><P type="MAC-Address">01-0c-cd-01-00-02</P></Address>
+        </GSE>
+      </ConnectedAP>"#,
+    );
+    let resolved = iec61850_scl::parse_scl(&xml)
+        .expect("parse")
+        .resolve()
+        .expect("an invalid value of IED2 does not fail stage 2");
+    let ied1 = resolved.build_model("IED1").expect("IED1 builds");
+    assert_eq!(
+        ied1.gse_address("LD0", "gcb1")
+            .and_then(|g| g.address.mac_address()),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
+    );
+    let e = resolved
+        .build_model("IED2")
+        .expect_err("IED2 has an invalid address");
+    match &*e.kind {
+        ErrorKind::AttributeValueInvalid {
+            name, raw_value, ..
+        } => {
+            assert_eq!(name, "P[type=\"IP\"]");
+            assert_eq!(raw_value, "10.0.0.256");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        e.element_path
+            .contains("ConnectedAP[iedName=\"IED2\",apName=\"AP1\"]"),
+        "{}",
+        e.element_path
     );
 }
 

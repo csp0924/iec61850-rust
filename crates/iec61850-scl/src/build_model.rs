@@ -109,7 +109,7 @@ pub(crate) fn build_ied_model(
         ));
     }
 
-    for ap in crate::communication::connected_access_points(raw, ied_name) {
+    for ap in crate::communication::connected_access_points(raw, ied_name)? {
         model_b = model_b.add_connected_ap(ap);
     }
 
@@ -129,10 +129,10 @@ pub(crate) fn build_ied_model(
 
     // Stage 2 has checked that every GSE and SMV names a control block of
     // this IED, so each one finds its control block.
-    for (ld_inst, cb_name, gse) in crate::communication::gse_addresses(raw, ied_name) {
+    for (ld_inst, cb_name, gse) in crate::communication::gse_addresses(raw, ied_name)? {
         crate::communication::attach_gse(&mut model, &ld_inst, &cb_name, gse);
     }
-    for (ld_inst, cb_name, smv) in crate::communication::smv_addresses(raw, ied_name) {
+    for (ld_inst, cb_name, smv) in crate::communication::smv_addresses(raw, ied_name)? {
         crate::communication::attach_smv(&mut model, &ld_inst, &cb_name, smv);
     }
     Ok(model)

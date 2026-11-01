@@ -167,6 +167,10 @@ fn emit_ied_fn(
     // The addressing of the Communication section comes from the helpers the
     // run-time build uses, so both attach the same values.
     let ap_exprs = connected_access_points(raw, &ied.name)
+        .map_err(|source| CompileError::BuildModel {
+            ied: ied.name.clone(),
+            source,
+        })?
         .iter()
         .map(|ap| {
             let sub_network = ap.sub_network.as_str();
@@ -189,6 +193,10 @@ fn emit_ied_fn(
         })
         .collect::<Vec<_>>();
     let gse_stmts = gse_addresses(raw, &ied.name)
+        .map_err(|source| CompileError::BuildModel {
+            ied: ied.name.clone(),
+            source,
+        })?
         .iter()
         .map(|(ld_inst, cb_name, gse)| {
             let address = emit_address(&gse.address);
@@ -209,6 +217,10 @@ fn emit_ied_fn(
         })
         .collect::<Vec<_>>();
     let smv_stmts = smv_addresses(raw, &ied.name)
+        .map_err(|source| CompileError::BuildModel {
+            ied: ied.name.clone(),
+            source,
+        })?
         .iter()
         .map(|(ld_inst, cb_name, smv)| {
             let address = emit_address(smv);

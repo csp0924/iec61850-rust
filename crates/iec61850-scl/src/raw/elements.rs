@@ -12,8 +12,6 @@
 
 use std::collections::BTreeMap;
 
-use iec61850_model::comm::Address;
-
 use crate::error::SourceSpan;
 
 // ------------------------------------------------------------------------
@@ -755,7 +753,7 @@ pub struct RawConnectedAp {
     /// The `apName` attribute.
     pub ap_name: String,
     /// The server address of the access point, from its `<Address>`.
-    pub address: Option<Address>,
+    pub address: Option<RawAddress>,
     /// The `<GSE>` children, in document order.
     pub gses: Vec<RawGse>,
     /// The `<SMV>` children, in document order.
@@ -774,7 +772,7 @@ pub struct RawGse {
     /// The `cbName` attribute, the name of the `<GSEControl>`.
     pub cb_name: String,
     /// The `<Address>` child.
-    pub address: Option<Address>,
+    pub address: Option<RawAddress>,
     /// The `<MinTime>` child, in milliseconds.
     pub min_time_ms: Option<u32>,
     /// The `<MaxTime>` child, in milliseconds.
@@ -794,7 +792,33 @@ pub struct RawSmv {
     /// The `cbName` attribute, the name of the `<SampledValueControl>`.
     pub cb_name: String,
     /// The `<Address>` child.
-    pub address: Option<Address>,
+    pub address: Option<RawAddress>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// An `<Address>` element: its `<P>` parameters as written, in document order.
+///
+/// The values are kept unchecked here. The model builder checks those of the
+/// IED it builds against the form their type prescribes, and stage 2 warns
+/// about an invalid value of any other IED.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawAddress {
+    /// The `<P>` children.
+    pub parameters: Vec<RawP>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// A `<P>` element of an `<Address>`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawP {
+    /// The `type` attribute.
+    pub p_type: String,
+    /// The element text.
+    pub value: String,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
 }

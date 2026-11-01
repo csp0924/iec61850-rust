@@ -18,9 +18,9 @@
 //!
 //! `<Communication>` is read: the subnetworks, the connected access points
 //! with their server addresses, and the `<GSE>` and `<SMV>` addressing of the
-//! control blocks. Every `<P>` value is checked against the form its type
-//! prescribes (IEC 61850-6 §9.4.3) as it is read. `<PhysConn>`, which
-//! describes cabling, is skipped without a warning.
+//! control blocks. The `<P>` values are kept as written here; the model
+//! builder checks those of the IED it builds. `<PhysConn>`, which describes
+//! cabling, is skipped without a warning.
 
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -28,14 +28,13 @@ use quick_xml::reader::Reader;
 use crate::attrs::{optional, parse_optional, parse_required, required};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawCommunication, RawConnectedAp, RawCount,
-    RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild,
-    RawDoi, RawEnumType, RawEnumValue, RawFcda, RawGse, RawGseControl, RawIed, RawLNodeType,
-    RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawReportSettings,
-    RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawSmv, RawSubNetwork, RawVal,
-    SmvOptsBits, TriggerOptionsBits,
+    Header, OptionFieldsBits, RawAccessPoint, RawAddress, RawBda, RawCommunication, RawConnectedAp,
+    RawCount, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef, RawDoType,
+    RawDoTypeChild, RawDoi, RawEnumType, RawEnumValue, RawFcda, RawGse, RawGseControl, RawIed,
+    RawLNodeType, RawLogControl, RawLogicalDevice, RawLogicalNode, RawP, RawReportControlBlock,
+    RawReportSettings, RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawSmv,
+    RawSubNetwork, RawVal, SmvOptsBits, TriggerOptionsBits,
 };
-use iec61850_model::comm::{Address, AddressError};
 
 /// Parses an SCL XML string into the stage 1 raw AST.
 ///
@@ -494,12 +493,15 @@ fn handle_start(
                     )),
                 ));
             }
-            state.cur_address = Some((Address::new(), span));
+            state.cur_address = Some(RawAddress {
+                parameters: Vec::new(),
+                span,
+            });
         }
         "P" if state.cur_address.is_some() && parent_tag.as_deref() == Some("Address") => {
             let path = state.path_str();
             let p_type = required(start.attributes(), "type", span, &path)?;
-            state.cur_p = Some((p_type, span, path));
+            state.cur_p = Some((p_type, span));
             state.comm_text.clear();
             state.text_target = TextTarget::CommText;
         }
@@ -1511,8 +1513,8 @@ fn handle_end(
             }
         }
         "Address" => {
-            if let Some((address, _)) = state.cur_address.take() {
-                if address.is_empty() {
+            if let Some(address) = state.cur_address.take() {
+                if address.parameters.is_empty() {
                     return Err(SclParseError::at(
                         span,
                         state.path_str(),
@@ -1533,12 +1535,14 @@ fn handle_end(
         "P" => {
             state.text_target = TextTarget::None;
             let text = std::mem::take(&mut state.comm_text);
-            if let (Some((p_type, p_span, path)), Some((address, _))) =
+            if let (Some((p_type, p_span)), Some(address)) =
                 (state.cur_p.take(), state.cur_address.as_mut())
             {
-                address
-                    .push(p_type, text)
-                    .map_err(|e| address_error(e, p_span, path))?;
+                address.parameters.push(RawP {
+                    p_type,
+                    value: text,
+                    span: p_span,
+                });
             }
         }
         "MinTime" | "MaxTime" => {
@@ -1627,42 +1631,6 @@ fn handle_text(state: &mut ParserState<'_>, raw: &str) {
             }
         }
         TextTarget::CommText => state.comm_text.push_str(raw),
-    }
-}
-
-/// Converts a refused `<P>` into an [`SclParseError`] at the element: a bad
-/// type names the `type` attribute, a bad value the element text.
-fn address_error(e: AddressError, span: SourceSpan, path: String) -> SclParseError {
-    match e {
-        AddressError::InvalidType { p_type, .. } => SclParseError::at(
-            span,
-            path,
-            ErrorKind::AttributeValueInvalid {
-                name: "type".to_string(),
-                expected_type: "a predefined address type, or an extension type of an \
-                                upper-case letter followed by letters, digits and hyphens"
-                    .to_string(),
-                raw_value: p_type,
-                cause: None,
-            },
-        )
-        .with_attribute("type"),
-        AddressError::InvalidValue {
-            p_type,
-            value,
-            expected,
-            ..
-        } => SclParseError::at(
-            span,
-            path,
-            ErrorKind::AttributeValueInvalid {
-                name: format!("P[type=\"{p_type}\"]"),
-                expected_type: expected.to_string(),
-                raw_value: value,
-                cause: None,
-            },
-        ),
-        other => SclParseError::at(span, path, ErrorKind::Xml(other.to_string())),
     }
 }
 
@@ -2516,10 +2484,10 @@ struct ParserState<'a> {
     cur_gse: Option<RawGse>,
     /// The SMV being assembled inside the ConnectedAP.
     cur_smv: Option<RawSmv>,
-    /// The Address being assembled, with where it starts.
-    cur_address: Option<(Address, SourceSpan)>,
-    /// The P being read: its type, where it starts and its element path.
-    cur_p: Option<(String, SourceSpan, String)>,
+    /// The Address being assembled.
+    cur_address: Option<RawAddress>,
+    /// The P being read: its type and where it starts.
+    cur_p: Option<(String, SourceSpan)>,
     /// The MinTime (`true`) or MaxTime (`false`) being read, with where it
     /// starts and its element path.
     cur_duration: Option<(bool, SourceSpan, String)>,
