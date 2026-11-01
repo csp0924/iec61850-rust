@@ -12,11 +12,15 @@
 //! An AP-title is an OBJECT IDENTIFIER, the ISO 8650 AARQ-apdu fields
 //! `called-AP-title` and `calling-AP-title`. [`ApTitle`] holds it as its arc
 //! values, parses the dotted form and encodes the BER content octets.
+//!
+//! The ACSE credentials the AARQ carries travel with the addressing, in
+//! [`IsoConnectionParameters::authentication`].
 
 use crate::compat::prelude::*;
 use core::fmt;
 use core::str::FromStr;
 
+use super::acse::AcseAuth;
 use super::cotp::TSelector;
 use super::presentation::PSelector;
 use super::session::SSelector;
@@ -288,12 +292,14 @@ pub struct AarqAddressing {
 
 // IsoConnectionParameters
 
-/// The ISO addressing a client offers when it associates.
+/// The ISO addressing and ACSE credentials a client offers when it associates.
 ///
 /// `local_*` names the calling side and `remote_*` the called side. The
 /// default selectors are the values IEC 61850-8-1 specifies for an MMS
 /// association; the default AP-titles and AE-qualifiers are the values IEDs
-/// customarily expect.
+/// customarily expect. The default offers no authentication.
+///
+/// The `Debug` output never shows a password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IsoConnectionParameters {
@@ -317,6 +323,9 @@ pub struct IsoConnectionParameters {
     pub local_ae_qualifier: Option<i32>,
     /// called-AE-qualifier; `None` leaves the field out of the AARQ.
     pub remote_ae_qualifier: Option<i32>,
+    /// Credentials written to the AARQ mechanism-name and
+    /// calling-authentication-value; `AcseAuth::None` leaves both out.
+    pub authentication: AcseAuth,
 }
 
 impl IsoConnectionParameters {
@@ -345,6 +354,7 @@ impl Default for IsoConnectionParameters {
             remote_ap_title: ApTitle::from_arcs(&DEFAULT_REMOTE_AP_TITLE).ok(),
             local_ae_qualifier: Some(DEFAULT_AE_QUALIFIER),
             remote_ae_qualifier: Some(DEFAULT_AE_QUALIFIER),
+            authentication: AcseAuth::None,
         }
     }
 }

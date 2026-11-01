@@ -968,8 +968,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     ///
     /// Every address written here comes from `iso_parameters`: the session
     /// selectors, the presentation selectors and the AARQ AP-title and
-    /// AE-qualifier fields. The T-Selectors reach the wire through the COTP
-    /// options instead, as the CR TPDU carries them.
+    /// AE-qualifier fields, as well as the AARQ authentication fields. The
+    /// T-Selectors reach the wire through the COTP options instead, as the CR
+    /// TPDU carries them.
     fn build_connect_request(&self) -> Result<BytesMut, session::SessionError> {
         let mut mms_buf = BytesMut::new();
         let mut init_req = InitiateRequestPdu::default();
@@ -982,7 +983,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
         let mut acse_buf = BytesMut::new();
         acse::encode_aarq(
             &mms_buf,
-            None,
+            Some(&self.iso_parameters.authentication),
             ACSE_INDIRECT_REFERENCE,
             &self.iso_parameters.aarq_addressing(),
             &mut acse_buf,
@@ -2195,5 +2196,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_connect_request_carries_the_password() {
+        let mut conn = MmsConnection::<TcpStream, TokioTimer>::new();
+        conn.iso_parameters.authentication = acse::AcseAuth::Password(b"secret".to_vec());
+        let cn = conn.build_connect_request().expect("cn");
+        // mechanism-name 2.2.3.1, then the charstring "secret"
+        assert!(contains(&cn, &[0x8b, 0x03, 0x52, 0x03, 0x01]), "{cn:02x?}");
+        assert!(contains(&cn, b"\x80\x06secret"), "{cn:02x?}");
+
+        conn.iso_parameters.authentication = acse::AcseAuth::None;
+        let cn = conn.build_connect_request().expect("cn");
+        assert!(!contains(&cn, &[0x8b, 0x03, 0x52, 0x03, 0x01]), "{cn:02x?}");
     }
 }
