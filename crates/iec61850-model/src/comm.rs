@@ -5,7 +5,7 @@
 //! An [`Address`] holds the `<P>` parameters of one SCL `<Address>` in document
 //! order, each value as written. The schema form of a predefined type of
 //! `tPTypeEnum` is the pattern of its `tP_` restriction in the SCL schema,
-//! together with the character limits of IEC 61850-8-1 §25.2 Table 162 and
+//! together with the character limits of IEC 61850-8-1 §25.3.1 Table 162 and
 //! §25.3 Tables 163 and 164; [`check_parameter`] tells whether a value has it.
 //! A value written another way that still reads without ambiguity, such as a
 //! lower-case MAC address or a VLAN-ID of one digit, is kept and read by the
@@ -173,7 +173,7 @@ impl Address {
     }
 
     /// Returns the first-hop IPv4 gateway `IP-GATEWAY`; `0.0.0.0` means none is
-    /// configured (IEC 61850-8-1 §25.2 Table 162).
+    /// configured (IEC 61850-8-1 §25.3.1 Table 162).
     pub fn ip_gateway(&self) -> Option<Ipv4Addr> {
         read_ipv4(self.text("IP-GATEWAY")?)
     }
@@ -539,7 +539,7 @@ impl ConnectedAccessPoint {
 /// Every value is a non-empty string free of carriage returns, line feeds and
 /// tabs (`tPAddr`). A predefined type further restricts it to the pattern of its
 /// `tP_` type in the SCL schema of IEC 61850-6 Annex A; the OSI selectors and
-/// the NSAP must also hold an even number of characters (IEC 61850-8-1 §25.2
+/// the NSAP must also hold an even number of characters (IEC 61850-8-1 §25.3.1
 /// Table 162). An extension type accepts any such string.
 ///
 /// Where the schema is narrower than the character rules of IEC 61850-8-1

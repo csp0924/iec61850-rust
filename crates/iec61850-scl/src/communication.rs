@@ -13,7 +13,7 @@
 //!
 //! A `<P>` value is compared with the schema form of its type: the patterns of
 //! the `tP_` types of the schema and the character rules of IEC 61850-8-1
-//! §25.2 Table 162, §25.3.2 Table 163 and §25.3.3 Table 164, and of
+//! §25.3.1 Table 162, §25.3.2 Table 163 and §25.3.3 Table 164, and of
 //! IEC 61850-9-2 Clause 11 Table 19. Stage 2 warns about every value that
 //! breaks it, with its position, type and value and the schema form, and
 //! tells whether it still reads without ambiguity, and as what. White space
