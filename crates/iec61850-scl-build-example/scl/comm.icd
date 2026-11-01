@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B">
+  <Header id="comm"/>
+  <Communication>
+    <SubNetwork name="W01" type="8-MMS">
+      <ConnectedAP iedName="Comm" apName="AP1">
+        <Address>
+          <P type="IP">10.0.0.11</P>
+          <P type="IP-SUBNET">255.255.255.0</P>
+          <P type="IP-GATEWAY">10.0.0.101</P>
+          <P type="OSI-TSEL">0001</P>
+          <P type="OSI-PSEL">00000001</P>
+          <P type="OSI-SSEL">0001</P>
+          <P type="MMS-Port">102</P>
+        </Address>
+        <GSE ldInst="LD0" cbName="gcbTrip">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-01-00-05</P>
+            <P type="APPID">3A01</P>
+            <P type="VLAN-ID">07B</P>
+            <P type="VLAN-PRIORITY">6</P>
+          </Address>
+          <MinTime unit="s" multiplier="m">8</MinTime>
+          <MaxTime unit="s" multiplier="m">2000</MaxTime>
+        </GSE>
+        <SMV ldInst="LD0" cbName="svcbMeas">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-04-00-01</P>
+            <P type="APPID">4001</P>
+            <P type="VLAN-ID">005</P>
+            <P type="VLAN-PRIORITY">4</P>
+          </Address>
+        </SMV>
+      </ConnectedAP>
+    </SubNetwork>
+    <SubNetwork name="P01">
+      <ConnectedAP iedName="Comm" apName="AP2">
+        <Address>
+          <P type="IP">192.168.1.5</P>
+        </Address>
+      </ConnectedAP>
+    </SubNetwork>
+  </Communication>
+  <IED name="Comm">
+    <AccessPoint name="AP1">
+      <Server>
+        <Authentication/>
+        <LDevice inst="LD0">
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+            <DataSet name="dsTrip">
+              <FCDA ldInst="LD0" lnClass="LLN0" doName="Mod" daName="stVal" fc="ST"/>
+            </DataSet>
+            <GSEControl name="gcbTrip" datSet="dsTrip" appID="Trip" confRev="1"/>
+            <GSEControl name="gcbSpare" datSet="dsTrip" appID="Spare" confRev="1"/>
+            <SampledValueControl name="svcbMeas" datSet="dsTrip" smvID="Meas" smpRate="80" nofASDU="1" confRev="1"/>
+          </LN0>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+    <AccessPoint name="AP2"/>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN" dchg="true"/>
+    </DOType>
+  </DataTypeTemplates>
+</SCL>

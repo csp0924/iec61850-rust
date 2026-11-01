@@ -28,9 +28,10 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use iec61850_scl::__private::{
-    attribute_type, dai_values, derives_setting_view, doi_children, element_count, fcda_do_path,
-    gse_control_go_id, instance_children, ld_domain_name, ld_num_of_sgs, parse_fc,
-    report_instances, report_settings, sv_control_sv_id, template_initial_value, MmsValue,
+    attribute_type, connected_access_points, dai_values, derives_setting_view, doi_children,
+    element_count, fcda_do_path, gse_addresses, gse_control_go_id, instance_children,
+    ld_domain_name, ld_num_of_sgs, parse_fc, report_instances, report_settings, smv_addresses,
+    sv_control_sv_id, template_initial_value, Address, MmsValue,
 };
 use iec61850_scl::raw::{
     DataTypeTemplates, RawBda, RawCount, RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet,
@@ -102,7 +103,7 @@ pub fn emit_file(
         use ::iec61850_scl::__private::{
             IedModelBuilder, LogicalDeviceBuilder, LogicalNodeBuilder, DataObjectBuilder,
             ReportControlBlock, GooseControlBlock, SvControlBlock, LogControlBlock,
-            SettingGroupControlBlock,
+            SettingGroupControlBlock, Address, GseAddress, ConnectedAccessPoint,
             FC, DataAttribute, DataObject, DataSet, DataSetEntry, IedModel,
             DataAttributeType, TrgOps, MmsValue,
         };
@@ -163,6 +164,60 @@ fn emit_ied_fn(
             other => other,
         })?;
 
+    // The addressing of the Communication section comes from the helpers the
+    // run-time build uses, so both attach the same values.
+    let ap_exprs = connected_access_points(raw, &ied.name)
+        .iter()
+        .map(|ap| {
+            let sub_network = ap.sub_network.as_str();
+            let ap_name = ap.ap_name.as_str();
+            let net_type = ap.sub_network_type.as_deref().map(|t| {
+                quote! { __c.sub_network_type = Some(::std::string::String::from(#t)); }
+            });
+            let address = ap.address.as_ref().map(|a| {
+                let a = emit_address(a);
+                quote! { __c.address = Some(#a); }
+            });
+            quote! {
+                {
+                    let mut __c = ConnectedAccessPoint::new(#sub_network, #ap_name);
+                    #net_type
+                    #address
+                    __c
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let gse_stmts = gse_addresses(raw, &ied.name)
+        .iter()
+        .map(|(ld_inst, cb_name, gse)| {
+            let address = emit_address(&gse.address);
+            let min = gse
+                .min_time_ms
+                .map(|v| quote! { __g.min_time_ms = Some(#v); });
+            let max = gse
+                .max_time_ms
+                .map(|v| quote! { __g.max_time_ms = Some(#v); });
+            quote! {
+                {
+                    let mut __g = GseAddress::new(#address);
+                    #min
+                    #max
+                    ::iec61850_scl::__private::attach_gse(&mut __model, #ld_inst, #cb_name, __g);
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let smv_stmts = smv_addresses(raw, &ied.name)
+        .iter()
+        .map(|(ld_inst, cb_name, smv)| {
+            let address = emit_address(smv);
+            quote! {
+                ::iec61850_scl::__private::attach_smv(&mut __model, #ld_inst, #cb_name, #address);
+            }
+        })
+        .collect::<Vec<_>>();
+
     Ok(quote! {
         /// Generated IED model.
         // Outer `#[allow]`: the function reaches the user crate through
@@ -175,9 +230,26 @@ fn emit_ied_fn(
                     .add_ld(#ld_exprs)
                     .expect("codegen: IedModelBuilder::add_ld failed");
             )*
-            __m.build().expect("codegen: IedModelBuilder::build failed")
+            #( __m = __m.add_connected_ap(#ap_exprs); )*
+            let mut __model = __m.build().expect("codegen: IedModelBuilder::build failed");
+            #( #gse_stmts )*
+            #( #smv_stmts )*
+            __model
         }
     })
+}
+
+/// Emits an [`Address`] expression that adds the parameters in their order.
+fn emit_address(address: &Address) -> TokenStream {
+    let types = address.parameters().iter().map(|p| p.p_type.as_str());
+    let values = address.parameters().iter().map(|p| p.value.as_str());
+    quote! {
+        {
+            let mut __a = Address::new();
+            #( __a.push(#types, #values).expect("codegen: Address::push failed"); )*
+            __a
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

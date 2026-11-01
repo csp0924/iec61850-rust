@@ -28,4 +28,9 @@ fn main() {
         .out_file("arrays_model.rs")
         .compile()
         .expect("iec61850-scl-build: compile arrays.icd failed");
+
+    iec61850_scl_build::compile_icd("scl/comm.icd")
+        .out_file("comm_model.rs")
+        .compile()
+        .expect("iec61850-scl-build: compile comm.icd failed");
 }
