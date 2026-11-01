@@ -405,3 +405,7 @@ required-features = ["full-server", "tls"]
 [[test]]
 name = "update_triggers_e2e"
 required-features = ["full-server"]
+
+[[test]]
+name = "update_order_e2e"
+required-features = ["full-server"]

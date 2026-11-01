@@ -563,11 +563,12 @@ fn write_to_target(
         };
         for (leaf, new_value) in updates {
             match store_value(leaf, new_value.clone()) {
-                Ok(old) => written.push(WrittenLeaf {
+                Ok((old, seq)) => written.push(WrittenLeaf {
                     value: Arc::clone(&leaf.value),
                     trg_ops: leaf.trg_ops,
                     old,
                     new: new_value.clone(),
+                    seq,
                 }),
                 Err(e) => {
                     tracing::warn!(
@@ -959,7 +960,8 @@ fn handler_at<'h>(
 }
 
 /// A leaf a write stored: the value lock of the attribute, its trigger
-/// options, the value it held before and the value it holds now.
+/// options, the value it held before, the value it holds now and the commit
+/// number of the store.
 #[derive(Debug)]
 #[cfg_attr(not(feature = "full-server"), allow(dead_code))]
 pub(crate) struct WrittenLeaf {
@@ -967,6 +969,22 @@ pub(crate) struct WrittenLeaf {
     pub(crate) trg_ops: iec61850_model::TrgOps,
     pub(crate) old: iec61850_model::MmsValue,
     pub(crate) new: iec61850_model::MmsValue,
+    pub(crate) seq: u64,
+}
+
+/// Returns the next commit number. Taken while an attribute value is
+/// write-locked, it numbers the stores of each attribute in the order they
+/// happened; numbers of different attributes are not comparable.
+#[cfg(feature = "full-server")]
+pub(crate) fn commit_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns zero: without the integrated server nothing orders the stores.
+#[cfg(not(feature = "full-server"))]
+pub(crate) fn commit_seq() -> u64 {
+    0
 }
 
 /// Raises the report and log triggers of the leaves one write request stored,
@@ -976,7 +994,8 @@ pub(crate) trait WrittenLeaves: Send + Sync {
     fn leaves_written(self: Arc<Self>, leaves: &[WrittenLeaf]);
 }
 
-/// Replaces the cached value of a leaf and returns the value it held.
+/// Replaces the cached value of a leaf and returns the value it held, with
+/// the commit number of the store, taken under the same lock.
 ///
 /// `std::sync::RwLock::write` yields a `Result` while `spin::RwLock::write`
 /// yields the guard, hence the two arms. Only a panic while the value was
@@ -984,7 +1003,7 @@ pub(crate) trait WrittenLeaves: Send + Sync {
 fn store_value(
     da: &DataAttribute,
     new_value: iec61850_model::MmsValue,
-) -> Result<iec61850_model::MmsValue, DataAccessError> {
+) -> Result<(iec61850_model::MmsValue, u64), DataAccessError> {
     #[cfg(feature = "std")]
     let mut guard = da
         .value
@@ -992,7 +1011,8 @@ fn store_value(
         .map_err(|_| DataAccessError::TemporarilyUnavailable)?;
     #[cfg(not(feature = "std"))]
     let mut guard = da.value.write();
-    Ok(core::mem::replace(&mut *guard, new_value))
+    let old = core::mem::replace(&mut *guard, new_value);
+    Ok((old, commit_seq()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

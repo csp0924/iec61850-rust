@@ -12,6 +12,14 @@
 //! value at once, but the report and log triggers it raises are held back and
 //! raised together when the lock is released; the periodic report and log
 //! triggers wait for the release as well.
+//!
+//! The report and log triggers of updates are raised one batch at a time, in
+//! the order the values were stored, so the reports and log entries of an
+//! attribute follow the order of its values whatever thread updates it and
+//! however long a log storage takes. An update returns once its own triggers
+//! have been raised. An update made by a log storage or a report sink while
+//! the server is raising triggers is raised after the batch under way, and
+//! returns at once.
 
 use crate::authentication::AssociationAuthenticator;
 use crate::config::IedServerConfig;
@@ -33,13 +41,15 @@ use iec61850_mms::mms::server::MmsServiceDispatcher;
 use iec61850_model::{DataAttribute, IedModel, MmsValue, TrgOps};
 #[cfg(feature = "tls")]
 use iec61850_tls::TlsAcceptor;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    TryLockError,
 };
+use std::thread::ThreadId;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// IEC 61850 server runtime.
@@ -85,9 +95,18 @@ struct IedServerInner {
     is_model_locked: AtomicBool,
 
     /// Triggers raised while the data model is locked, raised when it is
-    /// released. Deferring a trigger and releasing the batch both happen under
-    /// this lock, so a batch is delivered before any update that follows it.
+    /// released. Deferring a trigger and queuing the released batch both
+    /// happen under this lock, so a batch is raised before any update that
+    /// follows it.
     deferred: Mutex<DeferredTriggers>,
+
+    /// Triggers of stored values waiting to be raised, in the order the
+    /// values were stored. Taken after an attribute's value lock and after
+    /// `deferred`, and held only to queue or take a batch.
+    trigger_queue: Mutex<TriggerQueue>,
+    /// Signalled whenever a queued batch has been raised or the thread raising
+    /// batches stops.
+    trigger_turn: Condvar,
 
     /// Held for writing while the data model is locked, and for reading by
     /// each tick of the periodic report and log triggers, so a tick never runs
@@ -436,15 +455,27 @@ impl IedServer {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Returns the trigger queue, recovered from a poisoned lock.
+    fn queue(&self) -> MutexGuard<'_, TriggerQueue> {
+        self.inner
+            .trigger_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Ends the deferral and raises the deferred triggers as one batch.
     ///
-    /// The deferral lock is held until the batch is raised, so an update that
-    /// follows the release raises its triggers after the batch.
+    /// The batch is queued under the deferral lock, so an update that follows
+    /// the release raises its triggers after the batch.
     fn release_deferred(&self) {
-        let mut deferred = self.deferred();
-        let triggers = deferred.release();
-        self.raise_triggers(&triggers);
-        drop(deferred);
+        let queued = {
+            let mut deferred = self.deferred();
+            let triggers = deferred.release();
+            self.queue().push(triggers)
+        };
+        if let Some(number) = queued {
+            self.raise_queued(number);
+        }
     }
 
     // ── Typed value updates ─────────────────────────────────────────────
@@ -679,7 +710,7 @@ impl IedServer {
         }
         let mut leaves = Vec::new();
         collect_update_leaves(da, value, &mut leaves)?;
-        let triggers = {
+        let queued = {
             let _values = self
                 .inner
                 .mms_view
@@ -698,11 +729,14 @@ impl IedServer {
                     cell: Arc::clone(&leaf.value),
                     value: new_value,
                     flag,
+                    seq: crate::service::write::commit_seq(),
                 });
             }
-            triggers
+            self.submit(triggers)
         };
-        self.dispatch_triggers(triggers);
+        if let Some(number) = queued {
+            self.raise_queued(number);
+        }
         Ok(())
     }
 
@@ -734,14 +768,17 @@ impl IedServer {
     ///
     /// Reports and log entries act on the same triggers, each control block on
     /// those its TrgOps enable. While the data model is locked the triggers are
-    /// deferred until it is released.
+    /// deferred until it is released. Otherwise they are queued under the same
+    /// write lock, so the updates of an attribute raise their triggers in the
+    /// order their values were written, and the call returns once its own
+    /// triggers have been raised.
     fn update_with(
         &self,
         da: &DataAttribute,
         expected_name: &'static str,
         build: impl FnOnce(&MmsValue) -> Result<MmsValue>,
     ) -> Result<()> {
-        let trigger = {
+        let queued = {
             let mut guard = da.value.write().map_err(|_| {
                 ServerError::InvalidModel("DataAttribute value RwLock poisoned".into())
             })?;
@@ -756,24 +793,17 @@ impl IedServer {
             let new_value = build(&guard)?;
             let flag = update_triggers(da.trg_ops, &guard, &new_value);
             *guard = new_value.clone();
-            PendingTrigger {
+            self.submit(vec![PendingTrigger {
                 cell: Arc::clone(&da.value),
                 value: new_value,
                 flag,
-            }
+                seq: crate::service::write::commit_seq(),
+            }])
         };
         // The write lock is released before any trigger is raised.
-        if !trigger.flag.has_trigger() {
-            return Ok(());
+        if let Some(number) = queued {
+            self.raise_queued(number);
         }
-        {
-            let mut deferred = self.deferred();
-            if deferred.active {
-                deferred.merge(trigger);
-                return Ok(());
-            }
-        }
-        self.raise_triggers(std::slice::from_ref(&trigger));
         Ok(())
     }
 
@@ -785,6 +815,12 @@ impl IedServer {
     /// A leaf that raises nothing goes along with no reason, so a member
     /// naming a data object or a constructed attribute takes every value the
     /// request wrote rather than one another client wrote in the meantime.
+    ///
+    /// The leaves are handed over when the request ends, after their values
+    /// were stored. A leaf whose attribute has been updated since by an update
+    /// already queued is left out: its value was replaced before its triggers
+    /// could be raised in order, and raising them after the later update would
+    /// leave the control blocks with a value the attribute no longer holds.
     fn raise_written(&self, leaves: &[WrittenLeaf]) {
         let triggers: Vec<PendingTrigger> = leaves
             .iter()
@@ -792,27 +828,77 @@ impl IedServer {
                 cell: Arc::clone(&leaf.value),
                 value: leaf.new.clone(),
                 flag: update_triggers(leaf.trg_ops, &leaf.old, &leaf.new),
+                seq: leaf.seq,
             })
             .collect();
-        self.dispatch_triggers(triggers);
+        if let Some(number) = self.submit(triggers) {
+            self.raise_queued(number);
+        }
     }
 
-    /// Raises `triggers` as one batch, or defers them while the data model is
-    /// locked; nothing when none of them raises a reason.
-    fn dispatch_triggers(&self, triggers: Vec<PendingTrigger>) {
-        if !triggers.iter().any(|t| t.flag.has_trigger()) {
-            return;
-        }
-        {
-            let mut deferred = self.deferred();
-            if deferred.active {
-                for trigger in triggers {
-                    deferred.merge(trigger);
-                }
-                return;
+    /// Defers `triggers` while the data model is locked, or otherwise queues
+    /// them as one batch and returns its number; `None` when nothing is
+    /// queued, none of them raising a reason.
+    ///
+    /// A caller that stores values under a lock calls this before releasing
+    /// it, so the batches of an attribute queue in the order its values were
+    /// stored, and calls `raise_queued` once it holds no lock.
+    fn submit(&self, triggers: Vec<PendingTrigger>) -> Option<u64> {
+        let mut deferred = self.deferred();
+        if deferred.active {
+            for trigger in triggers {
+                deferred.merge(trigger);
             }
+            return None;
         }
-        self.raise_triggers(&triggers);
+        self.queue().push(triggers)
+    }
+
+    /// Raises the queued batches in order until batch `number` has been
+    /// raised.
+    ///
+    /// One thread at a time raises batches, holding no lock while it does;
+    /// another thread waits until its own batch has been raised. A batch the
+    /// raising thread queues itself, from a log storage or a report sink it
+    /// calls into, is raised after the one under way, and the update that
+    /// queued it returns at once. A thread whose own batch has been raised
+    /// goes on with the batches no thread waits for, and stops at the first
+    /// one a thread waits for, which that thread then raises.
+    fn raise_queued(&self, number: u64) {
+        let me = std::thread::current().id();
+        {
+            let mut queue = self.queue();
+            loop {
+                if queue.raised > number || queue.raiser == Some(me) {
+                    return;
+                }
+                if queue.raiser.is_none() {
+                    break;
+                }
+                queue = self
+                    .inner
+                    .trigger_turn
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            queue.raiser = Some(me);
+        }
+        let _turn = RaisingTurn(self);
+        loop {
+            let batch = {
+                let mut queue = self.queue();
+                let next_awaited = queue.batches.front().is_none_or(|b| b.awaited);
+                if queue.raised > number && next_awaited {
+                    return;
+                }
+                match queue.batches.pop_front() {
+                    Some(batch) => batch,
+                    None => return,
+                }
+            };
+            let _raised = RaisedBatch(self);
+            self.raise_triggers(&batch.triggers);
+        }
     }
 
     /// Raises the log and report triggers of attribute updates.
@@ -1671,6 +1757,9 @@ struct PendingTrigger {
     value: MmsValue,
     /// The reasons for inclusion the update raised.
     flag: InclusionFlag,
+    /// The commit number of the update, which orders the updates of the
+    /// attribute.
+    seq: u64,
 }
 
 impl PendingTrigger {
@@ -1692,14 +1781,17 @@ struct DeferredTriggers {
 }
 
 impl DeferredTriggers {
-    /// Adds a trigger; a later update of an attribute already held replaces
-    /// its value and adds its reasons.
+    /// Adds a trigger; another update of an attribute already held adds its
+    /// reasons, and replaces its value when it was stored later.
     fn merge(&mut self, trigger: PendingTrigger) {
         match self.index.get(&trigger.key()) {
             Some(&i) => {
                 let held = &mut self.triggers[i];
-                held.value = trigger.value;
                 held.flag = held.flag.union(trigger.flag);
+                if trigger.seq > held.seq {
+                    held.value = trigger.value;
+                    held.seq = trigger.seq;
+                }
             }
             None => {
                 self.index.insert(trigger.key(), self.triggers.len());
@@ -1713,6 +1805,82 @@ impl DeferredTriggers {
         self.active = false;
         self.index.clear();
         std::mem::take(&mut self.triggers)
+    }
+}
+
+/// The batches of triggers waiting to be raised, in the order their values
+/// were stored, and the state of the thread raising them.
+#[derive(Default)]
+struct TriggerQueue {
+    batches: VecDeque<QueuedBatch>,
+    /// Batches queued so far, which numbers the next one.
+    queued: u64,
+    /// Batches raised so far: a batch has been raised once this exceeds its
+    /// number.
+    raised: u64,
+    /// The thread raising batches, while one is.
+    raiser: Option<ThreadId>,
+    /// The commit number of the latest queued update of each attribute, by
+    /// the address of its value.
+    latest: HashMap<usize, u64>,
+}
+
+/// One batch of triggers waiting to be raised.
+struct QueuedBatch {
+    triggers: Vec<PendingTrigger>,
+    /// Whether the thread that queued it waits until it has been raised.
+    awaited: bool,
+}
+
+impl TriggerQueue {
+    /// Queues `triggers` as one batch and returns its number, or `None` when
+    /// none of those kept raises a reason.
+    ///
+    /// An update of an attribute with a later update already queued is left
+    /// out, so the queued updates of an attribute stay in commit order.
+    fn push(&mut self, triggers: Vec<PendingTrigger>) -> Option<u64> {
+        let mut kept = Vec::with_capacity(triggers.len());
+        for trigger in triggers {
+            let latest = self.latest.entry(trigger.key()).or_insert(trigger.seq);
+            if *latest > trigger.seq {
+                continue;
+            }
+            *latest = trigger.seq;
+            kept.push(trigger);
+        }
+        if !kept.iter().any(|t| t.flag.has_trigger()) {
+            return None;
+        }
+        let number = self.queued;
+        self.queued += 1;
+        let awaited = self.raiser != Some(std::thread::current().id());
+        self.batches.push_back(QueuedBatch {
+            triggers: kept,
+            awaited,
+        });
+        Some(number)
+    }
+}
+
+/// The turn of the thread raising queued batches; dropping it, also while
+/// the thread unwinds, lets another thread take over.
+struct RaisingTurn<'a>(&'a IedServer);
+
+impl Drop for RaisingTurn<'_> {
+    fn drop(&mut self) {
+        self.0.queue().raiser = None;
+        self.0.inner.trigger_turn.notify_all();
+    }
+}
+
+/// A batch taken from the queue; dropping it, also while the thread unwinds,
+/// counts it as raised.
+struct RaisedBatch<'a>(&'a IedServer);
+
+impl Drop for RaisedBatch<'_> {
+    fn drop(&mut self) {
+        self.0.queue().raised += 1;
+        self.0.inner.trigger_turn.notify_all();
     }
 }
 
@@ -2044,6 +2212,8 @@ impl IedServerBuilder<Bound> {
                 is_model_locked: AtomicBool::new(false),
                 deferred: Mutex::new(DeferredTriggers::default()),
                 batch_gate: RwLock::new(()),
+                trigger_queue: Mutex::new(TriggerQueue::default()),
+                trigger_turn: Condvar::new(),
                 dispatcher,
                 connection_block_requests_default: AtomicBool::new(false),
                 control_objects,
@@ -2927,6 +3097,7 @@ mod tests {
                 cell: Arc::clone(c),
                 value: MmsValue::Integer(v),
                 flag,
+                seq: crate::service::write::commit_seq(),
             });
         }
         let released = deferred.release();
@@ -2947,6 +3118,75 @@ mod tests {
             ]
         );
         assert!(deferred.release().is_empty());
+    }
+
+    /// An update handed over after a later update of the same attribute, as
+    /// the leaves of a write request are, adds its reasons but keeps the
+    /// value stored last.
+    #[test]
+    fn a_deferred_attribute_keeps_the_value_stored_last() {
+        let cell = Arc::new(RwLock::new(MmsValue::Integer(0)));
+        let mut deferred = DeferredTriggers {
+            active: true,
+            ..DeferredTriggers::default()
+        };
+        let (earlier, later) = (
+            crate::service::write::commit_seq(),
+            crate::service::write::commit_seq(),
+        );
+        for (v, flag, seq) in [
+            (2, InclusionFlag::VALUE_UPDATE, later),
+            (1, InclusionFlag::VALUE_CHANGED, earlier),
+        ] {
+            deferred.merge(PendingTrigger {
+                cell: Arc::clone(&cell),
+                value: MmsValue::Integer(v),
+                flag,
+                seq,
+            });
+        }
+        let released = deferred.release();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].value, MmsValue::Integer(2));
+        assert_eq!(
+            released[0].flag,
+            InclusionFlag::VALUE_CHANGED.union(InclusionFlag::VALUE_UPDATE)
+        );
+    }
+
+    /// A queued update of an attribute leaves out a later batch's update of
+    /// it stored earlier, and a batch left with no reason is not queued.
+    #[test]
+    fn the_queue_leaves_out_an_update_stored_before_a_queued_one() {
+        let (a, b) = (
+            Arc::new(RwLock::new(MmsValue::Integer(0))),
+            Arc::new(RwLock::new(MmsValue::Integer(0))),
+        );
+        let trigger = |cell: &Arc<RwLock<MmsValue>>, v: i64, seq: u64| PendingTrigger {
+            cell: Arc::clone(cell),
+            value: MmsValue::Integer(v),
+            flag: InclusionFlag::VALUE_CHANGED,
+            seq,
+        };
+        let (s1, s2, s3) = (
+            crate::service::write::commit_seq(),
+            crate::service::write::commit_seq(),
+            crate::service::write::commit_seq(),
+        );
+        let mut queue = TriggerQueue::default();
+        assert_eq!(queue.push(vec![trigger(&a, 2, s2)]), Some(0));
+        assert_eq!(queue.push(vec![trigger(&a, 1, s1)]), None);
+        assert_eq!(
+            queue.push(vec![trigger(&a, 1, s1), trigger(&b, 7, s3)]),
+            Some(1)
+        );
+        let kept: Vec<_> = queue.batches[1]
+            .triggers
+            .iter()
+            .map(|t| (Arc::ptr_eq(&t.cell, &b), t.value.clone()))
+            .collect();
+        assert_eq!(kept, [(true, MmsValue::Integer(7))]);
+        assert!(queue.batches.iter().all(|batch| batch.awaited));
     }
 
     #[test]
@@ -3154,12 +3394,14 @@ mod write_context_tests {
                 trg_ops: TrgOps::DCHG,
                 old: MmsValue::Integer(1),
                 new: MmsValue::Integer(5),
+                seq: crate::service::write::commit_seq(),
             },
             WrittenLeaf {
                 value: Arc::clone(hi),
                 trg_ops: TrgOps::DCHG,
                 old: MmsValue::Integer(9),
                 new: MmsValue::Integer(9),
+                seq: crate::service::write::commit_seq(),
             },
         ]
     }
@@ -3214,5 +3456,247 @@ mod write_context_tests {
         drop(guard);
 
         assert_carries_5_9(&server, &storage);
+    }
+}
+
+#[cfg(test)]
+mod update_order_tests {
+    use super::*;
+    use crate::logging::storage::{CollectingVisitor, EntryMeta, LogEntryVisitor};
+    use crate::logging::{
+        InMemoryLogStorage, JournalEntryData, LogControl, LogControlBlock, LogEntryId, LogStorage,
+        LogStorageError,
+    };
+    use crate::reporting::{Brcb, BufferedReportControl, DatasetEntry};
+    use iec61850_model::{
+        DataAttributeType, DataObject, DoChild, IedModelBuilder, LogicalDeviceBuilder,
+        LogicalNodeBuilder, FC,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const BRCB: &str = "IED1LD0/LLN0$BR$brcbA";
+
+    /// A log storage whose first entry waits for a go signal after telling
+    /// that it has started, as a slow backend does; every other entry is
+    /// written at once.
+    #[derive(Debug)]
+    struct GatedStorage {
+        inner: InMemoryLogStorage,
+        first: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    impl LogStorage for GatedStorage {
+        fn add_entry(&self, time_ms: u64) -> std::result::Result<LogEntryId, LogStorageError> {
+            self.inner.add_entry(time_ms)
+        }
+
+        fn add_entry_data(
+            &self,
+            entry_id: LogEntryId,
+            data_ref: &str,
+            value: MmsValue,
+            reason_code: u8,
+        ) -> std::result::Result<(), LogStorageError> {
+            self.inner
+                .add_entry_data(entry_id, data_ref, value, reason_code)
+        }
+
+        fn add_entry_with_data(
+            &self,
+            time_ms: u64,
+            data: &[JournalEntryData],
+        ) -> std::result::Result<LogEntryId, LogStorageError> {
+            let gate = self.first.lock().unwrap().take();
+            if let Some((started, go)) = gate {
+                started.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            self.inner.add_entry_with_data(time_ms, data)
+        }
+
+        fn query_by_time(
+            &self,
+            start_ms: u64,
+            end_ms: u64,
+            visitor: &mut dyn LogEntryVisitor,
+        ) -> std::result::Result<(), LogStorageError> {
+            self.inner.query_by_time(start_ms, end_ms, visitor)
+        }
+
+        fn query_after(
+            &self,
+            starting_time_ms: u64,
+            entry_id: LogEntryId,
+            visitor: &mut dyn LogEntryVisitor,
+        ) -> std::result::Result<(), LogStorageError> {
+            self.inner.query_after(starting_time_ms, entry_id, visitor)
+        }
+
+        fn oldest_and_newest(
+            &self,
+        ) -> std::result::Result<Option<(EntryMeta, EntryMeta)>, LogStorageError> {
+            self.inner.oldest_and_newest()
+        }
+
+        fn count(&self) -> usize {
+            self.inner.count()
+        }
+    }
+
+    /// A server whose enabled BRCB, with no buffer time and no client, and
+    /// whose log control block observe `GGIO1$ST$Ind$stVal`, a boolean that
+    /// declares dchg, logged into `storage`.
+    fn server(storage: Arc<dyn LogStorage>) -> IedServer {
+        let st_val = DataAttribute::new(
+            "stVal",
+            FC::St,
+            DataAttributeType::Boolean,
+            TrgOps::DCHG,
+            MmsValue::Boolean(false),
+        );
+        let ind = DataObject::new("Ind", vec![DoChild::Da(st_val)]);
+        let ggio = iec61850_model::LogicalNode::new(String::new(), "GGIO", "1", vec![ind]);
+        let ld = LogicalDeviceBuilder::new("LD0")
+            .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+            .add_ln(ggio)
+            .build()
+            .unwrap();
+        let model = Arc::new(
+            IedModelBuilder::new("IED1")
+                .add_ld(ld)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let server = IedServer::builder()
+            .model(model.clone())
+            .bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .build()
+            .unwrap();
+        let data_set = || {
+            let mut ds = Dataset::new("LLN0$dsInd");
+            ds.push(DatasetEntry::from_model(&model, "IED1LD0", "GGIO1$ST$Ind$stVal").unwrap());
+            ds
+        };
+        server
+            .register_brcb(
+                BufferedReportControl::new(
+                    BRCB,
+                    Brcb::new("brcbA", "LLN0$dsInd").with_trg_ops(TriggerOptions::DATA_CHANGED),
+                ),
+                data_set(),
+            )
+            .unwrap();
+        server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_brcb(BRCB)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .rpt_ena = true;
+        server.register_dataset("IED1LD0".to_string(), data_set());
+        let block = LogControlBlock::new("evlog")
+            .with_dataset("LLN0$dsInd")
+            .with_trg_ops(TriggerOptions::DATA_CHANGED)
+            .with_log_ref("IED1LD0/LLN0$EventLog");
+        let lc = LogControl::new("IED1LD0/LLN0$LG$evlog", block).with_storage(storage);
+        server.register_log_control("IED1LD0", "LLN0$LG$evlog", Arc::new(lc));
+        server
+    }
+
+    fn st_val(model: &IedModel) -> &DataAttribute {
+        let r = iec61850_model::ObjectRef::parse_mms("IED1LD0/GGIO1$ST$Ind$stVal").unwrap();
+        match model.node_by_object_ref(&r) {
+            Some(iec61850_model::NodeRef::Da(da)) => da,
+            _ => panic!("stVal is a data attribute"),
+        }
+    }
+
+    /// The value of the only member of each entry of the BRCB buffer, oldest
+    /// first.
+    fn buffered(server: &IedServer) -> Vec<MmsValue> {
+        let brcb = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_brcb(BRCB)
+            .unwrap();
+        let buffer = brcb.lock_buffer().unwrap();
+        buffer
+            .iter_entries()
+            .iter()
+            .map(|e| e.snapshot.as_ref().unwrap().values[0].clone().unwrap())
+            .collect()
+    }
+
+    /// The value of the only member of each log entry, oldest first.
+    fn logged(storage: &Arc<dyn LogStorage>) -> Vec<MmsValue> {
+        let mut v = CollectingVisitor::new();
+        storage.query_by_time(0, u64::MAX / 2, &mut v).unwrap();
+        v.entries
+            .iter()
+            .map(|e| e.variables[0].value.clone())
+            .collect()
+    }
+
+    /// Whether a batch of triggers waits in the queue behind the one being
+    /// raised.
+    fn queued_behind(server: &IedServer) -> bool {
+        !server.queue().batches.is_empty()
+    }
+
+    /// Two threads update the same attribute, true and then false, while the
+    /// log entry of the first is still being written: the BRCB buffers and the
+    /// log stores true and then false, in the order the values were stored,
+    /// and the last of each holds the value the model holds.
+    #[test]
+    fn concurrent_updates_reach_the_buffer_and_the_log_in_commit_order() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let storage: Arc<dyn LogStorage> = Arc::new(GatedStorage {
+            inner: InMemoryLogStorage::new(),
+            first: Mutex::new(Some((started_tx, go_rx))),
+        });
+        let server = server(Arc::clone(&storage));
+
+        let first = std::thread::spawn({
+            let server = server.clone();
+            move || {
+                server
+                    .update_boolean(st_val(&server.model()), true)
+                    .unwrap()
+            }
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first update writes its log entry");
+        let second = std::thread::spawn({
+            let server = server.clone();
+            move || {
+                server
+                    .update_boolean(st_val(&server.model()), false)
+                    .unwrap()
+            }
+        });
+        // The second update either completes or waits behind the first.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !second.is_finished() && !queued_behind(&server) {
+            assert!(Instant::now() < deadline, "the second update never settles");
+            std::thread::yield_now();
+        }
+        go_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(
+            *st_val(&server.model()).value.read().unwrap(),
+            MmsValue::Boolean(false)
+        );
+        let order = vec![MmsValue::Boolean(true), MmsValue::Boolean(false)];
+        assert_eq!(buffered(&server), order, "BRCB buffer");
+        assert_eq!(logged(&storage), order, "log");
     }
 }
