@@ -111,6 +111,11 @@ pub enum SvError {
     #[error("vlan priority {0} out of range 0-7")]
     VlanPriorityOutOfRange(u8),
 
+    /// An address parameter holds a value that cannot be read as its type,
+    /// named by its SCL `<P>` type.
+    #[error("the `{0}` parameter of the address cannot be read")]
+    UnreadableAddressParameter(&'static str),
+
     /// An ASDU field reaches past the length its ASDU declared.
     #[error("asdu field tag 0x{tag:02x} ends at {value_end}, past the asdu end {asdu_end}")]
     #[non_exhaustive]

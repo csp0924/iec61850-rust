@@ -3,12 +3,15 @@
 //! control block (IEC 61850-6 §9.4).
 //!
 //! An [`Address`] holds the `<P>` parameters of one SCL `<Address>` in document
-//! order. Every parameter is checked when it is added: a predefined type of
-//! `tPTypeEnum` must hold a value of the form its `tP_` restriction of the SCL
-//! schema prescribes, together with the character limits of IEC 61850-8-1
-//! §25.2 Table 162 and §25.3 Tables 163 and 164, and any other type must be a
-//! well-formed extension type name. The typed accessors therefore never fail on
-//! a parameter that is present.
+//! order, each value as written. The schema form of a predefined type of
+//! `tPTypeEnum` is the pattern of its `tP_` restriction in the SCL schema,
+//! together with the character limits of IEC 61850-8-1 §25.2 Table 162 and
+//! §25.3 Tables 163 and 164; [`check_parameter`] tells whether a value has it.
+//! A value written another way that still reads without ambiguity, such as a
+//! lower-case MAC address or a VLAN-ID of one digit, is kept and read by the
+//! typed accessors ([`value_form`] tells it apart); a value that cannot be read
+//! is kept too, and its accessor returns `None`, so the code that uses it
+//! decides how to fail.
 //!
 //! These types only describe addressing. Nothing in this crate opens a socket
 //! or binds an address; the GOOSE and sampled values crates turn an address
@@ -59,9 +62,12 @@ pub struct AddressParameter {
 
 /// The address parameters of an SCL `<Address>`, in document order.
 ///
-/// Built with [`push`](Self::push) or [`with`](Self::with), which check each
-/// parameter, so every parameter held has a valid type and value. When a type
-/// occurs more than once, the accessors read the first occurrence.
+/// Built with [`push`](Self::push) or [`with`](Self::with), which keep each
+/// value as written. The typed accessors read a value in the schema form and
+/// one written another way that reads without ambiguity, white space around
+/// it included, and return `None` for a parameter that is absent or cannot be
+/// read. When a type occurs more than
+/// once, the accessors read the first occurrence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Address {
     parameters: Vec<AddressParameter>,
@@ -75,11 +81,15 @@ impl Address {
 
     /// Adds the parameter `p_type` with the value `value`.
     ///
+    /// The value is kept as written, whether or not it has the schema form of
+    /// its type; see [`value_form`].
+    ///
     /// # Errors
     ///
     /// [`AddressError::InvalidType`] when `p_type` is not an address parameter
-    /// type, and [`AddressError::InvalidValue`] when `value` does not have the
-    /// form `p_type` prescribes; the address is then left unchanged.
+    /// type, and [`AddressError::InvalidValue`] when `value` holds nothing but
+    /// white space (`tPAddr` is a non-empty string); the address is then left
+    /// unchanged.
     pub fn push(
         &mut self,
         p_type: impl Into<String>,
@@ -87,7 +97,7 @@ impl Address {
     ) -> Result<(), AddressError> {
         let p_type = p_type.into();
         let value = value.into();
-        check_parameter(&p_type, &value)?;
+        check_type_and_text(&p_type, &value)?;
         self.parameters.push(AddressParameter { p_type, value });
         Ok(())
     }
@@ -117,7 +127,7 @@ impl Address {
         self.parameters.is_empty()
     }
 
-    /// Returns the value of the first parameter of type `p_type`.
+    /// Returns the value of the first parameter of type `p_type`, as written.
     pub fn get(&self, p_type: &str) -> Option<&str> {
         self.parameters
             .iter()
@@ -125,85 +135,341 @@ impl Address {
             .map(|p| p.value.as_str())
     }
 
-    /// Returns the `MAC-Address`.
+    /// Returns the value of the first parameter of type `p_type` without the
+    /// white space around it, as the typed accessors read it.
+    fn text(&self, p_type: &str) -> Option<&str> {
+        self.get(p_type).map(trim_xml_space)
+    }
+
+    /// Returns the `MAC-Address`: six octets of one or two hexadecimal digits
+    /// of either case, separated by `-` or `:`.
     pub fn mac_address(&self) -> Option<[u8; 6]> {
-        let text = self.get("MAC-Address")?;
-        let mut mac = [0u8; 6];
-        for (octet, pair) in mac.iter_mut().zip(text.split('-')) {
-            *octet = u8::from_str_radix(pair, 16).ok()?;
-        }
-        Some(mac)
+        read_mac(self.text("MAC-Address")?)
     }
 
-    /// Returns the `APPID`.
+    /// Returns the `APPID`: one to four hexadecimal digits of either case.
     pub fn app_id(&self) -> Option<u16> {
-        u16::from_str_radix(self.get("APPID")?, 16).ok()
+        read_hex(self.text("APPID")?, 4)
     }
 
-    /// Returns the `VLAN-ID`.
+    /// Returns the `VLAN-ID`: one to three hexadecimal digits of either case.
     pub fn vlan_id(&self) -> Option<u16> {
-        u16::from_str_radix(self.get("VLAN-ID")?, 16).ok()
+        read_hex(self.text("VLAN-ID")?, 3)
     }
 
-    /// Returns the `VLAN-PRIORITY`.
+    /// Returns the `VLAN-PRIORITY`: a decimal number from 0 to 7.
     pub fn vlan_priority(&self) -> Option<u8> {
-        self.get("VLAN-PRIORITY")?.parse().ok()
+        read_decimal(self.text("VLAN-PRIORITY")?, 7).map(|p| p as u8)
     }
 
     /// Returns the IPv4 address `IP`.
     pub fn ip(&self) -> Option<Ipv4Addr> {
-        parse_ipv4(self.get("IP")?)
+        read_ipv4(self.text("IP")?)
     }
 
     /// Returns the IPv4 network mask `IP-SUBNET`.
     pub fn ip_subnet(&self) -> Option<Ipv4Addr> {
-        parse_ipv4(self.get("IP-SUBNET")?)
+        read_ipv4(self.text("IP-SUBNET")?)
     }
 
     /// Returns the first-hop IPv4 gateway `IP-GATEWAY`; `0.0.0.0` means none is
     /// configured (IEC 61850-8-1 §25.2 Table 162).
     pub fn ip_gateway(&self) -> Option<Ipv4Addr> {
-        parse_ipv4(self.get("IP-GATEWAY")?)
+        read_ipv4(self.text("IP-GATEWAY")?)
     }
 
-    /// Returns the IPv6 address `IPv6`.
+    /// Returns the IPv6 address `IPv6`, in any notation of RFC 4291 §2.2.
     pub fn ipv6(&self) -> Option<Ipv6Addr> {
-        self.get("IPv6")?.parse().ok()
+        self.text("IPv6")?.parse().ok()
     }
 
     /// Returns the TCP port of the MMS server, `MMS-Port`.
     pub fn mms_port(&self) -> Option<u16> {
-        self.get("MMS-Port")?.parse().ok()
+        read_decimal(self.text("MMS-Port")?, 65_535).map(|p| p as u16)
     }
 
     /// Returns the OSI presentation selector `OSI-PSEL` as octets.
     pub fn osi_psel(&self) -> Option<Vec<u8>> {
-        hex_octets(self.get("OSI-PSEL")?)
+        read_octets(self.text("OSI-PSEL")?, 8)
     }
 
     /// Returns the OSI session selector `OSI-SSEL` as octets.
     pub fn osi_ssel(&self) -> Option<Vec<u8>> {
-        hex_octets(self.get("OSI-SSEL")?)
+        read_octets(self.text("OSI-SSEL")?, 8)
     }
 
     /// Returns the OSI transport selector `OSI-TSEL` as octets.
     pub fn osi_tsel(&self) -> Option<Vec<u8>> {
-        hex_octets(self.get("OSI-TSEL")?)
+        read_octets(self.text("OSI-TSEL")?, 4)
     }
 
     /// Returns the arcs of the ACSE AP title `OSI-AP-Title`, an object
-    /// identifier written as comma-separated numbers.
+    /// identifier written as numbers separated by commas or white space.
     pub fn osi_ap_title(&self) -> Option<Vec<u32>> {
-        self.get("OSI-AP-Title")?
-            .split(',')
-            .map(|arc| arc.parse().ok())
-            .collect()
+        read_arcs(self.text("OSI-AP-Title")?)
     }
 
     /// Returns the ACSE AE qualifier `OSI-AE-Qualifier`.
     pub fn osi_ae_qualifier(&self) -> Option<u32> {
-        self.get("OSI-AE-Qualifier")?.parse().ok()
+        read_decimal(self.text("OSI-AE-Qualifier")?, u32::MAX)
     }
+}
+
+/// How a parameter value relates to the schema form of its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueForm {
+    /// The value has the schema form, or its type is an extension type.
+    Canonical,
+    /// The value is written another way that reads without ambiguity, such as
+    /// a lower-case MAC address, a VLAN-ID of fewer than three digits, OSI
+    /// selector octets separated by white space, or a value with white space
+    /// around it; the typed accessors read it, and [`schema_value`] writes it
+    /// in the schema form.
+    Readable,
+    /// The value cannot be read as its type, such as a MAC address of five
+    /// octets or a VLAN-ID above 0xFFF; the typed accessor returns `None`.
+    Unreadable,
+}
+
+/// Tells whether the value of a parameter has the schema form of its type,
+/// reads another way, or cannot be read; see [`ValueForm`].
+///
+/// A type that is not an address parameter type, and a value of nothing but
+/// white space, are [`ValueForm::Unreadable`]. White space around a value, a
+/// line break or a tab included, is read past, as the `normalizedString` of
+/// `tPAddr` and the `collapse` of a number type allow.
+pub fn value_form(p_type: &str, value: &str) -> ValueForm {
+    if check_parameter(p_type, value).is_ok() {
+        ValueForm::Canonical
+    } else if schema_value(p_type, value).is_some() {
+        ValueForm::Readable
+    } else {
+        ValueForm::Unreadable
+    }
+}
+
+/// Returns the value of a parameter as read, written in the schema form of
+/// its type, or `None` when it cannot be read: `"1"` as a `VLAN-ID` is `"001"`,
+/// `"10"` as an `APPID` is `"0010"`, since a short value is hexadecimal as the
+/// schema form is, and `"1"` as an OSI selector is the octet `"01"`, an odd run
+/// of digits taking one leading zero. An extension type, which prescribes no
+/// form, returns the value without the white space around it.
+pub fn schema_value(p_type: &str, value: &str) -> Option<String> {
+    check_type_and_text(p_type, value).ok()?;
+    let text = trim_xml_space(value);
+    let hex_octets_text = |octets: Vec<u8>| {
+        octets
+            .iter()
+            .map(|o| format!("{o:02X}"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    match p_type {
+        "IP" | "IP-SUBNET" | "IP-GATEWAY" | "IP-IGMPv3Src" => {
+            read_ipv4(text).map(|ip| ip.to_string())
+        }
+        "IPv6" | "IPv6-GATEWAY" | "IPv6-IGMPv3Src" => text.parse::<Ipv6Addr>().ok().map(|ip| {
+            ip.segments()
+                .iter()
+                .map(|s| format!("{s:x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        }),
+        "IPv6-SUBNET" => read_decimal(text.strip_prefix('/').unwrap_or(text), 127)
+            .filter(|n| *n >= 1)
+            .map(|n| format!("/{n}")),
+        "DNSName" => (!text.contains(char::is_whitespace)).then(|| text.to_string()),
+        "IPv6FlowLabel" => read_hex(text, 5).map(|v| format!("{v:X}")),
+        "OSI-NSAP" => read_octets(text, 20).map(hex_octets_text),
+        "OSI-TSEL" => read_octets(text, 4).map(hex_octets_text),
+        "OSI-SSEL" | "OSI-PSEL" => read_octets(text, 8).map(hex_octets_text),
+        "OSI-AP-Title" => read_arcs(text).map(|arcs| {
+            arcs.iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }),
+        "OSI-AP-Invoke" | "OSI-AE-Qualifier" | "OSI-AE-Invoke" => {
+            read_decimal(text, u32::MAX).map(|n| n.to_string())
+        }
+        "MAC-Address" => read_mac(text).map(|mac| {
+            mac.iter()
+                .map(|o| format!("{o:02X}"))
+                .collect::<Vec<_>>()
+                .join("-")
+        }),
+        "APPID" => read_hex(text, 4).map(|v| format!("{v:04X}")),
+        "VLAN-PRIORITY" => read_decimal(text, 7).map(|n| n.to_string()),
+        "VLAN-ID" => read_hex(text, 3).map(|v| format!("{v:03X}")),
+        "SNTP-Port" | "MMS-Port" | "IP-UDP-PORT" | "IP-TCP-PORT" => {
+            read_decimal(text, 65_535).map(|n| n.to_string())
+        }
+        "IPv6ClassOfTraffic" => read_decimal(text, 255).map(|n| n.to_string()),
+        "C37-118-IP-Port" => read_decimal(text, 65_535)
+            .filter(|n| *n >= 1025)
+            .map(|n| n.to_string()),
+        "IP-ClassOfTraffic" => read_hex(text, 2).map(|v| format!("{v:02X}")),
+        _ => Some(text.to_string()),
+    }
+}
+
+/// Returns `text` without the XML white space, spaces, tabs, carriage returns
+/// and line feeds, around it.
+fn trim_xml_space(text: &str) -> &str {
+    text.trim_matches([' ', '\t', '\r', '\n'])
+}
+
+/// The schema form of a predefined type, as words for a message.
+pub fn schema_form(p_type: &str) -> &'static str {
+    expected_form(p_type)
+}
+
+/// Checks that `p_type` is an address parameter type and that `value` holds
+/// more than white space, as a `tPAddr` must.
+fn check_type_and_text(p_type: &str, value: &str) -> Result<(), AddressError> {
+    if !is_predefined_type(p_type) && !is_extension_type(p_type) {
+        return Err(AddressError::InvalidType {
+            p_type: p_type.to_string(),
+        });
+    }
+    if trim_xml_space(value).is_empty() {
+        return Err(AddressError::InvalidValue {
+            p_type: p_type.to_string(),
+            value: value.to_string(),
+            expected: "a non-empty string",
+        });
+    }
+    Ok(())
+}
+
+fn is_predefined_type(p_type: &str) -> bool {
+    matches!(
+        p_type,
+        "IP" | "IP-SUBNET"
+            | "IP-GATEWAY"
+            | "OSI-NSAP"
+            | "OSI-TSEL"
+            | "OSI-SSEL"
+            | "OSI-PSEL"
+            | "OSI-AP-Title"
+            | "OSI-AP-Invoke"
+            | "OSI-AE-Qualifier"
+            | "OSI-AE-Invoke"
+            | "MAC-Address"
+            | "APPID"
+            | "VLAN-PRIORITY"
+            | "VLAN-ID"
+            | "SNTP-Port"
+            | "MMS-Port"
+            | "DNSName"
+            | "IPv6FlowLabel"
+            | "IPv6ClassOfTraffic"
+            | "C37-118-IP-Port"
+            | "IP-UDP-PORT"
+            | "IP-TCP-PORT"
+            | "IPv6"
+            | "IPv6-SUBNET"
+            | "IPv6-GATEWAY"
+            | "IPv6-IGMPv3Src"
+            | "IP-IGMPv3Src"
+            | "IP-ClassOfTraffic"
+    )
+}
+
+/// Reads one to `max_digits` hexadecimal digits of either case.
+fn read_hex(text: &str, max_digits: usize) -> Option<u16> {
+    if text.is_empty() || text.len() > max_digits || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(text, 16)
+        .ok()
+        .and_then(|v| u16::try_from(v).ok())
+}
+
+/// Reads a decimal number, leading zeros allowed, of at most `max`.
+fn read_decimal(text: &str, max: u32) -> Option<u32> {
+    if !is_decimal(text) {
+        return None;
+    }
+    let digits = text.trim_start_matches('0');
+    if digits.len() > 10 {
+        return None;
+    }
+    let value: u64 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
+    u32::try_from(value).ok().filter(|v| *v <= max)
+}
+
+/// Reads a MAC address: six octets of one or two hexadecimal digits of either
+/// case, all separated by `-` or all by `:`.
+fn read_mac(text: &str) -> Option<[u8; 6]> {
+    let separator = if text.contains('-') { '-' } else { ':' };
+    let mut mac = [0u8; 6];
+    let mut parts = text.split(separator);
+    for octet in &mut mac {
+        let part = parts.next()?;
+        if !(1..=2).contains(&part.len()) || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        *octet = u8::from_str_radix(part, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+/// Reads a dotted-decimal IPv4 address: four decimal octets, leading zeros
+/// allowed.
+fn read_ipv4(text: &str) -> Option<Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = text.split('.');
+    for octet in &mut octets {
+        let part = parts.next()?;
+        if part.len() > 3 {
+            return None;
+        }
+        *octet = u8::try_from(read_decimal(part, 255)?).ok()?;
+    }
+    parts.next().is_none().then(|| Ipv4Addr::from(octets))
+}
+
+/// Reads octets written as hexadecimal digits of either case: groups of one
+/// or two digits separated by white space, or one run of digits, an odd run
+/// read with a leading zero. At least one and at most `max_octets` octets.
+fn read_octets(text: &str, max_octets: usize) -> Option<Vec<u8>> {
+    let octets: Option<Vec<u8>> = if text.contains(char::is_whitespace) {
+        text.split_whitespace()
+            .map(|group| {
+                ((1..=2).contains(&group.len()) && group.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u8::from_str_radix(group, 16).ok())
+                    .flatten()
+            })
+            .collect()
+    } else {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let padded = if text.len() % 2 == 1 {
+            format!("0{text}")
+        } else {
+            text.to_string()
+        };
+        hex_octets(&padded)
+    };
+    octets.filter(|o| (1..=max_octets).contains(&o.len()))
+}
+
+/// Reads the arcs of an object identifier written as decimal numbers
+/// separated by commas, white space, or both.
+fn read_arcs(text: &str) -> Option<Vec<u32>> {
+    let arcs: Option<Vec<u32>> = text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|arc| !arc.is_empty())
+        .map(|arc| read_decimal(arc, u32::MAX))
+        .collect();
+    arcs.filter(|a| !a.is_empty())
 }
 
 /// The addressing of a GOOSE control block: an SCL `<GSE>` (IEC 61850-6
@@ -261,9 +527,14 @@ impl ConnectedAccessPoint {
     }
 }
 
-/// Checks one address parameter: `p_type` must be a predefined type of
-/// `tPTypeEnum` or a well-formed extension type, and `value` must have the form
-/// the type prescribes.
+/// Checks that an address parameter has the schema form: `p_type` must be a
+/// predefined type of `tPTypeEnum` or a well-formed extension type, and
+/// `value` must have the form the type prescribes.
+///
+/// The schema form is the canonical one. An address keeps a value that breaks
+/// it, and the accessors still read one that reads without ambiguity
+/// ([`value_form`]); a loader reports such a value as a warning, with the form
+/// this function expects.
 ///
 /// Every value is a non-empty string free of carriage returns, line feeds and
 /// tabs (`tPAddr`). A predefined type further restricts it to the pattern of its
@@ -291,7 +562,7 @@ pub fn check_parameter(p_type: &str, value: &str) -> Result<(), AddressError> {
     }
     let ok = match p_type {
         "IP" | "IP-SUBNET" | "IP-GATEWAY" | "IP-IGMPv3Src" => {
-            return parse_ipv4(value)
+            return schema_ipv4(value)
                 .map(|_| ())
                 .ok_or_else(|| invalid("a dotted-decimal IPv4 address"))
         }
@@ -406,7 +677,7 @@ fn canonical_decimal(text: &str) -> Option<u32> {
 /// Parses a dotted-decimal IPv4 address in the form of the `tP_IPbase` pattern:
 /// four decimal octets, each at most three digits, a three-digit one without a
 /// leading zero.
-fn parse_ipv4(text: &str) -> Option<Ipv4Addr> {
+fn schema_ipv4(text: &str) -> Option<Ipv4Addr> {
     let mut octets = [0u8; 4];
     let mut parts = text.split('.');
     for octet in &mut octets {
@@ -611,10 +882,148 @@ mod tests {
     #[test]
     fn a_refused_parameter_leaves_the_address_unchanged() {
         let mut address = Address::new();
-        assert!(address.push("APPID", "zz").is_err());
+        assert!(address.push("APPID", "").is_err());
+        assert!(address.push("APPID", "  ").is_err());
+        assert!(address.push("appid", "0001").is_err());
         assert!(address.is_empty());
         address.push("APPID", "0001").expect("valid");
         address.push("APPID", "0002").expect("valid");
         assert_eq!(address.app_id(), Some(1), "the first occurrence is read");
+    }
+
+    #[test]
+    fn values_written_another_way_read_and_are_kept() {
+        let cases: &[(&str, &str)] = &[
+            ("MAC-Address", "01-0c-cd-01-00-01"),
+            ("MAC-Address", "01:0C:CD:01:00:01"),
+            ("MAC-Address", "1-c-cd-1-0-1"),
+            ("APPID", "1"),
+            ("APPID", "3a01"),
+            ("VLAN-ID", "1"),
+            ("VLAN-ID", "7b"),
+            ("VLAN-PRIORITY", "04"),
+            ("IP", "010.000.000.001"),
+            ("IPv6", "FE80::1"),
+            ("IPv6-SUBNET", "64"),
+            ("OSI-TSEL", "00 00 00 01"),
+            ("OSI-SSEL", "1"),
+            ("OSI-PSEL", "0 0 0 1"),
+            ("OSI-AP-Title", "1 3 9999 33"),
+            ("OSI-AP-Title", "1, 3, 9999, 33"),
+            ("OSI-AE-Qualifier", "123456"),
+            ("MMS-Port", "0102"),
+        ];
+        for (t, v) in cases {
+            assert_eq!(value_form(t, v), ValueForm::Readable, "{t} `{v}`");
+        }
+        let a = Address::new()
+            .with("MAC-Address", "01:0c:cd:01:00:01")
+            .and_then(|a| a.with("APPID", "1"))
+            .and_then(|a| a.with("VLAN-ID", "1"))
+            .and_then(|a| a.with("VLAN-PRIORITY", "04"))
+            .and_then(|a| a.with("IP", "010.000.000.001"))
+            .and_then(|a| a.with("IPv6", "FE80::1"))
+            .and_then(|a| a.with("OSI-TSEL", "00 00 00 01"))
+            .and_then(|a| a.with("OSI-SSEL", "1"))
+            .and_then(|a| a.with("OSI-PSEL", "0 0 0 1"))
+            .and_then(|a| a.with("OSI-AP-Title", "1 3 9999 33"))
+            .and_then(|a| a.with("MMS-Port", "0102"))
+            .expect("kept as written");
+        assert_eq!(a.mac_address(), Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01]));
+        assert_eq!(a.app_id(), Some(1));
+        assert_eq!(a.vlan_id(), Some(1));
+        assert_eq!(a.vlan_priority(), Some(4));
+        assert_eq!(a.ip(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(a.ipv6(), Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(a.osi_tsel(), Some(vec![0, 0, 0, 1]));
+        assert_eq!(a.osi_ssel(), Some(vec![1]));
+        assert_eq!(a.osi_psel(), Some(vec![0, 0, 0, 1]));
+        assert_eq!(a.osi_ap_title(), Some(vec![1, 3, 9999, 33]));
+        assert_eq!(a.mms_port(), Some(102));
+        assert_eq!(a.get("VLAN-ID"), Some("1"), "kept as written");
+
+        // A short value is hexadecimal, as the schema form is.
+        let short = Address::new()
+            .with("VLAN-ID", "10")
+            .and_then(|a| a.with("APPID", "10"))
+            .expect("kept as written");
+        assert_eq!(short.vlan_id(), Some(0x010));
+        assert_eq!(short.app_id(), Some(0x0010));
+        assert_eq!(schema_value("VLAN-ID", "10").as_deref(), Some("010"));
+        assert_eq!(schema_value("APPID", "10").as_deref(), Some("0010"));
+        assert_eq!(schema_value("VLAN-ID", "1").as_deref(), Some("001"));
+        assert_eq!(schema_value("OSI-SSEL", "1").as_deref(), Some("01"));
+        assert_eq!(schema_value("OSI-TSEL", "001").as_deref(), Some("0001"));
+        assert_eq!(
+            schema_value("MAC-Address", "1:c:cd:1:0:5").as_deref(),
+            Some("01-0C-CD-01-00-05")
+        );
+        assert_eq!(
+            schema_value("OSI-AP-Title", "1 3 9999 33").as_deref(),
+            Some("1,3,9999,33")
+        );
+        assert_eq!(
+            schema_value("IPv6", "FE80::1").as_deref(),
+            Some("fe80:0:0:0:0:0:0:1")
+        );
+        assert_eq!(schema_value("VLAN-ID", "1000"), None);
+    }
+
+    #[test]
+    fn white_space_around_a_value_is_read_past() {
+        for (t, v) in [
+            ("MAC-Address", "01-0C-CD-01-00-01 "),
+            ("APPID", "\n0001\n"),
+            ("VLAN-ID", "\t07B\r\n"),
+            ("OSI-TSEL", " 00 00\n00 01 "),
+        ] {
+            assert_eq!(value_form(t, v), ValueForm::Readable, "{t} {v:?}");
+        }
+        let a = Address::new()
+            .with("MAC-Address", "01-0C-CD-01-00-01 ")
+            .and_then(|a| a.with("APPID", "\n0001\n"))
+            .and_then(|a| a.with("VLAN-ID", "\t07B\r\n"))
+            .and_then(|a| a.with("OSI-TSEL", " 00 00\n00 01 "))
+            .expect("kept as written");
+        assert_eq!(a.mac_address(), Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01]));
+        assert_eq!(a.app_id(), Some(1));
+        assert_eq!(a.vlan_id(), Some(0x07b));
+        assert_eq!(a.osi_tsel(), Some(vec![0, 0, 0, 1]));
+        assert_eq!(a.get("APPID"), Some("\n0001\n"), "kept as written");
+        assert!(Address::new().push("APPID", " \n\t").is_err());
+    }
+
+    #[test]
+    fn values_that_cannot_be_read_are_kept_and_read_as_none() {
+        let cases: &[(&str, &str)] = &[
+            ("MAC-Address", "01-0C-CD-01-00"),
+            ("MAC-Address", "01-0C-CD-01-00-1G"),
+            ("MAC-Address", "010-C-CD-01-00-01"),
+            ("APPID", "10000"),
+            ("VLAN-ID", "1000"),
+            ("VLAN-ID", "g"),
+            ("VLAN-PRIORITY", "8"),
+            ("IP", "10.0.0.256"),
+            ("OSI-TSEL", "00 00 00 00 01"),
+            ("OSI-PSEL", "0x01"),
+            ("OSI-AP-Title", "1.3.9999"),
+            ("MMS-Port", "65536"),
+            ("DNSName", "a b"),
+        ];
+        for (t, v) in cases {
+            assert_eq!(value_form(t, v), ValueForm::Unreadable, "{t} `{v}`");
+        }
+        let a = Address::new()
+            .with("MAC-Address", "01-0C-CD-01-00")
+            .and_then(|a| a.with("VLAN-ID", "1000"))
+            .and_then(|a| a.with("IP", "10.0.0.256"))
+            .expect("kept as written");
+        assert_eq!(a.mac_address(), None);
+        assert_eq!(a.vlan_id(), None);
+        assert_eq!(a.ip(), None);
+        assert_eq!(a.get("MAC-Address"), Some("01-0C-CD-01-00"));
+        assert_eq!(value_form("IP", "10.0.0.1"), ValueForm::Canonical);
+        assert_eq!(value_form("Vendor-X", "anything"), ValueForm::Canonical);
+        assert_eq!(value_form("ip", "10.0.0.1"), ValueForm::Unreadable);
     }
 }

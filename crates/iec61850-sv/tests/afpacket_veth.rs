@@ -119,7 +119,9 @@ fn scl_address_reaches_the_wire() {
     ] {
         address.push(t, v).expect("valid parameter");
     }
-    let mut builder = SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 0x53]).with_address(&address);
+    let mut builder = SvPublisherBuilder::new([0x02, 0, 0, 0, 0, 0x53])
+        .with_address(&address)
+        .expect("readable address");
     builder.add_asdu("vethAddr", None::<&str>, 1, 8).unwrap();
     let publisher = builder.setup_complete().unwrap();
     tx.send(publisher.frame_bytes()).expect("send");

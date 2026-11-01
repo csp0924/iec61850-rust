@@ -270,93 +270,173 @@ fn a_gse_without_children_has_an_empty_address() {
     assert_eq!(model.connected_aps[0].address, None);
 }
 
-/// The value of each predefined type is checked against its schema form; a
-/// value the type does not accept is an error at the `<P>`.
+/// How a value relates to the schema form of its type, in the tests.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Form {
+    Schema,
+    Readable,
+    Unreadable,
+}
+
+/// Every value is kept as written and the file loads; a value in the schema
+/// form passes silently, and any other is reported with its type, its value
+/// and the schema form, saying whether it reads.
 #[test]
-fn each_address_type_accepts_its_form_and_rejects_others() {
-    let cases: &[(&str, &[&str], &[&str])] = &[
-        (
-            "IP",
-            &["10.0.0.11", "0.0.0.0"],
-            &["10.0.0", "10.0.0.256", "a.b.c.d"],
-        ),
-        ("IP-SUBNET", &["255.255.255.0"], &["255.255.255"]),
-        ("IP-GATEWAY", &["10.0.0.101"], &["10.0.0.1.1"]),
-        (
-            "OSI-TSEL",
-            &["0001", "00000001"],
-            &["001", "000000001", "000g"],
-        ),
-        ("OSI-SSEL", &["0001"], &["1"]),
-        ("OSI-PSEL", &["00000001"], &["0x01"]),
-        ("OSI-NSAP", &["49000102"], &["4900010"]),
-        ("OSI-AP-Title", &["1,1,9999,1"], &["1.1.9999.1"]),
-        ("OSI-AP-Invoke", &["0"], &["123456"]),
-        ("OSI-AE-Qualifier", &["12"], &["-1"]),
-        ("OSI-AE-Invoke", &["99999"], &["1a"]),
-        (
-            "MAC-Address",
-            &["01-0C-CD-01-00-01"],
-            &["01-0c-cd-01-00-01", "01:0C:CD:01:00:01"],
-        ),
-        ("APPID", &["3A01", "0000"], &["3a01", "301", "30001"]),
-        ("VLAN-ID", &["07B", "000"], &["7B", "07b", "0"]),
-        ("VLAN-PRIORITY", &["0", "7"], &["8", "04"]),
-        ("MMS-Port", &["102"], &["0102", "65536"]),
-        ("IPv6", &["fe80:0:0:0:0:0:0:1"], &["fe80::1"]),
-        ("Vendor-Extension", &["anything"], &[]),
+fn each_address_type_keeps_its_value_and_reports_other_forms() {
+    use Form::*;
+    let cases: &[(&str, &str, Form)] = &[
+        ("IP", "10.0.0.11", Schema),
+        ("IP", "010.000.000.011", Readable),
+        ("IP", "10.0.0.256", Unreadable),
+        ("IP-SUBNET", "255.255.255", Unreadable),
+        ("OSI-TSEL", "00000001", Schema),
+        ("OSI-TSEL", "00 00 00 01", Readable),
+        ("OSI-TSEL", "000g", Unreadable),
+        ("OSI-SSEL", "1", Readable),
+        ("OSI-PSEL", "00 00 00 01", Readable),
+        ("OSI-PSEL", "0x01", Unreadable),
+        ("OSI-AP-Title", "1,3,9999,33", Schema),
+        ("OSI-AP-Title", "1 3 9999 33", Readable),
+        ("OSI-AP-Title", "1.3.9999.33", Unreadable),
+        ("OSI-AE-Qualifier", "123456", Readable),
+        ("MAC-Address", "01-0C-CD-01-00-01", Schema),
+        ("MAC-Address", "01-0c-cd-01-00-01", Readable),
+        ("MAC-Address", "01:0C:CD:01:00:01", Readable),
+        ("MAC-Address", "01-0C-CD-01-00", Unreadable),
+        ("APPID", "3A01", Schema),
+        ("APPID", "3a01", Readable),
+        ("APPID", "301", Readable),
+        ("APPID", "30001", Unreadable),
+        ("VLAN-ID", "07B", Schema),
+        ("VLAN-ID", "1", Readable),
+        ("VLAN-ID", "7b", Readable),
+        ("VLAN-ID", "1000", Unreadable),
+        ("VLAN-PRIORITY", "04", Readable),
+        ("VLAN-PRIORITY", "8", Unreadable),
+        ("MMS-Port", "0102", Readable),
+        ("MMS-Port", "65536", Unreadable),
+        ("IPv6", "fe80:0:0:0:0:0:0:1", Schema),
+        ("IPv6", "fe80::1", Readable),
+        ("Vendor-Extension", "anything", Schema),
     ];
-    for (p_type, good, bad) in cases {
-        for value in *good {
-            try_build(&gse_with_p(p_type, value), "IED1")
-                .unwrap_or_else(|e| panic!("{p_type} `{value}` refused: {e}"));
-        }
-        for value in *bad {
-            let e = error(&gse_with_p(p_type, value));
-            match &*e.kind {
-                ErrorKind::AttributeValueInvalid {
-                    name, raw_value, ..
-                } => {
-                    assert_eq!(name, &format!("P[type=\"{p_type}\"]"), "{p_type} `{value}`");
-                    assert_eq!(raw_value, value);
-                }
-                other => panic!("{p_type} `{value}`: {other:?}"),
-            }
-            assert!(
-                e.element_path.contains("/GSE[ldInst=") && e.element_path.ends_with("/Address/P"),
-                "{}",
-                e.element_path
-            );
-            assert!(e.span.line > 0, "{p_type} `{value}` has no line");
+    for (p_type, value, form) in cases {
+        let (model, seen) = warnings(|| try_build(&gse_with_p(p_type, value), "IED1"));
+        let model = model.unwrap_or_else(|e| panic!("{p_type} `{value}` failed the file: {e}"));
+        let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+        assert_eq!(gse.address.get(p_type), Some(*value), "kept as written");
+        let report: Vec<&String> = seen
+            .iter()
+            .filter(|w| w.contains(&format!("`{value}`")))
+            .collect();
+        match form {
+            Schema => assert!(report.is_empty(), "{p_type} `{value}`: {report:?}"),
+            Readable => assert!(
+                report.len() == 1
+                    && report[0].contains(p_type)
+                    && report[0].contains("not in the schema form")
+                    && report[0].contains("it is read as `"),
+                "{p_type} `{value}`: {seen:?}"
+            ),
+            Unreadable => assert!(
+                report.len() == 1 && report[0].contains("cannot be read"),
+                "{p_type} `{value}`: {seen:?}"
+            ),
         }
     }
 }
 
-/// The error points at the line of the offending `<P>`.
+/// The deviations found in practice read as intended: a one-digit VLAN-ID, a
+/// lower-case MAC address, an AP title and OSI selectors separated by white
+/// space.
 #[test]
-fn an_invalid_value_is_reported_at_its_line() {
-    let xml = gse_with_p("VLAN-ID", "FFFF");
-    let line = xml
-        .lines()
-        .position(|l| l.contains("FFFF"))
-        .expect("the value is in the file") as u32
-        + 1;
-    let e = error(&xml);
-    assert_eq!(e.span.line, line);
-    assert!(e.to_string().contains("three digits 0-9 and A-F"), "{e}");
+fn common_deviations_read_as_intended() {
+    let xml = ied1_ap(
+        r#"<Address>
+          <P type="IP">10.0.0.11</P>
+          <P type="OSI-AP-Title">1 3 9999 33</P>
+          <P type="OSI-PSEL">00 00 00 01</P>
+          <P type="OSI-SSEL">00 01</P>
+          <P type="OSI-TSEL">00 01</P>
+        </Address>
+        <GSE ldInst="LD0" cbName="gcb1">
+          <Address>
+            <P type="MAC-Address">01-0c-cd-01-00-05</P>
+            <P type="APPID">1</P>
+            <P type="VLAN-ID">1</P>
+          </Address>
+        </GSE>"#,
+    );
+    let (model, seen) = warnings(|| build(&xml, "IED1"));
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("`1`") && w.contains("it is read as `001`")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("it is read as `1,3,9999,33`")),
+        "{seen:?}"
+    );
+    let address = model.connected_aps[0].address.as_ref().expect("address");
+    assert_eq!(address.osi_ap_title(), Some(vec![1, 3, 9999, 33]));
+    assert_eq!(address.osi_psel(), Some(vec![0, 0, 0, 1]));
+    assert_eq!(address.osi_ssel(), Some(vec![0, 1]));
+    assert_eq!(address.osi_tsel(), Some(vec![0, 1]));
+    let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+    assert_eq!(
+        gse.address.mac_address(),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05])
+    );
+    assert_eq!(gse.address.app_id(), Some(1));
+    assert_eq!(gse.address.vlan_id(), Some(1));
 }
 
-/// A type that is neither predefined nor a well-formed extension name, and an
-/// empty value, are refused.
+/// The warning about a value written another way carries its line.
 #[test]
-fn a_malformed_type_or_an_empty_value_is_refused() {
-    let e = error(&gse_with_p("mac-address", "01-0C-CD-01-00-01"));
-    assert_eq!(e.attribute.as_deref(), Some("type"));
-    let e = error(&gse_with_p("APPID", ""));
+fn a_value_written_another_way_is_reported_at_its_line() {
+    let xml = gse_with_p("VLAN-ID", "1");
+    let line = xml
+        .lines()
+        .position(|l| l.contains(r#"type="VLAN-ID""#))
+        .expect("the value is in the file")
+        + 1;
+    let (model, seen) = warnings(|| try_build(&xml, "IED1"));
+    model.expect("the file loads");
     assert!(
-        matches!(&*e.kind, ErrorKind::AttributeValueInvalid { .. }),
-        "{e}"
+        seen.iter().any(|w| w.contains(&format!("line={line} "))
+            && w.contains("VLAN-ID")
+            && w.contains("three digits 0-9 and A-F")),
+        "{seen:?}"
     );
+}
+
+/// A value that cannot be read loads, and its accessor reads `None`.
+#[test]
+fn an_unreadable_value_loads_and_reads_as_none() {
+    let model = build(&gse_with_p("VLAN-ID", "FFFF"), "IED1");
+    let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+    assert_eq!(gse.address.get("VLAN-ID"), Some("FFFF"));
+    assert_eq!(gse.address.vlan_id(), None);
+}
+
+/// A `<P>` of no address parameter type, or with an empty value, is left out
+/// of the address with a warning; an `<Address>` without `<P>` is still
+/// refused, as the schema requires one.
+#[test]
+fn a_malformed_type_or_an_empty_value_is_left_out() {
+    for xml in [
+        gse_with_p("mac-address", "01-0C-CD-01-00-01"),
+        gse_with_p("APPID", ""),
+    ] {
+        let (model, seen) = warnings(|| try_build(&xml, "IED1"));
+        let model = model.expect("the file loads");
+        let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+        assert!(gse.address.is_empty());
+        assert!(
+            seen.iter().any(|w| w.contains("left out of the address")),
+            "{seen:?}"
+        );
+    }
     let e = error(&ied1_ap(
         r#"<GSE ldInst="LD0" cbName="gcb1"><Address/></GSE>"#,
     ));
@@ -366,10 +446,10 @@ fn a_malformed_type_or_an_empty_value_is_refused() {
     );
 }
 
-/// An invalid address value fails only the model of the IED it belongs to:
-/// the file still parses and resolves, and another IED of it builds.
+/// An address value of another IED that cannot be read does not affect the
+/// IED being built, and the other IED loads too, reading it as `None`.
 #[test]
-fn an_invalid_address_of_another_ied_does_not_fail_this_one() {
+fn an_unreadable_address_of_another_ied_does_not_fail_either() {
     let xml = subnetwork(
         r#"<ConnectedAP iedName="IED1" apName="AP1">
         <GSE ldInst="LD0" cbName="gcb1">
@@ -378,39 +458,22 @@ fn an_invalid_address_of_another_ied_does_not_fail_this_one() {
       </ConnectedAP>
       <ConnectedAP iedName="IED2" apName="AP1">
         <Address><P type="IP">10.0.0.256</P></Address>
-        <GSE ldInst="LD0" cbName="gcb1">
-          <Address><P type="MAC-Address">01-0c-cd-01-00-02</P></Address>
-        </GSE>
       </ConnectedAP>"#,
     );
     let resolved = iec61850_scl::parse_scl(&xml)
         .expect("parse")
         .resolve()
-        .expect("an invalid value of IED2 does not fail stage 2");
+        .expect("resolve");
     let ied1 = resolved.build_model("IED1").expect("IED1 builds");
     assert_eq!(
         ied1.gse_address("LD0", "gcb1")
             .and_then(|g| g.address.mac_address()),
         Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
     );
-    let e = resolved
-        .build_model("IED2")
-        .expect_err("IED2 has an invalid address");
-    match &*e.kind {
-        ErrorKind::AttributeValueInvalid {
-            name, raw_value, ..
-        } => {
-            assert_eq!(name, "P[type=\"IP\"]");
-            assert_eq!(raw_value, "10.0.0.256");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(
-        e.element_path
-            .contains("ConnectedAP[iedName=\"IED2\",apName=\"AP1\"]"),
-        "{}",
-        e.element_path
-    );
+    let ied2 = resolved.build_model("IED2").expect("IED2 builds");
+    let address = ied2.connected_aps[0].address.as_ref().expect("address");
+    assert_eq!(address.get("IP"), Some("10.0.0.256"));
+    assert_eq!(address.ip(), None);
 }
 
 /// `MinTime` and `MaxTime` take any `xs:decimal` number of milliseconds,
@@ -721,4 +784,40 @@ fn the_build_script_helpers_check_the_built_ied_only() {
         .expect_err("IED2 names an access point it lacks");
     assert_eq!(e.attribute.as_deref(), Some("apName"));
     assert!(iec61850_scl::__private::smv_addresses(raw, "IED2").is_err());
+}
+
+/// White space around a value, a line break or a tab included, is read past
+/// with a warning, and a value spread over lines stays in the address.
+#[test]
+fn white_space_around_a_value_is_read_past() {
+    let xml = ied1_ap(
+        r#"<GSE ldInst="LD0" cbName="gcb1">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-01-00-05&#32;</P>
+            <P type="VLAN-ID">&#10;07B&#10;&#9;</P>
+            <P type="APPID">
+              3A01
+            </P>
+          </Address>
+        </GSE>"#,
+    );
+    let (model, seen) = warnings(|| build(&xml, "IED1"));
+    let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+    assert_eq!(
+        gse.address.mac_address(),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05])
+    );
+    assert_eq!(gse.address.vlan_id(), Some(0x07b));
+    assert_eq!(gse.address.app_id(), Some(0x3a01));
+    assert_eq!(gse.address.parameters().len(), 3, "nothing is left out");
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("MAC-Address") && w.contains("it is read as `01-0C-CD-01-00-05`")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("VLAN-ID") && w.contains("it is read as `07B`")),
+        "{seen:?}"
+    );
 }

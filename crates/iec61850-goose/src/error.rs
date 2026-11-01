@@ -94,6 +94,11 @@ pub enum GooseError {
     #[error("the address has no `{0}` parameter")]
     MissingAddressParameter(&'static str),
 
+    /// An address parameter the publication uses holds a value that cannot be
+    /// read as its type, named by its SCL `<P>` type.
+    #[error("the `{0}` parameter of the address cannot be read")]
+    UnreadableAddressParameter(&'static str),
+
     /// The encode buffer cannot hold the PDU.
     #[error("pdu buffer overflow")]
     PduOverflow,

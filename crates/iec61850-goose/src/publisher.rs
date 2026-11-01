@@ -85,24 +85,27 @@ impl CommParameters {
     /// value that marks a missing configuration (IEC 61850-8-1 Annex C.2.5). The
     /// frames always carry the 802.1Q tag (Annex C.2.2): a missing `VLAN-ID`
     /// is 0 (Annex C.2.4) and a missing `VLAN-PRIORITY` is 4 (Table C.1). No
-    /// source MAC override is set.
+    /// source MAC override is set. A value written another way than the schema
+    /// form is read as the accessors of [`Address`] read it.
     ///
     /// # Errors
     ///
     /// [`GooseError::MissingAddressParameter`] when the address has no
-    /// `MAC-Address`, as an address for GOOSE over UDP/IP has none.
+    /// `MAC-Address`, as an address for GOOSE over UDP/IP has none, and
+    /// [`GooseError::UnreadableAddressParameter`] when the `MAC-Address`,
+    /// `APPID`, `VLAN-ID` or `VLAN-PRIORITY` holds a value that cannot be read.
     pub fn from_address(address: &Address) -> Result<Self, GooseError> {
-        let dst_mac = address
-            .mac_address()
+        let dst_mac = read(address, "MAC-Address", address.mac_address())?
             .ok_or(GooseError::MissingAddressParameter("MAC-Address"))?;
-        let mut comm = Self::new(address.app_id().unwrap_or(0), dst_mac);
+        let app_id = read(address, "APPID", address.app_id())?;
+        let mut comm = Self::new(app_id.unwrap_or(0), dst_mac);
         let default = VlanTag::default();
         comm.vlan = Some(VlanTag {
-            priority: match address.vlan_priority() {
+            priority: match read(address, "VLAN-PRIORITY", address.vlan_priority())? {
                 Some(p) => VlanPriority::new(p)?,
                 None => default.priority,
             },
-            vlan_id: address.vlan_id().unwrap_or(default.vlan_id),
+            vlan_id: read(address, "VLAN-ID", address.vlan_id())?.unwrap_or(default.vlan_id),
         });
         Ok(comm)
     }
@@ -131,6 +134,20 @@ impl CommParameters {
         let vlan_id = self.vlan.map(|v| v.vlan_id).unwrap_or(0);
         self.vlan = Some(VlanTag { priority, vlan_id });
         self
+    }
+}
+
+/// Returns the value an accessor of `address` read for `p_type`, `None` when
+/// the address has no such parameter, and an error when it has one the
+/// accessor cannot read.
+fn read<T>(
+    address: &Address,
+    p_type: &'static str,
+    value: Option<T>,
+) -> Result<Option<T>, GooseError> {
+    match (address.get(p_type), value) {
+        (Some(_), None) => Err(GooseError::UnreadableAddressParameter(p_type)),
+        (_, value) => Ok(value),
     }
 }
 
@@ -1405,6 +1422,42 @@ mod tests {
             comm.vlan.map(|v| (v.priority.value(), v.vlan_id)),
             Some((2, 0))
         );
+    }
+
+    #[test]
+    fn values_written_another_way_give_the_same_parameters() {
+        let comm = CommParameters::from_address(&address(&[
+            ("MAC-Address", "01:0c:cd:01:00:05"),
+            ("APPID", "3a01"),
+            ("VLAN-ID", "7b"),
+            ("VLAN-PRIORITY", "06"),
+        ]))
+        .expect("readable address");
+        assert_eq!(
+            comm,
+            CommParameters::new(0x3a01, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05]).with_vlan(VlanTag {
+                priority: VlanPriority::new(6).unwrap(),
+                vlan_id: 0x07b,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unreadable_parameter_gives_no_parameters() {
+        for (t, v) in [
+            ("MAC-Address", "01-0C-CD-01-00"),
+            ("APPID", "10000"),
+            ("VLAN-ID", "1000"),
+            ("VLAN-PRIORITY", "8"),
+        ] {
+            let mut params = vec![("MAC-Address", "01-0C-CD-01-00-05")];
+            params.retain(|(p, _)| *p != t);
+            params.push((t, v));
+            match CommParameters::from_address(&address(&params)) {
+                Err(GooseError::UnreadableAddressParameter(p)) => assert_eq!(p, t),
+                other => panic!("{t} `{v}`: {other:?}"),
+            }
+        }
     }
 
     #[test]

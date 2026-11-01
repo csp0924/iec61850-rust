@@ -11,24 +11,28 @@
 //! one naming an IED the file lacks included, as a configuration file often
 //! carries the connections of IEDs it does not describe.
 //!
-//! A `<P>` value is checked against the form its type prescribes: the
-//! patterns of the `tP_` types of the schema and the character rules of
-//! IEC 61850-8-1 §25.2 Table 162, §25.3.2 Table 163 and §25.3.3 Table 164, and
-//! of IEC 61850-9-2 Clause 11 Table 19. A value that breaks them fails the
-//! model build of the IED it belongs to; stage 2 only warns about it, so an
-//! invalid address of another IED of an SCD does not prevent building this
-//! one.
+//! A `<P>` value is compared with the schema form of its type: the patterns of
+//! the `tP_` types of the schema and the character rules of IEC 61850-8-1
+//! §25.2 Table 162, §25.3.2 Table 163 and §25.3.3 Table 164, and of
+//! IEC 61850-9-2 Clause 11 Table 19. Stage 2 warns about every value that
+//! breaks it, with its position, type and value and the schema form, and
+//! tells whether it still reads without ambiguity, and as what. White space
+//! around a value is read past. Either way the value is
+//! kept as written: one that reads is read by the accessors of the model, and
+//! one that does not fails only where it is used, as when a GOOSE control block
+//! takes its destination from it. A `<P>` of no address parameter type, or
+//! with an empty value, is left out of the address.
 //!
 //! The run-time build and the build script share [`connected_access_points`],
 //! [`gse_addresses`], [`smv_addresses`], [`attach_gse`] and [`attach_smv`], so
 //! a generated model carries the same addressing as one built at run time.
 
 use iec61850_model::comm::{
-    check_parameter, Address, AddressError, ConnectedAccessPoint, GseAddress,
+    schema_form, schema_value, value_form, Address, ConnectedAccessPoint, GseAddress, ValueForm,
 };
 use iec61850_model::tree::IedModel;
 
-use crate::error::{ErrorKind, SclParseError, SourceSpan};
+use crate::error::{ErrorKind, SclParseError};
 use crate::raw::{RawAddress, RawConnectedAp, RawScl, RawSubNetwork};
 
 /// Warns about every reference of the Communication section that names
@@ -198,7 +202,8 @@ fn check_connected_ap(
 }
 
 /// Warns about each `<P>` of the connected access point, and of its `<GSE>`
-/// and `<SMV>`, whose value its type does not accept.
+/// and `<SMV>`, whose value is not in the schema form of its type, saying
+/// whether it still reads, and about each one left out of the address.
 fn warn_invalid_parameters(cap: &RawConnectedAp) {
     let addresses = cap
         .address
@@ -206,69 +211,54 @@ fn warn_invalid_parameters(cap: &RawConnectedAp) {
         .chain(cap.gses.iter().filter_map(|g| g.address.as_ref()))
         .chain(cap.smvs.iter().filter_map(|m| m.address.as_ref()));
     for p in addresses.flat_map(|a| &a.parameters) {
-        if let Err(e) = check_parameter(&p.p_type, &p.value) {
+        if Address::new()
+            .push(p.p_type.clone(), p.value.clone())
+            .is_err()
+        {
             tracing::warn!(
                 target: "iec61850_scl::communication",
                 line = p.span.line,
                 col = p.span.col,
-                "{e} in the Communication section of the IED `{}`; the model of that IED \
-                 cannot be built",
+                p_type = %p.p_type,
+                value = %p.value,
+                "the `<P>` of the IED `{}` is not an address parameter of a known type with \
+                 a non-empty value; it is left out of the address",
                 cap.ied_name,
             );
+            continue;
         }
+        let outcome = match value_form(&p.p_type, &p.value) {
+            ValueForm::Canonical => continue,
+            ValueForm::Readable => match schema_value(&p.p_type, &p.value) {
+                Some(read) => format!("it is read as `{read}`"),
+                None => continue,
+            },
+            _ => "it cannot be read, and a use of it fails".to_string(),
+        };
+        tracing::warn!(
+            target: "iec61850_scl::communication",
+            line = p.span.line,
+            col = p.span.col,
+            p_type = %p.p_type,
+            value = %p.value,
+            "the `{}` value `{}` of the IED `{}` is not in the schema form, {}; {outcome}",
+            p.p_type,
+            p.value,
+            cap.ied_name,
+            schema_form(&p.p_type),
+        );
     }
 }
 
-/// Converts an `<Address>` into an [`Address`], checking each `<P>`.
-///
-/// # Errors
-///
-/// [`ErrorKind::AttributeValueInvalid`] at the first `<P>` whose type or value
-/// is refused; a bad type names the `type` attribute.
-fn to_address(raw: &RawAddress, path: &str) -> Result<Address, SclParseError> {
+/// Converts an `<Address>` into an [`Address`], keeping each value as
+/// written and leaving out a `<P>` that [`Address::push`] refuses, which stage
+/// 2 has reported.
+fn to_address(raw: &RawAddress) -> Address {
     let mut address = Address::new();
     for p in &raw.parameters {
-        address
-            .push(p.p_type.clone(), p.value.clone())
-            .map_err(|e| address_error(e, p.span, format!("{path}/Address/P")))?;
+        let _ = address.push(p.p_type.clone(), p.value.clone());
     }
-    Ok(address)
-}
-
-/// Converts a refused `<P>` into an [`SclParseError`] at the element: a bad
-/// type names the `type` attribute, a bad value the element text.
-fn address_error(e: AddressError, span: SourceSpan, path: String) -> SclParseError {
-    match e {
-        AddressError::InvalidType { p_type, .. } => SclParseError::at(
-            span,
-            path,
-            ErrorKind::AttributeValueInvalid {
-                name: "type".to_string(),
-                expected_type: "a predefined address type, or an extension type of an \
-                                upper-case letter followed by letters, digits and hyphens"
-                    .to_string(),
-                raw_value: p_type,
-                cause: None,
-            },
-        )
-        .with_attribute("type"),
-        AddressError::InvalidValue {
-            p_type,
-            value,
-            expected,
-            ..
-        } => SclParseError::at(
-            span,
-            path,
-            ErrorKind::AttributeValueInvalid {
-                name: format!("P[type=\"{p_type}\"]"),
-                expected_type: expected.to_string(),
-                raw_value: value,
-                cause: None,
-            },
-        ),
-        other => SclParseError::at(span, path, ErrorKind::Xml(other.to_string())),
-    }
+    address
 }
 
 fn no_ld(cap: &RawConnectedAp, ld_inst: &str) -> String {
@@ -306,9 +296,7 @@ fn connected_aps_of<'a>(
 /// # Errors
 ///
 /// [`ErrorKind::SemanticConflict`] when a reference of a connected access
-/// point of the IED names nothing or a `MinTime` exceeds its `MaxTime`, and
-/// [`ErrorKind::AttributeValueInvalid`] at a `<P>` of the server address whose
-/// type or value is refused.
+/// point of the IED names nothing or a `MinTime` exceeds its `MaxTime`.
 pub fn connected_access_points(
     raw: &RawScl,
     ied_name: &str,
@@ -318,11 +306,7 @@ pub fn connected_access_points(
         .map(|(n, ap)| {
             let mut out = ConnectedAccessPoint::new(n.name.clone(), ap.ap_name.clone());
             out.sub_network_type = n.net_type.clone();
-            out.address = ap
-                .address
-                .as_ref()
-                .map(|a| to_address(a, &connected_ap_path(n, ap)))
-                .transpose()?;
+            out.address = ap.address.as_ref().map(to_address);
             Ok(out)
         })
         .collect()
@@ -338,8 +322,7 @@ pub fn connected_access_points(
 ///
 /// # Errors
 ///
-/// As [`connected_access_points`], and [`ErrorKind::AttributeValueInvalid`] at
-/// a `<P>` whose type or value is refused.
+/// As [`connected_access_points`].
 pub fn gse_addresses(
     raw: &RawScl,
     ied_name: &str,
@@ -355,16 +338,7 @@ pub fn gse_addresses(
                 warn_second_address(n, ap, "GSE", &gse.ld_inst, &gse.cb_name, gse.span.line);
                 continue;
             }
-            let path = format!(
-                "{}/GSE[ldInst=\"{}\",cbName=\"{}\"]",
-                connected_ap_path(n, ap),
-                gse.ld_inst,
-                gse.cb_name
-            );
-            let parameters = match &gse.address {
-                Some(a) => to_address(a, &path)?,
-                None => Address::new(),
-            };
+            let parameters = gse.address.as_ref().map(to_address).unwrap_or_default();
             let mut address = GseAddress::new(parameters);
             address.min_time_ms = gse.min_time_ms;
             address.max_time_ms = gse.max_time_ms;
@@ -384,8 +358,7 @@ pub fn gse_addresses(
 ///
 /// # Errors
 ///
-/// As [`connected_access_points`], and [`ErrorKind::AttributeValueInvalid`] at
-/// a `<P>` whose type or value is refused.
+/// As [`connected_access_points`].
 pub fn smv_addresses(
     raw: &RawScl,
     ied_name: &str,
@@ -401,16 +374,7 @@ pub fn smv_addresses(
                 warn_second_address(n, ap, "SMV", &smv.ld_inst, &smv.cb_name, smv.span.line);
                 continue;
             }
-            let path = format!(
-                "{}/SMV[ldInst=\"{}\",cbName=\"{}\"]",
-                connected_ap_path(n, ap),
-                smv.ld_inst,
-                smv.cb_name
-            );
-            let address = match &smv.address {
-                Some(a) => to_address(a, &path)?,
-                None => Address::new(),
-            };
+            let address = smv.address.as_ref().map(to_address).unwrap_or_default();
             out.push((smv.ld_inst.clone(), smv.cb_name.clone(), address));
         }
     }

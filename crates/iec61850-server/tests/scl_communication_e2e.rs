@@ -425,3 +425,52 @@ async fn a_gse_without_mac_address_disables_its_control_block() {
     assert_eq!(disabled.min_time_ms, Some(8));
     handle.stop().await;
 }
+
+/// A `<GSE>` whose values are written another way than the schema form, but
+/// read without ambiguity, gives its destination as read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gse_written_another_way_gives_its_destination() {
+    let server = server(model(
+        r#"<GSE ldInst="LD0" cbName="gcbTrip"><Address><P type="MAC-Address">01:0c:cd:01:00:07</P><P type="APPID">3a1</P><P type="VLAN-ID">1</P><P type="VLAN-PRIORITY">05</P></Address></GSE>"#,
+    ));
+    server.register_from_model().expect("register_from_model");
+    let trip = server
+        .gocb_registry()
+        .find(DOMAIN, "LLN0", "gcbTrip")
+        .expect("gcbTrip is registered");
+    assert!(trip.has_destination);
+    drop(trip);
+    let handle = server.start().await.expect("start");
+    let values = gocb_values(handle.bound_addr.port(), "gcbTrip").await;
+    assert_eq!(
+        values.dst_address.addr,
+        [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x07]
+    );
+    assert_eq!(values.dst_address.app_id, 0x3a1);
+    assert_eq!(values.dst_address.vlan_id, 1);
+    assert_eq!(values.dst_address.priority, 5);
+    handle.stop().await;
+}
+
+/// A `<GSE>` whose MAC address cannot be read loads, and its control block
+/// is registered disabled, as one without a layer 2 destination; every other
+/// control block is registered as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gse_with_an_unreadable_mac_address_disables_its_control_block() {
+    let server = server(model(
+        r#"<GSE ldInst="LD0" cbName="gcbTrip"><Address><P type="MAC-Address">01-0C-CD-01-00</P></Address></GSE>"#,
+    ));
+    let summary = server.register_from_model().expect("register_from_model");
+    assert_eq!(summary.gocbs, 2);
+    let trip = server
+        .gocb_registry()
+        .find(DOMAIN, "LLN0", "gcbTrip")
+        .expect("gcbTrip is registered");
+    assert!(!trip.has_destination);
+    drop(trip);
+    let handle = server.start().await.expect("start");
+    let values = gocb_values(handle.bound_addr.port(), "gcbTrip").await;
+    assert_eq!(values.dst_address.addr, [0; 6]);
+    assert!(!values.go_ena);
+    handle.stop().await;
+}

@@ -207,23 +207,47 @@ impl SvPublisherBuilder {
     /// is missing leaves the value the builder holds, by default
     /// `SV_DEFAULT_DST_MAC` and 0x4000 (IEC 61850-9-2 §5.3.3.4.2). The frames
     /// carry the 802.1Q tag: a missing `VLAN-ID` is 0 and a missing
-    /// `VLAN-PRIORITY` is 4 (IEC 61850-9-2 Table 7).
-    pub fn with_address(mut self, address: &Address) -> Self {
-        if let Some(mac) = address.mac_address() {
-            self.dst_mac = mac;
+    /// `VLAN-PRIORITY` is 4 (IEC 61850-9-2 Table 7). A value written another
+    /// way than the schema form is read as the accessors of [`Address`] read
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`SvError::UnreadableAddressParameter`] when the `MAC-Address`, `APPID`,
+    /// `VLAN-ID` or `VLAN-PRIORITY` holds a value that cannot be read.
+    pub fn with_address(mut self, address: &Address) -> Result<Self, SvError> {
+        let read = |p_type: &'static str, present: bool| {
+            if present {
+                Err(SvError::UnreadableAddressParameter(p_type))
+            } else {
+                Ok(())
+            }
+        };
+        match address.mac_address() {
+            Some(mac) => self.dst_mac = mac,
+            None => read("MAC-Address", address.get("MAC-Address").is_some())?,
         }
-        if let Some(app_id) = address.app_id() {
-            self.app_id = app_id;
+        match address.app_id() {
+            Some(app_id) => self.app_id = app_id,
+            None => read("APPID", address.get("APPID").is_some())?,
         }
         let default = VlanTag::default();
-        self.vlan = Some(VlanTag {
-            priority: address
-                .vlan_priority()
-                .and_then(|p| VlanPriority::new(p).ok())
-                .unwrap_or(default.priority),
-            vlan_id: address.vlan_id().unwrap_or(default.vlan_id),
-        });
-        self
+        let priority = match address.vlan_priority() {
+            Some(p) => VlanPriority::new(p)?,
+            None => {
+                read("VLAN-PRIORITY", address.get("VLAN-PRIORITY").is_some())?;
+                default.priority
+            }
+        };
+        let vlan_id = match address.vlan_id() {
+            Some(id) => id,
+            None => {
+                read("VLAN-ID", address.get("VLAN-ID").is_some())?;
+                default.vlan_id
+            }
+        };
+        self.vlan = Some(VlanTag { priority, vlan_id });
+        Ok(self)
     }
 
     /// Sets the S (simulate) bit of Reserved1, which marks the stream as sent
@@ -1309,7 +1333,11 @@ mod tests {
         ] {
             address.push(t, v).unwrap();
         }
-        let header = header_of(SvPublisherBuilder::new(SRC_MAC).with_address(&address));
+        let header = header_of(
+            SvPublisherBuilder::new(SRC_MAC)
+                .with_address(&address)
+                .unwrap(),
+        );
         assert_eq!(header.dst_mac, [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x01]);
         assert_eq!(header.app_id, 0x4001);
         assert_eq!(
@@ -1323,8 +1351,25 @@ mod tests {
 
     #[test]
     fn missing_address_parameters_keep_the_defaults() {
-        let header = header_of(SvPublisherBuilder::new(SRC_MAC).with_address(&Address::new()));
+        let header = header_of(
+            SvPublisherBuilder::new(SRC_MAC)
+                .with_address(&Address::new())
+                .unwrap(),
+        );
         assert_eq!(header.dst_mac, SV_DEFAULT_DST_MAC);
+        for (t, v) in [
+            ("MAC-Address", "01-0C-CD-04-00"),
+            ("APPID", "10000"),
+            ("VLAN-ID", "1000"),
+            ("VLAN-PRIORITY", "8"),
+        ] {
+            let mut unreadable = Address::new();
+            unreadable.push(t, v).unwrap();
+            match SvPublisherBuilder::new(SRC_MAC).with_address(&unreadable) {
+                Err(SvError::UnreadableAddressParameter(p)) => assert_eq!(p, t),
+                other => panic!("{t} `{v}`: {:?}", other.map(|_| ())),
+            }
+        }
         assert_eq!(header.app_id, SV_DEFAULT_APPID);
         assert_eq!(header.vlan, Some(VlanTag::default()));
     }

@@ -193,9 +193,11 @@ impl IedServer {
     ///   [without a destination](crate::goose_mapping::GoCBHandle::without_destination),
     ///   so it stays disabled and publishes nothing. A `<GSE>` whose address
     ///   has no `MAC-Address`, such as one for GOOSE over UDP/IP (IEC 61850-8-1
-    ///   §25.3.3 Table 164), gives no layer 2 destination: without
+    ///   §25.3.3 Table 164), or whose `MAC-Address`, `APPID`, `VLAN-ID` or
+    ///   `VLAN-PRIORITY` cannot be read, gives no layer 2 destination: without
     ///   `goose_comm` its control block is registered the same way, with a
-    ///   warning. The publisher stamps `t`, the time of the last stNum change
+    ///   warning; a value written another way that still reads is used as
+    ///   read. The publisher stamps `t`, the time of the last stNum change
     ///   (IEC 61850-8-1 §18.1.2.5), from [`FromModelOptions::wall_clock`]
     ///   with the [`time_quality`](crate::IedServerConfig::time_quality) of
     ///   the server configuration: once at registration, and again on every
