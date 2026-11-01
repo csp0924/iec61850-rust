@@ -16,17 +16,19 @@
 //! registry, so an object nothing registered is deliberately left out of the
 //! directory rather than advertised and then refused.
 //!
-//! That makes the three servers differ, and each line below is from a real run:
+//! That makes the three servers differ, and each line below is from a real run,
+//! except the number of named variables, written `N`: it counts every
+//! variable the server serves and so changes with the server and its version.
 //!
 //! - `server_from_scl` loads `examples/models/demo.cid` and registers both data
 //!   sets and both report control blocks, which is the transcript below.
 //!   `gcbStatus` is declared in the CID but never registered by that example,
 //!   so it is absent from the GOOSE control block list.
 //! - `min_server` loads the same CID and registers nothing, so it prints
-//!   `URCB: []`, `BRCB: []`, `DataSet: []` and 135 named variables.
+//!   `URCB: []`, `BRCB: []` and `DataSet: []`.
 //! - `server_with_reporting` builds its model in Rust and registers one report
 //!   control block and one data set, so it prints `URCB: ["urcbMeas"]`,
-//!   `BRCB: []`, `DataSet: ["dsMeas"]` and 129 named variables.
+//!   `BRCB: []` and `DataSet: ["dsMeas"]`.
 //!
 //! ```sh
 //! # Terminal 1
@@ -60,7 +62,9 @@
 //!     FloatingPoint(format=32, exponent=8)
 //! }
 //!
-//! device model refreshed: 1 LD, 137 named variables
+//! device model refreshed: 1 LD, N named variables
+//!
+//! disconnected
 //! ```
 //!
 //! Host and port default to `127.0.0.1` and `8102` and can be overridden.
