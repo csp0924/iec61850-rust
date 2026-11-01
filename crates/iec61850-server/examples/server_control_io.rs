@@ -1,9 +1,14 @@
 //! Serves the demonstration IED and exercises the control service.
 //!
 //! Loads `examples/models/demo.cid` and registers its one control point,
-//! `GGIO1.SPCSO1`, under the control model given on the command line. The four
-//! models of IEC 61850-7-2 differ in what a client must do before the value
-//! moves, so running the example once per model walks the whole matrix:
+//! `GGIO1.SPCSO1`, under the control model given on the command line. That
+//! model is written into the `ctlModel` attribute of the data object, which
+//! the server follows and a client reads to choose its sequence, replacing
+//! the value the CID declares.
+//!
+//! The four models of IEC 61850-7-2 differ in what a client must do before
+//! the value moves, so running the example once per model walks the whole
+//! matrix:
 //!
 //! | Argument | Control model | Client sequence |
 //! |---|---|---|
@@ -39,7 +44,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use iec61850_model::tree::IedModel;
-use iec61850_model::{ControlModel, MmsValue};
+use iec61850_model::{ControlModel, DoChild, MmsValue, FC};
 use iec61850_server::control::{
     AlwaysAcceptCheckHandler, AlwaysAcceptWaitHandler, AlwaysSuccessOperateHandler, CheckHandler,
     ControlAction, ControlAddCause, ControlHandler, ControlObject, ControlObjectConfig,
@@ -64,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
 
     let model = load_model(Path::new(DEMO_CID))?;
+    set_ctl_model(&model, ctl_model)?;
     let domain = model
         .ld_by_inst(LD_INST)
         .ok_or("the CID has no logical device LD0")?
@@ -148,6 +154,34 @@ fn register_control_object(
         .with_wait(Arc::new(AlwaysAcceptWaitHandler) as Arc<dyn WaitForExecutionHandler>)
         .with_operate(Arc::new(AlwaysSuccessOperateHandler) as Arc<dyn ControlHandler>);
     server.control_objects().register(entry);
+}
+
+/// Writes `ctl_model` into the `ctlModel` (FC=CF) attribute of the control
+/// point, so the model served, and the control object bound to it, use the
+/// model the command line selects.
+///
+/// # Errors
+///
+/// Returns an error when the CID declares no such attribute.
+fn set_ctl_model(
+    model: &IedModel,
+    ctl_model: ControlModel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let da = model
+        .ld_by_inst(LD_INST)
+        .and_then(|ld| ld.ln_by_name(LN_NAME))
+        .and_then(|ln| ln.do_by_name(DO_NAME))
+        .and_then(|data_object| {
+            data_object.children.iter().find_map(|child| match child {
+                DoChild::Da(da) if da.fc == FC::Cf && da.name == "ctlModel" => Some(da),
+                _ => None,
+            })
+        })
+        .ok_or("the CID declares no ctlModel for GGIO1.SPCSO1")?;
+    *da.value
+        .write()
+        .map_err(|_| "the ctlModel value lock is poisoned")? = MmsValue::Integer(ctl_model as i64);
+    Ok(())
 }
 
 /// Refuses every command, so a client sees the interlocking failure path.
