@@ -165,6 +165,16 @@ impl IedServer {
             .iter()
             .map(|rcb| self.rcb_data_set(&plan, rcb))
             .collect::<Result<Vec<_>>>()?;
+        for gocb in &plan.gocbs {
+            self.require_data_set(&plan, &gocb.data_set, || {
+                format!("GOOSE control block {}", gocb.reference)
+            })?;
+        }
+        for lcb in &plan.lcbs {
+            if let Some(key) = &lcb.data_set {
+                self.require_data_set(&plan, key, || lcb.description())?;
+            }
+        }
         let publishers = plan
             .gocbs
             .iter()
@@ -178,7 +188,7 @@ impl IedServer {
                     comm,
                     gocb.reference.clone(),
                     go_id,
-                    gocb.data_set.clone(),
+                    format!("{}/{}", gocb.data_set.0, gocb.data_set.1),
                     gocb.conf_rev,
                 )
                 .map_err(|e| {
@@ -233,8 +243,8 @@ impl IedServer {
                 .with_trg_ops(trigger_options(lcb.trg_ops))
                 .with_intg_pd_ms(lcb.intg_pd_ms)
                 .with_default_enabled(lcb.log_ena);
-            if let Some(ds) = &lcb.data_set {
-                block = block.with_dataset(ds.clone());
+            if let Some((_, name)) = &lcb.data_set {
+                block = block.with_dataset(name.clone());
             }
             block.include_reason_code = lcb.reason_code;
             // Binding the storage enables a block that starts enabled and
@@ -254,23 +264,40 @@ impl IedServer {
         let Some(key) = &rcb.data_set else {
             return Ok(Dataset::new(""));
         };
+        self.with_data_set(plan, key, Dataset::clone)
+            .ok_or_else(|| missing_data_set(&rcb.description(), key))
+    }
+
+    /// Fails when the data set `key` names is neither one of `plan` nor one
+    /// the server holds; `block` describes the control block naming it.
+    fn require_data_set(
+        &self,
+        plan: &Plan,
+        key: &(String, String),
+        block: impl FnOnce() -> String,
+    ) -> Result<()> {
+        self.with_data_set(plan, key, |_| ())
+            .ok_or_else(|| missing_data_set(&block(), key))
+    }
+
+    /// Applies `f` to the data set `key` names, one of `plan` or one the
+    /// server holds; `None` when there is none.
+    fn with_data_set<R>(
+        &self,
+        plan: &Plan,
+        key: &(String, String),
+        f: impl FnOnce(&Dataset) -> R,
+    ) -> Option<R> {
         if let Some((_, ds)) = plan
             .data_sets
             .iter()
             .find(|(domain, ds)| *domain == key.0 && ds.name == key.1)
         {
-            return Ok(ds.clone());
+            return Some(f(ds));
         }
-        self.dataset_registry()
-            .read()
-            .ok()
-            .and_then(|g| g.get(key).map(|ds| ds.as_ref().clone()))
-            .ok_or_else(|| {
-                ServerError::InvalidModel(format!(
-                    "report control block {}/{}.{} names the data set {}, which the server does not hold",
-                    rcb.domain, rcb.ln_name, rcb.block.name, key.1
-                ))
-            })
+        let registry = self.dataset_registry();
+        let g = registry.read().ok()?;
+        g.get(key).map(|ds| f(ds))
     }
 
     /// Fails when an item of `plan` is registered already.
@@ -319,6 +346,13 @@ impl IedServer {
     }
 }
 
+fn missing_data_set(block: &str, key: &(String, String)) -> ServerError {
+    ServerError::InvalidModel(format!(
+        "{block} names the data set {}, which the server does not hold",
+        key.1
+    ))
+}
+
 fn poisoned(what: &str) -> ServerError {
     ServerError::InvalidModel(format!("the {what} registry lock is poisoned"))
 }
@@ -342,14 +376,23 @@ struct RcbPlan {
     data_set: Option<(String, String)>,
 }
 
+impl RcbPlan {
+    fn description(&self) -> String {
+        format!(
+            "report control block {}/{}.{}",
+            self.domain, self.ln_name, self.block.name
+        )
+    }
+}
+
 struct GocbPlan {
     domain: String,
     ln_name: String,
     name: String,
     reference: String,
     go_id: String,
-    /// The data set reference, `<LD>/<LN>$<name>`.
-    data_set: String,
+    /// The registry key of the data set.
+    data_set: (String, String),
     conf_rev: u32,
 }
 
@@ -357,8 +400,8 @@ struct LcbPlan {
     domain: String,
     ln_name: String,
     name: String,
-    /// The data set as the log control block names it, `<LN>$<name>`.
-    data_set: Option<String>,
+    /// The registry key of the data set, `None` when the block names none.
+    data_set: Option<(String, String)>,
     log_ref: String,
     log_ena: bool,
     reason_code: bool,
@@ -373,6 +416,13 @@ impl LcbPlan {
 
     fn mms_path(&self) -> String {
         format!("{}/{}", self.domain, self.item())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "log control block {}/{}.{}",
+            self.domain, self.ln_name, self.name
+        )
     }
 }
 
@@ -447,7 +497,7 @@ impl Plan {
                         name: gocb.name.clone(),
                         reference,
                         go_id: gocb.go_id.clone(),
-                        data_set: format!("{}/{}", key.0, key.1),
+                        data_set: key,
                         conf_rev: gocb.conf_rev,
                     });
                 }
@@ -461,8 +511,7 @@ impl Plan {
                                 &format!("log control block {domain}/{ln_name}.{}", lcb.name),
                             )
                         })
-                        .transpose()?
-                        .map(|(_, name)| name);
+                        .transpose()?;
                     plan.lcbs.push(LcbPlan {
                         domain: domain.clone(),
                         ln_name: ln_name.clone(),

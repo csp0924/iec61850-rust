@@ -469,3 +469,84 @@ async fn two_instances_with_one_name_fail_the_call() {
         .is_empty());
     handle.stop().await;
 }
+
+/// The model of `FM_SCL` with `block`, the start of a control block element,
+/// naming the data set `Missing`, which neither the model nor the server
+/// holds, fails the call with an error naming `reference` before anything is
+/// registered: no data set, control block or control object is served.
+async fn a_missing_data_set_fails_the_whole_call(block: &str, reference: &str) {
+    assert!(FM_SCL.contains(block));
+    let scl = FM_SCL.replacen(block, &block.replace("\"Events\"", "\"Missing\""), 1);
+    let server = build_server(build_model_from(&scl));
+    match server.register_from_model() {
+        Err(ServerError::InvalidModel(why)) => {
+            assert!(why.contains(reference), "{why}");
+            assert!(why.contains("Missing"), "{why}");
+        }
+        other => panic!("expected InvalidModel, got {other:?}"),
+    }
+    {
+        let engine = server.reporting_engine();
+        let g = engine.lock().unwrap();
+        assert!(g.rcb_paths().is_empty());
+        assert!(g.brcb_paths().is_empty());
+    }
+    assert!(server.gocb_registry().is_empty());
+    assert!(server.log_controls().read().unwrap().is_empty());
+    assert!(server.control_objects().is_empty());
+    let handle = server.start().await.expect("start");
+    let mut c = connect(&handle).await;
+    assert!(names(&mut c, ObjectClass::NamedVariableList)
+        .await
+        .is_empty());
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_control_block_naming_a_missing_data_set_fails_the_call() {
+    a_missing_data_set_fails_the_whole_call(
+        r#"<ReportControl name="EventsBRCB" datSet="Events""#,
+        "LLN0.EventsBRCB",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_goose_control_block_naming_a_missing_data_set_fails_the_call() {
+    a_missing_data_set_fails_the_whole_call(
+        r#"<GSEControl name="gcbEvents" datSet="Events""#,
+        "LLN0$GO$gcbEvents",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_control_block_naming_a_missing_data_set_fails_the_call() {
+    a_missing_data_set_fails_the_whole_call(
+        r#"<LogControl name="EventLog" datSet="Events""#,
+        "LLN0.EventLog",
+    )
+    .await;
+}
+
+/// A GOOSE or log control block naming a data set the model does not declare
+/// but the application registered by hand is registered with it.
+#[test]
+fn a_control_block_may_name_a_data_set_registered_by_hand() {
+    let scl = FM_SCL
+        .replacen(
+            r#"<GSEControl name="gcbEvents" datSet="Events""#,
+            r#"<GSEControl name="gcbEvents" datSet="Manual""#,
+            1,
+        )
+        .replacen(
+            r#"<LogControl name="EventLog" datSet="Events""#,
+            r#"<LogControl name="EventLog" datSet="Manual""#,
+            1,
+        );
+    let server = build_server(build_model_from(&scl));
+    server.register_dataset(DOMAIN, Dataset::new("LLN0$Manual"));
+    let summary = server.register_from_model().expect("register_from_model");
+    assert_eq!(summary.gocbs, 1);
+    assert_eq!(summary.lcbs, 1);
+}
