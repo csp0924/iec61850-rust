@@ -98,12 +98,19 @@ impl ResolvedScl {
     /// the count. When the type gives that attribute no `<Val>`, the count is
     /// left naming it, and the model builder takes it from each instance.
     ///
+    /// The `datSet` of every report, log, GOOSE and sampled value control
+    /// block names a `<DataSet>` of its own logical node, as the keys of the
+    /// SCL schema require (IEC 61850-6 Annex A.4); an absent or empty
+    /// `datSet` names none.
+    ///
     /// # Errors
     ///
     /// [`ErrorKind::UnresolvedTypeReference`] when a reference does not
     /// resolve; the element path names the full logical node, data object and
     /// data attribute path of the reference, and the span is that of the
-    /// referencing element. [`ErrorKind::SemanticConflict`] when structure or
+    /// referencing element. [`ErrorKind::UnresolvedDataSetReference`] when a
+    /// control block names a data set its logical node does not declare, at
+    /// the control block. [`ErrorKind::SemanticConflict`] when structure or
     /// sub-object references form a cycle, nest deeper than 32 levels, or
     /// expand an IED or a type to more than
     /// [`ResolveOptions::max_expanded_nodes`] nodes, array elements and
@@ -234,6 +241,7 @@ impl ResolvedScl {
 
         // With every chain acyclic and bounded, the expansion sizes are finite.
         check_expanded_nodes(&raw, options.max_expanded_nodes)?;
+        check_data_set_references(&raw)?;
 
         Ok(Self {
             raw,
@@ -634,6 +642,67 @@ fn check_bda_recursive(
         )?);
     }
     Ok(below)
+}
+
+/// Rejects a control block whose `datSet` names no `<DataSet>` of its own
+/// logical node. The SCL schema keys the data sets of a logical node by name
+/// and makes the `datSet` of each report, log, GOOSE and sampled value
+/// control block in it refer to one of them (IEC 61850-6 Annex A.4,
+/// `DataSetKeyLN0`, `DataSetKeyInLN`). An absent or empty `datSet` names no
+/// data set and is accepted.
+fn check_data_set_references(raw: &RawScl) -> Result<(), SclParseError> {
+    for ied in &raw.ieds {
+        for ap in &ied.access_points {
+            let Some(server) = ap.server.as_ref() else {
+                continue;
+            };
+            for ld in &server.logical_devices {
+                for ln in &ld.logical_nodes {
+                    let blocks =
+                        ln.report_controls
+                            .iter()
+                            .map(|b| ("ReportControl", &b.name, b.dat_set.as_deref(), b.span))
+                            .chain(
+                                ln.log_controls.iter().map(|b| {
+                                    ("LogControl", &b.name, b.data_set.as_deref(), b.span)
+                                }),
+                            )
+                            .chain(ln.gse_controls.iter().map(|b| {
+                                ("GSEControl", &b.name, Some(b.data_set.as_str()), b.span)
+                            }))
+                            .chain(ln.smv_controls.iter().map(|b| {
+                                (
+                                    "SampledValueControl",
+                                    &b.name,
+                                    Some(b.data_set.as_str()),
+                                    b.span,
+                                )
+                            }));
+                    for (element, name, data_set, span) in blocks {
+                        let Some(data_set) = data_set.filter(|d| !d.is_empty()) else {
+                            continue;
+                        };
+                        if ln.data_sets.iter().any(|ds| ds.name == data_set) {
+                            continue;
+                        }
+                        let path = format!(
+                            "SCL/IED[name=\"{}\"]/AccessPoint[name=\"{}\"]/Server/LDevice[inst=\"{}\"]/LN[lnClass=\"{}\",inst=\"{}\"]/{element}[name=\"{name}\"]",
+                            ied.name, ap.name, ld.inst, ln.ln_class, ln.inst
+                        );
+                        return Err(SclParseError::at(
+                            span,
+                            path,
+                            ErrorKind::UnresolvedDataSetReference {
+                                data_set: data_set.to_string(),
+                            },
+                        )
+                        .with_attribute("datSet"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rejects an IED, or a type of the DataTypeTemplates, whose model expansion

@@ -17,7 +17,7 @@ use iec61850_mms::mms::pdu::get_name_list::ObjectClass;
 use iec61850_mms::mms::pdu::information_report::{decode_information_report, VariableAccessSpec};
 use iec61850_mms::mms::pdu::DataAccessError;
 use iec61850_mms::mms::MmsData;
-use iec61850_model::{DoChild, IedModel, FC};
+use iec61850_model::{DoChild, IedModel, LogicalNode, FC};
 use iec61850_server::control::{
     AlwaysSuccessOperateHandler, ControlHandler, ControlObject, ControlObjectConfig,
     ControlObjectEntry,
@@ -99,6 +99,25 @@ fn build_model_from(scl: &str) -> Arc<IedModel> {
             .build_model("Fm")
             .expect("build"),
     )
+}
+
+/// The model of `FM_SCL` with `edit` applied to its LLN0, for a model an SCL
+/// file cannot describe, such as a control block naming a data set its
+/// logical node does not declare.
+fn build_model_with(edit: impl FnOnce(&mut LogicalNode)) -> Arc<IedModel> {
+    let raw = iec61850_scl::parse_scl(FM_SCL).expect("parse");
+    let mut model = raw
+        .resolve()
+        .expect("resolve")
+        .build_model("Fm")
+        .expect("build");
+    let lln0 = model.lds[0]
+        .lns
+        .iter_mut()
+        .find(|ln| ln.full_name() == "LLN0")
+        .expect("LLN0");
+    edit(lln0);
+    Arc::new(model)
 }
 
 /// `FM_SCL` with `extra` added to LLN0 after the data set.
@@ -470,14 +489,15 @@ async fn two_instances_with_one_name_fail_the_call() {
     handle.stop().await;
 }
 
-/// The model of `FM_SCL` with `block`, the start of a control block element,
+/// The model of `FM_SCL` with a control block of LLN0, which `edit` selects,
 /// naming the data set `Missing`, which neither the model nor the server
 /// holds, fails the call with an error naming `reference` before anything is
 /// registered: no data set, control block or control object is served.
-async fn a_missing_data_set_fails_the_whole_call(block: &str, reference: &str) {
-    assert!(FM_SCL.contains(block));
-    let scl = FM_SCL.replacen(block, &block.replace("\"Events\"", "\"Missing\""), 1);
-    let server = build_server(build_model_from(&scl));
+async fn a_missing_data_set_fails_the_whole_call(
+    edit: impl FnOnce(&mut LogicalNode),
+    reference: &str,
+) {
+    let server = build_server(build_model_with(edit));
     match server.register_from_model() {
         Err(ServerError::InvalidModel(why)) => {
             assert!(why.contains(reference), "{why}");
@@ -505,7 +525,10 @@ async fn a_missing_data_set_fails_the_whole_call(block: &str, reference: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_report_control_block_naming_a_missing_data_set_fails_the_call() {
     a_missing_data_set_fails_the_whole_call(
-        r#"<ReportControl name="EventsBRCB" datSet="Events""#,
+        |ln| {
+            let rcb = ln.rcbs.iter_mut().find(|b| b.name == "EventsBRCB");
+            rcb.expect("EventsBRCB").dataset_ref = "Missing".into();
+        },
         "LLN0.EventsBRCB",
     )
     .await;
@@ -514,7 +537,7 @@ async fn a_report_control_block_naming_a_missing_data_set_fails_the_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_goose_control_block_naming_a_missing_data_set_fails_the_call() {
     a_missing_data_set_fails_the_whole_call(
-        r#"<GSEControl name="gcbEvents" datSet="Events""#,
+        |ln| ln.gocbs[0].dataset_ref = "Missing".into(),
         "LLN0$GO$gcbEvents",
     )
     .await;
@@ -523,7 +546,7 @@ async fn a_goose_control_block_naming_a_missing_data_set_fails_the_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_log_control_block_naming_a_missing_data_set_fails_the_call() {
     a_missing_data_set_fails_the_whole_call(
-        r#"<LogControl name="EventLog" datSet="Events""#,
+        |ln| ln.lcbs[0].dataset_ref = "Missing".into(),
         "LLN0.EventLog",
     )
     .await;
@@ -533,18 +556,10 @@ async fn a_log_control_block_naming_a_missing_data_set_fails_the_call() {
 /// but the application registered by hand is registered with it.
 #[test]
 fn a_control_block_may_name_a_data_set_registered_by_hand() {
-    let scl = FM_SCL
-        .replacen(
-            r#"<GSEControl name="gcbEvents" datSet="Events""#,
-            r#"<GSEControl name="gcbEvents" datSet="Manual""#,
-            1,
-        )
-        .replacen(
-            r#"<LogControl name="EventLog" datSet="Events""#,
-            r#"<LogControl name="EventLog" datSet="Manual""#,
-            1,
-        );
-    let server = build_server(build_model_from(&scl));
+    let server = build_server(build_model_with(|ln| {
+        ln.gocbs[0].dataset_ref = "Manual".into();
+        ln.lcbs[0].dataset_ref = "Manual".into();
+    }));
     server.register_dataset(DOMAIN, Dataset::new("LLN0$Manual"));
     let summary = server.register_from_model().expect("register_from_model");
     assert_eq!(summary.gocbs, 1);

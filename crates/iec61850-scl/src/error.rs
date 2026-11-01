@@ -124,6 +124,18 @@ pub enum ErrorKind {
         type_id: String,
     },
 
+    /// Stage 2: the `datSet` of a control block names no `<DataSet>` of its
+    /// logical node.
+    ///
+    /// The element path is that of the control block; the attribute is
+    /// `datSet`.
+    #[error("no DataSet named `{data_set}` is declared in the logical node of the control block")]
+    #[non_exhaustive]
+    UnresolvedDataSetReference {
+        /// The data set name that did not resolve.
+        data_set: String,
+    },
+
     /// The same identifier appears twice, such as two logical devices sharing
     /// one instance name, which SCL forbids.
     #[error("`{element}` has a duplicate `{key}=\"{value}\"`; the first is at {first_span}")]
