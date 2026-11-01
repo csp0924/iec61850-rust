@@ -5,11 +5,14 @@
 //! [`crate::resolved`], turns each reference into the type it names.
 //!
 //! Covered here: IED, AccessPoint, Server, LDevice, LN, DOI, DAI, DataSet, the
-//! control blocks, and the DataTypeTemplates type system. The Substation and
-//! Communication sections have placeholders only; the parser skips those
-//! subtrees and emits a `tracing::warn!` naming the element, line and column.
+//! control blocks, the DataTypeTemplates type system, and the Communication
+//! section. The Substation section has a placeholder only; the parser skips
+//! that subtree and emits a `tracing::warn!` naming the element, line and
+//! column.
 
 use std::collections::BTreeMap;
+
+use iec61850_model::comm::Address;
 
 use crate::error::SourceSpan;
 
@@ -707,6 +710,91 @@ pub struct RawEnumValue {
     pub name: String,
     /// The `desc` attribute.
     pub desc: Option<String>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+// ------------------------------------------------------------------------
+// The Communication section (IEC 61850-6 §9.4)
+// ------------------------------------------------------------------------
+
+/// The `<Communication>` section.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RawCommunication {
+    /// The `<SubNetwork>` children, in document order.
+    pub sub_networks: Vec<RawSubNetwork>,
+}
+
+/// A `<SubNetwork>` element.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawSubNetwork {
+    /// The `name` attribute, unique in the file.
+    pub name: String,
+    /// The `desc` attribute.
+    pub desc: Option<String>,
+    /// The `type` attribute, the protocol of the subnetwork, for example
+    /// `8-MMS`.
+    pub net_type: Option<String>,
+    /// The `<ConnectedAP>` children, in document order.
+    pub connected_aps: Vec<RawConnectedAp>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// A `<ConnectedAP>` element: an access point of an IED connected to the
+/// subnetwork.
+///
+/// The `<PhysConn>` children describe cabling only and are not read.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawConnectedAp {
+    /// The `iedName` attribute.
+    pub ied_name: String,
+    /// The `apName` attribute.
+    pub ap_name: String,
+    /// The server address of the access point, from its `<Address>`.
+    pub address: Option<Address>,
+    /// The `<GSE>` children, in document order.
+    pub gses: Vec<RawGse>,
+    /// The `<SMV>` children, in document order.
+    pub smvs: Vec<RawSmv>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// A `<GSE>` element: the addressing of a GOOSE control block of the IED.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawGse {
+    /// The `ldInst` attribute, the logical device whose `LLN0` holds the
+    /// control block.
+    pub ld_inst: String,
+    /// The `cbName` attribute, the name of the `<GSEControl>`.
+    pub cb_name: String,
+    /// The `<Address>` child.
+    pub address: Option<Address>,
+    /// The `<MinTime>` child, in milliseconds.
+    pub min_time_ms: Option<u32>,
+    /// The `<MaxTime>` child, in milliseconds.
+    pub max_time_ms: Option<u32>,
+    /// Where the element starts in the source XML.
+    pub span: SourceSpan,
+}
+
+/// An `<SMV>` element: the address of a sampled values control block of the
+/// IED.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawSmv {
+    /// The `ldInst` attribute, the logical device whose `LLN0` holds the
+    /// control block.
+    pub ld_inst: String,
+    /// The `cbName` attribute, the name of the `<SampledValueControl>`.
+    pub cb_name: String,
+    /// The `<Address>` child.
+    pub address: Option<Address>,
     /// Where the element starts in the source XML.
     pub span: SourceSpan,
 }

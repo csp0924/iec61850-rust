@@ -109,7 +109,11 @@ pub(crate) fn build_ied_model(
         ));
     }
 
-    model_b.build().map_err(|e| {
+    for ap in crate::communication::connected_access_points(raw, ied_name) {
+        model_b = model_b.add_connected_ap(ap);
+    }
+
+    let mut model = model_b.build().map_err(|e| {
         let detail = format!("the model builder rejected the IED: {}", e);
         if let ModelError::DataSetEntryUnresolved { dataset, entry, .. } = &e {
             if let Some((span, path)) = locate_fcda(ied, dataset, entry) {
@@ -121,7 +125,17 @@ pub(crate) fn build_ied_model(
             format!("SCL/IED[name=\"{}\"]", ied_name),
             ErrorKind::SemanticConflict { detail },
         )
-    })
+    })?;
+
+    // Stage 2 has checked that every GSE and SMV names a control block of
+    // this IED, so each one finds its control block.
+    for (ld_inst, cb_name, gse) in crate::communication::gse_addresses(raw, ied_name) {
+        crate::communication::attach_gse(&mut model, &ld_inst, &cb_name, gse);
+    }
+    for (ld_inst, cb_name, smv) in crate::communication::smv_addresses(raw, ied_name) {
+        crate::communication::attach_smv(&mut model, &ld_inst, &cb_name, smv);
+    }
+    Ok(model)
 }
 
 /// Finds the `<FCDA>` of the data set `dataset` in `ied` whose entry renders

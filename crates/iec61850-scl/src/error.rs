@@ -162,8 +162,8 @@ pub enum ErrorKind {
     /// A valid SCL construct this crate does not implement yet.
     ///
     /// Currently never constructed: the parser skips a construct it does not
-    /// implement, with a warning for `<Substation>` and `<Communication>` and
-    /// without one otherwise. The variant is reserved for a construct that
+    /// implement, with a warning for `<Substation>` and without one
+    /// otherwise. The variant is reserved for a construct that
     /// must be reported rather than skipped, because dropping it would change
     /// the model a client sees.
     // TODO: return this for a skipped construct that alters the resulting model.

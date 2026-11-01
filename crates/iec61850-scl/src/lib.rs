@@ -20,6 +20,7 @@
 
 pub mod attrs;
 mod build_model;
+mod communication;
 pub mod enums;
 pub mod error;
 pub mod parser;
@@ -87,6 +88,7 @@ pub mod __private {
         GooseControlBlock, LogControlBlock, OptFlds, ReportControlBlock, SettingGroupControlBlock,
         SvControlBlock,
     };
+    pub use iec61850_model::comm::{Address, ConnectedAccessPoint, GseAddress};
     pub use iec61850_model::fc::FC;
     pub use iec61850_model::tree::{
         DataAttribute, DataObject, DataSet, DataSetEntry, DoChild, IedModel,
@@ -100,6 +102,9 @@ pub mod __private {
         ld_domain_name, ld_num_of_sgs, log_trg_ops_to_model, opt_fields_to_model, parse_fc,
         parse_val_for_b_type, report_instances, report_settings, report_trg_ops_to_model,
         setting_view, sv_control_sv_id, template_initial_value, trg_ops_to_model,
+    };
+    pub use crate::communication::{
+        attach_gse, attach_smv, connected_access_points, gse_addresses, smv_addresses,
     };
     pub use crate::error::SourceSpan;
     pub use crate::raw::{OptionFieldsBits, TriggerOptionsBits};

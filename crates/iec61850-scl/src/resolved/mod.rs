@@ -243,6 +243,10 @@ impl ResolvedScl {
         check_expanded_nodes(&raw, options.max_expanded_nodes)?;
         check_data_set_references(&raw)?;
 
+        // The Communication section names IEDs, access points and control
+        // blocks; each has to exist.
+        crate::communication::check_communication(&raw)?;
+
         Ok(Self {
             raw,
             max_expanded_nodes: options.max_expanded_nodes,

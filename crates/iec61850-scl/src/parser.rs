@@ -12,12 +12,15 @@
 //! literal ends of a run are trimmed, while a reference replacement and the
 //! content of a CDATA section keep the whitespace the document spells out.
 //!
-//! `<Substation>` and `<Communication>`, direct children of `<SCL>` that carry
-//! nothing the model needs, are skipped as whole subtrees. Each skip emits a
-//! `tracing::warn!` naming the line, column and element, so nothing disappears
-//! silently: a real `.cid` almost always carries a `<Communication>` section
-//! with the GSE and SMV publisher addresses, which belong to the communication
-//! configuration rather than to the model.
+//! `<Substation>`, a direct child of `<SCL>` that carries nothing the model
+//! needs, is skipped as a whole subtree. Each skip emits a `tracing::warn!`
+//! naming the line, column and element, so nothing disappears silently.
+//!
+//! `<Communication>` is read: the subnetworks, the connected access points
+//! with their server addresses, and the `<GSE>` and `<SMV>` addressing of the
+//! control blocks. Every `<P>` value is checked against the form its type
+//! prescribes (IEC 61850-6 §9.4.3) as it is read. `<PhysConn>`, which
+//! describes cabling, is skipped without a warning.
 
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -25,12 +28,14 @@ use quick_xml::reader::Reader;
 use crate::attrs::{optional, parse_optional, parse_required, required};
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{
-    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawCount, RawDaDef, RawDaType, RawDai,
-    RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild, RawDoi, RawEnumType,
-    RawEnumValue, RawFcda, RawGseControl, RawIed, RawLNodeType, RawLogControl, RawLogicalDevice,
-    RawLogicalNode, RawReportControlBlock, RawReportSettings, RawSampledValueControl, RawScl,
-    RawSdi, RawSdoDef, RawServer, RawVal, SmvOptsBits, TriggerOptionsBits,
+    Header, OptionFieldsBits, RawAccessPoint, RawBda, RawCommunication, RawConnectedAp, RawCount,
+    RawDaDef, RawDaType, RawDai, RawDataInstance, RawDataSet, RawDoDef, RawDoType, RawDoTypeChild,
+    RawDoi, RawEnumType, RawEnumValue, RawFcda, RawGse, RawGseControl, RawIed, RawLNodeType,
+    RawLogControl, RawLogicalDevice, RawLogicalNode, RawReportControlBlock, RawReportSettings,
+    RawSampledValueControl, RawScl, RawSdi, RawSdoDef, RawServer, RawSmv, RawSubNetwork, RawVal,
+    SmvOptsBits, TriggerOptionsBits,
 };
+use iec61850_model::comm::{Address, AddressError};
 
 /// Parses an SCL XML string into the stage 1 raw AST.
 ///
@@ -320,22 +325,225 @@ fn handle_start(
                 ));
             }
         }
-        // Direct children of <SCL> that are skipped with a warning.
-        // A real .cid or .scd almost always carries them: <Communication> holds
-        // the GSE and SMV publisher addresses, <Substation> the logical node
-        // references of the single-line diagram. Neither contributes to the
-        // model, so the subtree is skipped and the warning keeps it visible.
-        "Substation" | "Communication" => {
+        // A direct child of <SCL> that is skipped with a warning. A real .scd
+        // often carries it: <Substation> holds the logical node references of
+        // the single-line diagram, which do not contribute to the model, so the
+        // subtree is skipped and the warning keeps it visible.
+        "Substation" => {
             tracing::warn!(
                 target: "iec61850_scl::parser",
                 element = %name,
                 line = span.line,
                 col = span.col,
-                "skipping the whole `<{}>` subtree; the communication and \
-                 substation information it carries does not enter the model",
+                "skipping the whole `<{}>` subtree; the substation information \
+                 it carries does not enter the model",
                 name,
             );
             state.enter_skip(name.clone());
+        }
+        // The Communication section (IEC 61850-6 §9.4)
+        "Communication" => {
+            if parent_tag.as_deref() != Some("SCL") {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::Xml("`<Communication>` must be a direct child of `<SCL>`".into()),
+                ));
+            }
+            if result.communication.is_some() {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::Xml("`<SCL>` may hold at most one `<Communication>`".into()),
+                ));
+            }
+            result.communication = Some(RawCommunication::default());
+        }
+        "SubNetwork" if parent_tag.as_deref() == Some("Communication") => {
+            let path = state.path_str();
+            let sub_network = RawSubNetwork {
+                name: required(start.attributes(), "name", span, &path)?,
+                desc: optional(start.attributes(), "desc"),
+                net_type: optional(start.attributes(), "type"),
+                connected_aps: Vec::new(),
+                span,
+            };
+            if sub_network.net_type.as_deref() == Some("") {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::AttributeValueInvalid {
+                        name: "type".to_string(),
+                        expected_type: "a non-empty protocol name".to_string(),
+                        raw_value: String::new(),
+                        cause: None,
+                    },
+                )
+                .with_attribute("type"));
+            }
+            let siblings = result.communication.iter().flat_map(|c| &c.sub_networks);
+            if let Some(dup) = siblings.into_iter().find(|n| n.name == sub_network.name) {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::DuplicateIdentifier {
+                        element: "SubNetwork".to_string(),
+                        key: "name".to_string(),
+                        value: sub_network.name.clone(),
+                        first_span: dup.span,
+                    },
+                ));
+            }
+            state.cur_sub_network = Some(sub_network);
+        }
+        "ConnectedAP"
+            if state.cur_sub_network.is_some() && parent_tag.as_deref() == Some("SubNetwork") =>
+        {
+            let path = state.path_str();
+            let ap = RawConnectedAp {
+                ied_name: required(start.attributes(), "iedName", span, &path)?,
+                ap_name: required(start.attributes(), "apName", span, &path)?,
+                address: None,
+                gses: Vec::new(),
+                smvs: Vec::new(),
+                span,
+            };
+            let siblings = state.cur_sub_network.iter().flat_map(|n| &n.connected_aps);
+            if let Some(dup) = siblings
+                .into_iter()
+                .find(|a| a.ied_name == ap.ied_name && a.ap_name == ap.ap_name)
+            {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::DuplicateIdentifier {
+                        element: "ConnectedAP".to_string(),
+                        key: "iedName+apName".to_string(),
+                        value: format!("{}/{}", ap.ied_name, ap.ap_name),
+                        first_span: dup.span,
+                    },
+                ));
+            }
+            state.cur_connected_ap = Some(ap);
+        }
+        "GSE" | "SMV"
+            if state.cur_connected_ap.is_some() && parent_tag.as_deref() == Some("ConnectedAP") =>
+        {
+            let path = state.path_str();
+            let ld_inst = required(start.attributes(), "ldInst", span, &path)?;
+            let cb_name = required(start.attributes(), "cbName", span, &path)?;
+            let first_span = state.cur_connected_ap.as_ref().and_then(|ap| {
+                if name == "GSE" {
+                    ap.gses
+                        .iter()
+                        .find(|g| g.ld_inst == ld_inst && g.cb_name == cb_name)
+                        .map(|g| g.span)
+                } else {
+                    ap.smvs
+                        .iter()
+                        .find(|m| m.ld_inst == ld_inst && m.cb_name == cb_name)
+                        .map(|m| m.span)
+                }
+            });
+            if let Some(first_span) = first_span {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::DuplicateIdentifier {
+                        element: name.clone(),
+                        key: "ldInst+cbName".to_string(),
+                        value: format!("{ld_inst}/{cb_name}"),
+                        first_span,
+                    },
+                ));
+            }
+            if name == "GSE" {
+                state.cur_gse = Some(RawGse {
+                    ld_inst,
+                    cb_name,
+                    address: None,
+                    min_time_ms: None,
+                    max_time_ms: None,
+                    span,
+                });
+            } else {
+                state.cur_smv = Some(RawSmv {
+                    ld_inst,
+                    cb_name,
+                    address: None,
+                    span,
+                });
+            }
+        }
+        "Address"
+            if matches!(parent_tag.as_deref(), Some("ConnectedAP" | "GSE" | "SMV"))
+                && (state.cur_connected_ap.is_some()) =>
+        {
+            let taken = match parent_tag.as_deref() {
+                Some("GSE") => state.cur_gse.as_ref().map(|g| g.address.is_some()),
+                Some("SMV") => state.cur_smv.as_ref().map(|m| m.address.is_some()),
+                _ => state.cur_connected_ap.as_ref().map(|a| a.address.is_some()),
+            };
+            if taken == Some(true) {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::Xml(format!(
+                        "`<{}>` may hold at most one `<Address>`",
+                        parent_tag.unwrap_or_default()
+                    )),
+                ));
+            }
+            state.cur_address = Some((Address::new(), span));
+        }
+        "P" if state.cur_address.is_some() && parent_tag.as_deref() == Some("Address") => {
+            let path = state.path_str();
+            let p_type = required(start.attributes(), "type", span, &path)?;
+            state.cur_p = Some((p_type, span, path));
+            state.comm_text.clear();
+            state.text_target = TextTarget::CommText;
+        }
+        "MinTime" | "MaxTime"
+            if state.cur_gse.is_some() && parent_tag.as_deref() == Some("GSE") =>
+        {
+            let path = state.path_str();
+            // tDurationInMilliSec fixes `unit` to `s` and `multiplier` to `m`
+            // whenever they are present.
+            for (attr, fixed) in [("unit", "s"), ("multiplier", "m")] {
+                if let Some(value) = optional(start.attributes(), attr) {
+                    if value != fixed {
+                        return Err(SclParseError::at(
+                            span,
+                            path,
+                            ErrorKind::AttributeValueInvalid {
+                                name: attr.to_string(),
+                                expected_type: format!("`{fixed}`"),
+                                raw_value: value,
+                                cause: None,
+                            },
+                        )
+                        .with_attribute(attr));
+                    }
+                }
+            }
+            let is_min = name == "MinTime";
+            let set = state.cur_gse.as_ref().is_some_and(|g| {
+                if is_min {
+                    g.min_time_ms.is_some()
+                } else {
+                    g.max_time_ms.is_some()
+                }
+            });
+            if set {
+                return Err(SclParseError::at(
+                    span,
+                    path,
+                    ErrorKind::Xml(format!("`<GSE>` may hold at most one `<{name}>`")),
+                ));
+            }
+            state.cur_duration = Some((is_min, span, path));
+            state.comm_text.clear();
+            state.text_target = TextTarget::CommText;
         }
         // The Header carries attributes only as far as the model is
         // concerned; its Text and History children are skipped.
@@ -1252,6 +1460,114 @@ fn handle_end(
         // TrgOps, OptFields and SmvOpts are attribute-only and were written into
         // their parent on start.
         "TrgOps" | "OptFields" | "SmvOpts" => {}
+        // The Communication section
+        "Communication" => {
+            if result
+                .communication
+                .as_ref()
+                .is_some_and(|c| c.sub_networks.is_empty())
+            {
+                return Err(SclParseError::at(
+                    span,
+                    state.path_str(),
+                    ErrorKind::MissingRequiredElement {
+                        name: "SubNetwork".to_string(),
+                    },
+                ));
+            }
+        }
+        "SubNetwork" => {
+            if let Some(sub_network) = state.cur_sub_network.take() {
+                if sub_network.connected_aps.is_empty() {
+                    return Err(SclParseError::at(
+                        span,
+                        state.path_str(),
+                        ErrorKind::MissingRequiredElement {
+                            name: "ConnectedAP".to_string(),
+                        },
+                    ));
+                }
+                if let Some(communication) = result.communication.as_mut() {
+                    communication.sub_networks.push(sub_network);
+                }
+            }
+        }
+        "ConnectedAP" => {
+            if let (Some(ap), Some(sub_network)) = (
+                state.cur_connected_ap.take(),
+                state.cur_sub_network.as_mut(),
+            ) {
+                sub_network.connected_aps.push(ap);
+            }
+        }
+        "GSE" => {
+            if let (Some(gse), Some(ap)) = (state.cur_gse.take(), state.cur_connected_ap.as_mut()) {
+                ap.gses.push(gse);
+            }
+        }
+        "SMV" => {
+            if let (Some(smv), Some(ap)) = (state.cur_smv.take(), state.cur_connected_ap.as_mut()) {
+                ap.smvs.push(smv);
+            }
+        }
+        "Address" => {
+            if let Some((address, _)) = state.cur_address.take() {
+                if address.is_empty() {
+                    return Err(SclParseError::at(
+                        span,
+                        state.path_str(),
+                        ErrorKind::MissingRequiredElement {
+                            name: "P".to_string(),
+                        },
+                    ));
+                }
+                if let Some(gse) = state.cur_gse.as_mut() {
+                    gse.address = Some(address);
+                } else if let Some(smv) = state.cur_smv.as_mut() {
+                    smv.address = Some(address);
+                } else if let Some(ap) = state.cur_connected_ap.as_mut() {
+                    ap.address = Some(address);
+                }
+            }
+        }
+        "P" => {
+            state.text_target = TextTarget::None;
+            let text = std::mem::take(&mut state.comm_text);
+            if let (Some((p_type, p_span, path)), Some((address, _))) =
+                (state.cur_p.take(), state.cur_address.as_mut())
+            {
+                address
+                    .push(p_type, text)
+                    .map_err(|e| address_error(e, p_span, path))?;
+            }
+        }
+        "MinTime" | "MaxTime" => {
+            state.text_target = TextTarget::None;
+            let text = std::mem::take(&mut state.comm_text);
+            if let Some((is_min, d_span, path)) = state.cur_duration.take() {
+                let ms = parse_duration_ms(&text).ok_or_else(|| {
+                    SclParseError::at(
+                        d_span,
+                        path,
+                        ErrorKind::AttributeValueInvalid {
+                            name: name.clone(),
+                            expected_type:
+                                "a whole number of milliseconds from 0 to 4294967295 (tDurationInMilliSec)"
+                                    .to_string(),
+                            raw_value: text.clone(),
+                            cause: None,
+                        },
+                    )
+                })?;
+                if let Some(gse) = state.cur_gse.as_mut() {
+                    if is_min {
+                        gse.min_time_ms = Some(ms);
+                    } else {
+                        gse.max_time_ms = Some(ms);
+                    }
+                }
+            }
+        }
         _ => {
             // Anything else was taken by the skip handler, so this arm is
             // normally unreachable.
@@ -1310,7 +1626,68 @@ fn handle_text(state: &mut ParserState<'_>, raw: &str) {
                 }
             }
         }
+        TextTarget::CommText => state.comm_text.push_str(raw),
     }
+}
+
+/// Converts a refused `<P>` into an [`SclParseError`] at the element: a bad
+/// type names the `type` attribute, a bad value the element text.
+fn address_error(e: AddressError, span: SourceSpan, path: String) -> SclParseError {
+    match e {
+        AddressError::InvalidType { p_type, .. } => SclParseError::at(
+            span,
+            path,
+            ErrorKind::AttributeValueInvalid {
+                name: "type".to_string(),
+                expected_type: "a predefined address type, or an extension type of an \
+                                upper-case letter followed by letters, digits and hyphens"
+                    .to_string(),
+                raw_value: p_type,
+                cause: None,
+            },
+        )
+        .with_attribute("type"),
+        AddressError::InvalidValue {
+            p_type,
+            value,
+            expected,
+            ..
+        } => SclParseError::at(
+            span,
+            path,
+            ErrorKind::AttributeValueInvalid {
+                name: format!("P[type=\"{p_type}\"]"),
+                expected_type: expected.to_string(),
+                raw_value: value,
+                cause: None,
+            },
+        ),
+        other => SclParseError::at(span, path, ErrorKind::Xml(other.to_string())),
+    }
+}
+
+/// Parses the text of a `tDurationInMilliSec`, an `xs:decimal` number of
+/// milliseconds, into a whole number of milliseconds.
+///
+/// A fraction is accepted only when it is zero, since the GOOSE control block
+/// carries `MinTime` and `MaxTime` as whole milliseconds; a negative value, or
+/// one above `u32::MAX`, is refused.
+fn parse_duration_ms(text: &str) -> Option<u32> {
+    let unsigned = text.strip_prefix('+').unwrap_or(text);
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (unsigned, ""),
+    };
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    if whole.is_empty() {
+        return Some(0);
+    }
+    whole.parse().ok()
 }
 
 /// Attaches an SDI or a DAI to the innermost open parent: the topmost SDI when
@@ -2130,6 +2507,24 @@ struct ParserState<'a> {
     cur_gse_control: Option<RawGseControl>,
     /// The SampledValueControl being assembled; valid only on an LN0.
     cur_smv_control: Option<RawSampledValueControl>,
+    // Communication scratch state
+    /// The SubNetwork being assembled.
+    cur_sub_network: Option<RawSubNetwork>,
+    /// The ConnectedAP being assembled inside the SubNetwork.
+    cur_connected_ap: Option<RawConnectedAp>,
+    /// The GSE being assembled inside the ConnectedAP.
+    cur_gse: Option<RawGse>,
+    /// The SMV being assembled inside the ConnectedAP.
+    cur_smv: Option<RawSmv>,
+    /// The Address being assembled, with where it starts.
+    cur_address: Option<(Address, SourceSpan)>,
+    /// The P being read: its type, where it starts and its element path.
+    cur_p: Option<(String, SourceSpan, String)>,
+    /// The MinTime (`true`) or MaxTime (`false`) being read, with where it
+    /// starts and its element path.
+    cur_duration: Option<(bool, SourceSpan, String)>,
+    /// The text of the current P, MinTime or MaxTime.
+    comm_text: String,
 }
 
 /// Names the field that the next text event feeds.
@@ -2150,6 +2545,9 @@ enum TextTarget {
     /// The setting group was recorded on start, so text accumulation only looks
     /// at the last slot.
     DaiVal,
+    /// The text of the current `<P>`, `<MinTime>` or `<MaxTime>` of the
+    /// Communication section, collected in `comm_text`.
+    CommText,
 }
 
 impl<'a> ParserState<'a> {
@@ -2179,6 +2577,14 @@ impl<'a> ParserState<'a> {
             cur_log_control: None,
             cur_gse_control: None,
             cur_smv_control: None,
+            cur_sub_network: None,
+            cur_connected_ap: None,
+            cur_gse: None,
+            cur_smv: None,
+            cur_address: None,
+            cur_p: None,
+            cur_duration: None,
+            comm_text: String::new(),
         }
     }
 
@@ -2502,18 +2908,21 @@ mod tests {
         );
     }
 
-    /// `<Substation>` and `<Communication>` are skipped, so a real `.cid` still
-    /// parses. Only the parse result is asserted: the skip also emits a
-    /// `tracing::warn!`, which this test does not capture.
+    /// `<Substation>` is skipped, so a real `.scd` still parses, and
+    /// `<Communication>` is read alongside it. Only the parse result is
+    /// asserted: the skip also emits a `tracing::warn!`, which this test does
+    /// not capture.
     #[test]
-    fn substation_and_communication_are_skipped_silently() {
+    fn substation_is_skipped_and_communication_is_read() {
         let xml = r#"<SCL>
   <Header id="H1"/>
   <Substation name="S1">
     <VoltageLevel name="VL1"/>
   </Substation>
   <Communication>
-    <SubNetwork name="W1"/>
+    <SubNetwork name="W1">
+      <ConnectedAP iedName="IED1" apName="AP1"/>
+    </SubNetwork>
   </Communication>
   <IED name="IED1">
     <AccessPoint name="AP1">
@@ -2523,10 +2932,15 @@ mod tests {
     </AccessPoint>
   </IED>
 </SCL>"#;
-        let raw = parse(xml)
-            .expect("Substation and Communication must be skipped, leaving the IED parseable");
+        let raw = parse(xml).expect("Substation must be skipped, leaving the IED parseable");
         assert_eq!(raw.ieds.len(), 1);
         assert_eq!(raw.ieds[0].name, "IED1");
+        let communication = raw.communication.expect("Communication is read");
+        assert_eq!(communication.sub_networks[0].name, "W1");
+        assert_eq!(
+            communication.sub_networks[0].connected_aps[0].ap_name,
+            "AP1"
+        );
     }
 
     /// A DataTypeTemplates section and an IED parse together.

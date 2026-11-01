@@ -13,13 +13,17 @@
 //! logical node, the children of a data object, the sub-attributes of a data
 //! attribute, and the entries of a data set.
 //!
-//! The summary covers structure and schema only. It is plain text, so it can
-//! be grepped and diffed; there is no binary form and no hash.
+//! The summary covers structure and schema only, the communication addressing
+//! included: a line per connected access point, kept in model order, and a
+//! line below each GOOSE or sampled values control block that has an address.
+//! A model without addressing summarizes to no such line. It is plain text, so
+//! it can be grepped and diffed; there is no binary form and no hash.
 
 use iec61850_model::cb::{
     GooseControlBlock, LogControlBlock, ReportControlBlock, SettingGroupControlBlock,
     SvControlBlock,
 };
+use iec61850_model::comm::Address;
 use iec61850_model::tree::{
     DataAttribute, DataObject, DataSet, DataSetEntry, DoChild, IedModel, LogicalDevice, LogicalNode,
 };
@@ -37,6 +41,18 @@ use std::fmt::Write;
 pub fn summarize_model(model: &IedModel) -> String {
     let mut out = String::with_capacity(4096);
     let _ = writeln!(out, "IED name={}", model.ied_name);
+    for ap in &model.connected_aps {
+        let _ = writeln!(
+            out,
+            "  ConnectedAP subNetwork={} type={} ap={} address={}",
+            ap.sub_network,
+            ap.sub_network_type.as_deref().unwrap_or("<None>"),
+            ap.ap_name,
+            ap.address
+                .as_ref()
+                .map_or("<None>".to_string(), address_text),
+        );
+    }
 
     let mut lds: Vec<&LogicalDevice> = model.lds.iter().collect();
     lds.sort_by(|a, b| a.inst.cmp(&b.inst));
@@ -130,6 +146,16 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
             "      GoCB name={} dataset={} confRev={} goID={}",
             cb.name, cb.dataset_ref, cb.conf_rev, cb.go_id,
         );
+        if let Some(gse) = &cb.gse {
+            let ms = |v: Option<u32>| v.map_or("<None>".to_string(), |v| v.to_string());
+            let _ = writeln!(
+                out,
+                "        GSE address={} minTime={} maxTime={}",
+                address_text(&gse.address),
+                ms(gse.min_time_ms),
+                ms(gse.max_time_ms),
+            );
+        }
     }
 
     // SvCBs
@@ -141,6 +167,9 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
             "      SvCB name={} dataset={} confRev={} svID={} multicast={}",
             cb.name, cb.dataset_ref, cb.conf_rev, cb.sv_id, cb.is_multicast,
         );
+        if let Some(smv) = &cb.smv {
+            let _ = writeln!(out, "        SMV address={}", address_text(smv));
+        }
     }
 
     // LCBs
@@ -165,6 +194,20 @@ fn write_ln(out: &mut String, ln: &LogicalNode) {
     if let Some(sgcb) = &ln.sgcb {
         write_sgcb(out, sgcb);
     }
+}
+
+/// Renders the parameters of an address in their order, as `type=value`
+/// separated by commas; an empty address renders as `<empty>`.
+fn address_text(address: &Address) -> String {
+    if address.is_empty() {
+        return "<empty>".to_string();
+    }
+    address
+        .parameters()
+        .iter()
+        .map(|p| format!("{}={}", p.p_type, p.value))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn write_do(out: &mut String, d: &DataObject, indent: usize) {

@@ -1,0 +1,521 @@
+//! The `<Communication>` section: the subnetworks, the connected access points
+//! with their server addresses, and the `<GSE>` and `<SMV>` addressing of the
+//! control blocks (IEC 61850-6 §9.4), checked as it is read and carried into
+//! the model of each IED.
+
+use std::net::Ipv4Addr;
+
+use iec61850_model::comm::Address;
+use iec61850_model::tree::IedModel;
+use iec61850_scl::{ErrorKind, SclParseError};
+
+/// Two IEDs: `IED1` with a GOOSE and a sampled values control block on
+/// `LD0`, and `IED2` with a GOOSE control block, so an SCD-like file can
+/// address both.
+fn scl(communication: &str) -> String {
+    format!(
+        r#"<SCL>
+  <Header id="comm"/>
+  {communication}
+  <IED name="IED1">
+    <AccessPoint name="AP1">
+      <Server>
+        <LDevice inst="LD0">
+          <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
+            <DataSet name="ds1">
+              <FCDA ldInst="LD0" lnClass="LLN0" doName="Mod" daName="stVal" fc="ST"/>
+            </DataSet>
+            <GSEControl name="gcb1" datSet="ds1" appID="G1" confRev="1"/>
+            <GSEControl name="gcb2" datSet="ds1" appID="G2" confRev="1"/>
+            <SampledValueControl name="svcb1" datSet="ds1" smvID="S1" smpRate="80" nofASDU="1" confRev="1"/>
+          </LN0>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+    <AccessPoint name="AP2"/>
+  </IED>
+  <IED name="IED2">
+    <AccessPoint name="AP1">
+      <Server>
+        <LDevice inst="LD0">
+          <LN0 inst="" lnClass="LLN0" lnType="LLN0_T">
+            <DataSet name="ds1">
+              <FCDA ldInst="LD0" lnClass="LLN0" doName="Mod" daName="stVal" fc="ST"/>
+            </DataSet>
+            <GSEControl name="gcb1" datSet="ds1" appID="H1" confRev="1"/>
+          </LN0>
+        </LDevice>
+      </Server>
+    </AccessPoint>
+  </IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="Mod" type="ENC_T"/>
+    </LNodeType>
+    <DOType id="ENC_T" cdc="ENC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN" dchg="true"/>
+    </DOType>
+  </DataTypeTemplates>
+</SCL>"#
+    )
+}
+
+/// A `<Communication>` with one subnetwork holding `body`.
+fn subnetwork(body: &str) -> String {
+    scl(&format!(
+        r#"<Communication>
+    <SubNetwork name="W01" type="8-MMS">
+      {body}
+    </SubNetwork>
+  </Communication>"#
+    ))
+}
+
+/// A connected access point `IED1`/`AP1` holding `body`.
+fn ied1_ap(body: &str) -> String {
+    subnetwork(&format!(
+        r#"<ConnectedAP iedName="IED1" apName="AP1">
+        {body}
+      </ConnectedAP>"#
+    ))
+}
+
+/// A `<GSE>` for `IED1`/`LD0`/`gcb1` whose address holds one parameter.
+fn gse_with_p(p_type: &str, value: &str) -> String {
+    ied1_ap(&format!(
+        r#"<GSE ldInst="LD0" cbName="gcb1">
+          <Address><P type="{p_type}">{value}</P></Address>
+        </GSE>"#
+    ))
+}
+
+fn try_build(xml: &str, ied: &str) -> Result<IedModel, SclParseError> {
+    iec61850_scl::parse_scl(xml)?.resolve()?.build_model(ied)
+}
+
+fn build(xml: &str, ied: &str) -> IedModel {
+    try_build(xml, ied).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn error(xml: &str) -> SclParseError {
+    match try_build(xml, "IED1") {
+        Ok(_) => panic!("the file was accepted"),
+        Err(e) => e,
+    }
+}
+
+const FULL: &str = r#"<Communication>
+    <SubNetwork name="W01" type="8-MMS">
+      <Text>Station bus</Text>
+      <BitRate unit="b/s" multiplier="M">100</BitRate>
+      <ConnectedAP iedName="IED1" apName="AP1">
+        <Address>
+          <P type="IP">10.0.0.11</P>
+          <P type="IP-SUBNET">255.255.255.0</P>
+          <P type="IP-GATEWAY">10.0.0.101</P>
+          <P type="OSI-TSEL">00000001</P>
+          <P type="OSI-PSEL">01</P>
+          <P type="OSI-SSEL">0001</P>
+          <P type="OSI-AP-Title">1,1,9999,1</P>
+          <P type="OSI-AE-Qualifier">12</P>
+          <P type="MMS-Port">102</P>
+        </Address>
+        <GSE ldInst="LD0" cbName="gcb1">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-01-00-05</P>
+            <P type="APPID">3A01</P>
+            <P type="VLAN-ID">07B</P>
+            <P type="VLAN-PRIORITY">6</P>
+          </Address>
+          <MinTime unit="s" multiplier="m">8</MinTime>
+          <MaxTime unit="s" multiplier="m">2000</MaxTime>
+        </GSE>
+        <SMV ldInst="LD0" cbName="svcb1">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-04-00-01</P>
+            <P type="APPID">4001</P>
+          </Address>
+        </SMV>
+        <PhysConn type="Connection">
+          <P type="Type">FOC</P>
+          <P type="Plug">ST</P>
+        </PhysConn>
+      </ConnectedAP>
+      <ConnectedAP iedName="IED2" apName="AP1">
+        <GSE ldInst="LD0" cbName="gcb1">
+          <Address><P type="MAC-Address">01-0C-CD-01-00-09</P></Address>
+        </GSE>
+      </ConnectedAP>
+    </SubNetwork>
+    <SubNetwork name="P01">
+      <ConnectedAP iedName="IED1" apName="AP2">
+        <Address><P type="IP">192.168.1.5</P></Address>
+      </ConnectedAP>
+    </SubNetwork>
+  </Communication>"#;
+
+/// Every element of the section reaches the raw AST, in document order.
+#[test]
+fn the_section_is_read_into_the_raw_ast() {
+    let raw = iec61850_scl::parse_scl(&scl(FULL)).expect("parse");
+    let communication = raw.communication.as_ref().expect("Communication");
+    let names: Vec<&str> = communication
+        .sub_networks
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect();
+    assert_eq!(names, ["W01", "P01"]);
+    let w01 = &communication.sub_networks[0];
+    assert_eq!(w01.net_type.as_deref(), Some("8-MMS"));
+    assert_eq!(w01.connected_aps.len(), 2);
+    let ap = &w01.connected_aps[0];
+    assert_eq!((ap.ied_name.as_str(), ap.ap_name.as_str()), ("IED1", "AP1"));
+    assert_eq!(ap.address.as_ref().map(|a| a.parameters().len()), Some(9));
+    let gse = &ap.gses[0];
+    assert_eq!(
+        (gse.ld_inst.as_str(), gse.cb_name.as_str()),
+        ("LD0", "gcb1")
+    );
+    assert_eq!((gse.min_time_ms, gse.max_time_ms), (Some(8), Some(2000)));
+    assert_eq!(ap.smvs[0].cb_name, "svcb1");
+    assert_eq!(communication.sub_networks[1].net_type, None);
+}
+
+/// The model of an IED holds its own connected access points, with their
+/// server addresses, and the addressing of its own control blocks.
+#[test]
+fn the_model_holds_the_addressing_of_its_ied() {
+    let model = build(&scl(FULL), "IED1");
+
+    assert_eq!(model.connected_aps.len(), 2);
+    let ap1 = &model.connected_aps[0];
+    assert_eq!(ap1.sub_network, "W01");
+    assert_eq!(ap1.sub_network_type.as_deref(), Some("8-MMS"));
+    assert_eq!(ap1.ap_name, "AP1");
+    let address = ap1.address.as_ref().expect("server address");
+    assert_eq!(address.ip(), Some(Ipv4Addr::new(10, 0, 0, 11)));
+    assert_eq!(address.ip_subnet(), Some(Ipv4Addr::new(255, 255, 255, 0)));
+    assert_eq!(address.ip_gateway(), Some(Ipv4Addr::new(10, 0, 0, 101)));
+    assert_eq!(address.osi_tsel(), Some(vec![0, 0, 0, 1]));
+    assert_eq!(address.osi_psel(), Some(vec![1]));
+    assert_eq!(address.osi_ssel(), Some(vec![0, 1]));
+    assert_eq!(address.osi_ap_title(), Some(vec![1, 1, 9999, 1]));
+    assert_eq!(address.osi_ae_qualifier(), Some(12));
+    assert_eq!(address.mms_port(), Some(102));
+    let ap2: Vec<_> = model.connected_ap("AP2").collect();
+    assert_eq!(ap2.len(), 1);
+    assert_eq!(ap2[0].sub_network, "P01");
+    assert_eq!(
+        ap2[0].address.as_ref().and_then(Address::ip),
+        Some(Ipv4Addr::new(192, 168, 1, 5))
+    );
+
+    let gse = model.gse_address("LD0", "gcb1").expect("GSE of gcb1");
+    assert_eq!(
+        gse.address.mac_address(),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05])
+    );
+    assert_eq!(gse.address.app_id(), Some(0x3a01));
+    assert_eq!(gse.address.vlan_id(), Some(0x07b));
+    assert_eq!(gse.address.vlan_priority(), Some(6));
+    assert_eq!((gse.min_time_ms, gse.max_time_ms), (Some(8), Some(2000)));
+    let lln0 = &model.lds[0].lns[0];
+    assert_eq!(lln0.gocbs[0].gse.as_ref(), Some(gse));
+
+    let smv = model.smv_address("LD0", "svcb1").expect("SMV of svcb1");
+    assert_eq!(
+        smv.mac_address(),
+        Some([0x01, 0x0c, 0xcd, 0x04, 0x00, 0x01])
+    );
+    assert_eq!(smv.app_id(), Some(0x4001));
+    assert_eq!(lln0.svcbs[0].smv.as_ref(), Some(smv));
+}
+
+/// A control block the section does not address has no addressing, and the
+/// addressing of another IED does not leak into this one.
+#[test]
+fn a_control_block_without_gse_has_no_addressing() {
+    let model = build(&scl(FULL), "IED1");
+    assert_eq!(model.gse_address("LD0", "gcb2"), None);
+    assert!(model.lds[0].lns[0].gocbs[1].gse.is_none());
+    assert_eq!(model.gse_address("LD0", "absent"), None);
+    assert_eq!(model.smv_address("LD9", "svcb1"), None);
+
+    let other = build(&scl(FULL), "IED2");
+    assert_eq!(other.connected_aps.len(), 1);
+    assert_eq!(
+        other
+            .gse_address("LD0", "gcb1")
+            .and_then(|g| g.address.mac_address()),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x09])
+    );
+
+    let bare = build(&scl(""), "IED1");
+    assert!(bare.connected_aps.is_empty());
+    assert_eq!(bare.gse_address("LD0", "gcb1"), None);
+}
+
+/// A `<GSE>` without `<Address>`, `<MinTime>` or `<MaxTime>` addresses its
+/// control block with an empty address and no times.
+#[test]
+fn a_gse_without_children_has_an_empty_address() {
+    let model = build(&ied1_ap(r#"<GSE ldInst="LD0" cbName="gcb1"/>"#), "IED1");
+    let gse = model.gse_address("LD0", "gcb1").expect("GSE");
+    assert!(gse.address.is_empty());
+    assert_eq!((gse.min_time_ms, gse.max_time_ms), (None, None));
+    assert_eq!(model.connected_aps[0].address, None);
+}
+
+/// The value of each predefined type is checked against its schema form; a
+/// value the type does not accept is an error at the `<P>`.
+#[test]
+fn each_address_type_accepts_its_form_and_rejects_others() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "IP",
+            &["10.0.0.11", "0.0.0.0"],
+            &["10.0.0", "10.0.0.256", "a.b.c.d"],
+        ),
+        ("IP-SUBNET", &["255.255.255.0"], &["255.255.255"]),
+        ("IP-GATEWAY", &["10.0.0.101"], &["10.0.0.1.1"]),
+        (
+            "OSI-TSEL",
+            &["0001", "00000001"],
+            &["001", "000000001", "000g"],
+        ),
+        ("OSI-SSEL", &["0001"], &["1"]),
+        ("OSI-PSEL", &["00000001"], &["0x01"]),
+        ("OSI-NSAP", &["49000102"], &["4900010"]),
+        ("OSI-AP-Title", &["1,1,9999,1"], &["1.1.9999.1"]),
+        ("OSI-AP-Invoke", &["0"], &["123456"]),
+        ("OSI-AE-Qualifier", &["12"], &["-1"]),
+        ("OSI-AE-Invoke", &["99999"], &["1a"]),
+        (
+            "MAC-Address",
+            &["01-0C-CD-01-00-01"],
+            &["01-0c-cd-01-00-01", "01:0C:CD:01:00:01"],
+        ),
+        ("APPID", &["3A01", "0000"], &["3a01", "301", "30001"]),
+        ("VLAN-ID", &["07B", "000"], &["7B", "07b", "0"]),
+        ("VLAN-PRIORITY", &["0", "7"], &["8", "04"]),
+        ("MMS-Port", &["102"], &["0102", "65536"]),
+        ("IPv6", &["fe80:0:0:0:0:0:0:1"], &["fe80::1"]),
+        ("Vendor-Extension", &["anything"], &[]),
+    ];
+    for (p_type, good, bad) in cases {
+        for value in *good {
+            try_build(&gse_with_p(p_type, value), "IED1")
+                .unwrap_or_else(|e| panic!("{p_type} `{value}` refused: {e}"));
+        }
+        for value in *bad {
+            let e = error(&gse_with_p(p_type, value));
+            match &*e.kind {
+                ErrorKind::AttributeValueInvalid {
+                    name, raw_value, ..
+                } => {
+                    assert_eq!(name, &format!("P[type=\"{p_type}\"]"), "{p_type} `{value}`");
+                    assert_eq!(raw_value, value);
+                }
+                other => panic!("{p_type} `{value}`: {other:?}"),
+            }
+            assert!(
+                e.element_path.ends_with("GSE/Address/P"),
+                "{}",
+                e.element_path
+            );
+            assert!(e.span.line > 0, "{p_type} `{value}` has no line");
+        }
+    }
+}
+
+/// The error points at the line of the offending `<P>`.
+#[test]
+fn an_invalid_value_is_reported_at_its_line() {
+    let xml = gse_with_p("VLAN-ID", "FFFF");
+    let line = xml
+        .lines()
+        .position(|l| l.contains("FFFF"))
+        .expect("the value is in the file") as u32
+        + 1;
+    let e = error(&xml);
+    assert_eq!(e.span.line, line);
+    assert!(e.to_string().contains("three digits 0-9 and A-F"), "{e}");
+}
+
+/// A type that is neither predefined nor a well-formed extension name, and an
+/// empty value, are refused.
+#[test]
+fn a_malformed_type_or_an_empty_value_is_refused() {
+    let e = error(&gse_with_p("mac-address", "01-0C-CD-01-00-01"));
+    assert_eq!(e.attribute.as_deref(), Some("type"));
+    let e = error(&gse_with_p("APPID", ""));
+    assert!(
+        matches!(&*e.kind, ErrorKind::AttributeValueInvalid { .. }),
+        "{e}"
+    );
+    let e = error(&ied1_ap(
+        r#"<GSE ldInst="LD0" cbName="gcb1"><Address/></GSE>"#,
+    ));
+    assert!(
+        matches!(&*e.kind, ErrorKind::MissingRequiredElement { name, .. } if name == "P"),
+        "{e}"
+    );
+}
+
+/// `MinTime` and `MaxTime` take whole milliseconds and the fixed unit and
+/// multiplier of `tDurationInMilliSec`.
+#[test]
+fn min_and_max_time_are_whole_milliseconds() {
+    let gse = |min: &str| {
+        ied1_ap(&format!(
+            r#"<GSE ldInst="LD0" cbName="gcb1">{min}<MaxTime>5000</MaxTime></GSE>"#
+        ))
+    };
+    let model = build(&gse("<MinTime>4.000</MinTime>"), "IED1");
+    assert_eq!(
+        model.gse_address("LD0", "gcb1").and_then(|g| g.min_time_ms),
+        Some(4)
+    );
+    for bad in [
+        "<MinTime>4.5</MinTime>",
+        "<MinTime>-4</MinTime>",
+        "<MinTime>4ms</MinTime>",
+        "<MinTime>4294967296</MinTime>",
+        r#"<MinTime unit="ms">4</MinTime>"#,
+        r#"<MinTime multiplier="k">4</MinTime>"#,
+        "<MinTime>4</MinTime><MinTime>5</MinTime>",
+    ] {
+        error(&gse(bad));
+    }
+}
+
+/// A `MinTime` above the `MaxTime` contradicts the repetition scheme.
+#[test]
+fn a_min_time_above_the_max_time_is_refused() {
+    let e = error(&ied1_ap(
+        r#"<GSE ldInst="LD0" cbName="gcb1"><MinTime>50</MinTime><MaxTime>40</MaxTime></GSE>"#,
+    ));
+    assert!(
+        matches!(&*e.kind, ErrorKind::SemanticConflict { detail, .. } if detail.contains("MinTime 50")),
+        "{e}"
+    );
+}
+
+/// A reference that names nothing in the file is an error naming the
+/// attribute.
+#[test]
+fn a_reference_to_nothing_is_refused() {
+    let unknown_ied = subnetwork(r#"<ConnectedAP iedName="NOPE" apName="AP1"/>"#);
+    assert_eq!(error(&unknown_ied).attribute.as_deref(), Some("iedName"));
+
+    let unknown_ap = subnetwork(r#"<ConnectedAP iedName="IED1" apName="AP9"/>"#);
+    assert_eq!(error(&unknown_ap).attribute.as_deref(), Some("apName"));
+
+    let unknown_ld = ied1_ap(r#"<GSE ldInst="LD9" cbName="gcb1"/>"#);
+    assert_eq!(error(&unknown_ld).attribute.as_deref(), Some("ldInst"));
+
+    let unknown_cb = ied1_ap(r#"<GSE ldInst="LD0" cbName="nope"/>"#);
+    assert_eq!(error(&unknown_cb).attribute.as_deref(), Some("cbName"));
+
+    // A sampled values control block is not a GOOSE control block, and the
+    // other way round.
+    let wrong_kind = ied1_ap(r#"<GSE ldInst="LD0" cbName="svcb1"/>"#);
+    assert_eq!(error(&wrong_kind).attribute.as_deref(), Some("cbName"));
+    let wrong_kind = ied1_ap(r#"<SMV ldInst="LD0" cbName="gcb1"/>"#);
+    assert_eq!(error(&wrong_kind).attribute.as_deref(), Some("cbName"));
+
+    // AP2 has no server, so it holds no logical device.
+    let no_server = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP2"><SMV ldInst="LD0" cbName="svcb1"/></ConnectedAP>"#,
+    );
+    assert_eq!(error(&no_server).attribute.as_deref(), Some("ldInst"));
+}
+
+/// The uniqueness rules of the schema: subnetwork names, connected access
+/// points within a subnetwork, and control blocks within a connected access
+/// point.
+#[test]
+fn duplicates_are_refused() {
+    let duplicate = |xml: &str, element: &str| {
+        let e = error(xml);
+        match &*e.kind {
+            ErrorKind::DuplicateIdentifier { element: got, .. } => assert_eq!(got, element),
+            other => panic!("{element}: {other:?}"),
+        }
+    };
+    duplicate(
+        &scl(r#"<Communication>
+    <SubNetwork name="W01"><ConnectedAP iedName="IED1" apName="AP1"/></SubNetwork>
+    <SubNetwork name="W01"><ConnectedAP iedName="IED1" apName="AP2"/></SubNetwork>
+  </Communication>"#),
+        "SubNetwork",
+    );
+    duplicate(
+        &subnetwork(
+            r#"<ConnectedAP iedName="IED1" apName="AP1"/><ConnectedAP iedName="IED1" apName="AP1"/>"#,
+        ),
+        "ConnectedAP",
+    );
+    duplicate(
+        &ied1_ap(r#"<GSE ldInst="LD0" cbName="gcb1"/><GSE ldInst="LD0" cbName="gcb1"/>"#),
+        "GSE",
+    );
+    duplicate(
+        &ied1_ap(r#"<SMV ldInst="LD0" cbName="svcb1"/><SMV ldInst="LD0" cbName="svcb1"/>"#),
+        "SMV",
+    );
+}
+
+/// The structure the schema requires: a subnetwork in the section, a
+/// connected access point in a subnetwork, the section at most once and
+/// directly under `<SCL>`.
+#[test]
+fn the_required_structure_is_enforced() {
+    let e = error(&scl("<Communication/>"));
+    assert!(
+        matches!(&*e.kind, ErrorKind::MissingRequiredElement { name, .. } if name == "SubNetwork"),
+        "{e}"
+    );
+    let e = error(&scl(
+        r#"<Communication><SubNetwork name="W01"/></Communication>"#,
+    ));
+    assert!(
+        matches!(&*e.kind, ErrorKind::MissingRequiredElement { name, .. } if name == "ConnectedAP"),
+        "{e}"
+    );
+    let twice = scl(&format!("{FULL}{FULL}"));
+    assert!(matches!(&*error(&twice).kind, ErrorKind::Xml(_)));
+    let e = error(&subnetwork(r#"<ConnectedAP iedName="IED1"/>"#));
+    assert!(
+        matches!(&*e.kind, ErrorKind::MissingRequiredAttribute { name, .. } if name == "apName"),
+        "{e}"
+    );
+}
+
+/// The summary lists the connected access points and the addressing below
+/// each control block, and a model without addressing summarizes as before.
+#[test]
+fn the_summary_lists_the_addressing() {
+    let summary = iec61850_scl::summarize::summarize_model(&build(&scl(FULL), "IED1"));
+    assert!(summary.contains(
+        "  ConnectedAP subNetwork=W01 type=8-MMS ap=AP1 address=IP=10.0.0.11,IP-SUBNET=255.255.255.0,"
+    ), "{summary}");
+    assert!(
+        summary.contains("  ConnectedAP subNetwork=P01 type=<None> ap=AP2 address=IP=192.168.1.5"),
+        "{summary}"
+    );
+    assert!(summary.contains(
+        "        GSE address=MAC-Address=01-0C-CD-01-00-05,APPID=3A01,VLAN-ID=07B,VLAN-PRIORITY=6 minTime=8 maxTime=2000"
+    ), "{summary}");
+    assert!(
+        summary.contains("        SMV address=MAC-Address=01-0C-CD-04-00-01,APPID=4001"),
+        "{summary}"
+    );
+
+    let bare = iec61850_scl::summarize::summarize_model(&build(&scl(""), "IED1"));
+    assert!(
+        !bare.contains("ConnectedAP")
+            && !bare.contains("GSE address")
+            && !bare.contains("SMV address")
+    );
+}

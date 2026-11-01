@@ -5,7 +5,7 @@
 //! contract of that file: the IED identity, the loopback access point, the
 //! measurement data set, and the three control blocks.
 
-use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use iec61850_model::tree::{IedModel, LogicalNode};
 
@@ -152,55 +152,43 @@ fn demo_cid_defines_the_three_control_blocks() {
     assert_eq!(gocb.dataset_ref, "dsStatus");
 }
 
-// ---------------------------------------------------------------------------
-// Contracts the runtime model does not carry
-// ---------------------------------------------------------------------------
-
-/// The address a client connects to, and the `indexed` flag that decides the
-/// instantiated names of the report control blocks, live only in the document:
-/// `iec61850-scl` skips `<Communication>` and drops `indexed`, so neither
-/// reaches [`IedModel`]. The helpers below read the document structurally, by
-/// element and attribute, so reindenting or reordering attributes in the CID
-/// cannot break these assertions.
+/// A client connects to the address the access point is connected with:
+/// loopback, on the MMS port.
 #[test]
 fn demo_cid_binds_the_access_point_to_loopback() {
-    let xml = demo_cid_text();
-    let comm = element(&xml, "Communication").expect("no <Communication> section");
-
-    let ap = start_tag(comm, "ConnectedAP").expect("no <ConnectedAP>");
-    assert_eq!(attr(ap, "iedName").as_deref(), Some("DemoIED"));
-    assert_eq!(attr(ap, "apName").as_deref(), Some("AP1"));
-
-    let address = element(comm, "Address").expect("the ConnectedAP has no <Address>");
-    let p = p_values(address);
-    assert_eq!(p.get("IP").map(String::as_str), Some("127.0.0.1"));
-    assert_eq!(p.get("MMS-Port").map(String::as_str), Some("102"));
+    let model = demo_model();
+    let ap = model
+        .connected_ap("AP1")
+        .next()
+        .expect("AP1 is not connected");
+    let address = ap
+        .address
+        .as_ref()
+        .expect("the ConnectedAP has no <Address>");
+    assert_eq!(address.ip(), Some(Ipv4Addr::LOCALHOST));
+    assert_eq!(address.mms_port(), Some(102));
 }
 
-/// The GOOSE control block needs its multicast address, APPID and VLAN tag
-/// bound under the access point; a subscriber cannot join the publication from
-/// `<GSEControl>` alone.
+/// The GOOSE control block carries its multicast address, APPID and VLAN tag;
+/// a subscriber cannot join the publication from `<GSEControl>` alone.
 #[test]
 fn demo_cid_binds_the_goose_control_block() {
-    let xml = demo_cid_text();
-    let comm = element(&xml, "Communication").expect("no <Communication> section");
-    let gse = element(comm, "GSE").expect("no <GSE> binding for the GoCB");
-
-    let tag = start_tag(gse, "GSE").expect("malformed <GSE>");
-    assert_eq!(attr(tag, "ldInst").as_deref(), Some("LD0"));
-    assert_eq!(attr(tag, "cbName").as_deref(), Some("gcbStatus"));
-
-    let p = p_values(element(gse, "Address").expect("the GSE has no <Address>"));
+    let model = demo_model();
+    let gse = model
+        .gse_address("LD0", "gcbStatus")
+        .expect("no <GSE> binding for the GoCB");
     assert_eq!(
-        p.get("MAC-Address").map(String::as_str),
-        Some("01-0C-CD-01-00-01")
+        gse.address.mac_address(),
+        Some([0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01])
     );
-    assert!(p.contains_key("APPID"), "the GSE binding carries no APPID");
-    assert!(
-        p.contains_key("VLAN-PRIORITY"),
-        "the GSE binding carries no VLAN priority"
-    );
+    assert_eq!(gse.address.app_id(), Some(0x1000));
+    assert_eq!(gse.address.vlan_priority(), Some(4));
+    assert_eq!((gse.min_time_ms, gse.max_time_ms), (Some(10), Some(1000)));
 }
+
+// ---------------------------------------------------------------------------
+// Contracts read from the document
+// ---------------------------------------------------------------------------
 
 /// Left at the SCL default of `true`, a conformant tool would instantiate
 /// `urcbMeas01` and `urcbMeas02` rather than the `urcbMeas` that every
@@ -224,14 +212,14 @@ fn demo_cid_report_control_blocks_are_not_indexed() {
 }
 
 // ---------------------------------------------------------------------------
-// A small structural reader, enough for the document-level assertions above
+// A small structural reader, enough for the document-level assertion above
 // ---------------------------------------------------------------------------
 
 /// The byte offset of the opening `<` and the text of the first start tag of
 /// `name` in `xml`, without the angle brackets.
 ///
 /// Callers need the offset: searching `xml` for the returned text would find
-/// the first place that text occurs, which for a name like `Communication` is
+/// the first place that text occurs, which for a name like `ReportControl` can be
 /// a comment long before the tag.
 fn start_tag_at<'a>(xml: &'a str, name: &str) -> Option<(usize, &'a str)> {
     let mut from = 0;
@@ -250,12 +238,6 @@ fn start_tag_at<'a>(xml: &'a str, name: &str) -> Option<(usize, &'a str)> {
         }
         from = after;
     }
-}
-
-/// The text of the first start tag of `name`, without the angle brackets.
-/// Matches on the element name, so attribute layout is irrelevant.
-fn start_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    start_tag_at(xml, name).map(|(_, tag)| tag)
 }
 
 /// The value of `name` in a start tag, with the surrounding quotes removed.
@@ -277,33 +259,4 @@ fn attr(tag: &str, name: &str) -> Option<String> {
         }
         from = at + name.len();
     }
-}
-
-/// The first `<name>…</name>` element of `xml`, start tag included.
-fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    let (start, _) = start_tag_at(xml, name)?;
-    let close = format!("</{name}>");
-    let end = xml[start..].find(&close)? + start + close.len();
-    let slice = &xml[start..end];
-    assert!(
-        slice.starts_with('<'),
-        "element({name}) did not begin at a tag: {:?}",
-        &slice[..slice.len().min(40)]
-    );
-    Some(slice)
-}
-
-/// Every `<P type="…">value</P>` inside `scope`, keyed by the `type` attribute.
-fn p_values(scope: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut rest = scope;
-    while let Some((at, tag)) = start_tag_at(rest, "P") {
-        // Past the `<`, the tag text and the `>`.
-        let after_tag = at + tag.len() + 2;
-        if let (Some(key), Some(end)) = (attr(tag, "type"), rest[after_tag..].find("</P>")) {
-            out.insert(key, rest[after_tag..after_tag + end].trim().to_string());
-        }
-        rest = &rest[after_tag..];
-    }
-    out
 }

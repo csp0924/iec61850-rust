@@ -3,10 +3,10 @@
 //! The file is loaded into an `IedModel`, serialized back to SCL, re-parsed and
 //! compared through [`summarize_model`], the canonical text form of a model.
 //! The comparison covers everything the runtime model retains: the LD/LN/DO/DA
-//! tree with types, functional constraints, trigger options and values, plus
-//! the data sets and control blocks. Labels that the model does not carry (CDC
-//! names, descriptions, the Communication section) are outside the round trip
-//! and are gated by `iec61850-scl/tests/demo_cid.rs` instead.
+//! tree with types, functional constraints, trigger options and values, the
+//! data sets and control blocks, and the communication addressing. Labels that
+//! the model does not carry (CDC names, descriptions) are outside the round
+//! trip and are gated by `iec61850-scl/tests/demo_cid.rs` instead.
 //!
 //! The model is also handed to `MmsDeviceModel`, which is what an `IedServer`
 //! serves, so a CID that parses but cannot be exposed over MMS fails here.
@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use iec61850_model::cb::{
     GooseControlBlock, LogControlBlock, ReportControlBlock, SettingGroupControlBlock,
 };
+use iec61850_model::comm::Address;
 use iec61850_model::tree::{
     DataAttribute, DataObject, DataSet, DoChild, IedModel, LogicalDevice, LogicalNode,
 };
@@ -115,6 +116,7 @@ fn emit_scl(model: &IedModel) -> String {
     let mut body = String::new();
 
     let _ = writeln!(body, r#"<SCL version="2007" revision="B" release="4">"#);
+    emit_communication(&mut body, model);
     let _ = writeln!(body, r#"  <IED name="{}">"#, esc(&model.ied_name));
     let _ = writeln!(body, r#"    <AccessPoint name="AP1">"#);
     let _ = writeln!(body, "      <Server>");
@@ -127,6 +129,88 @@ fn emit_scl(model: &IedModel) -> String {
     body.push_str(&types.render());
     let _ = writeln!(body, "</SCL>");
     body
+}
+
+/// Writes the `<Communication>` section: one `<SubNetwork>` per subnetwork
+/// the connected access points name, in model order, and the `<GSE>` of each
+/// addressed GOOSE control block under the connection of `AP1`, the access
+/// point every logical device is emitted under.
+fn emit_communication(out: &mut String, model: &IedModel) {
+    if model.connected_aps.is_empty() {
+        return;
+    }
+    let mut sub_networks: Vec<&str> = Vec::new();
+    for ap in &model.connected_aps {
+        if !sub_networks.contains(&ap.sub_network.as_str()) {
+            sub_networks.push(&ap.sub_network);
+        }
+    }
+    let mut gse_written = false;
+    let _ = writeln!(out, "  <Communication>");
+    for name in sub_networks {
+        let aps: Vec<_> = model
+            .connected_aps
+            .iter()
+            .filter(|ap| ap.sub_network == name)
+            .collect();
+        let type_attr = aps[0]
+            .sub_network_type
+            .as_deref()
+            .map(|t| format!(r#" type="{}""#, esc(t)))
+            .unwrap_or_default();
+        let _ = writeln!(out, r#"    <SubNetwork name="{}"{type_attr}>"#, esc(name));
+        for ap in aps {
+            let _ = writeln!(
+                out,
+                r#"      <ConnectedAP iedName="{}" apName="{}">"#,
+                esc(&model.ied_name),
+                esc(&ap.ap_name)
+            );
+            if let Some(address) = &ap.address {
+                emit_address(out, address, "        ");
+            }
+            if ap.ap_name == "AP1" && !gse_written {
+                gse_written = true;
+                for ld in &model.lds {
+                    for gocb in &ld.lns[0].gocbs {
+                        let Some(gse) = &gocb.gse else { continue };
+                        let _ = writeln!(
+                            out,
+                            r#"        <GSE ldInst="{}" cbName="{}">"#,
+                            esc(&ld.inst),
+                            esc(&gocb.name)
+                        );
+                        if !gse.address.is_empty() {
+                            emit_address(out, &gse.address, "          ");
+                        }
+                        if let Some(ms) = gse.min_time_ms {
+                            let _ = writeln!(out, "          <MinTime>{ms}</MinTime>");
+                        }
+                        if let Some(ms) = gse.max_time_ms {
+                            let _ = writeln!(out, "          <MaxTime>{ms}</MaxTime>");
+                        }
+                        let _ = writeln!(out, "        </GSE>");
+                    }
+                }
+            }
+            let _ = writeln!(out, "      </ConnectedAP>");
+        }
+        let _ = writeln!(out, "    </SubNetwork>");
+    }
+    let _ = writeln!(out, "  </Communication>");
+}
+
+fn emit_address(out: &mut String, address: &Address, pad: &str) {
+    let _ = writeln!(out, "{pad}<Address>");
+    for p in address.parameters() {
+        let _ = writeln!(
+            out,
+            r#"{pad}  <P type="{}">{}</P>"#,
+            esc(&p.p_type),
+            esc(&p.value)
+        );
+    }
+    let _ = writeln!(out, "{pad}</Address>");
 }
 
 #[derive(Default)]

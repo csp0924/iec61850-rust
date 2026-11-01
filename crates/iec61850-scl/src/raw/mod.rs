@@ -25,9 +25,11 @@ pub struct RawScl {
     pub ieds: Vec<RawIed>,
     /// The `<DataTypeTemplates>` section.
     pub data_type_templates: DataTypeTemplates,
-    /// The Communication and Substation sections are not parsed. The field is
-    /// reserved so that adding them later does not break the API; until then
-    /// the parser skips those subtrees and emits a `tracing::warn!` naming the
-    /// element, line and column, so a skip is visible in a log.
+    /// The `<Communication>` section, `None` when the file has none.
+    pub communication: Option<RawCommunication>,
+    /// The Substation section is not parsed. The field is reserved so that
+    /// adding it later does not break the API; until then the parser skips the
+    /// subtree and emits a `tracing::warn!` naming the element, line and
+    /// column, so a skip is visible in a log.
     pub _unsupported_sections: (),
 }
