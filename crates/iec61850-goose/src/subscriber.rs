@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use iec61850_model::utc_time::UtcTime;
 use iec61850_model::MmsValue;
 
 use crate::error::GooseError;
@@ -55,13 +56,14 @@ pub struct GooseSubscriberState {
     pub sq_num: u32,
     /// Configuration revision.
     pub conf_rev: u32,
-    /// Raw 8-byte UTC time from the `t` member of the PDU.
+    /// The `t` member of the PDU, the time of the last state change.
     ///
     /// `t` is mandatory (IEC 61850-8-1 Annex A): a frame without it, or with
-    /// one that is not 8 bytes, fails to decode and is dropped before any
-    /// state is built, so every delivered state carries the time the
-    /// publisher sent.
-    pub timestamp_raw: [u8; 8],
+    /// one that is not a valid 8-byte UtcTime, fails to decode and is dropped
+    /// before any state is built, so every delivered state carries the time
+    /// the publisher sent. A value whose `clock_failure` flag is set is to be
+    /// ignored (IEC 61850-7-2 §6.1.2.9.3.3).
+    pub timestamp: UtcTime,
     /// `simulation` member of the PDU, the Simulation parameter of SendGOOSE.
     pub simulation: bool,
     /// S bit of Reserved1 in the frame header, which a conforming publisher
@@ -617,7 +619,7 @@ mod tests {
             st_num,
             sq_num,
             conf_rev,
-            timestamp_raw: [0u8; 8],
+            timestamp: UtcTime::NULL,
             simulation: false,
             frame_simulation: false,
             nds_com: false,

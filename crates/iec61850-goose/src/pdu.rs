@@ -3,7 +3,8 @@
 //! The PDU is an `[APPLICATION 1] IMPLICIT SEQUENCE` (outer tag `0x61`) whose
 //! members carry context tags. Decoding is bounds-checked field by field and
 //! rejects malformed input rather than repairing it; every accepted PDU has a
-//! timestamp and a `numDatSetEntries` that matches the decoded `allData`.
+//! valid UtcTime timestamp and a `numDatSetEntries` that matches the decoded
+//! `allData`.
 //!
 //! ## Wire format
 //!
@@ -13,7 +14,7 @@
 //! | 0x81 | timeAllowedToLive   |
 //! | 0x82 | datSet              |
 //! | 0x83 | goID (always sent)  |
-//! | 0x84 | t (8-byte UTC time) |
+//! | 0x84 | t (UtcTime)         |
 //! | 0x85 | stNum               |
 //! | 0x86 | sqNum               |
 //! | 0x87 | simulation (test)   |
@@ -35,6 +36,7 @@
 
 use bytes::BytesMut;
 use iec61850_asn1::{decode_length, encode_length};
+use iec61850_model::utc_time::UtcTime;
 use iec61850_model::MmsValue;
 
 use crate::error::GooseError;
@@ -110,8 +112,12 @@ pub struct GoosePdu {
     /// `[0x83]` goID, a mandatory member of the IECGoosePdu (IEC 61850-8-1
     /// Annex A).
     pub go_id: String,
-    /// `[0x84]` t, a UTC time of exactly 8 bytes.
-    pub t: [u8; 8],
+    /// `[0x84]` t, the time of the last state change.
+    ///
+    /// Decoding has checked that it is a valid UtcTime; how far it lies from
+    /// the local clock and what its TimeQuality means are left to the
+    /// application.
+    pub t: UtcTime,
     /// `[0x85]` stNum, the state number; 0 is reserved and never sent.
     pub st_num: u32,
     /// `[0x86]` sqNum, the sequence number.
@@ -543,7 +549,7 @@ impl GoosePdu {
     /// `num_dataset_entries` is the length of `all_data` and `go_id` equals
     /// `gocb_ref`. `time_allowed_to_live` is 2000 ms, twice the default Tmax
     /// of [`RetransIntervals`](crate::RetransIntervals) and so the
-    /// steady-state value; `t` is all zero, `st_num` is 1, `sq_num` is 0,
+    /// steady-state value; `t` is [`UtcTime::NULL`], `st_num` is 1, `sq_num` is 0,
     /// `conf_rev` is 1, and `simulation` and `nds_com` are `false`.
     pub fn new(
         gocb_ref: impl Into<String>,
@@ -556,7 +562,7 @@ impl GoosePdu {
             gocb_ref,
             time_allowed_to_live: 2000,
             dat_set: dat_set.into(),
-            t: [0; 8],
+            t: UtcTime::NULL,
             st_num: 1,
             sq_num: 0,
             simulation: false,
@@ -595,7 +601,7 @@ impl GoosePdu {
         write_string_tlv(&mut pdu, TAG_GO_ID, &self.go_id);
 
         // [0x84] t, 8-byte UTC time
-        write_tlv(&mut pdu, TAG_T, &self.t);
+        write_tlv(&mut pdu, TAG_T, &self.t.to_bytes());
 
         // [0x85] stNum
         write_u32_tlv(&mut pdu, TAG_ST_NUM, self.st_num);
@@ -681,7 +687,7 @@ impl GoosePdu {
         let mut time_allowed_to_live: Option<u32> = None;
         let mut dat_set: Option<String> = None;
         let mut go_id: Option<String> = None;
-        let mut t: Option<[u8; 8]> = None;
+        let mut t: Option<UtcTime> = None;
         let mut st_num: Option<u32> = None;
         let mut sq_num: Option<u32> = None;
         let mut simulation = false;
@@ -720,6 +726,10 @@ impl GoosePdu {
                     }
                     let mut ts = [0u8; 8];
                     ts.copy_from_slice(value);
+                    let ts = UtcTime::from_bytes(ts).map_err(|e| {
+                        tracing::warn!("goose timestamp field is not a valid utctime: {}", e);
+                        GooseError::InvalidTimestampQuality(e)
+                    })?;
                     t = Some(ts);
                 }
                 TAG_ST_NUM => {
@@ -837,7 +847,7 @@ mod tests {
             time_allowed_to_live: 2000,
             dat_set: "A/L$DS".to_string(),
             go_id: "A/L$GO$gcb".to_string(),
-            t: [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
+            t: UtcTime::from_bytes([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]).unwrap(),
             st_num: 1,
             sq_num: 1,
             simulation: false,

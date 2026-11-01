@@ -14,6 +14,7 @@
 
 use bytes::{Bytes, BytesMut};
 use core::time::Duration;
+use iec61850_model::utc_time::UtcTime;
 use iec61850_model::MmsValue;
 use std::time::Instant;
 
@@ -204,8 +205,8 @@ pub struct GoosePublisher {
     sq_num: u32,
     simulation: bool,
     needs_commission: bool,
-    /// Event timestamp as an 8-byte UTC time.
-    timestamp_8: [u8; 8],
+    /// Event timestamp, the `t` member of every publication.
+    timestamp: UtcTime,
     /// Caller override for timeAllowedToLive; `None` derives it from the phase.
     time_allowed_to_live_override: Option<u32>,
 
@@ -285,7 +286,7 @@ impl GoosePublisher {
             sq_num: 0,
             simulation: false,
             needs_commission: false,
-            timestamp_8: [0u8; 8],
+            timestamp: UtcTime::NULL,
             time_allowed_to_live_override: None,
             comm,
             frame_header_bytes,
@@ -466,12 +467,14 @@ impl GoosePublisher {
         self.next_publish_at = None;
     }
 
-    /// Sets the 8-byte UTC event timestamp.
+    /// Sets the event timestamp, the `t` member of every publication.
     ///
     /// The value persists until it is set again, so a caller that never calls
-    /// this publishes the same timestamp on every frame.
-    pub fn set_timestamp(&mut self, ts: [u8; 8]) {
-        self.timestamp_8 = ts;
+    /// this publishes the same timestamp on every frame, [`UtcTime::NULL`]
+    /// before the first call. A `UtcTime` is always a valid encoding, so a
+    /// subscriber of this crate accepts every value set here.
+    pub fn set_timestamp(&mut self, ts: UtcTime) {
+        self.timestamp = ts;
     }
 
     /// Returns the time of the next publication.
@@ -522,7 +525,7 @@ impl GoosePublisher {
             time_allowed_to_live: self.time_allowed_to_live_ms(),
             dat_set: self.data_set_ref.clone(),
             go_id: self.go_id.clone().unwrap_or_else(|| self.gocb_ref.clone()),
-            t: self.timestamp_8,
+            t: self.timestamp,
             st_num: self.st_num,
             // Encoded before the increment, so per IEC 61850-8-1 §A.3 the first
             // frame after a reset carries sqNum 0.
@@ -1193,7 +1196,7 @@ mod tests {
     #[test]
     fn timestamp_propagates_to_pdu() {
         let mut p = sample_publisher();
-        let ts = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let ts = UtcTime::from_bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]).unwrap();
         p.set_timestamp(ts);
         let frame = p.publish(&sample_data()).unwrap();
         let goose_frame = GooseFrame::decode(&frame).unwrap();

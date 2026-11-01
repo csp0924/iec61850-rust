@@ -7,10 +7,11 @@ use thiserror::Error;
 
 /// GOOSE encode and decode errors.
 ///
-/// Decoding is strict: an out-of-range string length, a missing timestamp, and
-/// a `numDatSetEntries` that disagrees with the number of decoded `allData`
-/// entries are all reported as errors instead of being repaired silently, so a
-/// subscriber never acts on a partially reconstructed data set.
+/// Decoding is strict: an out-of-range string length, a missing timestamp or one
+/// that is not a valid UtcTime, and a `numDatSetEntries` that disagrees with the
+/// number of decoded `allData` entries are all reported as errors instead of
+/// being repaired silently, so a subscriber never acts on a partially
+/// reconstructed data set.
 #[derive(Debug, Error, PartialEq, Clone)]
 #[non_exhaustive]
 pub enum GooseError {
@@ -68,6 +69,12 @@ pub enum GooseError {
     /// The timestamp field is not 8 bytes long.
     #[error("timestamp field is not 8 bytes")]
     InvalidTimestamp,
+
+    /// The timestamp field is 8 bytes long but not a valid UtcTime: its
+    /// TimeQuality octet holds one of the TimeAccuracy codes IEC 61850-8-1
+    /// Table 36 defines as invalid.
+    #[error("invalid timestamp: {0}")]
+    InvalidTimestampQuality(iec61850_model::utc_time::UtcTimeError),
 
     /// Ethernet frame shorter than 14 bytes, or shorter than 18 bytes when a
     /// VLAN tag is present.

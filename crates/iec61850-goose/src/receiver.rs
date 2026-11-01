@@ -12,8 +12,8 @@
 //! receive thread walks it.
 //!
 //! The PDU is decoded by `GoosePdu::decode_ber`, so a frame reaches a
-//! subscriber only when every mandatory member is present, stNum is not 0, and
-//! numDatSetEntries matches allData. Frames may be injected directly with
+//! subscriber only when every mandatory member is present, `t` is a valid
+//! UtcTime, stNum is not 0, and numDatSetEntries matches allData. Frames may be injected directly with
 //! `handle_message`, or read from an `EthernetSource` by `start_thread`. Both
 //! paths also sweep the subscribers for expired publications.
 
@@ -249,7 +249,7 @@ impl GooseReceiver<Running> {
             st_num: parsed.st_num,
             sq_num: parsed.sq_num,
             conf_rev: parsed.conf_rev,
-            timestamp_raw: parsed.t,
+            timestamp: parsed.t,
             simulation: parsed.simulation,
             frame_simulation,
             nds_com: parsed.nds_com,
@@ -391,6 +391,7 @@ mod tests {
     use crate::publisher::{CommParameters, GoosePublisher};
     use crate::subscriber::GooseSubscriberBuilder;
     use bytes::{Bytes, BytesMut};
+    use iec61850_model::utc_time::UtcTime;
     use iec61850_model::MmsValue;
     use std::sync::{Arc, Mutex};
 
@@ -428,7 +429,7 @@ mod tests {
                 gocb_ref.split('/').next().unwrap_or("IED")
             ),
             go_id: gocb_ref.to_string(),
-            t: [0u8; 8],
+            t: UtcTime::NULL,
             st_num,
             sq_num,
             simulation: false,
@@ -1059,7 +1060,7 @@ mod tests {
             time_allowed_to_live: 2000,
             dat_set: "IED1/LLN0$GO$gcbEvents".to_string(),
             go_id: "gcbEvents".to_string(),
-            t: [0x5A, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            t: UtcTime::from_bytes([0x5A, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap(),
             st_num: 1,
             sq_num: 0,
             simulation: false,
@@ -1099,7 +1100,7 @@ mod tests {
                         time_allowed_to_live: state.time_allowed_to_live_ms,
                         dat_set: state.dat_set.clone(),
                         go_id: state.go_id.clone(),
-                        t: state.timestamp_raw,
+                        t: state.timestamp,
                         st_num: state.st_num,
                         sq_num: state.sq_num,
                         simulation: state.simulation,

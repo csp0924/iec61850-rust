@@ -35,3 +35,5 @@ pub use subscriber::{
     GooseEvent, GooseSubscriber, GooseSubscriberBuilder, GooseSubscriberState, SimulationFilter,
     GOOSE_STRING_MAX_LEN,
 };
+
+pub use iec61850_model::utc_time::{TimeAccuracy, TimeQuality, UtcTime, UtcTimeError};
