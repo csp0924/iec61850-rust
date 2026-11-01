@@ -907,7 +907,7 @@ impl IedServer {
     /// update with no reason only lends its value to the members above it.
     fn raise_triggers(&self, triggers: &[PendingTrigger]) {
         self.log_updates(triggers);
-        let indexed: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> = {
+        let indexed: Vec<(DataAttributeRef, MmsValue, InclusionFlag, u64)> = {
             let index = self.inner.attr_ref_index.read().ok();
             triggers
                 .iter()
@@ -919,26 +919,30 @@ impl IedServer {
                         // over MMS is in the engine's index only, which is read
                         // without the engine lock.
                         .or_else(|| self.inner.value_index.attr_ref_for(&t.cell))
-                        .map(|attr_ref| (attr_ref, t.value.clone(), t.flag))
+                        .map(|attr_ref| (attr_ref, t.value.clone(), t.flag, t.seq))
                 })
                 .collect()
         };
         let (updates, context): (Vec<_>, Vec<_>) = indexed
             .into_iter()
-            .partition(|(_, _, flag)| flag.has_trigger());
+            .partition(|(_, _, flag, _)| flag.has_trigger());
         // An attribute in no data set has no index entry, which is the ordinary
         // case and needs no report.
         if updates.is_empty() {
             return;
         }
+        let (updates, committed): (Vec<_>, Vec<_>) = updates
+            .into_iter()
+            .map(|(r, v, flag, seq)| ((r, v, flag), seq))
+            .unzip();
         let context: Vec<(DataAttributeRef, MmsValue)> =
-            context.into_iter().map(|(r, v, _)| (r, v)).collect();
+            context.into_iter().map(|(r, v, _, _)| (r, v)).collect();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         match self.inner.reporting_engine.lock() {
-            Ok(engine) => engine.on_values_updated_with(&updates, &context, now_ms),
+            Ok(engine) => engine.on_values_updated_with(&updates, &committed, &context, now_ms),
             Err(_) => tracing::warn!(
                 updates = updates.len(),
                 "the reporting engine lock is poisoned, the update triggered no report"
@@ -3697,5 +3701,53 @@ mod update_order_tests {
         let order = vec![MmsValue::Boolean(true), MmsValue::Boolean(false)];
         assert_eq!(buffered(&server), order, "BRCB buffer");
         assert_eq!(logged(&storage), order, "log");
+    }
+
+    /// A value stored before PurgeBuf whose triggers reach the reporting
+    /// engine only after it, held up by a slow log storage, is not buffered:
+    /// the purge discarded its event (IEC 61850-7-2 17.2.2.14). A value stored
+    /// after the purge is buffered.
+    #[test]
+    fn a_value_stored_before_a_purge_is_not_buffered_after_it() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let storage: Arc<dyn LogStorage> = Arc::new(GatedStorage {
+            inner: InMemoryLogStorage::new(),
+            first: Mutex::new(Some((started_tx, go_rx))),
+        });
+        let server = server(Arc::clone(&storage));
+        let brcb = server
+            .reporting_engine()
+            .lock()
+            .unwrap()
+            .get_brcb(BRCB)
+            .unwrap();
+        brcb.lock_state().unwrap().rpt_ena = false;
+
+        let stored_before = std::thread::spawn({
+            let server = server.clone();
+            move || {
+                server
+                    .update_boolean(st_val(&server.model()), true)
+                    .unwrap()
+            }
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the update writes its log entry");
+        brcb.handle_purge_buf_write(true).unwrap();
+        go_tx.send(()).unwrap();
+        stored_before.join().unwrap();
+        assert_eq!(buffered(&server), [], "the purged event");
+
+        server
+            .update_boolean(st_val(&server.model()), false)
+            .unwrap();
+        assert_eq!(buffered(&server), [MmsValue::Boolean(false)]);
+        assert_eq!(
+            logged(&storage),
+            [MmsValue::Boolean(true), MmsValue::Boolean(false)],
+            "a purge of the BRCB leaves the log alone"
+        );
     }
 }

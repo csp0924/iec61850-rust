@@ -974,11 +974,13 @@ pub(crate) struct WrittenLeaf {
 
 /// Returns the next commit number. Taken while an attribute value is
 /// write-locked, it numbers the stores of each attribute in the order they
-/// happened; numbers of different attributes are not comparable.
+/// happened; numbers of different attributes are not comparable. Whatever a
+/// thread did before taking a number is visible to a thread that takes a
+/// later one.
 #[cfg(feature = "full-server")]
 pub(crate) fn commit_seq() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
 }
 
 /// Returns zero: without the integrated server nothing orders the stores.

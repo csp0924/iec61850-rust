@@ -293,6 +293,9 @@ enum Resumed {
 struct BrcbBufTmPending {
     /// `BufferedReportControl::purge_count` when the window opened.
     purges: u64,
+    /// The commit number of the oldest update the window holds, `u64::MAX`
+    /// while it holds only updates given without one.
+    oldest_commit: u64,
     /// Millisecond timestamp of the first trigger, used as the entry time.
     first_trigger_ms: u64,
     /// Instant at which the buffer time expires, compared against in `tick`.
@@ -890,9 +893,12 @@ impl ReportingEngine {
         };
         for (mms_path, p) in due_paths {
             if let Some(brcb_arc) = self.brcbs.get(&mms_path) {
-                if let Err(e) =
-                    brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
-                {
+                if let Err(e) = brcb_arc.enqueue_window_entry(
+                    p.purges,
+                    p.oldest_commit,
+                    p.first_trigger_ms,
+                    p.snapshot,
+                ) {
                     tracing::warn!(
                         mms_path = %mms_path,
                         error = ?e,
@@ -2073,7 +2079,7 @@ impl ReportingEngine {
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
         now_ms: u64,
     ) {
-        self.on_values_updated_with(updates, &[], now_ms);
+        self.on_values_updated_with(updates, &[], &[], now_ms);
     }
 
     /// Reports a batch of updates as [`ReportingEngine::on_values_updated`]
@@ -2082,13 +2088,19 @@ impl ReportingEngine {
     /// attribute takes the values of `context` and `updates` beneath it over
     /// the values it reads from the model, so it holds the state the batch
     /// left rather than one a concurrent writer made since.
+    ///
+    /// `committed` holds the commit number each update was stored with, or is
+    /// empty for updates stored just now. A BRCB purged after an update was
+    /// stored leaves that update out: its event was discarded with the buffer,
+    /// per the PurgeBuf procedure of IEC 61850-7-2.
     pub(crate) fn on_values_updated_with(
         &self,
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
+        committed: &[u64],
         context: &[(DataAttributeRef, MmsValue)],
         now_ms: u64,
     ) {
-        let updates = merge_updates(updates);
+        let (updates, committed) = merge_updates(updates, committed);
         let mut to_drop: Vec<ConnectionId> = Vec::new();
         for (rc_arc, members) in group_by_watcher(&updates, &self.watch_map) {
             if let Some(c) = self.trigger_urcb_batch(&rc_arc, &updates, &members, context, now_ms) {
@@ -2096,7 +2108,22 @@ impl ReportingEngine {
             }
         }
         for (brcb_arc, members) in group_by_watcher(&updates, &self.brcb_watch_map) {
-            self.trigger_brcb_batch(&brcb_arc, &updates, &members, context, now_ms);
+            // The purge count is read before the members are checked against
+            // the latest purge, so a purge that runs in between leaves the
+            // window the batch opens stale, and it is never enqueued.
+            let purges = brcb_arc.purge_count();
+            let members: Vec<usize> = members
+                .into_iter()
+                .filter(|&u| brcb_arc.stored_after_purge(committed[u]))
+                .collect();
+            let Some(oldest_commit) = members.iter().map(|&u| committed[u]).min() else {
+                continue;
+            };
+            let purge = PurgeView {
+                purges,
+                oldest_commit,
+            };
+            self.trigger_brcb_batch(&brcb_arc, &updates, &members, context, purge, now_ms);
         }
         for c in to_drop {
             self.on_connection_dropped(c);
@@ -2209,13 +2236,15 @@ impl ReportingEngine {
     }
 
     /// Adds the batch members `members` of `updates` to one BRCB: one entry
-    /// with no buffer time, the open window otherwise.
+    /// with no buffer time, the open window otherwise. `purge` tells the entry
+    /// or the window apart from the events a PurgeBuf procedure discards.
     fn trigger_brcb_batch(
         &self,
         brcb_arc: &Arc<BufferedReportControl>,
         updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
         members: &[usize],
         context: &[(DataAttributeRef, MmsValue)],
+        purge: PurgeView,
         now_ms: u64,
     ) {
         let mms_path = &brcb_arc.mms_path;
@@ -2269,7 +2298,7 @@ impl ReportingEngine {
         if buf_tm_ms == 0 {
             let mut snap = EnqueuedSnapshot::new(ds.len());
             fill(&mut snap);
-            if let Err(e) = brcb_arc.enqueue_entry_with_snapshot(now_ms, false, false, snap) {
+            if let Err(e) = brcb_arc.enqueue_stored_entry(purge.oldest_commit, now_ms, snap) {
                 tracing::warn!(
                     mms_path = %mms_path,
                     error = ?e,
@@ -2279,7 +2308,7 @@ impl ReportingEngine {
             return;
         }
 
-        let purges = brcb_arc.purge_count();
+        let purges = purge.purges;
         let completed = {
             let Ok(mut pending) = self.brcb_buftm_pending.lock() else {
                 tracing::warn!(mms_path = %mms_path, "brcb buffer-time pending mutex poisoned");
@@ -2308,16 +2337,22 @@ impl ReportingEngine {
                 .entry(mms_path.clone())
                 .or_insert_with(|| BrcbBufTmPending {
                     purges,
+                    oldest_commit: purge.oldest_commit,
                     first_trigger_ms: now_ms,
                     due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
                     snapshot: EnqueuedSnapshot::new(ds.len()),
                 });
+            entry.oldest_commit = entry.oldest_commit.min(purge.oldest_commit);
             fill(&mut entry.snapshot);
             completed
         };
         if let Some(p) = completed {
-            if let Err(e) = brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
-            {
+            if let Err(e) = brcb_arc.enqueue_window_entry(
+                p.purges,
+                p.oldest_commit,
+                p.first_trigger_ms,
+                p.snapshot,
+            ) {
                 tracing::warn!(
                     mms_path = %mms_path,
                     error = ?e,
@@ -2440,6 +2475,7 @@ impl ReportingEngine {
                 .entry(mms_path.clone())
                 .or_insert_with(|| BrcbBufTmPending {
                     purges,
+                    oldest_commit: u64::MAX,
                     first_trigger_ms: now_ms,
                     due_at: Instant::now() + Duration::from_millis(buf_tm_ms as u64),
                     snapshot: EnqueuedSnapshot::new(ds_len),
@@ -2454,8 +2490,12 @@ impl ReportingEngine {
                 attr_ref = %attr_ref,
                 "buffer-time bypass: member retriggered inside the buffer window, buffering the entry now"
             );
-            if let Err(e) = brcb_arc.enqueue_window_entry(p.purges, p.first_trigger_ms, p.snapshot)
-            {
+            if let Err(e) = brcb_arc.enqueue_window_entry(
+                p.purges,
+                p.oldest_commit,
+                p.first_trigger_ms,
+                p.snapshot,
+            ) {
                 tracing::warn!(
                     mms_path = %mms_path,
                     error = ?e,
@@ -2466,27 +2506,43 @@ impl ReportingEngine {
     }
 }
 
+/// What a batch of updates knows of the purges of one BRCB: the purge count
+/// read before its members were checked against the latest purge, and the
+/// commit number of its oldest member.
+#[derive(Debug, Clone, Copy)]
+struct PurgeView {
+    purges: u64,
+    oldest_commit: u64,
+}
+
 /// Merges the elements of a batch that name the same reference: the last
-/// value and the reasons of all of them, in the order references first appear.
+/// value, the reasons of all of them and the latest commit number, in the
+/// order references first appear; an element with no commit number given
+/// counts as stored just now.
 fn merge_updates(
     updates: &[(DataAttributeRef, MmsValue, InclusionFlag)],
-) -> Vec<(DataAttributeRef, MmsValue, InclusionFlag)> {
+    committed: &[u64],
+) -> (Vec<(DataAttributeRef, MmsValue, InclusionFlag)>, Vec<u64>) {
     let mut merged: Vec<(DataAttributeRef, MmsValue, InclusionFlag)> =
         Vec::with_capacity(updates.len());
+    let mut merged_committed: Vec<u64> = Vec::with_capacity(updates.len());
     let mut index: HashMap<&str, usize> = HashMap::new();
-    for (attr_ref, value, flag) in updates {
+    for (u, (attr_ref, value, flag)) in updates.iter().enumerate() {
+        let commit = committed.get(u).copied().unwrap_or(u64::MAX);
         match index.get(attr_ref.as_str()) {
             Some(&i) => {
                 merged[i].1 = value.clone();
                 merged[i].2 = merged[i].2.union(*flag);
+                merged_committed[i] = merged_committed[i].max(commit);
             }
             None => {
                 index.insert(attr_ref.as_str(), merged.len());
                 merged.push((attr_ref.clone(), value.clone(), *flag));
+                merged_committed.push(commit);
             }
         }
     }
-    merged
+    (merged, merged_committed)
 }
 
 /// Adds `watcher` to the watch list of every leaf of the members of `dataset`,

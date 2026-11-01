@@ -659,6 +659,9 @@ pub struct BufferedReportControl {
     /// How many times the PurgeBuf procedure has run; advanced under the
     /// buffer lock.
     purges: AtomicU64,
+    /// One past the commit number the latest PurgeBuf procedure took, zero
+    /// before any; set under the buffer lock.
+    purge_mark: AtomicU64,
 }
 
 impl BufferedReportControl {
@@ -690,6 +693,7 @@ impl BufferedReportControl {
             report_buffer: std::sync::Mutex::new(backend),
             brcb,
             purges: AtomicU64::new(0),
+            purge_mark: AtomicU64::new(0),
         }
     }
 
@@ -885,7 +889,11 @@ impl BufferedReportControl {
     ///
     /// Events the reporting engine still holds in a buffer-time window are
     /// discarded too: the procedure advances [`purge_count`](Self::purge_count),
-    /// and a window opened at an earlier count is never enqueued.
+    /// and a window opened at an earlier count is never enqueued. So are the
+    /// events of values stored before the procedure whose triggers have not
+    /// reached the engine yet: the procedure takes a commit number, and
+    /// [`stored_after_purge`](Self::stored_after_purge) refuses an update
+    /// stored before it.
     ///
     /// The caller holds neither lock; the buffer lock and the state lock are
     /// taken one after the other.
@@ -894,6 +902,8 @@ impl BufferedReportControl {
             let mut buf = self.lock_buffer()?;
             buf.set_formatted_through(None);
             self.purges.fetch_add(1, Ordering::AcqRel);
+            let commit = crate::service::write::commit_seq();
+            self.purge_mark.store(commit + 1, Ordering::Release);
             buf.purge()
         };
         let mut state = self.lock_state()?;
@@ -991,14 +1001,74 @@ impl BufferedReportControl {
         self.purges.load(Ordering::Acquire)
     }
 
-    /// Enqueues the entry of a buffer-time window that was opened when
-    /// [`purge_count`](Self::purge_count) read `opened_at`.
+    /// Reports whether a value stored with commit number `committed` was
+    /// stored after the latest PurgeBuf procedure, so its event is still to be
+    /// buffered; an event stored before it was discarded with the buffer.
+    pub(crate) fn stored_after_purge(&self, committed: u64) -> bool {
+        committed >= self.purge_mark.load(Ordering::Acquire)
+    }
+
+    /// Enqueues the entry of a batch of updates taken with no buffer time,
+    /// the oldest of which was stored with commit number `oldest_commit`.
     ///
-    /// Returns `Ok(None)` and enqueues nothing when a purge has run since: the
-    /// events of the window were discarded with the buffer, per the PurgeBuf
-    /// procedure of IEC 61850-7-2. The count is compared under the buffer lock
-    /// the purge takes, so the entry lands either before the purge, which then
+    /// Returns `Ok(None)` and enqueues nothing when a PurgeBuf procedure has
+    /// run since that update was stored: its event was discarded with the
+    /// buffer. A batch with any member stored before the purge is not
+    /// enqueued at all. The check is made again under the buffer lock the
+    /// purge takes, so the entry lands either before the purge, which then
     /// removes it, or not at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServerError::InvalidModel` when the state or buffer mutex is
+    /// poisoned.
+    pub(crate) fn enqueue_stored_entry(
+        &self,
+        oldest_commit: u64,
+        time_ms: u64,
+        snapshot: EnqueuedSnapshot,
+    ) -> Result<Option<(EntryId, bool)>, crate::error::ServerError> {
+        if !self.stored_after_purge(oldest_commit) {
+            return Ok(None);
+        }
+        let entry_id = {
+            let mut state = self.lock_state()?;
+            state.allocate_entry_id(time_ms)
+        };
+        let entry = Arc::new(ReportEntry::with_snapshot(
+            entry_id,
+            time_ms,
+            false,
+            false,
+            Arc::new(snapshot),
+        ));
+        let evicted = {
+            let mut buf = self.lock_buffer()?;
+            // A purge since the check above leaves the EntryID just allocated
+            // unused; later identifiers still increase.
+            if !self.stored_after_purge(oldest_commit) {
+                return Ok(None);
+            }
+            buf.push(entry.clone())
+        };
+        {
+            let mut state = self.lock_state()?;
+            state.on_enqueue(&entry);
+        }
+        Ok(Some((entry_id, evicted)))
+    }
+
+    /// Enqueues the entry of a buffer-time window that was opened when
+    /// [`purge_count`](Self::purge_count) read `opened_at`, and whose oldest
+    /// update was stored with commit number `oldest_commit`.
+    ///
+    /// Returns `Ok(None)` and enqueues nothing when a purge has run since the
+    /// window opened or since that update was stored: the events of the window
+    /// were discarded with the buffer, per the PurgeBuf procedure of
+    /// IEC 61850-7-2. A window with any member stored before the purge is not
+    /// enqueued at all. Both are compared under the buffer lock the purge
+    /// takes, so the entry lands either before the purge, which then removes
+    /// it, or not at all.
     ///
     /// # Errors
     ///
@@ -1007,10 +1077,12 @@ impl BufferedReportControl {
     pub(crate) fn enqueue_window_entry(
         &self,
         opened_at: u64,
+        oldest_commit: u64,
         first_trigger_ms: u64,
         snapshot: EnqueuedSnapshot,
     ) -> Result<Option<(EntryId, bool)>, crate::error::ServerError> {
-        if self.purge_count() != opened_at {
+        let purged = || self.purge_count() != opened_at || !self.stored_after_purge(oldest_commit);
+        if purged() {
             return Ok(None);
         }
         let entry_id = {
@@ -1028,7 +1100,7 @@ impl BufferedReportControl {
             let mut buf = self.lock_buffer()?;
             // A purge since the check above leaves the EntryID just allocated
             // unused; later identifiers still increase.
-            if self.purge_count() != opened_at {
+            if purged() {
                 return Ok(None);
             }
             buf.push(entry.clone())

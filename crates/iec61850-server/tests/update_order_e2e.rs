@@ -124,8 +124,8 @@ fn server(m: &Arc<IedModel>, storage: Arc<dyn LogStorage>) -> IedServer {
     srv
 }
 
-/// Starts the server and enables the BRCB from a new association.
-async fn start(srv: &IedServer) -> (ServerHandle, MmsClient) {
+/// Starts the server and opens an association, leaving the BRCB disabled.
+async fn start_disabled(srv: &IedServer) -> (ServerHandle, MmsClient) {
     let handle = srv.start().await.expect("start");
     let mut mms = MmsClientBuilder::new()
         .connect_timeout_ms(3_000)
@@ -134,6 +134,12 @@ async fn start(srv: &IedServer) -> (ServerHandle, MmsClient) {
     mms.connect("127.0.0.1", handle.bound_addr.port())
         .await
         .expect("connect");
+    (handle, mms)
+}
+
+/// Starts the server and enables the BRCB from a new association.
+async fn start(srv: &IedServer) -> (ServerHandle, MmsClient) {
+    let (handle, mut mms) = start_disabled(srv).await;
     mms.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true))
         .await
         .expect("enable the BRCB");
@@ -432,4 +438,43 @@ async fn a_written_value_replaced_before_the_request_ends_is_not_reported_after(
         [(SET2, MmsValue::Boolean(true))],
         "the request reports only the value still held"
     );
+}
+
+/// A client purges the disabled BRCB while the log entry of `Ind` = true is
+/// still being written, so the value was stored before the purge but its
+/// triggers reach the reporting engine after it. The purge discarded that
+/// event (IEC 61850-7-2 17.2.2.14): once the client enables the BRCB, the
+/// first report it receives is the one of `Ind` = false, stored after the
+/// purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_stored_before_a_purge_is_not_reported_after_it() {
+    let m = model();
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let storage = Arc::new(HookedStorage::new(move || {
+        started_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+    }));
+    let srv = server(&m, storage.clone());
+    let (_handle, mut mms) = start_disabled(&srv).await;
+
+    let stored_before = std::thread::spawn({
+        let (srv, m) = (srv.clone(), m.clone());
+        move || srv.update_boolean(da(&m, 0), true).unwrap()
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the update writes its log entry");
+    mms.write(DOM, &format!("{BRCB}$PurgeBuf"), MmsData::Boolean(true))
+        .await
+        .expect("purge the BRCB");
+    go_tx.send(()).unwrap();
+    stored_before.join().unwrap();
+
+    srv.update_boolean(da(&m, 0), false).unwrap();
+    mms.write(DOM, &format!("{BRCB}$RptEna"), MmsData::Boolean(true))
+        .await
+        .expect("enable the BRCB");
+    let first = next_report(&mut mms).await;
+    assert_eq!(members(&first), [(IND, MmsValue::Boolean(false))]);
 }
