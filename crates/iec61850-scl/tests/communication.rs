@@ -98,7 +98,11 @@ fn build(xml: &str, ied: &str) -> IedModel {
 }
 
 fn error(xml: &str) -> SclParseError {
-    match try_build(xml, "IED1") {
+    error_of(xml, "IED1")
+}
+
+fn error_of(xml: &str, ied: &str) -> SclParseError {
+    match try_build(xml, ied) {
         Ok(_) => panic!("the file was accepted"),
         Err(e) => e,
     }
@@ -458,13 +462,10 @@ fn a_min_time_above_the_max_time_is_refused() {
     );
 }
 
-/// A reference that names nothing in the file is an error naming the
-/// attribute.
+/// A reference of a connected access point of the IED being built that names
+/// nothing in the file is an error naming the attribute.
 #[test]
 fn a_reference_to_nothing_is_refused() {
-    let unknown_ied = subnetwork(r#"<ConnectedAP iedName="NOPE" apName="AP1"/>"#);
-    assert_eq!(error(&unknown_ied).attribute.as_deref(), Some("iedName"));
-
     let unknown_ap = subnetwork(r#"<ConnectedAP iedName="IED1" apName="AP9"/>"#);
     assert_eq!(error(&unknown_ap).attribute.as_deref(), Some("apName"));
 
@@ -575,4 +576,149 @@ fn the_summary_lists_the_addressing() {
             && !bare.contains("GSE address")
             && !bare.contains("SMV address")
     );
+}
+
+/// Collects the messages of the WARN events emitted while `f` runs.
+fn warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    struct Collect(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Collect {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={:?} ", f.name(), v));
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut text = Text(String::new());
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = tracing::subscriber::with_default(Collect(seen.clone()), f);
+    let seen = seen.lock().unwrap().clone();
+    (out, seen)
+}
+
+/// A ConnectedAP naming an IED the file does not declare is skipped with a
+/// warning naming that IED: the file loads and the IED it declares builds.
+#[test]
+fn a_connected_ap_naming_an_undeclared_ied_is_skipped() {
+    let xml = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP1">
+        <Address><P type="IP">10.0.0.11</P></Address>
+      </ConnectedAP>
+      <ConnectedAP iedName="UNDECLARED" apName="AP1">
+        <Address><P type="IP">10.0.0.99</P></Address>
+        <GSE ldInst="LD0" cbName="gcbAbsent"/>
+      </ConnectedAP>"#,
+    );
+    let (model, seen) = warnings(|| try_build(&xml, "IED1"));
+    let model = model.expect("a ConnectedAP of an absent IED does not fail the file");
+    assert_eq!(model.connected_aps.len(), 1);
+    assert_eq!(model.connected_aps[0].ap_name, "AP1");
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("UNDECLARED") && w.contains("declares no IED")),
+        "{seen:?}"
+    );
+}
+
+/// A reference of another IED that names nothing only warns: the file loads,
+/// the IED being built is unaffected, and building the other IED fails at the
+/// reference.
+#[test]
+fn a_bad_reference_of_another_ied_only_warns() {
+    let xml = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP1">
+        <GSE ldInst="LD0" cbName="gcb1"><MinTime>4</MinTime><MaxTime>100</MaxTime></GSE>
+      </ConnectedAP>
+      <ConnectedAP iedName="IED2" apName="AP1">
+        <GSE ldInst="LD0" cbName="nope"/>
+      </ConnectedAP>
+      <ConnectedAP iedName="IED2" apName="AP9"/>"#,
+    );
+    let (resolved, seen) = warnings(|| {
+        iec61850_scl::parse_scl(&xml)
+            .expect("parse")
+            .resolve()
+            .expect("references of IED2 do not fail stage 2")
+    });
+    assert!(
+        seen.iter().any(|w| w.contains("GSEControl named `nope`")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|w| w.contains("no access point named `AP9`")),
+        "{seen:?}"
+    );
+    let ied1 = resolved.build_model("IED1").expect("IED1 builds");
+    assert_eq!(
+        ied1.gse_address("LD0", "gcb1").and_then(|g| g.max_time_ms),
+        Some(100)
+    );
+    let e = resolved
+        .build_model("IED2")
+        .expect_err("IED2 has a dangling reference");
+    assert_eq!(e.attribute.as_deref(), Some("cbName"), "{e}");
+    assert!(
+        e.element_path
+            .contains("ConnectedAP[iedName=\"IED2\",apName=\"AP1\"]"),
+        "{}",
+        e.element_path
+    );
+}
+
+/// A `MinTime` above its `MaxTime` in another IED only warns, while the same
+/// in the IED being built fails its build.
+#[test]
+fn a_min_time_above_the_max_time_of_another_ied_only_warns() {
+    let xml = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP1"/>
+      <ConnectedAP iedName="IED2" apName="AP1">
+        <GSE ldInst="LD0" cbName="gcb1"><MinTime>50</MinTime><MaxTime>40</MaxTime></GSE>
+      </ConnectedAP>"#,
+    );
+    build(&xml, "IED1");
+    let e = error_of(&xml, "IED2");
+    assert!(
+        matches!(&*e.kind, ErrorKind::SemanticConflict { detail, .. } if detail.contains("MinTime 50")),
+        "{e}"
+    );
+}
+
+/// The code `iec61850-scl-build` generates reads the addressing through the
+/// same helpers, so it skips and rejects the same references.
+#[test]
+fn the_build_script_helpers_check_the_built_ied_only() {
+    let xml = subnetwork(
+        r#"<ConnectedAP iedName="IED1" apName="AP1"/>
+      <ConnectedAP iedName="UNDECLARED" apName="AP1"/>
+      <ConnectedAP iedName="IED2" apName="AP9"/>"#,
+    );
+    let resolved = iec61850_scl::parse_scl(&xml)
+        .expect("parse")
+        .resolve()
+        .expect("resolve");
+    let raw = resolved.raw();
+    let aps = iec61850_scl::__private::connected_access_points(raw, "IED1").expect("IED1");
+    assert_eq!(aps.len(), 1);
+    assert!(iec61850_scl::__private::gse_addresses(raw, "IED1").is_ok());
+    let e = iec61850_scl::__private::connected_access_points(raw, "IED2")
+        .expect_err("IED2 names an access point it lacks");
+    assert_eq!(e.attribute.as_deref(), Some("apName"));
+    assert!(iec61850_scl::__private::smv_addresses(raw, "IED2").is_err());
 }

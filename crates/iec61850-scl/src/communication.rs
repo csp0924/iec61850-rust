@@ -4,8 +4,12 @@
 //! A `<ConnectedAP>` names an IED and one of its access points (IEC 61850-6
 //! §9.4.2, and the `refConnectedAP2IED` key reference of the schema), and a
 //! `<GSE>` or `<SMV>` names a control block of the `LLN0` of a logical device
-//! of that access point (§9.4.4, §9.4.5). Stage 2 rejects a reference that
-//! names nothing, so the model builder can attach every address it finds.
+//! of that access point (§9.4.4, §9.4.5). The model build of an IED rejects a
+//! reference of its own connected access points that names nothing, or a
+//! `MinTime` above its `MaxTime`, so it attaches every address it finds.
+//! Stage 2 only warns about the connected access points of the other IEDs,
+//! one naming an IED the file lacks included, as a configuration file often
+//! carries the connections of IEDs it does not describe.
 //!
 //! A `<P>` value is checked against the form its type prescribes: the
 //! patterns of the `tP_` types of the schema and the character rules of
@@ -27,129 +31,167 @@ use iec61850_model::tree::IedModel;
 use crate::error::{ErrorKind, SclParseError, SourceSpan};
 use crate::raw::{RawAddress, RawConnectedAp, RawScl, RawSubNetwork};
 
-/// Checks that every `<ConnectedAP>` names an access point of an IED of the
-/// file, that every `<GSE>` and `<SMV>` names a control block of that access
-/// point, and that no `<GSE>` declares a `MinTime` above its `MaxTime`, and
-/// warns about every `<P>` whose value its type does not accept.
+/// Warns about every reference of the Communication section that names
+/// nothing, every `MinTime` above its `MaxTime`, and every `<P>` whose value
+/// its type does not accept.
+///
+/// None of them fails stage 2: the model build of the IED a `<ConnectedAP>`
+/// names rejects them for that IED, and a `<ConnectedAP>` naming an IED the
+/// file lacks is never built.
+pub(crate) fn check_communication(raw: &RawScl) {
+    let Some(communication) = raw.communication.as_ref() else {
+        return;
+    };
+    for sub_network in &communication.sub_networks {
+        for cap in &sub_network.connected_aps {
+            warn_invalid_parameters(cap);
+            if let Err(e) = check_connected_ap(raw, sub_network, cap) {
+                tracing::warn!(
+                    target: "iec61850_scl::communication",
+                    line = e.span.line,
+                    col = e.span.col,
+                    "{e}; the connected access point of the IED `{}` is skipped unless that \
+                     IED is built",
+                    cap.ied_name,
+                );
+            }
+        }
+    }
+}
+
+/// Checks the `<ConnectedAP>` elements of the IED `ied_name`.
+///
+/// Also used by the build-script path, through the helpers that read the
+/// addressing of that IED.
+///
+/// # Errors
+///
+/// As [`check_connected_ap`].
+fn check_connected_aps_of(raw: &RawScl, ied_name: &str) -> Result<(), SclParseError> {
+    for (sub_network, cap) in connected_aps_of(raw, ied_name) {
+        check_connected_ap(raw, sub_network, cap)?;
+    }
+    Ok(())
+}
+
+/// Checks that a `<ConnectedAP>` names an access point of an IED of the file,
+/// that each of its `<GSE>` and `<SMV>` names a control block of that access
+/// point, and that no `<GSE>` declares a `MinTime` above its `MaxTime`.
 ///
 /// # Errors
 ///
 /// [`ErrorKind::SemanticConflict`] naming the attribute whose reference does
 /// not resolve, or the `MinTime` above the `MaxTime`.
-pub(crate) fn check_communication(raw: &RawScl) -> Result<(), SclParseError> {
-    let Some(communication) = raw.communication.as_ref() else {
-        return Ok(());
+fn check_connected_ap(
+    raw: &RawScl,
+    sub_network: &RawSubNetwork,
+    cap: &RawConnectedAp,
+) -> Result<(), SclParseError> {
+    let ap_path = connected_ap_path(sub_network, cap);
+    let conflict = |path: &str, attr: &str, detail: String| {
+        SclParseError::at(cap.span, path, ErrorKind::SemanticConflict { detail })
+            .with_attribute(attr)
     };
-    for sub_network in &communication.sub_networks {
-        for cap in &sub_network.connected_aps {
-            let ap_path = connected_ap_path(sub_network, cap);
-            warn_invalid_parameters(cap);
-            let conflict = |path: &str, attr: &str, detail: String| {
-                SclParseError::at(cap.span, path, ErrorKind::SemanticConflict { detail })
-                    .with_attribute(attr)
-            };
-            let ied = raw
-                .ieds
-                .iter()
-                .find(|i| i.name == cap.ied_name)
-                .ok_or_else(|| {
-                    conflict(
-                        &ap_path,
-                        "iedName",
-                        format!("the file declares no IED named `{}`", cap.ied_name),
-                    )
-                })?;
-            let ap = ied
-                .access_points
-                .iter()
-                .find(|a| a.name == cap.ap_name)
-                .ok_or_else(|| {
-                    conflict(
-                        &ap_path,
-                        "apName",
-                        format!(
-                            "the IED `{}` declares no access point named `{}`",
-                            cap.ied_name, cap.ap_name
-                        ),
-                    )
-                })?;
-            let lln0 = |ld_inst: &str| {
-                ap.server
-                    .as_ref()?
-                    .logical_devices
-                    .iter()
-                    .find(|ld| ld.inst == ld_inst)?
-                    .logical_nodes
-                    .iter()
-                    .find(|ln| ln.ln_class == "LLN0")
-            };
-            for gse in &cap.gses {
-                let path = format!(
-                    "{ap_path}/GSE[ldInst=\"{}\",cbName=\"{}\"]",
+    let ied = raw
+        .ieds
+        .iter()
+        .find(|i| i.name == cap.ied_name)
+        .ok_or_else(|| {
+            conflict(
+                &ap_path,
+                "iedName",
+                format!("the file declares no IED named `{}`", cap.ied_name),
+            )
+        })?;
+    let ap = ied
+        .access_points
+        .iter()
+        .find(|a| a.name == cap.ap_name)
+        .ok_or_else(|| {
+            conflict(
+                &ap_path,
+                "apName",
+                format!(
+                    "the IED `{}` declares no access point named `{}`",
+                    cap.ied_name, cap.ap_name
+                ),
+            )
+        })?;
+    let lln0 = |ld_inst: &str| {
+        ap.server
+            .as_ref()?
+            .logical_devices
+            .iter()
+            .find(|ld| ld.inst == ld_inst)?
+            .logical_nodes
+            .iter()
+            .find(|ln| ln.ln_class == "LLN0")
+    };
+    for gse in &cap.gses {
+        let path = format!(
+            "{ap_path}/GSE[ldInst=\"{}\",cbName=\"{}\"]",
+            gse.ld_inst, gse.cb_name
+        );
+        let at = |attr: &str, detail: String| {
+            SclParseError::at(
+                gse.span,
+                path.clone(),
+                ErrorKind::SemanticConflict { detail },
+            )
+            .with_attribute(attr)
+        };
+        let Some(ln) = lln0(&gse.ld_inst) else {
+            return Err(at("ldInst", no_ld(cap, &gse.ld_inst)));
+        };
+        if !ln.gse_controls.iter().any(|c| c.name == gse.cb_name) {
+            return Err(at(
+                "cbName",
+                format!(
+                    "the LLN0 of the logical device `{}` declares no GSEControl named `{}`",
                     gse.ld_inst, gse.cb_name
-                );
-                let at = |attr: &str, detail: String| {
-                    SclParseError::at(
-                        gse.span,
-                        path.clone(),
-                        ErrorKind::SemanticConflict { detail },
-                    )
-                    .with_attribute(attr)
-                };
-                let Some(ln) = lln0(&gse.ld_inst) else {
-                    return Err(at("ldInst", no_ld(cap, &gse.ld_inst)));
-                };
-                if !ln.gse_controls.iter().any(|c| c.name == gse.cb_name) {
-                    return Err(at(
-                        "cbName",
-                        format!(
-                            "the LLN0 of the logical device `{}` declares no GSEControl named `{}`",
-                            gse.ld_inst, gse.cb_name
+                ),
+            ));
+        }
+        if let (Some(min), Some(max)) = (gse.min_time_ms, gse.max_time_ms) {
+            if min > max {
+                return Err(SclParseError::at(
+                    gse.span,
+                    path.clone(),
+                    ErrorKind::SemanticConflict {
+                        detail: format!(
+                            "MinTime {min} ms exceeds MaxTime {max} ms; a repetition \
+                             interval lies between the two (IEC 61850-8-1 §18.1.2.5.1)"
                         ),
-                    ));
-                }
-                if let (Some(min), Some(max)) = (gse.min_time_ms, gse.max_time_ms) {
-                    if min > max {
-                        return Err(SclParseError::at(
-                            gse.span,
-                            path.clone(),
-                            ErrorKind::SemanticConflict {
-                                detail: format!(
-                                    "MinTime {min} ms exceeds MaxTime {max} ms; a repetition \
-                                     interval lies between the two (IEC 61850-8-1 §18.1.2.5.1)"
-                                ),
-                            },
-                        ));
-                    }
-                }
+                    },
+                ));
             }
-            for smv in &cap.smvs {
-                let path = format!(
-                    "{ap_path}/SMV[ldInst=\"{}\",cbName=\"{}\"]",
+        }
+    }
+    for smv in &cap.smvs {
+        let path = format!(
+            "{ap_path}/SMV[ldInst=\"{}\",cbName=\"{}\"]",
+            smv.ld_inst, smv.cb_name
+        );
+        let at = |attr: &str, detail: String| {
+            SclParseError::at(
+                smv.span,
+                path.clone(),
+                ErrorKind::SemanticConflict { detail },
+            )
+            .with_attribute(attr)
+        };
+        let Some(ln) = lln0(&smv.ld_inst) else {
+            return Err(at("ldInst", no_ld(cap, &smv.ld_inst)));
+        };
+        if !ln.smv_controls.iter().any(|c| c.name == smv.cb_name) {
+            return Err(at(
+                "cbName",
+                format!(
+                    "the LLN0 of the logical device `{}` declares no \
+                     SampledValueControl named `{}`",
                     smv.ld_inst, smv.cb_name
-                );
-                let at = |attr: &str, detail: String| {
-                    SclParseError::at(
-                        smv.span,
-                        path.clone(),
-                        ErrorKind::SemanticConflict { detail },
-                    )
-                    .with_attribute(attr)
-                };
-                let Some(ln) = lln0(&smv.ld_inst) else {
-                    return Err(at("ldInst", no_ld(cap, &smv.ld_inst)));
-                };
-                if !ln.smv_controls.iter().any(|c| c.name == smv.cb_name) {
-                    return Err(at(
-                        "cbName",
-                        format!(
-                            "the LLN0 of the logical device `{}` declares no \
-                             SampledValueControl named `{}`",
-                            smv.ld_inst, smv.cb_name
-                        ),
-                    ));
-                }
-            }
+                ),
+            ));
         }
     }
     Ok(())
@@ -263,12 +305,15 @@ fn connected_aps_of<'a>(
 ///
 /// # Errors
 ///
+/// [`ErrorKind::SemanticConflict`] when a reference of a connected access
+/// point of the IED names nothing or a `MinTime` exceeds its `MaxTime`, and
 /// [`ErrorKind::AttributeValueInvalid`] at a `<P>` of the server address whose
 /// type or value is refused.
 pub fn connected_access_points(
     raw: &RawScl,
     ied_name: &str,
 ) -> Result<Vec<ConnectedAccessPoint>, SclParseError> {
+    check_connected_aps_of(raw, ied_name)?;
     connected_aps_of(raw, ied_name)
         .map(|(n, ap)| {
             let mut out = ConnectedAccessPoint::new(n.name.clone(), ap.ap_name.clone());
@@ -293,12 +338,13 @@ pub fn connected_access_points(
 ///
 /// # Errors
 ///
-/// [`ErrorKind::AttributeValueInvalid`] at a `<P>` whose type or value is
-/// refused.
+/// As [`connected_access_points`], and [`ErrorKind::AttributeValueInvalid`] at
+/// a `<P>` whose type or value is refused.
 pub fn gse_addresses(
     raw: &RawScl,
     ied_name: &str,
 ) -> Result<Vec<(String, String, GseAddress)>, SclParseError> {
+    check_connected_aps_of(raw, ied_name)?;
     let mut out: Vec<(String, String, GseAddress)> = Vec::new();
     for (n, ap) in connected_aps_of(raw, ied_name) {
         for gse in &ap.gses {
@@ -338,12 +384,13 @@ pub fn gse_addresses(
 ///
 /// # Errors
 ///
-/// [`ErrorKind::AttributeValueInvalid`] at a `<P>` whose type or value is
-/// refused.
+/// As [`connected_access_points`], and [`ErrorKind::AttributeValueInvalid`] at
+/// a `<P>` whose type or value is refused.
 pub fn smv_addresses(
     raw: &RawScl,
     ied_name: &str,
 ) -> Result<Vec<(String, String, Address)>, SclParseError> {
+    check_connected_aps_of(raw, ied_name)?;
     let mut out: Vec<(String, String, Address)> = Vec::new();
     for (n, ap) in connected_aps_of(raw, ied_name) {
         for smv in &ap.smvs {

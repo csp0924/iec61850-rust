@@ -244,8 +244,9 @@ impl ResolvedScl {
         check_data_set_references(&raw)?;
 
         // The Communication section names IEDs, access points and control
-        // blocks; each has to exist.
-        crate::communication::check_communication(&raw)?;
+        // blocks; one that names nothing is reported here and rejected by the
+        // model build of the IED it belongs to.
+        crate::communication::check_communication(&raw);
 
         Ok(Self {
             raw,
