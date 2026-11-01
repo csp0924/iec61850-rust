@@ -322,7 +322,10 @@ impl IedServer {
     /// as soon as it finishes negotiating.
     ///
     /// The flag is written to every open association, so it acts as one
-    /// server-wide policy rather than per-association state.
+    /// server-wide policy rather than per-association state. An association
+    /// reads it as each request starts: a request already being dispatched
+    /// when this returns completes, and the flag applies from the next
+    /// request on.
     pub fn block_requests(&self, on: bool) {
         if let Ok(g) = self.inner.connections.read() {
             for conn in g.values() {

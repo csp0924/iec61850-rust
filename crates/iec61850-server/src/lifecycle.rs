@@ -12,9 +12,10 @@
 //!
 //! The work that can reach an application callback, the dispatch of a request,
 //! a tick of the periodic triggers and the release of an association, runs on
-//! the blocking thread pool of the runtime. A callback that blocks therefore
-//! holds up only the association, or the tick, that is waiting for it, on a
-//! current-thread runtime too.
+//! the blocking thread pool of the runtime, and a request is dispatched on a
+//! snapshot of the association's MMS state rather than under its lock. A
+//! callback that blocks therefore holds up only the association, or the tick,
+//! that is waiting for it, on a current-thread runtime too.
 //!
 //! A runtime shut down under a running server drops the association tasks
 //! while a dispatch already started keeps running on the blocking pool: it
@@ -1076,24 +1077,28 @@ where
                 break;
             }
             id if id == pres.mms_context_id => {
-                // The request is dispatched off the runtime, so the handlers it
-                // reaches do not run on a worker thread.
-                let dispatched = {
-                    let client_conn = client_conn.clone();
-                    let dispatcher = dispatcher.clone();
-                    crate::blocking::off_the_runtime(move || {
-                        client_conn
-                            .with_mms(|m| parse_message(m, dispatcher.as_ref(), &inner_payload))
-                            .unwrap_or(MessageOutcome::Silent)
-                    })
-                    .await
-                };
-                let outcome = match dispatched {
-                    Some(outcome) => outcome,
-                    None => {
-                        tracing::warn!(conn_id, "the runtime is shutting down, closing the socket");
-                        break;
+                // The request is dispatched on a snapshot of the MMS state and
+                // off the runtime, so the handlers it reaches run neither on a
+                // worker thread nor under the lock of the association's state.
+                let outcome = match client_conn.with_mms(MmsServerConnection::clone) {
+                    Some(mms) => {
+                        let dispatcher = dispatcher.clone();
+                        let dispatched = crate::blocking::off_the_runtime(move || {
+                            parse_message(&mms, dispatcher.as_ref(), &inner_payload)
+                        })
+                        .await;
+                        match dispatched {
+                            Some(outcome) => outcome,
+                            None => {
+                                tracing::warn!(
+                                    conn_id,
+                                    "the runtime is shutting down, closing the socket"
+                                );
+                                break;
+                            }
+                        }
                     }
+                    None => MessageOutcome::Silent,
                 };
 
                 // Reports the request produced go ahead of its response.

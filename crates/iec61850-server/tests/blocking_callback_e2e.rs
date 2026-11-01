@@ -9,6 +9,9 @@
 //! is still held when they finish, so they cannot have waited for it. Opening
 //! the gate then completes whatever the callback held up.
 //!
+//! `IedServer::block_requests` does not wait for a held callback either, also
+//! when a handler makes it.
+//!
 //! The server runs on a runtime of its own, on its own thread: a
 //! current-thread runtime, or a multi-thread runtime with one worker, where a
 //! callback blocking the thread that polls the server's tasks would stall
@@ -20,7 +23,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::reject::{ConfirmedRequestRejectReason, RejectReason};
 use iec61850_mms::mms::MmsData;
 use iec61850_model::cdc::{self, CdcOptions, ControlOptions};
 use iec61850_model::{
@@ -547,6 +551,150 @@ async fn a_blocked_write_handler_leaves_the_server_serving() {
     assert_eq!(
         held_write.await.unwrap().expect("held write"),
         MmsData::Integer(9)
+    );
+    running.stop();
+}
+
+/// A read handler may call `IedServer::block_requests`, which reaches the
+/// association whose request the handler is answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_handler_may_block_and_unblock_requests() {
+    #[derive(Debug)]
+    struct Blocking(IedServer);
+    impl ReadHandler for Blocking {
+        fn read(&self, _ctx: &ReadContext<'_>) -> ReadOutcome {
+            self.0.block_requests(true);
+            self.0.block_requests(false);
+            ReadOutcome::CacheHit(MmsValue::Boolean(true))
+        }
+    }
+
+    let server = build_server(30_000);
+    server
+        .handler_registry()
+        .install_read_handler(GATED_READ, Arc::new(Blocking(server.clone())))
+        .unwrap();
+    let running = ServerThread::start(&server, Flavor::OneWorker);
+    let mut client = connect(running.port).await;
+    let answered = tokio::time::timeout(STALL, client.read(DOMAIN, GATED_READ)).await;
+    assert_eq!(
+        answered
+            .expect("the read deadlocked in its handler")
+            .unwrap(),
+        MmsData::Boolean(true)
+    );
+    assert_eq!(
+        client.read(DOMAIN, PROBE_READ).await.unwrap(),
+        MmsData::Boolean(false),
+        "requests are served again"
+    );
+    running.stop();
+}
+
+/// `IedServer::block_requests` returns while a handler of an association is
+/// held, and the association answers the held request afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_requests_does_not_wait_for_a_blocked_handler() {
+    let server = build_server(30_000);
+    let gate = Arc::new(Gate::default());
+    let _opener = gate.opener();
+    server
+        .handler_registry()
+        .install_read_handler(GATED_READ, Arc::new(GatedRead(gate.clone())))
+        .unwrap();
+    let running = ServerThread::start(&server, Flavor::OneWorker);
+
+    let mut held = connect(running.port).await;
+    let held_read = tokio::spawn(async move { held.read(DOMAIN, GATED_READ).await });
+    gate.wait_entered().await;
+
+    let toggled = tokio::time::timeout(
+        STALL,
+        tokio::task::spawn_blocking({
+            let server = server.clone();
+            move || {
+                server.block_requests(true);
+                server.block_requests(false);
+            }
+        }),
+    )
+    .await;
+    assert!(
+        toggled.is_ok(),
+        "block_requests waited for the held handler"
+    );
+    assert!(!held_read.is_finished());
+
+    gate.open();
+    assert_eq!(
+        held_read.await.unwrap().expect("held read"),
+        MmsData::Boolean(true)
+    );
+    running.stop();
+}
+
+fn is_blocked(result: Result<MmsData, ClientError>) -> bool {
+    matches!(
+        result,
+        Err(ClientError::RejectError {
+            reason: RejectReason::ConfirmedRequest(ConfirmedRequestRejectReason::Other),
+            ..
+        })
+    )
+}
+
+/// `IedServer::block_requests` reaches an association that is already open
+/// from its next request on: that request is rejected, and once the flag is
+/// cleared the association is served again. A request being dispatched when
+/// the flag is set completes; the one after it is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_requests_applies_to_an_open_association_from_its_next_request() {
+    let server = build_server(30_000);
+    let gate = Arc::new(Gate::default());
+    let _opener = gate.opener();
+    server
+        .handler_registry()
+        .install_read_handler(GATED_READ, Arc::new(GatedRead(gate.clone())))
+        .unwrap();
+    let running = ServerThread::start(&server, Flavor::OneWorker);
+    let mut client = connect(running.port).await;
+
+    assert_eq!(
+        client.read(DOMAIN, PROBE_READ).await.unwrap(),
+        MmsData::Boolean(false)
+    );
+    server.block_requests(true);
+    assert!(
+        is_blocked(client.read(DOMAIN, PROBE_READ).await),
+        "the next request is rejected"
+    );
+    server.block_requests(false);
+    assert_eq!(
+        client.read(DOMAIN, PROBE_READ).await.unwrap(),
+        MmsData::Boolean(false),
+        "the association is served again"
+    );
+
+    let held_read = tokio::spawn(async move {
+        let held = client.read(DOMAIN, GATED_READ).await;
+        (client, held)
+    });
+    gate.wait_entered().await;
+    server.block_requests(true);
+    gate.open();
+    let (mut client, held) = held_read.await.unwrap();
+    assert_eq!(
+        held.expect("the request being dispatched completes"),
+        MmsData::Boolean(true)
+    );
+    assert!(
+        is_blocked(client.read(DOMAIN, PROBE_READ).await),
+        "the request after it is rejected"
+    );
+    server.block_requests(false);
+    assert_eq!(
+        client.read(DOMAIN, PROBE_READ).await.unwrap(),
+        MmsData::Boolean(false)
     );
     running.stop();
 }
