@@ -355,10 +355,13 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
 
     /// Writes attributes of a GOOSE control block (ACSI SetGoCBValues).
     ///
-    /// DatSet is written first, then GoID, then GoEna, one request at a time,
-    /// and the first failure ends the call. A server refuses DatSet and GoID
-    /// while the control block is enabled, and one that follows
-    /// IEC 61850-8-1 Ed2.1 refuses them always (8-1 §18.1.1.1.1 Table 83).
+    /// The attributes are written one request at a time, and the first failure
+    /// ends the call. `GoEna = false` is written first, then DatSet, then GoID,
+    /// so one call can stop publishing and change the configuration. Otherwise
+    /// DatSet and GoID come first and GoEna last, so publishing never starts
+    /// under the old configuration. A server refuses DatSet and GoID while the
+    /// control block is enabled, and one that follows IEC 61850-8-1 Ed2.1
+    /// refuses them always (8-1 §18.1.1.1.1 Table 83).
     ///
     /// # Errors
     ///
@@ -375,8 +378,14 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
         let (domain, item_base) = parse_gocb_ref(reference)?;
         let arc = self.mms_client_arc();
         let mut client = arc.lock().await;
-        // DatSet and GoID are written before GoEna, so publishing never starts
-        // under the old configuration and then changes it mid-stream.
+        let go_ena_item = format!("{item_base}$GoEna");
+        // Disabling precedes DatSet and GoID, which a server refuses while the
+        // block is enabled; enabling follows them.
+        let disable_first = write.go_ena == Some(false);
+        if disable_first {
+            let value = mms_value_to_mms_data(&MmsValue::Boolean(false));
+            client.write(&domain, &go_ena_item, value).await?;
+        }
         if let Some(dat_set) = write.dat_set {
             let item = format!("{item_base}$DatSet");
             let value = mms_value_to_mms_data(&MmsValue::VisibleString(dat_set));
@@ -387,10 +396,9 @@ impl<T: AsyncTransport, Tm: Timer> IedConnection<T, Tm> {
             let value = mms_value_to_mms_data(&MmsValue::VisibleString(go_id));
             client.write(&domain, &item, value).await?;
         }
-        if let Some(go_ena) = write.go_ena {
-            let item = format!("{item_base}$GoEna");
+        if let Some(go_ena) = write.go_ena.filter(|_| !disable_first) {
             let value = mms_value_to_mms_data(&MmsValue::Boolean(go_ena));
-            client.write(&domain, &item, value).await?;
+            client.write(&domain, &go_ena_item, value).await?;
         }
         Ok(())
     }

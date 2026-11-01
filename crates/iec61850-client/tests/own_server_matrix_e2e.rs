@@ -910,7 +910,9 @@ async fn segmented_reports(handle: &ServerHandle) {
     small.disconnect().await.expect("release");
 }
 
-/// The GOOSE control block is read whole and written as a block.
+/// The GOOSE control block is read whole and written as a block; one write
+/// disables an enabled block and changes its DatSet, another changes DatSet
+/// and enables it.
 async fn goose_control_block(conn: &IedConnection) {
     let gocb = format!("{LD}/LLN0$GO$gcbStatus");
     let values = conn.get_gocb_values(&gocb).await.expect("GoCB values");
@@ -927,6 +929,27 @@ async fn goose_control_block(conn: &IedConnection) {
             .expect("GoCB values")
             .go_ena
     );
+    conn.set_gocb_values(
+        &gocb,
+        GoCBValuesWrite::new()
+            .with_go_ena(false)
+            .with_dat_set(format!("{LD}/LLN0$dsLog")),
+    )
+    .await
+    .expect("disable the GoCB and change its DatSet");
+    let values = conn.get_gocb_values(&gocb).await.expect("GoCB values");
+    assert!(!values.go_ena);
+    assert_eq!(values.dat_set, format!("{LD}/LLN0$dsLog"));
+    assert_eq!(values.conf_rev, 2);
+    // Enabling follows the DatSet write.
+    conn.set_gocb_values(
+        &gocb,
+        GoCBValuesWrite::new()
+            .with_dat_set(format!("{LD}/LLN0$dsStatus"))
+            .with_go_ena(true),
+    )
+    .await
+    .expect("restore the DatSet and enable");
     conn.set_gocb_values(&gocb, GoCBValuesWrite::new().with_go_ena(false))
         .await
         .expect("disable the GoCB");
