@@ -22,7 +22,7 @@ use crate::handler::{AttributeAccessHandler, HandlerRegistry, ReadHandler};
 use crate::mapping::{
     bit_string_fits, bit_string_len, declared_bit_string_size, MmsDeviceModel, StringSize,
 };
-use crate::policy::WriteAccessPolicies;
+use crate::policy::SharedWriteAccessPolicies;
 use crate::reporting::{
     BufferedReportControl, ChannelReportSink, DataAttributeRef, Dataset, InclusionFlag,
     ReportControl, ReportingEngine, TriggerOptions,
@@ -72,7 +72,7 @@ struct IedServerInner {
 
     /// Which functional constraints accept a remote Write; changeable at run
     /// time, hence the lock.
-    write_access_policies: RwLock<WriteAccessPolicies>,
+    write_access_policies: SharedWriteAccessPolicies,
 
     /// Whether the server still accepts associations.
     running: AtomicBool,
@@ -262,26 +262,29 @@ impl IedServer {
 
     /// Allows or refuses remote writes under one functional constraint.
     ///
+    /// The change applies to the next Write any association sends, also while
+    /// the server runs, when the builder made the dispatcher. A dispatcher
+    /// supplied through [`IedServerBuilder::dispatcher`] enforces its own
+    /// policy instead; give it a clone of [`IedServer::write_access_policies`]
+    /// to follow this one.
+    ///
     /// # Errors
     ///
-    /// Returns `InvalidModel` when the policy lock is poisoned.
+    /// Always returns `Ok`.
     pub fn set_write_access_policy(&self, fc: iec61850_model::FC, allow: bool) -> Result<()> {
-        let mut g = self
-            .inner
-            .write_access_policies
-            .write()
-            .map_err(|_| ServerError::InvalidModel("write_access_policies poisoned".into()))?;
-        g.set(fc, allow);
+        self.inner.write_access_policies.set(fc, allow);
         Ok(())
     }
 
     /// Reports whether remote writes are allowed under a functional constraint.
     pub fn write_access_allowed(&self, fc: iec61850_model::FC) -> bool {
-        self.inner
-            .write_access_policies
-            .read()
-            .map(|g| g.is_allowed(fc))
-            .unwrap_or(false)
+        self.inner.write_access_policies.is_allowed(fc)
+    }
+
+    /// Returns the write-access policy the server and the dispatcher the
+    /// builder made share; a change through it applies to the next Write.
+    pub fn write_access_policies(&self) -> SharedWriteAccessPolicies {
+        self.inner.write_access_policies.clone()
     }
 
     /// Reports whether the data model is locked, in which case the report and
@@ -1906,10 +1909,9 @@ impl IedServerBuilder<Bound> {
     /// Without a dispatcher of its own the builder constructs a model-backed
     /// one, so the server serves requests as soon as it starts.
     ///
-    /// That dispatcher holds the write access policy as it stood when the
-    /// server was built. A later `set_write_access_policy` changes what
-    /// [`IedServer::write_access_allowed`] reports but not what the Write
-    /// service enforces, so set every policy before starting the server.
+    /// That dispatcher shares the write access policy with the server, so a
+    /// later [`IedServer::set_write_access_policy`] applies to the Write
+    /// service at once.
     ///
     /// # Errors
     ///
@@ -1924,7 +1926,8 @@ impl IedServerBuilder<Bound> {
             .bind_addr
             .expect("type-state guarantees bind_addr is set in Bound phase");
 
-        let write_access_policies = self.config.write_access_policies;
+        let write_access_policies =
+            SharedWriteAccessPolicies::new(self.config.write_access_policies);
 
         // Every registry below is created even when the caller supplied its own
         // dispatcher; in that case the caller is responsible for wiring them in,
@@ -2001,7 +2004,7 @@ impl IedServerBuilder<Bound> {
                 let dispatcher = MmsModelDispatcher::with_identification(
                     model.clone(),
                     mms_model,
-                    Arc::new(write_access_policies),
+                    write_access_policies.clone(),
                     Arc::new(ident),
                 )
                 .with_control_objects(control_objects.clone())
@@ -2035,7 +2038,7 @@ impl IedServerBuilder<Bound> {
                 connections: RwLock::new(HashMap::new()),
                 open_sockets: AtomicUsize::new(0),
                 next_connection_id: AtomicU64::new(1),
-                write_access_policies: RwLock::new(write_access_policies),
+                write_access_policies,
                 running: AtomicBool::new(false),
                 data_model_lock_guard: Mutex::new(()),
                 is_model_locked: AtomicBool::new(false),

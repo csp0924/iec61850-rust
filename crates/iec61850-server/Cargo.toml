@@ -295,6 +295,10 @@ name = "acse_authentication_log"
 required-features = ["full-server"]
 
 [[test]]
+name = "write_access_policy_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "journal_query_e2e"
 required-features = ["full-server"]
 

@@ -4,7 +4,13 @@
 //! The default is `SP | SV | SE` (0x1C), the set IEC 61850 leaves writable
 //! without further configuration. All six writable constraints can be enabled,
 //! `FC::Bl` included.
+//!
+//! [`SharedWriteAccessPolicies`] holds one mask that several owners read and
+//! change together, so a change made while the server runs reaches the Write
+//! service at once.
 
+use crate::compat::Arc;
+use core::sync::atomic::{AtomicU8, Ordering};
 use iec61850_model::FC;
 
 /// Which functional constraints accept a remote Write, as a bitmask.
@@ -97,6 +103,73 @@ impl Default for WriteAccessPolicies {
     }
 }
 
+/// A write-access policy shared by every clone.
+///
+/// A change made through one clone is seen by all the others on their next
+/// read. The server and the dispatcher it builds hold clones of one value, so
+/// `IedServer::set_write_access_policy` applies to the next Write any
+/// association sends.
+#[derive(Debug, Clone)]
+pub struct SharedWriteAccessPolicies(Arc<AtomicU8>);
+
+impl SharedWriteAccessPolicies {
+    /// Creates a shared policy holding `policies`.
+    pub fn new(policies: WriteAccessPolicies) -> Self {
+        Self(Arc::new(AtomicU8::new(policies.0)))
+    }
+
+    /// Returns the policy as it stands now.
+    pub fn get(&self) -> WriteAccessPolicies {
+        WriteAccessPolicies(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Replaces the whole policy.
+    pub fn replace(&self, policies: WriteAccessPolicies) {
+        self.0.store(policies.0, Ordering::SeqCst);
+    }
+
+    /// Sets the policy for one functional constraint, as
+    /// [`WriteAccessPolicies::set`] does, in one atomic step.
+    pub fn set(&self, fc: FC, allow: bool) {
+        let Some(bit) = WriteAccessPolicies::fc_bit(fc) else {
+            tracing::warn!(
+                ?fc,
+                "write access policy set for a non-writable FC, ignored"
+            );
+            return;
+        };
+        if allow {
+            self.0.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            self.0.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
+
+    /// Reports whether the functional constraint accepts a remote Write now.
+    pub fn is_allowed(&self, fc: FC) -> bool {
+        self.get().is_allowed(fc)
+    }
+}
+
+impl Default for SharedWriteAccessPolicies {
+    fn default() -> Self {
+        Self::new(WriteAccessPolicies::default())
+    }
+}
+
+impl From<WriteAccessPolicies> for SharedWriteAccessPolicies {
+    fn from(policies: WriteAccessPolicies) -> Self {
+        Self::new(policies)
+    }
+}
+
+impl From<Arc<WriteAccessPolicies>> for SharedWriteAccessPolicies {
+    /// Creates a shared policy holding a copy of the value behind the `Arc`.
+    fn from(policies: Arc<WriteAccessPolicies>) -> Self {
+        Self::new(*policies)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +218,44 @@ mod tests {
         p.set(FC::Mx, true);
         p.set(FC::Co, true);
         assert_eq!(p.raw(), before, "a non-writable FC must be ignored");
+    }
+
+    #[test]
+    fn a_change_through_one_clone_is_seen_by_the_others() {
+        let shared = SharedWriteAccessPolicies::default();
+        let other = shared.clone();
+        assert!(other.is_allowed(FC::Sp));
+        shared.set(FC::Sp, false);
+        assert!(!other.is_allowed(FC::Sp));
+        other.set(FC::Cf, true);
+        assert!(shared.is_allowed(FC::Cf));
+        shared.set(FC::St, true);
+        assert_eq!(shared.get().raw(), 0x18 | 0x02, "SV | SE | CF");
+        shared.replace(WriteAccessPolicies::default());
+        assert_eq!(other.get(), WriteAccessPolicies::default());
+    }
+
+    #[test]
+    fn setting_a_constraint_to_its_current_state_keeps_it() {
+        let shared = SharedWriteAccessPolicies::default();
+        shared.set(FC::Sp, true);
+        assert!(
+            shared.is_allowed(FC::Sp),
+            "allowing an allowed FC keeps it allowed"
+        );
+        shared.set(FC::Cf, false);
+        assert!(
+            !shared.is_allowed(FC::Cf),
+            "refusing a refused FC keeps it refused"
+        );
+        assert_eq!(shared.get(), WriteAccessPolicies::default());
+    }
+
+    #[test]
+    fn a_shared_policy_starts_from_the_value_it_is_made_from() {
+        let mut p = WriteAccessPolicies::default();
+        p.set(FC::Bl, true);
+        assert_eq!(SharedWriteAccessPolicies::from(p).get(), p);
+        assert_eq!(SharedWriteAccessPolicies::from(Arc::new(p)).get(), p);
     }
 }

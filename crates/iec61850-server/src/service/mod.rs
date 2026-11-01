@@ -91,7 +91,7 @@ use crate::logging::{
 #[cfg(feature = "logging")]
 use crate::mapping::qualified_object_reference;
 use crate::mapping::MmsDeviceModel;
-use crate::policy::WriteAccessPolicies;
+use crate::policy::{SharedWriteAccessPolicies, WriteAccessPolicies};
 #[cfg(feature = "reporting")]
 use crate::reporting::{NullReportSink, ReportingEngine};
 
@@ -167,8 +167,9 @@ pub struct MmsModelDispatcher {
     /// The MMS view of the model, which GetNameList and
     /// GetVariableAccessAttributes resolve against.
     pub mms_model: Arc<MmsDeviceModel>,
-    /// Which functional constraints accept a remote Write.
-    pub write_policies: Arc<WriteAccessPolicies>,
+    /// Which functional constraints accept a remote Write, read anew for
+    /// every Write so that a change made through a clone applies at once.
+    pub write_policies: SharedWriteAccessPolicies,
     /// Strings returned by the Identify service.
     pub identification: Arc<IdentificationStrings>,
     /// Read and write handlers, keyed by canonical attribute path. Empty by
@@ -214,10 +215,14 @@ pub struct MmsModelDispatcher {
 impl MmsModelDispatcher {
     /// Builds a dispatcher over a model, using the built-in identification
     /// strings and empty registries.
+    ///
+    /// `write_policies` is a [`SharedWriteAccessPolicies`] to follow a policy
+    /// shared with others, or a `WriteAccessPolicies`, alone or in an `Arc`,
+    /// for a policy of the dispatcher's own.
     pub fn new(
         model: Arc<IedModel>,
         mms_model: Arc<MmsDeviceModel>,
-        write_policies: Arc<WriteAccessPolicies>,
+        write_policies: impl Into<SharedWriteAccessPolicies>,
     ) -> Self {
         Self::with_identification(
             model,
@@ -228,17 +233,18 @@ impl MmsModelDispatcher {
     }
 
     /// Builds a dispatcher over a model with the supplied identification
-    /// strings and empty registries.
+    /// strings and empty registries; `write_policies` is taken as in
+    /// [`MmsModelDispatcher::new`].
     pub fn with_identification(
         model: Arc<IedModel>,
         mms_model: Arc<MmsDeviceModel>,
-        write_policies: Arc<WriteAccessPolicies>,
+        write_policies: impl Into<SharedWriteAccessPolicies>,
         identification: Arc<IdentificationStrings>,
     ) -> Self {
         Self {
             model,
             mms_model,
-            write_policies,
+            write_policies: write_policies.into(),
             identification,
             handler_registry: Arc::new(HandlerRegistry::new()),
             #[cfg(feature = "control")]
@@ -529,7 +535,7 @@ impl MmsServiceDispatcher for MmsModelDispatcher {
                 &body,
                 &self.model,
                 &self.mms_model,
-                &self.write_policies,
+                &self.write_policies.get(),
                 #[cfg(feature = "control")]
                 &self.control_objects,
                 #[cfg(feature = "reporting")]

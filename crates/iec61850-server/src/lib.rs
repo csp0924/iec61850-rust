@@ -123,7 +123,7 @@ pub use logging::{
 pub use mapping::{
     DomainView, MmsDeviceModel, MmsLeafType, MmsTypeSpec, NamedVariableSpec, StringSize,
 };
-pub use policy::WriteAccessPolicies;
+pub use policy::{SharedWriteAccessPolicies, WriteAccessPolicies};
 #[cfg(feature = "reporting")]
 pub use reporting::{
     ChannelReportSink, Dataset, DatasetEntry, InclusionFlag, NullReportSink, OptFlds, Rcb,
