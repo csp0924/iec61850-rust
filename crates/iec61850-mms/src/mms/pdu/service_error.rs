@@ -305,42 +305,34 @@ impl ErrorClass {
     /// Decodes the errorClass CHOICE, starting at its EXPLICIT `[0]` wrapper.
     ///
     /// `data` starts at the `0xa0` byte; the number of bytes consumed is returned.
+    /// Lengths may use the short or the long form. The wrapper must hold
+    /// exactly one primitive alternative, `[0]` through `[12]`, whose subcode
+    /// is a non-negative INTEGER no larger than 255.
     pub fn decode_explicit(data: &[u8]) -> Result<(Self, usize), MmsError> {
-        // at least 5 bytes are needed: 0xa0 len 0x8n 0x01 code
-        if data.len() < 5 {
-            return Err(MmsError::TruncatedPdu);
-        }
-
-        // the outer tag
-        if data[0] != 0xa0 {
+        let (tag, content, consumed) = split_tlv(data)?;
+        if tag != 0xa0 {
             return Err(MmsError::InvalidTag {
                 expected: 0xa0,
-                actual: data[0],
+                actual: tag,
             });
-        }
-
-        let outer_len = data[1] as usize;
-        if outer_len < 3 || data.len() < 2 + outer_len {
-            return Err(MmsError::InvalidLength);
         }
 
         // the inner tag is context-specific and primitive, with the choice index in
         // its low five bits
-        let inner_tag = data[2];
+        let (inner_tag, code_bytes, inner_used) = split_tlv(content)?;
+        if inner_used != content.len() {
+            return Err(MmsError::InvalidLength);
+        }
         if inner_tag & 0xe0 != 0x80 {
             return Err(MmsError::InvalidTag {
                 expected: 0x80,
                 actual: inner_tag,
             });
         }
+        let code =
+            u8::try_from(decode_unsigned32(code_bytes)?).map_err(|_| MmsError::InvalidLength)?;
 
-        let choice_idx = inner_tag & 0x1f;
-        if data[3] != 0x01 {
-            return Err(MmsError::InvalidLength);
-        }
-        let code = data[4];
-
-        let ec = match choice_idx {
+        let ec = match inner_tag & 0x1f {
             0 => ErrorClass::VmdState(code),
             1 => ErrorClass::ApplicationReference(code),
             2 => ErrorClass::Definition(code),
@@ -354,7 +346,7 @@ impl ErrorClass {
             10 => ErrorClass::Cancel(code),
             11 => ErrorClass::File(code),
             12 => ErrorClass::Others(code),
-            _ => {
+            choice_idx => {
                 tracing::warn!(
                     "unknown serviceerror errorclass choice index {}",
                     choice_idx
@@ -363,7 +355,7 @@ impl ErrorClass {
             }
         };
 
-        Ok((ec, 2 + outer_len))
+        Ok((ec, consumed))
     }
 }
 
@@ -373,8 +365,8 @@ impl ErrorClass {
 ///
 /// Wire format, whose outer `0xaa` is written by `MmsPdu`:
 /// ```text
-/// 0xa0 0x03      -- errorClass [0] EXPLICIT CHOICE
-///   0x8n 0x01 c  -- inner choice tag + sub-code
+/// 0xa0 <len>     -- errorClass [0] EXPLICIT CHOICE
+///   0x8n <len> c -- inner choice tag + sub-code
 /// (0x81 ... )    -- additionalCode [1] IMPLICIT INTEGER, OPTIONAL
 /// (0x82 ... )    -- additionalDescription [2] IMPLICIT VisibleString, OPTIONAL
 /// (0xa3 ... )    -- serviceSpecificInformation [3] CHOICE, OPTIONAL
@@ -385,6 +377,8 @@ pub struct ServiceError {
     /// errorClass `[0]` EXPLICIT, the one mandatory field.
     pub error_class: ErrorClass,
     /// additionalCode `[1]` IMPLICIT INTEGER, OPTIONAL.
+    ///
+    /// A value outside the `i32` range decodes as `None`.
     pub additional_code: Option<i32>,
     /// additionalDescription `[2]` IMPLICIT VisibleString, OPTIONAL.
     pub additional_description: Option<String>,
@@ -525,8 +519,13 @@ impl ServiceError {
 
             match tag {
                 0x81 => {
-                    // additionalCode [1] IMPLICIT INTEGER
-                    additional_code = Some(decode_int32(val_bytes)?);
+                    // additionalCode [1] IMPLICIT INTEGER, unbounded on the wire
+                    additional_code = if val_bytes.len() > 4 {
+                        tracing::debug!("skipping additionalcode outside the i32 range");
+                        None
+                    } else {
+                        Some(decode_int32(val_bytes)?)
+                    };
                 }
                 0x82 => {
                     // additionalDescription [2] IMPLICIT VisibleString
@@ -1405,6 +1404,200 @@ mod tests {
             0x02,
         ];
         assert!(decode_confirmed_error_pdu(negative).is_err());
+    }
+
+    /// Wraps ServiceError content in a ConfirmedError PDU under the invokeID
+    /// content bytes `invoke_id`, with every length in the short form.
+    fn confirmed_error(invoke_id: &[u8], service_error: &[u8]) -> Vec<u8> {
+        let mut inner = vec![0x80, invoke_id.len() as u8];
+        inner.extend_from_slice(invoke_id);
+        inner.extend_from_slice(&[0xa2, service_error.len() as u8]);
+        inner.extend_from_slice(service_error);
+        let mut pdu = vec![0xa2, inner.len() as u8];
+        pdu.extend_from_slice(&inner);
+        pdu
+    }
+
+    /// Every errorClass alternative decodes under its own context tag.
+    #[test]
+    fn confirmed_error_decodes_every_error_class_alternative() {
+        for idx in 0u8..=12 {
+            let pdu = confirmed_error(&[0x05], &[0xa0, 0x03, 0x80 | idx, 0x01, 0x01]);
+            let (invoke_id, se) = decode_confirmed_error_pdu(&pdu)
+                .unwrap_or_else(|e| panic!("alternative {idx} failed to decode: {e}"));
+            assert_eq!(invoke_id, 5);
+            assert_eq!(se.error_class.context_tag(), idx);
+            assert_eq!(se.error_class.code(), 1);
+        }
+    }
+
+    /// An errorClass index outside the thirteen alternatives does not decode.
+    #[test]
+    fn confirmed_error_rejects_an_unknown_error_class_alternative() {
+        let pdu = confirmed_error(&[0x05], &[0xa0, 0x03, 0x8d, 0x01, 0x01]);
+        assert!(decode_confirmed_error_pdu(&pdu).is_err());
+    }
+
+    /// The invokeID decodes at every content width an Unsigned32 takes.
+    #[test]
+    fn confirmed_error_decodes_every_invoke_id_width() {
+        let service_error = [0xa0, 0x03, 0x87, 0x01, 0x02];
+        let cases: &[(&[u8], u32)] = &[
+            (&[0x00], 0),
+            (&[0x7f], 0x7f),
+            (&[0x00, 0x80], 0x80),
+            (&[0x7f, 0xff], 0x7fff),
+            (&[0x00, 0x80, 0x00], 0x8000),
+            (&[0x01, 0x00, 0x00, 0x00], 0x0100_0000),
+            (&[0x00, 0xff, 0xff, 0xff, 0xff], u32::MAX),
+        ];
+        for (content, want) in cases {
+            let pdu = confirmed_error(content, &service_error);
+            let (invoke_id, se) = decode_confirmed_error_pdu(&pdu)
+                .unwrap_or_else(|e| panic!("invoke id {content:02x?} failed to decode: {e}"));
+            assert_eq!(invoke_id, *want);
+            assert_eq!(se.error_class, ErrorClass::Access(2));
+        }
+    }
+
+    /// Lengths written in the long form, with one and with two length octets,
+    /// decode at every level of the PDU.
+    #[test]
+    fn confirmed_error_decodes_long_form_lengths() {
+        let cases: &[&[u8]] = &[
+            // the outer SEQUENCE length as 0x81
+            &[
+                0xa2, 0x81, 0x0a, 0x80, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the outer SEQUENCE length as 0x82
+            &[
+                0xa2, 0x82, 0x00, 0x0a, 0x80, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the invokeID length as 0x81
+            &[
+                0xa2, 0x0b, 0x80, 0x81, 0x01, 0x03, 0xa2, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the serviceError length as 0x82
+            &[
+                0xa2, 0x0c, 0x80, 0x01, 0x03, 0xa2, 0x82, 0x00, 0x05, 0xa0, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the errorClass wrapper length as 0x81
+            &[
+                0xa2, 0x0b, 0x80, 0x01, 0x03, 0xa2, 0x06, 0xa0, 0x81, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the errorClass wrapper length as 0x82
+            &[
+                0xa2, 0x0c, 0x80, 0x01, 0x03, 0xa2, 0x07, 0xa0, 0x82, 0x00, 0x03, 0x87, 0x01, 0x02,
+            ],
+            // the subcode length as 0x81
+            &[
+                0xa2, 0x0b, 0x80, 0x01, 0x03, 0xa2, 0x06, 0xa0, 0x04, 0x87, 0x81, 0x01, 0x02,
+            ],
+            // every length in the long form
+            &[
+                0xa2, 0x81, 0x10, 0x80, 0x81, 0x01, 0x03, 0xa2, 0x82, 0x00, 0x08, 0xa0, 0x82, 0x00,
+                0x04, 0x87, 0x81, 0x01, 0x02,
+            ],
+        ];
+        for pdu in cases {
+            let (invoke_id, se) = decode_confirmed_error_pdu(pdu)
+                .unwrap_or_else(|e| panic!("{pdu:02x?} failed to decode: {e}"));
+            assert_eq!(invoke_id, 3, "{pdu:02x?}");
+            assert_eq!(
+                se.error_class,
+                ErrorClass::Access(subcode::access::OBJECT_NON_EXISTENT),
+                "{pdu:02x?}"
+            );
+        }
+    }
+
+    /// A subcode from 128 up carries a leading zero octet to stay
+    /// non-negative, and decodes to the same value.
+    #[test]
+    fn confirmed_error_decodes_a_two_octet_subcode() {
+        let pdu = confirmed_error(&[0x03], &[0xa0, 0x04, 0x8c, 0x02, 0x00, 0xc8]);
+        let (_, se) = decode_confirmed_error_pdu(&pdu).unwrap();
+        assert_eq!(se.error_class, ErrorClass::Others(200));
+    }
+
+    /// A subcode that is negative, too large for the subcode type or empty does
+    /// not decode; neither does a wrapper holding anything but exactly one
+    /// primitive alternative.
+    #[test]
+    fn confirmed_error_rejects_malformed_error_class() {
+        let cases: &[&[u8]] = &[
+            // a negative subcode
+            &[0xa0, 0x03, 0x87, 0x01, 0xff],
+            // a subcode of 256
+            &[0xa0, 0x04, 0x87, 0x02, 0x01, 0x00],
+            // an empty subcode
+            &[0xa0, 0x02, 0x87, 0x00],
+            // a wrapper carrying a second alternative
+            &[0xa0, 0x06, 0x87, 0x01, 0x02, 0x87, 0x01, 0x02],
+            // a constructed alternative
+            &[0xa0, 0x03, 0xa7, 0x01, 0x02],
+            // a wrapper length that runs past the ServiceError
+            &[0xa0, 0x04, 0x87, 0x01, 0x02],
+        ];
+        for service_error in cases {
+            let pdu = confirmed_error(&[0x03], service_error);
+            assert!(
+                decode_confirmed_error_pdu(&pdu).is_err(),
+                "{service_error:02x?} must not decode"
+            );
+        }
+    }
+
+    /// The optional ServiceError fields decode in every combination, each with
+    /// its length in the short and in the long form.
+    #[test]
+    fn confirmed_error_decodes_the_optional_fields() {
+        let class = [0xa0, 0x03, 0x87, 0x01, 0x03];
+        let code_short: &[u8] = &[0x81, 0x01, 0x07];
+        let code_long: &[u8] = &[0x81, 0x81, 0x02, 0xff, 0x00];
+        let desc_short: &[u8] = &[0x82, 0x02, 0x6e, 0x6f];
+        let desc_long: &[u8] = &[0x82, 0x82, 0x00, 0x02, 0x6e, 0x6f];
+        let info_short: &[u8] = &[0xa3, 0x03, 0x86, 0x01, 0x02];
+        let info_long: &[u8] = &[0xa3, 0x81, 0x04, 0x86, 0x81, 0x01, 0x02];
+        for code in [None, Some(code_short), Some(code_long)] {
+            for desc in [None, Some(desc_short), Some(desc_long)] {
+                for info in [None, Some(info_short), Some(info_long)] {
+                    let mut body = class.to_vec();
+                    for field in [code, desc, info].into_iter().flatten() {
+                        body.extend_from_slice(field);
+                    }
+                    let pdu = confirmed_error(&[0x03], &body);
+                    let (_, se) = decode_confirmed_error_pdu(&pdu)
+                        .unwrap_or_else(|e| panic!("{body:02x?} failed to decode: {e}"));
+                    assert_eq!(se.error_class, ErrorClass::Access(3));
+                    let want_code = code.map(|c| if c.len() == 3 { 7 } else { -256 });
+                    assert_eq!(se.additional_code, want_code, "{body:02x?}");
+                    assert_eq!(
+                        se.additional_description.as_deref(),
+                        desc.map(|_| "no"),
+                        "{body:02x?}"
+                    );
+                    assert_eq!(
+                        se.service_specific,
+                        info.map(|_| ServiceSpecificInfo::DeleteNamedVariableList(2)),
+                        "{body:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An additionalCode wider than 32 bits is a legal INTEGER this type
+    /// cannot hold: it decodes as `None` and the error class still decodes.
+    #[test]
+    fn wide_additional_code_keeps_the_error_class() {
+        let body = [
+            0xa0, 0x03, 0x87, 0x01, 0x03, 0x81, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let pdu = confirmed_error(&[0x03], &body);
+        let (_, se) = decode_confirmed_error_pdu(&pdu).unwrap();
+        assert_eq!(se.error_class, ErrorClass::Access(3));
+        assert_eq!(se.additional_code, None);
     }
 
     /// The access subcodes are not the `DataAccessError` codes; the two sets
