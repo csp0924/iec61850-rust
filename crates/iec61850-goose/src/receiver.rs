@@ -261,7 +261,7 @@ impl GooseReceiver<Running> {
             state_valid: true,
         };
 
-        let simulated = state.simulation || state.frame_simulation;
+        let simulated = state.is_simulated();
         for idx in candidates() {
             if let Some(Some(sub)) = subscribers.get_mut(idx) {
                 if sub.matches_frame(app_id, &dst_mac)

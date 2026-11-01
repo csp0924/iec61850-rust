@@ -8,9 +8,11 @@
 //! its APPID and destination MAC filters let through, and one without any
 //! filter accepts every GOOSE frame.
 //!
-//! Sequence state is kept per gocbRef, so an observer that sees several
-//! publications checks each one against its own predecessor; the number of
-//! publications an observer tracks is bounded.
+//! Sequence state is kept per publication, that is per gocbRef and
+//! Simulation flag, so an observer that sees several publications checks each
+//! one against its own predecessor, and a simulation of a GoCB is checked
+//! apart from the original messages of the same GoCB. The number of
+//! publications a subscriber tracks is bounded.
 //!
 //! Each event carries an owned `Arc<GooseSubscriberState>` snapshot rather than
 //! a borrow of subscriber internals, so a listener may keep or move it. State
@@ -86,13 +88,22 @@ pub struct GooseSubscriberState {
     pub state_valid: bool,
 }
 
+impl GooseSubscriberState {
+    /// Returns whether the message is simulated: the PDU `simulation` member
+    /// or the S bit of Reserved1 is set.
+    pub fn is_simulated(&self) -> bool {
+        self.simulation || self.frame_simulation
+    }
+}
+
 /// Event delivered to a subscriber's listener.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum GooseEvent {
     /// A new stNum, meaning the publisher reported a data change.
     ///
-    /// `prev_st_num` is 0 for the first publication received. `parse_result`
+    /// `prev_st_num` is the stNum of the previous message with the same
+    /// gocbRef and Simulation flag, and 0 for the first one. `parse_result`
     /// carries a decode or consistency error while `state` is still provided,
     /// leaving the decision to the application.
     #[non_exhaustive]
@@ -123,17 +134,27 @@ pub enum GooseEvent {
 /// simulated messages through LPHD.Sim, and IEC 61850-8-1 Annex C.2.5 places
 /// the S bit in the frame header for that purpose. The standard leaves the
 /// choice to the receiving application, so the default accepts both and the
-/// flag is reported in [`GooseSubscriberState`]. A publication counts as
-/// simulated when either the PDU `simulation` member or the S bit is set.
+/// flag is reported in [`GooseSubscriberState`]. A message counts as
+/// simulated when either the PDU `simulation` member or the S bit is set
+/// ([`GooseSubscriberState::is_simulated`]).
+///
+/// IEC 61850-7-2 §18.2.3.8 has simulated messages sent by a simulation unit
+/// rather than by the publisher of the original ones, so the two carry
+/// independent stNum and sqNum sequences. Whatever the filter, the subscriber
+/// keeps the sequence state, the confRev check, and the timeAllowedToLive
+/// supervision of the original and of the simulated messages of one gocbRef
+/// apart: a simulation that starts at stNum 1 while the original publication
+/// is at stNum 100 is a first state, not an stNum that moved backwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SimulationFilter {
-    /// Accepts original and simulated publications.
+    /// Accepts original and simulated messages, each sequenced and
+    /// supervised on its own.
     #[default]
     Any,
-    /// Accepts only publications that are not simulated.
+    /// Accepts only messages that are not simulated.
     NonSimulated,
-    /// Accepts only simulated publications.
+    /// Accepts only simulated messages.
     ///
     /// This is a plain filter, not the LPHD.Sim behavior of IEC 61850-7-4:
     /// with Sim set, a subscriber keeps using the original publication until
@@ -218,7 +239,9 @@ impl GooseSubscriberBuilder {
     /// When a publication arrives with every slot taken, the one heard from
     /// least recently, in the order frames were handed to the subscriber, is
     /// forgotten, and its next frame counts as a first publication; the first
-    /// eviction is logged. A subscription on one gocbRef tracks a single publication.
+    /// eviction is logged. The original and the simulated messages of one
+    /// gocbRef are two publications, so a subscription on one gocbRef tracks
+    /// at most two.
     pub fn max_streams(mut self, n: usize) -> Self {
         self.max_streams = Some(n);
         self
@@ -274,7 +297,8 @@ pub struct GooseSubscriber {
     pub(crate) listener: Option<Box<dyn Fn(GooseEvent) + Send + Sync + 'static>>,
     /// Most recent state snapshot over every tracked publication.
     pub(crate) last_state: Option<Arc<GooseSubscriberState>>,
-    /// Per-gocbRef sequence state, at most `max_streams` entries.
+    /// Sequence state per gocbRef and Simulation flag, at most `max_streams`
+    /// entries.
     pub(crate) streams: Vec<StreamTrack>,
     /// Publication counter, the recency stamp of `StreamTrack::last_seen`.
     pub(crate) clock: u64,
@@ -416,19 +440,19 @@ impl GooseSubscriber {
 
     /// Applies a decoded publication and invokes the listener.
     ///
-    /// The publication is compared with the previous one of the same gocbRef.
-    /// A higher stNum, or the first publication, raises `NewState`; the same
-    /// stNum raises `Retransmission`. An stNum that moves backwards, or an
-    /// sqNum that does not advance within a state, clears `state_valid` while
-    /// the listener is still called. Both counters skip 0 when they overflow
+    /// The message is compared with the previous one of the same gocbRef and
+    /// Simulation flag. A higher stNum, or the first message, raises
+    /// `NewState`; the same stNum raises `Retransmission`. An stNum that moves
+    /// backwards, or an sqNum that does not advance within a state, clears
+    /// `state_valid` while the listener is still called. Both counters skip 0 when they overflow
     /// (IEC 61850-8-1 §18.1.2.5.2), so a step from 4294967295 to 1 is an
     /// advance. A change of confRev is passed as `Err(ConfRevMismatch)` in
     /// `parse_result`.
     pub(crate) fn update_and_dispatch(&mut self, new_state: GooseSubscriberState) {
-        let slot = self
-            .streams
-            .iter()
-            .position(|t| t.last.gocb_ref == new_state.gocb_ref);
+        let simulated = new_state.is_simulated();
+        let slot = self.streams.iter().position(|t| {
+            t.last.gocb_ref == new_state.gocb_ref && t.last.is_simulated() == simulated
+        });
         let prev = slot
             .and_then(|i| self.streams.get(i))
             .map(|t| t.last.clone());

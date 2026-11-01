@@ -7,7 +7,9 @@ use bytes::BytesMut;
 use iec61850_goose::frame::{GooseFrame, GooseFrameHeader};
 use iec61850_goose::publisher::{CommParameters, GoosePublisher};
 use iec61850_goose::GoosePdu;
-use iec61850_goose::{GooseEvent, GooseReceiver, GooseSubscriber, GooseSubscriberBuilder};
+use iec61850_goose::{
+    GooseEvent, GooseReceiver, GooseSubscriber, GooseSubscriberBuilder, SimulationFilter,
+};
 use iec61850_model::MmsValue;
 
 mod log_capture;
@@ -570,4 +572,168 @@ fn malformed_goose_frame_is_still_reported() {
         rx.handle_message(&truncated);
     });
     assert_eq!(logged, 1);
+}
+
+/// The frame of `p` sent by a simulation unit, with the PDU `simulation`
+/// member set to `member` and the S bit of Reserved1 to `s_bit`.
+fn frame_from_simulation_unit(p: &GoosePdu, app_id: u16, member: bool, s_bit: bool) -> Vec<u8> {
+    let mut p = p.clone();
+    p.simulation = member;
+    let mut header = GooseFrameHeader::new(DST, [0, 0x50, 0xc2, 0, 0, 2], app_id);
+    header.simulation = s_bit;
+    let mut out = BytesMut::new();
+    GooseFrame::new(header, pdu_bytes(&p))
+        .encode(&mut out)
+        .unwrap();
+    out.to_vec()
+}
+
+/// The frame of `p` sent as a simulated publication: the PDU `simulation`
+/// member and the S bit of Reserved1 both set.
+fn simulated_frame_of(p: &GoosePdu, app_id: u16) -> Vec<u8> {
+    frame_from_simulation_unit(p, app_id, true, true)
+}
+
+/// Original publication at stNum 100 and a simulation of the same GoCB that
+/// starts at stNum 1, interleaved.
+fn original_and_simulated_frames() -> Vec<Vec<u8>> {
+    let g = "LD/LLN0$GO$g";
+    vec![
+        frame_of(&pdu(g, 100, 0), 0x1000),
+        frame_of(&pdu(g, 100, 1), 0x1000),
+        simulated_frame_of(&pdu(g, 1, 0), 0x1000),
+        simulated_frame_of(&pdu(g, 1, 1), 0x1000),
+        frame_of(&pdu(g, 100, 2), 0x1000),
+        simulated_frame_of(&pdu(g, 2, 0), 0x1000),
+    ]
+}
+
+#[test]
+fn simulated_publication_is_sequenced_apart_from_the_original() {
+    let g = "LD/LLN0$GO$g";
+    for builder in [
+        GooseSubscriberBuilder::new().gocb_ref(g),
+        GooseSubscriberBuilder::new().observer(),
+    ] {
+        let (sub, seen) = recording(builder);
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut rx = rx.start();
+        for frame in original_and_simulated_frames() {
+            rx.handle_message(&frame);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Seen::New(g.into(), 100, true),
+                Seen::Retx(g.into(), 100, true),
+                Seen::New(g.into(), 1, true),
+                Seen::Retx(g.into(), 1, true),
+                Seen::Retx(g.into(), 100, true),
+                Seen::New(g.into(), 2, true),
+            ]
+        );
+    }
+}
+
+#[test]
+fn either_simulation_flag_alone_separates_the_sequence() {
+    let g = "LD/LLN0$GO$g";
+    // Only the S bit, then only the PDU member.
+    for (member, s_bit) in [(false, true), (true, false)] {
+        let (sub, seen) = recording(GooseSubscriberBuilder::new().gocb_ref(g));
+        let mut rx = GooseReceiver::new();
+        rx.add_subscriber(sub);
+        let mut rx = rx.start();
+        for frame in [
+            frame_of(&pdu(g, 100, 0), 0x1000),
+            frame_from_simulation_unit(&pdu(g, 1, 0), 0x1000, member, s_bit),
+            frame_of(&pdu(g, 100, 1), 0x1000),
+            frame_from_simulation_unit(&pdu(g, 1, 1), 0x1000, member, s_bit),
+        ] {
+            rx.handle_message(&frame);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Seen::New(g.into(), 100, true),
+                Seen::New(g.into(), 1, true),
+                Seen::Retx(g.into(), 100, true),
+                Seen::Retx(g.into(), 1, true),
+            ],
+            "simulation member {member}, S bit {s_bit}"
+        );
+    }
+}
+
+#[test]
+fn first_simulated_publication_is_a_first_state() {
+    let g = "LD/LLN0$GO$g";
+    let prev = Arc::new(Mutex::new(Vec::new()));
+    let p = prev.clone();
+    let sub = GooseSubscriberBuilder::new()
+        .gocb_ref(g)
+        .listener(move |e: GooseEvent| {
+            if let GooseEvent::NewState {
+                prev_st_num, state, ..
+            } = e
+            {
+                p.lock().unwrap().push((state.simulation, prev_st_num));
+            }
+        })
+        .build();
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    for frame in original_and_simulated_frames() {
+        rx.handle_message(&frame);
+    }
+    assert_eq!(
+        *prev.lock().unwrap(),
+        vec![(false, 0), (true, 0), (true, 1)],
+        "prev_st_num follows the publication of the same Simulation flag"
+    );
+}
+
+#[test]
+fn simulated_and_original_publications_expire_on_their_own() {
+    let g = "LD/LLN0$GO$g";
+    let (sub, seen) = recording(GooseSubscriberBuilder::new().gocb_ref(g));
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    let t0 = Instant::now();
+    rx.handle_message_at(&frame_of(&pdu(g, 100, 0), 0x1000), t0);
+    rx.handle_message_at(
+        &simulated_frame_of(&pdu(g, 1, 0), 0x1000),
+        t0 + Duration::from_millis(1000),
+    );
+    rx.tick_at(None, t0 + Duration::from_millis(2001));
+    assert_eq!(expired_count(&seen), 1, "the original publication expires");
+    rx.tick_at(None, t0 + Duration::from_millis(3001));
+    assert_eq!(expired_count(&seen), 2, "and the simulation after it");
+}
+
+#[test]
+fn non_simulated_filter_keeps_the_original_sequence() {
+    let g = "LD/LLN0$GO$g";
+    let (sub, seen) = recording(
+        GooseSubscriberBuilder::new()
+            .gocb_ref(g)
+            .simulation(SimulationFilter::NonSimulated),
+    );
+    let mut rx = GooseReceiver::new();
+    rx.add_subscriber(sub);
+    let mut rx = rx.start();
+    for frame in original_and_simulated_frames() {
+        rx.handle_message(&frame);
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            Seen::New(g.into(), 100, true),
+            Seen::Retx(g.into(), 100, true),
+            Seen::Retx(g.into(), 100, true),
+        ]
+    );
 }
