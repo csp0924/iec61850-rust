@@ -285,21 +285,15 @@ impl ErrorClass {
 
     /// Encodes the errorClass CHOICE, including its EXPLICIT `[0]` wrapper.
     ///
-    /// The output is `0xa0 0x03 0x8<n> 0x01 <code>`, where `0x8<n>` is
-    /// `0x80 | context_tag()`, an IMPLICIT primitive tag.
+    /// The output is `0xa0 <len> 0x8<n> <len> <code>`, where `0x8<n>` is
+    /// `0x80 | context_tag()`, an IMPLICIT primitive tag, and `<code>` is the
+    /// subcode as a minimal non-negative INTEGER: one octet below 128, two
+    /// octets with a leading zero from 128 up.
     pub fn encode_explicit(&self, buf: &mut BytesMut) {
-        // the inner TLV, an IMPLICIT primitive context tag
         let inner_tag = 0x80 | self.context_tag();
-        let inner_code = self.code();
-
-        // errorClass [0] EXPLICIT, whose content is 3 bytes: tag, length and value
-        buf.extend_from_slice(&[
-            0xa0,       // EXPLICIT [0] constructed
-            0x03,       // outer length = 3
-            inner_tag,  // inner IMPLICIT tag
-            0x01,       // inner length = 1
-            inner_code, // sub-code
-        ]);
+        let code = super::common::encode_unsigned_int_minimal(u64::from(self.code()));
+        buf.extend_from_slice(&[0xa0, (code.len() + 2) as u8, inner_tag, code.len() as u8]);
+        buf.extend_from_slice(&code);
     }
 
     /// Decodes the errorClass CHOICE, starting at its EXPLICIT `[0]` wrapper.
@@ -482,7 +476,8 @@ impl ServiceError {
         if let Some(ref desc) = self.additional_description {
             // additionalDescription [2] IMPLICIT VisibleString
             let bytes = desc.as_bytes();
-            buf.extend_from_slice(&[0x82, bytes.len() as u8]);
+            buf.extend_from_slice(&[0x82]);
+            super::initiate::encode_length(bytes.len(), buf);
             buf.extend_from_slice(bytes);
         }
 
@@ -1598,6 +1593,69 @@ mod tests {
         let (_, se) = decode_confirmed_error_pdu(&pdu).unwrap();
         assert_eq!(se.error_class, ErrorClass::Access(3));
         assert_eq!(se.additional_code, None);
+    }
+
+    /// The same alternative as `ec`, carrying `code`.
+    fn with_code(ec: &ErrorClass, code: u8) -> ErrorClass {
+        match ec {
+            ErrorClass::VmdState(_) => ErrorClass::VmdState(code),
+            ErrorClass::ApplicationReference(_) => ErrorClass::ApplicationReference(code),
+            ErrorClass::Definition(_) => ErrorClass::Definition(code),
+            ErrorClass::Resource(_) => ErrorClass::Resource(code),
+            ErrorClass::Service(_) => ErrorClass::Service(code),
+            ErrorClass::ServicePreempt(_) => ErrorClass::ServicePreempt(code),
+            ErrorClass::TimeResolution(_) => ErrorClass::TimeResolution(code),
+            ErrorClass::Access(_) => ErrorClass::Access(code),
+            ErrorClass::Initiate(_) => ErrorClass::Initiate(code),
+            ErrorClass::Conclude(_) => ErrorClass::Conclude(code),
+            ErrorClass::Cancel(_) => ErrorClass::Cancel(code),
+            ErrorClass::File(_) => ErrorClass::File(code),
+            ErrorClass::Others(_) => ErrorClass::Others(code),
+        }
+    }
+
+    /// Every subcode value, under every alternative, survives the round trip.
+    #[test]
+    fn error_class_round_trips_every_subcode() {
+        for idx in 0u8..=12 {
+            let pdu = confirmed_error(&[0x01], &[0xa0, 0x03, 0x80 | idx, 0x01, 0x00]);
+            let (_, template) = decode_confirmed_error_pdu(&pdu).unwrap();
+            for code in 0u8..=255 {
+                let ec = with_code(&template.error_class, code);
+                let mut buf = BytesMut::new();
+                ec.encode_explicit(&mut buf);
+                let (decoded, consumed) = ErrorClass::decode_explicit(&buf)
+                    .unwrap_or_else(|e| panic!("{ec:?} failed to decode: {e}"));
+                assert_eq!(decoded, ec);
+                assert_eq!(consumed, buf.len());
+            }
+        }
+    }
+
+    /// A subcode from 128 up is encoded with a leading zero octet, so it does
+    /// not read back as a negative INTEGER.
+    #[test]
+    fn error_class_encodes_a_high_subcode_as_a_non_negative_integer() {
+        let mut buf = BytesMut::new();
+        ErrorClass::Others(200).encode_explicit(&mut buf);
+        assert_eq!(&buf[..], &[0xa0, 0x04, 0x8c, 0x02, 0x00, 0xc8]);
+    }
+
+    /// An additionalDescription of 128 bytes or more is written with a long
+    /// form length and reads back whole.
+    #[test]
+    fn confirmed_error_round_trips_a_long_additional_description() {
+        for n in [127usize, 128, 255, 256, 300] {
+            let se = ServiceError::new(ErrorClass::Access(3))
+                .with_additional_description("d".repeat(n))
+                .with_additional_code(i32::MIN);
+            let mut buf = BytesMut::new();
+            encode_confirmed_error_pdu(7, &se, &mut buf);
+            let (invoke_id, got) = decode_confirmed_error_pdu(&buf)
+                .unwrap_or_else(|e| panic!("a {n}-byte description failed to decode: {e}"));
+            assert_eq!(invoke_id, 7);
+            assert_eq!(got, se, "n = {n}");
+        }
     }
 
     /// The access subcodes are not the `DataAccessError` codes; the two sets
