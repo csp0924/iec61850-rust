@@ -112,10 +112,12 @@ pub use server_status::ServerStatus;
 // `get_data_set_values` can be named without depending on `iec61850-mms`
 // directly.
 pub use iec61850_mms::AccessResult;
-// Re-exported so that the ISO addressing accepted by
-// `IedConnection::with_iso_parameters` can be built without depending on
-// `iec61850-mms` directly.
-pub use iec61850_mms::{ApTitle, ApTitleError, IsoConnectionParameters};
+// Re-exported so that the ISO addressing and credentials accepted by
+// `IedConnection::with_iso_parameters`, and the diagnostic of a refused
+// authentication, can be named without depending on `iec61850-mms` directly.
+pub use iec61850_mms::{
+    AcseAuth, AcseServiceUserDiagnostic, ApTitle, ApTitleError, IsoConnectionParameters,
+};
 // Re-exported so that the return type of
 // `IedConnection::get_variable_specification` can be named without depending
 // on `iec61850-mms` directly.

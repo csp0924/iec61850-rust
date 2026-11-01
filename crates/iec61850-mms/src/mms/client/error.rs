@@ -19,8 +19,11 @@
 //! - `RejectError`: the peer answered with a reject PDU
 //! - `SessionRefused`: the peer answered the connect request with a session
 //!   REFUSE SPDU
+//! - `AuthenticationRejected`: the peer refused the association for the
+//!   calling identity or its credentials
 
 use crate::compat::prelude::*;
+use crate::iso::acse::AcseServiceUserDiagnostic;
 use crate::iso::presentation::provider_reason_name;
 use crate::iso::session::refuse_reason_name;
 use crate::mms::pdu::{DataAccessError, ErrorClass, RejectReason, ServiceSpecificInfo};
@@ -220,6 +223,18 @@ pub enum ClientError {
     #[error("the acse association was refused")]
     AssociateFailed,
 
+    /// The peer refused the association with an AARE whose
+    /// result-source-diagnostic refuses the calling AP-title, AE-qualifier or
+    /// invocation identifier, or the authentication
+    /// ([`AcseServiceUserDiagnostic::is_authentication_refusal`]), whether the
+    /// AARE travelled in a session ACCEPT or in a REFUSE.
+    #[error("the association was refused for its authentication: {diagnostic}")]
+    #[non_exhaustive]
+    AuthenticationRejected {
+        /// acse-service-user diagnostic of the rejecting AARE.
+        diagnostic: AcseServiceUserDiagnostic,
+    },
+
     /// The peer answered the connect request with a session REFUSE SPDU.
     ///
     /// `reason_code` is PI 50 of the RF SPDU and `transport_disconnect` PI 17.
@@ -331,6 +346,12 @@ impl ClientError {
     /// Initiate error PDU.
     pub fn initiate_failed(error_code: u8) -> Self {
         Self::InitiateFailed { error_code }
+    }
+
+    /// Builds a [`ClientError::AuthenticationRejected`] carrying the
+    /// acse-service-user diagnostic of the rejecting AARE.
+    pub fn authentication_rejected(diagnostic: AcseServiceUserDiagnostic) -> Self {
+        Self::AuthenticationRejected { diagnostic }
     }
 
     /// Builds a [`ClientError::SessionRefused`] whose RF SPDU carries no

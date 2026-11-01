@@ -242,6 +242,16 @@ pub enum ClientError {
     #[error("mms layer error: the acse association was refused")]
     AssociateFailed,
 
+    /// The server refused the association for the calling AP-title,
+    /// AE-qualifier or invocation identifier, or for the authentication, as
+    /// the result-source-diagnostic of its AARE names.
+    #[error("mms layer error: the association was refused for its authentication: {diagnostic}")]
+    #[non_exhaustive]
+    AuthenticationRejected {
+        /// acse-service-user diagnostic of the rejecting AARE.
+        diagnostic: iec61850_mms::AcseServiceUserDiagnostic,
+    },
+
     /// The server answered the MMS Initiate request with an Initiate-ErrorPDU.
     #[error("mms layer error: mms initiate failed: errorCode={error_code}")]
     #[non_exhaustive]
@@ -336,6 +346,9 @@ impl From<iec61850_mms::ClientError> for ClientError {
             M::RejectError { reason, .. } => ClientError::Reject { reason },
             M::ConcludeRejected => ClientError::ConcludeRejected,
             M::AssociateFailed => ClientError::AssociateFailed,
+            M::AuthenticationRejected { diagnostic, .. } => {
+                ClientError::AuthenticationRejected { diagnostic }
+            }
             M::InitiateFailed { error_code, .. } => ClientError::InitiateFailed { error_code },
             M::PduTooLarge {
                 pdu_size, max_size, ..
@@ -490,6 +503,14 @@ mod tests {
         assert_eq!(
             map(M::initiate_failed(2)),
             ClientError::InitiateFailed { error_code: 2 }
+        );
+        assert_eq!(
+            map(M::authentication_rejected(
+                iec61850_mms::AcseServiceUserDiagnostic::AuthenticationFailure
+            )),
+            ClientError::AuthenticationRejected {
+                diagnostic: iec61850_mms::AcseServiceUserDiagnostic::AuthenticationFailure
+            }
         );
     }
 

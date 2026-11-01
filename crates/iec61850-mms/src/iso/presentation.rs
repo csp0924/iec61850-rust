@@ -404,6 +404,27 @@ impl PresentationReject {
             &[]
         }
     }
+
+    /// Parses the PDV-list of the user-data and returns its context identifier
+    /// and the location of its payload inside `buf`, the buffer the CPR was
+    /// parsed from.
+    ///
+    /// # Errors
+    ///
+    /// - `UserDataTooShort` when the CPR carries no user-data.
+    /// - `WrongTag`, `MissingAbstractSyntaxName` or `LengthOverflow` for a
+    ///   malformed PDV-list.
+    pub fn parse_user_data(&self, buf: &[u8]) -> Result<UserDataResult, PresentationError> {
+        let user_data = self.user_data(buf);
+        if user_data.is_empty() {
+            return Err(PresentationError::UserDataTooShort { len: 0 });
+        }
+        parse_fully_encoded_data_inner(
+            buf,
+            self.user_data_start,
+            self.user_data_start + self.user_data_len,
+        )
+    }
 }
 
 /// Returns the ISO 8823 name of a CPR provider-reason, or `None` when the value

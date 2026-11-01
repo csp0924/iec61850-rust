@@ -568,7 +568,9 @@ impl MmsConnection<TcpStream, TokioTimer> {
     /// - `ServiceTimeout` when the Initiate response does not arrive within
     ///   `request_timeout_ms`.
     /// - `SessionRefused`, `AssociateFailed` or `InitiateFailed` when the peer
-    ///   refuses at the Session, ACSE or MMS level.
+    ///   refuses at the Session, ACSE or MMS level, and
+    ///   `AuthenticationRejected` when it refuses the calling identity or its
+    ///   credentials.
     /// - `IsoError` or `PduParse` for a malformed answer.
     pub async fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         self.reset_association_state();
@@ -732,7 +734,7 @@ impl MmsConnection<TcpStream, TokioTimer> {
                 .map_err(|e| ClientError::IsoError(format!("acse aare tls: {e}")))?;
             if acse_ind != AcseIndication::Associate {
                 warn!("acse association over tls was rejected: {:?}", acse_ind);
-                return Err(ClientError::AssociateFailed);
+                return Err(association_rejected(&self.acse));
             }
             let mms_init_bytes: Vec<u8> = mms_init_bytes_ref.to_vec();
 
@@ -842,7 +844,9 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
     /// - `ServiceTimeout` when the Initiate response does not arrive within
     ///   `request_timeout_ms`.
     /// - `SessionRefused`, `AssociateFailed` or `InitiateFailed` when the peer
-    ///   refuses at the Session, ACSE or MMS level.
+    ///   refuses at the Session, ACSE or MMS level, and
+    ///   `AuthenticationRejected` when it refuses the calling identity or its
+    ///   credentials.
     /// - `IsoError` or `PduParse` for a malformed answer.
     pub async fn connect_via(&mut self, transport: T) -> Result<(), ClientError> {
         self.reset_association_state();
@@ -1052,7 +1056,7 @@ impl<T: AsyncTransport, Tm: Timer> MmsConnection<T, Tm> {
             .map_err(|e| ClientError::IsoError(format!("acse aare: {e}")))?;
         if acse_ind != AcseIndication::Associate {
             warn!("acse association was rejected: {:?}", acse_ind);
-            return Err(ClientError::AssociateFailed);
+            return Err(association_rejected(&self.acse));
         }
         let mms_init_bytes: Vec<u8> = mms_init_bytes_ref.to_vec();
 
@@ -1819,18 +1823,62 @@ fn leading_unsigned32(content: &[u8], tag: u8) -> Option<u32> {
     Some(value.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b)))
 }
 
+/// Turns the rejecting AARE last parsed by `acse` into an error:
+/// `ClientError::AuthenticationRejected` when its diagnostic refuses the
+/// calling identity or its credentials, `ClientError::AssociateFailed`
+/// otherwise.
+fn association_rejected(acse: &AcseConnection) -> ClientError {
+    match acse.result_source_diagnostic() {
+        Some(diagnostic) if diagnostic.is_authentication_refusal() => {
+            ClientError::AuthenticationRejected { diagnostic }
+        }
+        _ => ClientError::AssociateFailed,
+    }
+}
+
+/// Returns the acse-service-user diagnostic of the rejecting AARE that a CPR
+/// for a user rejection carries on the ACSE presentation context, or `None`
+/// when `cpr` carries no such AARE.
+fn refused_aare_diagnostic(cpr: &[u8]) -> Option<acse::AcseServiceUserDiagnostic> {
+    let reject = presentation::parse_reject(cpr).ok()?;
+    if reject.provider_reason.is_some() {
+        return None;
+    }
+    let pdv = reject.parse_user_data(cpr).ok()?;
+    if pdv.context_id != presentation::ACSE_CONTEXT_ID {
+        return None;
+    }
+    let mut acse = AcseConnection::new(None);
+    match acse.parse_message(pdv.payload(cpr)).ok()? {
+        (AcseIndication::AssociateFailed, _) => acse.result_source_diagnostic(),
+        _ => None,
+    }
+}
+
 /// Accepts a Session AC and turns every other indication into an error.
 ///
-/// A REFUSE becomes `ClientError::SessionRefused`, carrying the reason code and
-/// the transport disconnect parameter of the RF SPDU together with the
-/// provider-reason of the CPR PPDU it carries, when that decodes. `raw` is the
-/// SPDU the indication was parsed from, which the refusal user data borrows
-/// from.
+/// A REFUSE whose CPR carries a rejecting AARE with a diagnostic that refuses
+/// the calling identity or its credentials becomes
+/// `ClientError::AuthenticationRejected`. Any other REFUSE becomes
+/// `ClientError::SessionRefused`, carrying the reason code and the transport
+/// disconnect parameter of the RF SPDU together with the provider-reason of the
+/// CPR PPDU it carries, when that decodes. `raw` is the SPDU the indication was
+/// parsed from, which the refusal user data borrows from.
 fn check_session_accept(raw: &[u8], indication: SessionIndication) -> Result<(), ClientError> {
     match indication {
         SessionIndication::Accept => Ok(()),
         SessionIndication::Refuse(info) => {
-            let provider_reason = presentation::parse_reject(info.user_data(raw))
+            let cpr = info.user_data(raw);
+            if let Some(diagnostic) =
+                refused_aare_diagnostic(cpr).filter(|d| d.is_authentication_refusal())
+            {
+                warn!(
+                    %diagnostic,
+                    "the peer refused the association for its authentication"
+                );
+                return Err(ClientError::AuthenticationRejected { diagnostic });
+            }
+            let provider_reason = presentation::parse_reject(cpr)
                 .ok()
                 .and_then(|reject| reject.provider_reason);
             warn!(
@@ -2196,6 +2244,95 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Encodes a session REFUSE whose CPR carries, for a user rejection, an
+    /// AARE with result 1 and `diagnostic`, and parses it back.
+    fn refusal_carrying(
+        diagnostic: acse::AcseServiceUserDiagnostic,
+        provider_reason: Option<u8>,
+    ) -> (Vec<u8>, SessionIndication) {
+        let mut aare = BytesMut::new();
+        acse::encode_aare_with_diagnostic(1, diagnostic, None, 3, &mut aare);
+        let mut cpr = BytesMut::new();
+        presentation::encode_cpr(
+            &IsoPresentation::new(),
+            provider_reason,
+            Some(&aare),
+            &mut cpr,
+        );
+        let mut rf = BytesMut::new();
+        session::encode_refuse_with_user_data(&cpr, &mut rf).expect("rf");
+        let raw = rf.to_vec();
+        let indication = IsoSession::new().parse_message(&raw).expect("parse rf");
+        (raw, indication)
+    }
+
+    #[test]
+    fn a_refusal_of_the_authentication_becomes_its_typed_error() {
+        use acse::AcseServiceUserDiagnostic as D;
+        for diagnostic in [D::AuthenticationFailure, D::CallingApTitleNotRecognized] {
+            let (raw, indication) = refusal_carrying(diagnostic, None);
+            let err = check_session_accept(&raw, indication).expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    ClientError::AuthenticationRejected { diagnostic: d, .. } if d == diagnostic
+                ),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(&diagnostic.to_string()), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_for_another_reason_stays_a_session_refusal() {
+        use acse::AcseServiceUserDiagnostic as D;
+        for (diagnostic, provider_reason) in [
+            (D::NoReasonGiven, None),
+            (D::CalledApTitleNotRecognized, None),
+            (D::AuthenticationFailure, Some(0)),
+        ] {
+            let (raw, indication) = refusal_carrying(diagnostic, provider_reason);
+            let err = check_session_accept(&raw, indication).expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    ClientError::SessionRefused {
+                        reason_code: Some(2),
+                        ..
+                    }
+                ),
+                "{diagnostic:?} {provider_reason:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejecting_aare_in_an_accept_names_a_refused_authentication() {
+        use acse::AcseServiceUserDiagnostic as D;
+        for (diagnostic, authentication) in [
+            (D::AuthenticationRequired, true),
+            (D::CallingAeQualifierNotRecognized, true),
+            (D::Null, false),
+        ] {
+            let mut aare = BytesMut::new();
+            acse::encode_aare_with_diagnostic(1, diagnostic, None, 3, &mut aare);
+            let mut conn = AcseConnection::new(None);
+            conn.parse_message(&aare).expect("aare");
+            let err = association_rejected(&conn);
+            if authentication {
+                assert!(
+                    matches!(
+                        err,
+                        ClientError::AuthenticationRejected { diagnostic: d, .. } if d == diagnostic
+                    ),
+                    "got {err:?}"
+                );
+            } else {
+                assert!(matches!(err, ClientError::AssociateFailed), "got {err:?}");
+            }
+        }
     }
 
     #[test]
