@@ -241,6 +241,9 @@ pub enum SeekResult {
 /// # Concurrency
 ///
 /// The trait takes `&mut self`; the caller owns the lock that serializes access.
+/// The reporting engine calls it with the engine lock held, also while an
+/// `IedServer` raises the triggers of value updates one batch at a time, so a
+/// backend must not update the server or wait for anything that does.
 pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
     /// Stores an entry.
     ///

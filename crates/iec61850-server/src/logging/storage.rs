@@ -117,6 +117,16 @@ pub trait LogEntryVisitor {
 ///   entry identifier.
 /// - `oldest_and_newest` answers from cached metadata rather than scanning, and
 ///   returns `None` for an empty log.
+///
+/// # Calls from the update path
+///
+/// An `IedServer` writes the entries of value updates while it raises their
+/// triggers, one batch at a time in the order the values were stored, and
+/// holds none of its locks while it calls the backend. The backend may update
+/// the server from the thread it is called on: that update is raised after the
+/// batch under way, and the call returns at once. It must not wait for an
+/// update made on another thread, which waits in turn for the batch under way
+/// and so for the backend.
 pub trait LogStorage: std::fmt::Debug + Send + Sync {
     /// Writes a new entry header with its time and a fresh entry identifier.
     ///

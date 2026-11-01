@@ -17,9 +17,8 @@
 //! the order the values were stored, so the reports and log entries of an
 //! attribute follow the order of its values whatever thread updates it and
 //! however long a log storage takes. An update returns once its own triggers
-//! have been raised. An update made by a log storage or a report sink while
-//! the server is raising triggers is raised after the batch under way, and
-//! returns at once.
+//! have been raised. An update a log storage makes while the server writes an
+//! entry to it is raised after the batch under way, and returns at once.
 
 use crate::authentication::AssociationAuthenticator;
 use crate::config::IedServerConfig;
@@ -859,11 +858,11 @@ impl IedServer {
     ///
     /// One thread at a time raises batches, holding no lock while it does;
     /// another thread waits until its own batch has been raised. A batch the
-    /// raising thread queues itself, from a log storage or a report sink it
-    /// calls into, is raised after the one under way, and the update that
-    /// queued it returns at once. A thread whose own batch has been raised
-    /// goes on with the batches no thread waits for, and stops at the first
-    /// one a thread waits for, which that thread then raises.
+    /// raising thread queues itself, from a log storage it calls into, is
+    /// raised after the one under way, and the update that queued it returns
+    /// at once. A thread whose own batch has been raised goes on with the
+    /// batches no thread waits for, and stops at the first one a thread waits
+    /// for, which that thread then raises.
     fn raise_queued(&self, number: u64) {
         let me = std::thread::current().id();
         {

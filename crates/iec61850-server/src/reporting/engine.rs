@@ -39,6 +39,12 @@ use std::time::{Duration, Instant};
 /// After `ReportingEngine::tick` encodes a report, it hands the bytes to this
 /// trait; the connection lifecycle layer implements it by writing them to the
 /// client transport.
+///
+/// The engine calls the sink with the engine lock held, from its periodic
+/// tick and while an `IedServer` raises the triggers of value updates. A sink
+/// must not block on the client, update the server, or wait for anything that
+/// does: an update raises its triggers through the engine lock, and the server
+/// raises the triggers of the updates one batch at a time.
 pub trait ReportSink: Send + Sync {
     /// Sends one PDU to the given connection.
     ///
