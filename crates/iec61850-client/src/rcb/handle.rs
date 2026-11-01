@@ -261,7 +261,7 @@ impl RcbHandle {
         self.gi.unwrap_or(false)
     }
 
-    /// Sets GI.
+    /// Sets GI, the value `set_rcb_values` writes when its mask names GI.
     pub fn set_gi(&mut self, v: bool) {
         self.gi = Some(v);
     }

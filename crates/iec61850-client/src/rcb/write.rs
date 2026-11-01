@@ -245,7 +245,7 @@ pub(crate) fn item_to_field_value(
             let v = rcb.purge_buf.unwrap_or(false);
             Some(("$PurgeBuf", MmsValue::Boolean(v)))
         }
-        RcbWriteItem::Gi => Some(("$GI", MmsValue::Boolean(true))),
+        RcbWriteItem::Gi => Some(("$GI", MmsValue::Boolean(rcb.gi()))),
     }
 }
 
@@ -478,6 +478,30 @@ mod tests {
             .unwrap();
         let (_, value) = item_to_field_value(&RcbWriteItem::EntryId, &rcb).unwrap();
         assert_eq!(value, MmsValue::OctetString(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    /// Each Boolean field is written with the value the handle holds.
+    #[test]
+    fn boolean_writes_carry_the_handle_value() {
+        for v in [false, true] {
+            let mut u = urcb(false);
+            u.set_resv(v);
+            u.set_gi(v);
+            let mut b = brcb(false);
+            b.set_purge_buf(v);
+            assert_eq!(
+                item_to_field_value(&RcbWriteItem::ResvFirst, &u).unwrap().1,
+                MmsValue::Boolean(v)
+            );
+            assert_eq!(
+                item_to_field_value(&RcbWriteItem::Gi, &u).unwrap().1,
+                MmsValue::Boolean(v)
+            );
+            assert_eq!(
+                item_to_field_value(&RcbWriteItem::PurgeBuf, &b).unwrap().1,
+                MmsValue::Boolean(v)
+            );
+        }
     }
 
     // validate_mask_vs_type.

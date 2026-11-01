@@ -8,10 +8,14 @@
 //!
 //! This guards the path the reporting example relies on: the example can still
 //! compile while the wire path is broken, and a user would then see no reports.
+//!
+//! The GI write carries the value the handle holds: on a reserved URCB that is
+//! not enabled, `GI = false` is accepted and `GI = true` is refused, as the
+//! general interrogation state machine of IEC 61850-7-2 requires.
 
 use iec61850_client::rcb::{RcbHandle, RcbWriteMask};
 use iec61850_client::report::{ClientReport, ReportCallback};
-use iec61850_client::IedConnection;
+use iec61850_client::{ClientError, IedConnection};
 use iec61850_mms::mms::client::MmsClientBuilder;
 use iec61850_model::{
     DataAttribute, DataAttributeType, IedModel, IedModelBuilder, LogicalDeviceBuilder,
@@ -141,5 +145,46 @@ async fn client_set_rcb_values_enables_and_receives_report() {
 
     let _ = conn.disconnect().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), dispatcher).await;
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gi_write_carries_the_value_of_the_handle() {
+    let server = build_server();
+    let _da = register_urcb(&server);
+    let handle = server.start().await.unwrap();
+
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .unwrap();
+
+    let mut rcb = RcbHandle::new(RPT_MMS_PATH).unwrap();
+    rcb.set_resv(true);
+    conn.set_rcb_values(&rcb, RcbWriteMask::RESV, false)
+        .await
+        .expect("reserve the control block");
+
+    // Reporting is not enabled, so only GI = false is accepted.
+    rcb.set_gi(false);
+    conn.set_rcb_values(&rcb, RcbWriteMask::GI, false)
+        .await
+        .expect("GI = false on a disabled URCB");
+    assert!(!conn.get_rcb_values(RPT_MMS_PATH).await.unwrap().gi());
+
+    rcb.set_gi(true);
+    match conn.set_rcb_values(&rcb, RcbWriteMask::GI, false).await {
+        Err(ClientError::DataAccessError(
+            iec61850_mms::DataAccessError::TemporarilyUnavailable,
+        )) => {}
+        other => panic!("GI = true on a disabled URCB: {other:?}"),
+    }
+
+    let _ = conn.disconnect().await;
     handle.stop().await;
 }
