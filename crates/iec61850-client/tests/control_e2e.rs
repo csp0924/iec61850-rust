@@ -344,12 +344,17 @@ async fn sbo_normal_operate_without_select_rejects() {
     let conn = make_connected_client(port).await;
     let spc = make_control_handle(&conn, "SPCSN_NS", ControlModel::SboNormal);
 
-    // Operate without selecting first.
+    // Operate without selecting first. The state machine refuses it with the
+    // add cause Object-not-selected, an application error, so the Error of the
+    // LastApplError is No Error (IEC 61850-8-1 §20.11).
     let outcome = spc.operate(MmsValue::Boolean(true)).await.expect("operate");
     assert_eq!(
         outcome.add_cause(),
         Some(ControlAddCause::ObjectNotSelected)
     );
+    let e = failure_last_appl_error(&outcome);
+    assert_eq!(e.ctl_obj, format!("{DOMAIN}/{LN}$CO$SPCSN_NS$Oper"));
+    assert_eq!(e.error, ControlLastApplError::NoError);
 
     let _ = conn.disconnect().await;
     handle.stop().await;
