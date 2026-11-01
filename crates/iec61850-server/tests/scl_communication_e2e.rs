@@ -7,8 +7,8 @@
 //!
 //! In a system configuration, an SCL whose Communication section connects the
 //! IED, a control block without `<GSE>` is disabled (IEC 61850-8-1 §25.3.2):
-//! its `DstAddress$Addr` reads as an empty OctetString and GoEna cannot be set
-//! TRUE. An SCL without Communication section keeps the default destination.
+//! its `DstAddress$Addr` reads as the NULL address, six zero octets, and GoEna
+//! cannot be set TRUE. An SCL without Communication section keeps the default destination.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use iec61850_client::IedConnection;
 use iec61850_goose::{CommParameters, RetransIntervals};
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::common::DataAccessError;
+use iec61850_mms::mms::pdu::type_specification::TypeSpecification;
 use iec61850_mms::mms::MmsData;
 use iec61850_model::IedModel;
 use iec61850_server::{FromModelOptions, IedServer, IedServerConfig};
@@ -179,6 +180,20 @@ async fn a_client_reads_the_scl_addressing_of_the_gocb() {
     handle.stop().await;
 }
 
+/// Reads the GoCB `name` with the client's GetGoCBValues.
+async fn gocb_values(port: u16, name: &str) -> iec61850_client::GoCBValues {
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", port).await.expect("connect");
+    conn.get_gocb_values(&format!("{DOMAIN}/LLN0$GO${name}"))
+        .await
+        .unwrap_or_else(|e| panic!("GetGoCBValues {name}: {e:?}"))
+}
+
 async fn connect(port: u16) -> MmsClient {
     let mut c = MmsClientBuilder::new()
         .connect_timeout_ms(3_000)
@@ -222,11 +237,31 @@ async fn a_control_block_without_gse_in_an_scd_is_disabled() {
         MmsData::Boolean(false)
     );
     let (addr, enable) = addr_and_enable(&mut c, "gcbSpare").await;
-    assert_eq!(addr, MmsData::OctetString(Vec::new()));
+    assert_eq!(addr, MmsData::OctetString(vec![0; 6]));
     match enable {
         Err(ClientError::DataAccessError(DataAccessError::TemporarilyUnavailable)) => {}
         other => panic!("GoEna=TRUE on a disabled control block: {other:?}"),
     }
+    // The type description keeps Addr a fixed six-octet OctetString.
+    match c
+        .get_variable_access_attributes(DOMAIN, "LLN0$GO$gcbSpare$DstAddress")
+        .await
+        .expect("GetVariableAccessAttributes DstAddress")
+    {
+        TypeSpecification::Structure { components } => assert!(
+            matches!(
+                components[0].type_spec,
+                TypeSpecification::OctetString { max_octets: 6, .. }
+            ),
+            "{:?}",
+            components[0]
+        ),
+        other => panic!("DstAddress: {other:?}"),
+    }
+    // The client reads the disabled control block with its NULL address.
+    let disabled = gocb_values(handle.bound_addr.port(), "gcbSpare").await;
+    assert_eq!(disabled.dst_address.addr, [0; 6]);
+    assert!(!disabled.go_ena);
     let spare = server
         .gocb_registry()
         .find(DOMAIN, "LLN0", "gcbSpare")
@@ -234,7 +269,7 @@ async fn a_control_block_without_gse_in_an_scd_is_disabled() {
     assert!(!spare.has_destination);
     assert!(!spare.enabled(), "the publisher stays disabled");
     match c.read(DOMAIN, "LLN0$GO$gcbSpare$DstAddress").await {
-        Ok(MmsData::Structure(items)) => assert_eq!(items[0], MmsData::OctetString(Vec::new())),
+        Ok(MmsData::Structure(items)) => assert_eq!(items[0], MmsData::OctetString(vec![0; 6])),
         other => panic!("DstAddress: {other:?}"),
     }
 
@@ -380,10 +415,13 @@ async fn a_gse_without_mac_address_disables_its_control_block() {
     let handle = server.start().await.expect("start");
     let mut c = connect(handle.bound_addr.port()).await;
     let (addr, enable) = addr_and_enable(&mut c, "gcbTrip").await;
-    assert_eq!(addr, MmsData::OctetString(Vec::new()));
+    assert_eq!(addr, MmsData::OctetString(vec![0; 6]));
     match enable {
         Err(ClientError::DataAccessError(DataAccessError::TemporarilyUnavailable)) => {}
         other => panic!("GoEna=TRUE without a layer 2 destination: {other:?}"),
     }
+    let disabled = gocb_values(handle.bound_addr.port(), "gcbTrip").await;
+    assert_eq!(disabled.dst_address.addr, [0; 6]);
+    assert_eq!(disabled.min_time_ms, Some(8));
     handle.stop().await;
 }

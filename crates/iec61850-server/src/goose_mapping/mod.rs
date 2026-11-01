@@ -48,10 +48,12 @@
 //!
 //! A control block the configuration gives no destination
 //! ([`GoCBHandle::without_destination`]) is disabled by that configuration
-//! (IEC 61850-8-1 §25.3.2): its `DstAddress$Addr` reads as an empty
-//! OctetString, and setting GoEna TRUE is refused with `TemporarilyUnavailable`,
-//! since whether GoEna is writable depends on the value of another attribute
-//! (IEC 61850-8-1 §8.1.3.4.4.2 Table 27).
+//! (IEC 61850-8-1 §25.3.2): its `DstAddress$Addr` reads as the NULL address,
+//! six zero octets, since `Addr` is a fixed six-octet OctetString (IEC 61850-8-1
+//! §8.1.3.3 Table 16) and a fixed-length NULL value is all zero octets, as the
+//! NULL EntryID of IEC 61850-7-2 is. Setting GoEna TRUE is refused with
+//! `TemporarilyUnavailable`, since whether GoEna is writable depends on the
+//! value of another attribute (IEC 61850-8-1 §8.1.3.4.4.2 Table 27).
 //!
 //! An unknown component name is refused with ObjectNonExistent on both read and
 //! write, and a write to a read-only component with ObjectAccessDenied, rather
@@ -87,8 +89,8 @@ pub struct GoCBHandle {
     pub publisher: Arc<Mutex<GoosePublisher>>,
     /// Whether the configuration gives the control block a destination.
     /// `false` marks a control block an SCD file disables by giving it no
-    /// `<GSE>`: its `DstAddress$Addr` reads as an empty OctetString and GoEna
-    /// cannot be set TRUE, whatever the publisher holds.
+    /// `<GSE>`: its `DstAddress$Addr` reads as the NULL address, six zero
+    /// octets, and GoEna cannot be set TRUE, whatever the publisher holds.
     pub has_destination: bool,
 }
 
@@ -440,8 +442,7 @@ fn lock_publisher(
 }
 
 /// Encodes one component from the publisher; `None` for a name that is not a
-/// component. Without a destination, `DstAddress$Addr` is an empty
-/// OctetString.
+/// component. Without a destination, `DstAddress$Addr` is six zero octets.
 fn encode_component(p: &GoosePublisher, has_destination: bool, da_name: &str) -> Option<MmsData> {
     let millis =
         |d: std::time::Duration| u64::from(u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
@@ -455,13 +456,13 @@ fn encode_component(p: &GoosePublisher, has_destination: bool, da_name: &str) ->
             let comm = p.comm_parameters();
             let vlan = comm.vlan;
             MmsData::Structure(vec![
-                // Addr: the six-byte MAC address, an OctetString on the wire,
-                // empty for a control block the configuration disables
-                // (IEC 61850-8-1 §25.3.2).
+                // Addr: the six-byte MAC address, an OctetString on the wire;
+                // the NULL address, six zero octets, for a control block the
+                // configuration disables (IEC 61850-8-1 §25.3.2).
                 MmsData::OctetString(if has_destination {
                     comm.dst_mac.to_vec()
                 } else {
-                    Vec::new()
+                    vec![0; 6]
                 }),
                 // PRIORITY: the VLAN priority, 0 when there is no VLAN tag.
                 MmsData::Unsigned(vlan.map_or(0, |v| u64::from(v.priority.value()))),
@@ -489,11 +490,12 @@ fn encode_component(p: &GoosePublisher, has_destination: bool, da_name: &str) ->
 /// with `ObjectValueInvalid` while DatSet is empty or ConfRev is 0, the
 /// inconsistent configuration of IEC 61850-7-2 §18.2.1.3, and with
 /// `TemporarilyUnavailable` when the control block has no destination
-/// (IEC 61850-8-1 §8.1.3.4.4.2 Table 27); either leaves it disabled. Under `Edition::Ed2_1`, GoID and
-/// DatSet are read-only and refused with `ObjectAccessDenied`
-/// (IEC 61850-8-1 §18.1.1.1.1 Table 83). Under `Ed2` and `Ed1`, GoID and
-/// DatSet, visible strings, are writable while the publisher is disabled, and
-/// otherwise they are refused with `TemporarilyUnavailable`
+/// (IEC 61850-8-1 §8.1.3.4.4.2 Table 27); either leaves it disabled.
+///
+/// Under `Edition::Ed2_1`, GoID and DatSet are read-only and refused with
+/// `ObjectAccessDenied` (IEC 61850-8-1 §18.1.1.1.1 Table 83). Under `Ed2` and
+/// `Ed1`, GoID and DatSet, visible strings, are writable while the publisher
+/// is disabled, and otherwise they are refused with `TemporarilyUnavailable`
 /// (IEC 61850-7-2 §18.2.2.6.3).
 ///
 /// A DatSet write takes a data set reference with or without its domain and
