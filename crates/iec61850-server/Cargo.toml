@@ -339,6 +339,10 @@ name = "register_from_model_e2e"
 required-features = ["full-server"]
 
 [[test]]
+name = "scl_communication_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "report_backpressure_e2e"
 required-features = ["full-server"]
 

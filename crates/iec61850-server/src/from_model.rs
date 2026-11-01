@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iec61850_goose::{CommParameters, GoosePublisher};
+use iec61850_goose::{CommParameters, GoosePublisher, RetransIntervals};
 use iec61850_model::utc_time::{TimeQuality, UtcTime};
-use iec61850_model::{DataSetEntry, IedModel, LogicalDevice, LogicalNode};
+use iec61850_model::{DataSetEntry, GseAddress, IedModel, LogicalDevice, LogicalNode};
 
 use crate::error::{Result, ServerError};
 use crate::goose_mapping::GoCBHandle;
@@ -47,8 +47,10 @@ pub struct FromModelOptions {
     /// Creates the storage of each log the log control blocks write to, once
     /// per log; `None` gives each log an unbounded [`InMemoryLogStorage`].
     pub log_storage: Option<LogStorageFactory>,
-    /// Gives the destination of each GOOSE publication; `None` gives every
-    /// publisher APPID 0 and the destination `01-0C-CD-01-00-00`.
+    /// Gives the destination of each GOOSE publication, in place of the one
+    /// the model holds. `None` takes the address of the SCL `<GSE>` of each
+    /// control block, and gives a control block without one APPID 0 and the
+    /// destination `01-0C-CD-01-00-00`.
     pub goose_comm: Option<GooseCommFactory>,
     /// Clock the GOOSE publishers registered from the model stamp `t` from;
     /// `None` reads the system clock. A publisher registered through
@@ -67,7 +69,8 @@ impl std::fmt::Debug for FromModelOptions {
 }
 
 impl FromModelOptions {
-    /// Returns the defaults: in-memory logs and placeholder GOOSE destinations.
+    /// Returns the defaults: in-memory logs and the GOOSE destinations of the
+    /// model.
     pub fn new() -> Self {
         Self::default()
     }
@@ -78,7 +81,8 @@ impl FromModelOptions {
         self
     }
 
-    /// Sets the communication parameters of the GOOSE publishers.
+    /// Sets the communication parameters of the GOOSE publishers, which take
+    /// precedence over the addresses the model holds.
     pub fn with_goose_comm(mut self, factory: GooseCommFactory) -> Self {
         self.goose_comm = Some(factory);
         self
@@ -175,10 +179,13 @@ impl IedServer {
     ///   instance has its own state and, when buffered, its own buffer;
     /// - each GOOSE control block, with a publisher carrying its `GoID`,
     ///   `DatSet` and `ConfRev`; the application finds the publisher through
-    ///   [`gocb_registry`](Self::gocb_registry) and transmits its frames, and
-    ///   [`FromModelOptions::goose_comm`] gives its destination, which the
-    ///   model does not hold. `MinTime` and `MaxTime` are those of
-    ///   [`iec61850_goose::RetransIntervals::default`]. The publisher stamps
+    ///   [`gocb_registry`](Self::gocb_registry) and transmits its frames. The
+    ///   destination is the one [`FromModelOptions::goose_comm`] gives when it
+    ///   is set, otherwise the address of the SCL `<GSE>` the model holds
+    ///   ([`CommParameters::from_address`]), otherwise APPID 0 and
+    ///   `01-0C-CD-01-00-00`. `MinTime` and `MaxTime` are those of the
+    ///   `<GSE>` ([`RetransIntervals::from_gse`]), and those of
+    ///   [`RetransIntervals::default`] without one. The publisher stamps
     ///   `t`, the time of the last stNum change (IEC 61850-8-1 §18.1.2.5),
     ///   from [`FromModelOptions::wall_clock`] with the
     ///   [`time_quality`](crate::IedServerConfig::time_quality) of the server
@@ -209,7 +216,9 @@ impl IedServer {
     /// resolve, names an element past the end of its array, resolves to no attribute or to more
     /// than [`DatasetEntry::MAX_LEAVES`] attributes, when a
     /// control block names a data set of another logical device or one the
-    /// server does not hold, or when a GOOSE control block names no data set.
+    /// server does not hold, when a GOOSE control block names no data set, or
+    /// when, with no [`FromModelOptions::goose_comm`], the address of its
+    /// `<GSE>` has no `MAC-Address`.
     /// Nothing is registered when an error is returned. A control object
     /// already registered is left as it is, its handlers included.
     pub fn register_from_model_with(&self, options: &FromModelOptions) -> Result<FromModelSummary> {
@@ -237,24 +246,32 @@ impl IedServer {
             .gocbs
             .iter()
             .map(|gocb| {
-                let comm = match &options.goose_comm {
-                    Some(factory) => factory(&gocb.reference),
-                    None => CommParameters::new(0, DEFAULT_GOOSE_DESTINATION),
+                let invalid = |e: iec61850_goose::GooseError| {
+                    ServerError::InvalidModel(format!(
+                        "GOOSE control block {}: {e}",
+                        gocb.reference
+                    ))
+                };
+                let comm = match (&options.goose_comm, &gocb.gse) {
+                    (Some(factory), _) => factory(&gocb.reference),
+                    (None, Some(gse)) => {
+                        CommParameters::from_address(&gse.address).map_err(invalid)?
+                    }
+                    (None, None) => CommParameters::new(0, DEFAULT_GOOSE_DESTINATION),
                 };
                 let go_id = Some(gocb.go_id.clone()).filter(|id| !id.is_empty());
-                GoosePublisher::new(
+                let mut publisher = GoosePublisher::new(
                     comm,
                     gocb.reference.clone(),
                     go_id,
                     format!("{}/{}", gocb.data_set.0, gocb.data_set.1),
                     gocb.conf_rev,
                 )
-                .map_err(|e| {
-                    ServerError::InvalidModel(format!(
-                        "GOOSE control block {}: {e}",
-                        gocb.reference
-                    ))
-                })
+                .map_err(invalid)?;
+                if let Some(gse) = &gocb.gse {
+                    publisher.set_retrans_intervals(RetransIntervals::from_gse(gse));
+                }
+                Ok(publisher)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -462,6 +479,8 @@ struct GocbPlan {
     /// The registry key of the data set.
     data_set: (String, String),
     conf_rev: u32,
+    /// The addressing of the SCL `<GSE>`, when the model holds one.
+    gse: Option<GseAddress>,
 }
 
 struct LcbPlan {
@@ -567,6 +586,7 @@ impl Plan {
                         go_id: gocb.go_id.clone(),
                         data_set: key,
                         conf_rev: gocb.conf_rev,
+                        gse: gocb.gse.clone(),
                     });
                 }
                 for lcb in &ln.lcbs {
