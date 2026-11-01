@@ -714,6 +714,49 @@ async fn oper_timeout_ends_the_command_with_time_limit_over() {
     h.stop().await;
 }
 
+/// A test command, its `Test` set, that outlasts the operate timeout ends with
+/// the same negative termination, whose Error is Operator Test Not OK instead
+/// of No Error (IEC 61850-8-1 §20.11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oper_timeout_of_a_test_command_carries_operator_test_not_ok() {
+    let s = server();
+    let obj = ControlObject::new({
+        let mut config =
+            ControlObjectConfig::new("SPCSO3", "GGIO1", DOMAIN, ControlModel::DirectEnhanced);
+        config.oper_timeout_ms = 20;
+        config
+    });
+    register(&s, obj.clone(), Arc::new(NeverDone));
+    let h = start(&s).await;
+    let mut a = connect(&h).await;
+
+    let MmsData::Structure(mut test_oper) = oper(on(), 4) else {
+        unreachable!()
+    };
+    test_oper[4] = MmsData::Boolean(true);
+    a.write(
+        DOMAIN,
+        "GGIO1$CO$SPCSO3$Oper",
+        MmsData::Structure(test_oper),
+    )
+    .await
+    .expect("accepted");
+    let (names, values) = next_report(&mut a, WAIT).await.expect("CommandTermination");
+    assert_eq!(names.len(), 2, "the timeout ends in a negative termination");
+    let MmsData::Structure(lae) = &values[0] else {
+        panic!("LastApplError is not a structure")
+    };
+    assert_eq!(
+        lae[0],
+        MmsData::VisibleString(format!("{DOMAIN}/GGIO1$CO$SPCSO3$Oper"))
+    );
+    assert_eq!(lae[1], MmsData::Integer(3), "Error is Operator Test Not OK");
+    assert_eq!(lae[3], MmsData::Unsigned(4), "ctlNum echoes the command");
+    assert_eq!(lae[4], MmsData::Integer(16), "AddCause is Time-limit-over");
+    assert_eq!(obj.state(), ControlState::Unselected);
+    h.stop().await;
+}
+
 // ── Type of the written value ───────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
