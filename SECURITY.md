@@ -26,8 +26,8 @@ the advisory unless they ask not to be.
 
 | Version | Supported |
 |---|---|
-| `0.3.x` | yes |
-| `0.2.x` and earlier | no |
+| `0.4.x` | yes |
+| `0.3.x` and earlier | no |
 
 While the project is below `1.0`, only the latest published minor version
 receives security fixes. Older minor versions are not backported.
@@ -145,7 +145,7 @@ the real synchronization state rather than claim more than is true.
 ## Known dependency advisories
 
 `cargo deny check advisories` runs in CI and is the authoritative list. No
-advisory stands open at `0.3.3`: the `deny.toml` ignore list is empty.
+advisory stands open at `0.4.0`: the `deny.toml` ignore list is empty.
 
 An advisory is never suppressed silently. Every entry added to the `deny.toml`
 ignore list carries the reason it is there.

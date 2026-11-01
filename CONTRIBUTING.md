@@ -100,7 +100,7 @@ cargo +1.88 check --workspace --all-targets
 
 **cargo-deny** runs `cargo deny check`, which covers advisories, the license
 allow list, duplicate versions and dependency sources. No advisories stand open
-against `0.3.3`; a change must not introduce one. Adding a crate under a license
+against `0.4.0`; a change must not introduce one. Adding a crate under a license
 outside the allow list, or suppressing an advisory, needs the reason recorded
 in `deny.toml` next to the entry.
 

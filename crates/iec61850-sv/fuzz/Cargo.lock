@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-asn1"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "thiserror",
@@ -61,14 +61,14 @@ dependencies = [
 
 [[package]]
 name = "iec61850-hal"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "iec61850-model"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "iec61850-sv"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "iec61850-asn1",

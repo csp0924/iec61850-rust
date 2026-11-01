@@ -8,6 +8,8 @@ Every crate in the workspace shares one version number.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-01
+
 0.4.0 is a breaking release. It removes the workarounds 0.3.x kept to stay
 within patch releases, makes the public enums and structs of every crate
 `#[non_exhaustive]`, and changes several behaviors on the wire to follow
@@ -2875,7 +2877,8 @@ Initial public release.
   name rather than discovered by browsing.
 - SVCB management over MMS, R-GOOSE and R-SV are not implemented.
 
-[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/csp0924/iec61850-rust/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.4.0
 [0.3.3]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/csp0924/iec61850-rust/releases/tag/v0.3.1

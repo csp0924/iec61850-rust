@@ -1,13 +1,13 @@
 # Protocol Implementation Conformance Statement
 
-Implementation: **iec61850-rust**, version **0.3.3**.
+Implementation: **iec61850-rust**, version **0.4.0**.
 
 This document states which ACSI services and models of IEC 61850-7-2, and which
 parts of the MMS mapping of IEC 61850-8-1, the crates of this workspace
 implement, in the server role, the client role, or both.
 
 This statement has **not been certified by any conformance test body**. It
-describes the source code of release 0.3.3 and nothing else. Every entry below
+describes the source code of release 0.4.0 and nothing else. Every entry below
 is derived from the implementation; where a service is absent, incomplete, or
 constrained, the row says so.
 
@@ -16,7 +16,7 @@ constrained, the row says so.
 | Item | Value |
 |---|---|
 | Implementation name | iec61850-rust |
-| Version | 0.3.3 |
+| Version | 0.4.0 |
 | Roles | Server and client |
 | Editions | Edition 2 by default. `IedServerConfig::edition` selects Edition 1, Edition 2 or Edition 2.1; the only behavior that depends on it is whether a client may write the `GoID` and `DatSet` of a GOOSE control block, which Edition 2.1 makes read-only (IEC 61850-8-1 Table 83). Edition 1 behaves as Edition 2 |
 | Default identification strings | vendor `rust61850`, model `iec61850-rust`, revision = crate version; all three configurable |
