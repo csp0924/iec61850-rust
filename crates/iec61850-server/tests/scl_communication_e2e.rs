@@ -4,6 +4,11 @@
 //! the `<GSE>` that names its control block, and `MinTime` and `MaxTime` from
 //! the same element. A client reads them back as `DstAddress`, `MinTime` and
 //! `MaxTime` (IEC 61850-8-1 §18.1.1.1.1 Table 83).
+//!
+//! In a system configuration, an SCL whose Communication section connects the
+//! IED, a control block without `<GSE>` is disabled (IEC 61850-8-1 §25.3.2):
+//! its `DstAddress$Addr` reads as an empty OctetString and GoEna cannot be set
+//! TRUE. An SCL without Communication section keeps the default destination.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +16,9 @@ use std::time::Duration;
 
 use iec61850_client::IedConnection;
 use iec61850_goose::{CommParameters, RetransIntervals};
-use iec61850_mms::mms::client::MmsClientBuilder;
+use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
+use iec61850_mms::mms::pdu::common::DataAccessError;
+use iec61850_mms::mms::MmsData;
 use iec61850_model::IedModel;
 use iec61850_server::{FromModelOptions, IedServer, IedServerConfig, ServerError};
 
@@ -64,8 +71,23 @@ const TRIP_GSE: &str = r#"<GSE ldInst="LD0" cbName="gcbTrip">
           <MaxTime unit="s" multiplier="m">2000</MaxTime>
         </GSE>"#;
 
+/// The IED of [`scl`] without Communication section, as an ICD describes it.
+fn icd() -> String {
+    let full = scl("");
+    let start = full.find("  <Communication>").expect("Communication");
+    let end = full
+        .find("</Communication>\n")
+        .expect("end of Communication")
+        + "</Communication>\n".len();
+    format!("{}{}", &full[..start], &full[end..])
+}
+
 fn model(gse: &str) -> Arc<IedModel> {
-    let raw = iec61850_scl::parse_scl(&scl(gse)).expect("parse");
+    model_of(&scl(gse))
+}
+
+fn model_of(xml: &str) -> Arc<IedModel> {
+    let raw = iec61850_scl::parse_scl(xml).expect("parse");
     Arc::new(
         raw.resolve()
             .expect("resolve")
@@ -100,8 +122,8 @@ fn publisher_settings(server: &IedServer, name: &str) -> (CommParameters, Retran
 }
 
 /// The publisher of a control block the SCL addresses sends to the `<GSE>`
-/// address, repeats after `MinTime` and settles at `MaxTime`; one the SCL
-/// does not address keeps the defaults.
+/// address, repeats after `MinTime` and settles at `MaxTime`; the publisher of
+/// one the SCL does not address keeps the defaults.
 #[test]
 fn the_publisher_takes_the_gse_of_its_control_block() {
     let model = model(TRIP_GSE);
@@ -154,12 +176,160 @@ async fn a_client_reads_the_scl_addressing_of_the_gocb() {
     assert_eq!(trip.dst_address.priority, 6);
     assert_eq!(trip.min_time_ms, Some(8));
     assert_eq!(trip.max_time_ms, Some(2000));
+    handle.stop().await;
+}
 
+async fn connect(port: u16) -> MmsClient {
+    let mut c = MmsClientBuilder::new()
+        .connect_timeout_ms(3_000)
+        .request_timeout_ms(3_000)
+        .build();
+    c.connect("127.0.0.1", port).await.expect("connect");
+    c
+}
+
+/// Reads `DstAddress$Addr` of `name`, then writes its GoEna TRUE.
+async fn addr_and_enable(c: &mut MmsClient, name: &str) -> (MmsData, Result<(), ClientError>) {
+    let addr = c
+        .read(DOMAIN, &format!("LLN0$GO${name}$DstAddress$Addr"))
+        .await
+        .expect("read DstAddress$Addr");
+    let enable = c
+        .write(
+            DOMAIN,
+            &format!("LLN0$GO${name}$GoEna"),
+            MmsData::Boolean(true),
+        )
+        .await;
+    (addr, enable)
+}
+
+/// In a system configuration, the control block the SCL gives no `<GSE>` is
+/// registered disabled: no destination address, GoEna FALSE and refused TRUE,
+/// so its publisher never becomes enabled. The addressed one beside it is the
+/// control group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_block_without_gse_in_an_scd_is_disabled() {
+    let server = server(model(TRIP_GSE));
+    server.register_from_model().expect("register_from_model");
+    let handle = server.start().await.expect("start");
+    let mut c = connect(handle.bound_addr.port()).await;
+
+    assert_eq!(
+        c.read(DOMAIN, "LLN0$GO$gcbSpare$GoEna")
+            .await
+            .expect("GoEna"),
+        MmsData::Boolean(false)
+    );
+    let (addr, enable) = addr_and_enable(&mut c, "gcbSpare").await;
+    assert_eq!(addr, MmsData::OctetString(Vec::new()));
+    match enable {
+        Err(ClientError::DataAccessError(DataAccessError::TemporarilyUnavailable)) => {}
+        other => panic!("GoEna=TRUE on a disabled control block: {other:?}"),
+    }
+    let spare = server
+        .gocb_registry()
+        .find(DOMAIN, "LLN0", "gcbSpare")
+        .expect("gcbSpare is registered");
+    assert!(!spare.has_destination);
+    assert!(!spare.enabled(), "the publisher stays disabled");
+    match c.read(DOMAIN, "LLN0$GO$gcbSpare$DstAddress").await {
+        Ok(MmsData::Structure(items)) => assert_eq!(items[0], MmsData::OctetString(Vec::new())),
+        other => panic!("DstAddress: {other:?}"),
+    }
+
+    let (addr, enable) = addr_and_enable(&mut c, "gcbTrip").await;
+    assert_eq!(
+        addr,
+        MmsData::OctetString(vec![0x01, 0x0c, 0xcd, 0x01, 0x00, 0x05])
+    );
+    enable.expect("GoEna=TRUE on the addressed control block");
+    assert!(server
+        .gocb_registry()
+        .find(DOMAIN, "LLN0", "gcbTrip")
+        .expect("gcbTrip")
+        .enabled());
+    handle.stop().await;
+}
+
+/// A disabled control block is stamped like any other: its publisher carries
+/// the timestamp source and starts from the wall clock reading.
+#[test]
+fn a_disabled_control_block_still_stamps_t() {
+    let server = server(model(TRIP_GSE));
+    let clock: iec61850_server::WallClock = Arc::new(|| Duration::from_secs(1_700_000_000));
+    server
+        .register_from_model_with(&FromModelOptions::new().with_wall_clock(clock))
+        .expect("register_from_model_with");
+    for name in ["gcbSpare", "gcbTrip"] {
+        let handle = server
+            .gocb_registry()
+            .find(DOMAIN, "LLN0", name)
+            .unwrap_or_else(|| panic!("{name} is registered"));
+        assert_eq!(handle.has_destination, name == "gcbTrip");
+        let publisher = handle.publisher.lock().unwrap();
+        assert!(publisher.has_timestamp_source(), "{name}");
+        assert_eq!(
+            publisher.timestamp().seconds_since_epoch(),
+            1_700_000_000,
+            "{name}"
+        );
+    }
+}
+
+/// A destination the application supplies replaces the missing `<GSE>`: the
+/// control block has an address and can be enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_comm_factory_gives_a_destination_to_a_control_block_without_gse() {
+    let server = server(model(TRIP_GSE));
+    let options = FromModelOptions::new().with_goose_comm(Arc::new(|_reference: &str| {
+        CommParameters::new(0x0042, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x42])
+    }));
+    server
+        .register_from_model_with(&options)
+        .expect("register_from_model_with");
+    let handle = server.start().await.expect("start");
+    let mut c = connect(handle.bound_addr.port()).await;
+
+    let (addr, enable) = addr_and_enable(&mut c, "gcbSpare").await;
+    assert_eq!(
+        addr,
+        MmsData::OctetString(vec![0x01, 0x0c, 0xcd, 0x01, 0x00, 0x42])
+    );
+    enable.expect("GoEna=TRUE with a destination from the factory");
+    handle.stop().await;
+}
+
+/// An SCL without Communication section, as an ICD, disables nothing: the
+/// control block keeps the default destination and can be enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_block_of_an_icd_keeps_the_default_destination() {
+    let model = model_of(&icd());
+    assert!(model.connected_aps.is_empty());
+    let server = server(model);
+    server.register_from_model().expect("register_from_model");
+    let handle = server.start().await.expect("start");
+    let mut c = connect(handle.bound_addr.port()).await;
+
+    let (addr, enable) = addr_and_enable(&mut c, "gcbSpare").await;
+    assert_eq!(
+        addr,
+        MmsData::OctetString(vec![0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00])
+    );
+    enable.expect("GoEna=TRUE on a control block of an ICD");
+    let conn = IedConnection::with_mms_client(
+        MmsClientBuilder::new()
+            .connect_timeout_ms(3_000)
+            .request_timeout_ms(3_000)
+            .build(),
+    );
+    conn.connect("127.0.0.1", handle.bound_addr.port())
+        .await
+        .expect("connect");
     let spare = conn
         .get_gocb_values(&format!("{DOMAIN}/LLN0$GO$gcbSpare"))
         .await
         .expect("GetGoCBValues gcbSpare");
-    assert_eq!(spare.dst_address.addr, [0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00]);
     assert_eq!(spare.dst_address.app_id, 0);
     assert_eq!(spare.min_time_ms, Some(4));
     assert_eq!(spare.max_time_ms, Some(1000));

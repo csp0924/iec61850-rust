@@ -49,8 +49,9 @@ pub struct FromModelOptions {
     pub log_storage: Option<LogStorageFactory>,
     /// Gives the destination of each GOOSE publication, in place of the one
     /// the model holds. `None` takes the address of the SCL `<GSE>` of each
-    /// control block, and gives a control block without one APPID 0 and the
-    /// destination `01-0C-CD-01-00-00`.
+    /// control block; a control block without one is disabled when the model
+    /// holds a connected access point of the IED (IEC 61850-8-1 §25.3.2), and
+    /// otherwise gets APPID 0 and the destination `01-0C-CD-01-00-00`.
     pub goose_comm: Option<GooseCommFactory>,
     /// Clock the GOOSE publishers registered from the model stamp `t` from;
     /// `None` reads the system clock. A publisher registered through
@@ -185,16 +186,22 @@ impl IedServer {
     ///   ([`CommParameters::from_address`]), otherwise APPID 0 and
     ///   `01-0C-CD-01-00-00`. `MinTime` and `MaxTime` are those of the
     ///   `<GSE>` ([`RetransIntervals::from_gse`]), and those of
-    ///   [`RetransIntervals::default`] without one. The publisher stamps
+    ///   [`RetransIntervals::default`] without one. When the model holds a
+    ///   connected access point of the IED, the SCL is a system configuration
+    ///   in which a control block without `<GSE>` is disabled (IEC 61850-8-1
+    ///   §25.3.2): without `goose_comm` it is registered
+    ///   [without a destination](crate::goose_mapping::GoCBHandle::without_destination),
+    ///   so it stays disabled and publishes nothing. The publisher stamps
     ///   `t`, the time of the last stNum change (IEC 61850-8-1 §18.1.2.5),
     ///   from [`FromModelOptions::wall_clock`] with the
     ///   [`time_quality`](crate::IedServerConfig::time_quality) of the server
     ///   configuration: once at registration, and again on every
-    ///   `increase_st_num` and `reset`. A system clock before the epoch, or a
-    ///   reading past the 32-bit SecondSinceEpoch, is sent as the epoch with
-    ///   ClockFailure set. `set_timestamp_source(None)` on the publisher
-    ///   removes the stamping; a publisher registered through
-    ///   [`register_gocb`](Self::register_gocb) is not stamped by the server;
+    ///   `increase_st_num` and `reset`, a disabled control block included. A
+    ///   system clock before the epoch, or a reading past the 32-bit
+    ///   SecondSinceEpoch, is sent as the epoch with ClockFailure set.
+    ///   `set_timestamp_source(None)` on the publisher removes the stamping; a
+    ///   publisher registered through [`register_gocb`](Self::register_gocb)
+    ///   is not stamped by the server;
     /// - each log control block, with its `DatSet`, `TrgOps`, `IntgPd`,
     ///   reason code setting and initial `LogEna`, writing to the log its
     ///   `LogRef` names; a bare log name is a log of `LLN0` of the same
@@ -301,17 +308,26 @@ impl IedServer {
                 summary.urcbs += n;
             }
         }
+        // In a system configuration, a control block the SCL gives no <GSE>
+        // is disabled unless the application supplies a destination.
+        let disables = options.goose_comm.is_none() && !model.connected_aps.is_empty();
         for (gocb, mut publisher) in plan.gocbs.iter().zip(publishers) {
             let clock = clock.clone();
             let source = move || goose_timestamp(clock(), time_quality);
             publisher.set_timestamp(source());
             publisher.set_timestamp_source(Some(Box::new(source)));
-            self.register_gocb(Arc::new(GoCBHandle::new(
+            let handle = GoCBHandle::new(
                 gocb.domain.clone(),
                 gocb.ln_name.clone(),
                 gocb.name.clone(),
                 Arc::new(Mutex::new(publisher)),
-            )));
+            );
+            let handle = if disables && gocb.gse.is_none() {
+                handle.without_destination()
+            } else {
+                handle
+            };
+            self.register_gocb(Arc::new(handle));
             summary.gocbs += 1;
         }
         let mut logs: HashMap<String, Arc<dyn LogStorage>> = HashMap::new();

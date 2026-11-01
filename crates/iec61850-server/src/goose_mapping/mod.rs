@@ -46,6 +46,13 @@
 //! MAC address as an OctetString, then the VLAN priority, VLAN identifier, and
 //! APPID as unsigned integers.
 //!
+//! A control block the configuration gives no destination
+//! ([`GoCBHandle::without_destination`]) is disabled by that configuration
+//! (IEC 61850-8-1 §25.3.2): its `DstAddress$Addr` reads as an empty
+//! OctetString, and setting GoEna TRUE is refused with `TemporarilyUnavailable`,
+//! since whether GoEna is writable depends on the value of another attribute
+//! (IEC 61850-8-1 §8.1.3.4.4.2 Table 27).
+//!
 //! An unknown component name is refused with ObjectNonExistent on both read and
 //! write, and a write to a read-only component with ObjectAccessDenied, rather
 //! than being silently ignored.
@@ -78,6 +85,11 @@ pub struct GoCBHandle {
     pub name: String,
     /// The publisher this control block drives and reads its values from.
     pub publisher: Arc<Mutex<GoosePublisher>>,
+    /// Whether the configuration gives the control block a destination.
+    /// `false` marks a control block an SCD file disables by giving it no
+    /// `<GSE>`: its `DstAddress$Addr` reads as an empty OctetString and GoEna
+    /// cannot be set TRUE, whatever the publisher holds.
+    pub has_destination: bool,
 }
 
 impl std::fmt::Debug for GoCBHandle {
@@ -106,7 +118,15 @@ impl GoCBHandle {
             ln: ln.into(),
             name: name.into(),
             publisher,
+            has_destination: true,
         }
+    }
+
+    /// Marks the control block as given no destination by the configuration;
+    /// see [`has_destination`](Self::has_destination).
+    pub fn without_destination(mut self) -> Self {
+        self.has_destination = false;
+        self
     }
 
     /// Returns the GoCBRef, `<LD>/<LN>$GO$<name>`.
@@ -344,7 +364,7 @@ pub fn encode_gocb_structure(handle: &GoCBHandle) -> Result<MmsData, DataAccessE
     let publisher = lock_publisher(handle)?;
     let items = GOCB_DA_NAMES
         .iter()
-        .filter_map(|name| encode_component(&publisher, name))
+        .filter_map(|name| encode_component(&publisher, handle.has_destination, name))
         .collect();
     Ok(MmsData::Structure(items))
 }
@@ -364,7 +384,7 @@ pub fn encode_gocb_da(handle: &GoCBHandle, da_name: &str) -> Result<MmsData, Dat
     let component = segments.next().unwrap_or_default();
     let value = {
         let publisher = lock_publisher(handle)?;
-        encode_component(&publisher, component)
+        encode_component(&publisher, handle.has_destination, component)
     };
     let (Some(mut value), Some(mut spec)) = (value, component_type_spec(component)) else {
         tracing::warn!(da_name, "read of an unknown GoCB component");
@@ -420,8 +440,9 @@ fn lock_publisher(
 }
 
 /// Encodes one component from the publisher; `None` for a name that is not a
-/// component.
-fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
+/// component. Without a destination, `DstAddress$Addr` is an empty
+/// OctetString.
+fn encode_component(p: &GoosePublisher, has_destination: bool, da_name: &str) -> Option<MmsData> {
     let millis =
         |d: std::time::Duration| u64::from(u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
     let value = match da_name {
@@ -434,8 +455,14 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
             let comm = p.comm_parameters();
             let vlan = comm.vlan;
             MmsData::Structure(vec![
-                // Addr: the six-byte MAC address, an OctetString on the wire.
-                MmsData::OctetString(comm.dst_mac.to_vec()),
+                // Addr: the six-byte MAC address, an OctetString on the wire,
+                // empty for a control block the configuration disables
+                // (IEC 61850-8-1 §25.3.2).
+                MmsData::OctetString(if has_destination {
+                    comm.dst_mac.to_vec()
+                } else {
+                    Vec::new()
+                }),
                 // PRIORITY: the VLAN priority, 0 when there is no VLAN tag.
                 MmsData::Unsigned(vlan.map_or(0, |v| u64::from(v.priority.value()))),
                 // VID: the VLAN identifier, 0 when there is no VLAN tag.
@@ -460,8 +487,9 @@ fn encode_component(p: &GoosePublisher, da_name: &str) -> Option<MmsData> {
 ///
 /// GoEna, a boolean, is writable in every edition; setting it TRUE is refused
 /// with `ObjectValueInvalid` while DatSet is empty or ConfRev is 0, the
-/// inconsistent configuration of IEC 61850-7-2 §18.2.1.3, and leaves the
-/// control block disabled. Under `Edition::Ed2_1`, GoID and
+/// inconsistent configuration of IEC 61850-7-2 §18.2.1.3, and with
+/// `TemporarilyUnavailable` when the control block has no destination
+/// (IEC 61850-8-1 §8.1.3.4.4.2 Table 27); either leaves it disabled. Under `Edition::Ed2_1`, GoID and
 /// DatSet are read-only and refused with `ObjectAccessDenied`
 /// (IEC 61850-8-1 §18.1.1.1.1 Table 83). Under `Ed2` and `Ed1`, GoID and
 /// DatSet, visible strings, are writable while the publisher is disabled, and
@@ -518,6 +546,13 @@ pub fn apply_gocb_write(
                 Ok(p) => p,
                 Err(e) => return WriteOutcome::Failure(e),
             };
+            if *b && !handle.has_destination {
+                tracing::warn!(
+                    gocb = handle.go_cb_ref(),
+                    "write GoEna=TRUE refused: the configuration gives no destination"
+                );
+                return WriteOutcome::Failure(DataAccessError::TemporarilyUnavailable);
+            }
             if *b && (p.data_set_ref().is_empty() || p.conf_rev() == 0) {
                 tracing::warn!(
                     gocb = handle.go_cb_ref(),
