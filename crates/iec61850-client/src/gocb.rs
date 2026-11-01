@@ -59,7 +59,9 @@ pub struct GoCBValues {
 /// The DstAddress attribute: the destination of the GOOSE publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhyComAddress {
-    /// Destination MAC address.
+    /// Destination MAC address. All zeros means no destination: a GoCB the
+    /// configuration leaves disabled (IEC 61850-8-1 §25.3.2). An empty `Addr`,
+    /// which some servers reveal for such a block, is read as all zeros.
     pub addr: [u8; 6],
     /// VLAN priority, 0 to 7; 0 means no VLAN is configured.
     pub priority: u8,
@@ -250,14 +252,18 @@ fn parse_phy_com_address(data: &MmsData) -> Result<PhyComAddress, ClientError> {
             });
         }
     };
-    if addr_bytes.len() != 6 {
-        return Err(ClientError::InvalidArgument(format!(
-            "DstAddress.Addr is {} bytes, expected 6",
-            addr_bytes.len()
-        )));
-    }
+    // An empty Addr is the octet string a disabled GoCB may reveal; it reads
+    // as all zeros, the no-destination address.
     let mut addr = [0u8; 6];
-    addr.copy_from_slice(&addr_bytes);
+    match addr_bytes.len() {
+        0 => {}
+        6 => addr.copy_from_slice(&addr_bytes),
+        len => {
+            return Err(ClientError::InvalidArgument(format!(
+                "DstAddress.Addr is {len} bytes, expected 6, or 0 for no destination"
+            )));
+        }
+    }
     let priority = expect_unsigned_u32(&items[1], "PRIORITY")?;
     let vlan_id = expect_unsigned_u32(&items[2], "VID")?;
     let app_id = expect_unsigned_u32(&items[3], "APPID")?;
@@ -526,6 +532,17 @@ mod tests {
     fn parse_wrong_element_count_rejects() {
         let r = parse_gocb_structure(&MmsData::Structure(vec![MmsData::Boolean(true)]));
         assert!(matches!(r, Err(ClientError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn parse_dst_address_empty_addr_is_no_destination() {
+        let mut items = sample_items();
+        if let MmsData::Structure(inner) = &mut items[5] {
+            inner[0] = MmsData::OctetString(Vec::new());
+        }
+        let v = parse_gocb_structure(&MmsData::Structure(items)).unwrap();
+        assert_eq!(v.dst_address.addr, [0; 6]);
+        assert_eq!(v.dst_address.app_id, 0x1000);
     }
 
     #[test]
