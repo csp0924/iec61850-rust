@@ -218,7 +218,11 @@ pub const DEFAULT_CONCLUDE_TIMEOUT_MS: u64 = 10_000;
 ///
 /// Only the negotiated parameters and the invokeID counter live here; the transport
 /// and the association object belong to the server crate.
-#[derive(Debug)]
+///
+/// A clone is a snapshot of the flags and parameters that shares the
+/// outstanding-request permits of the original, so a request dispatched on the
+/// clone counts against the same limit.
+#[derive(Debug, Clone)]
 pub struct MmsServerConnection {
     /// Filled in when Initiate completes; `None` before that.
     negotiated: Option<NegotiatedParams>,
@@ -475,5 +479,28 @@ mod tests {
         assert_eq!(conn.outstanding_available(), 1);
         drop(p2);
         assert_eq!(conn.outstanding_available(), 2);
+    }
+
+    #[test]
+    fn a_clone_shares_the_outstanding_permits() {
+        let mut conn = MmsServerConnection::new();
+        conn.set_negotiated(NegotiatedParams {
+            max_serv_outstanding_calling: 1,
+            ..Default::default()
+        });
+        conn.set_connection_id(7);
+        let snapshot = conn.clone();
+        assert_eq!(snapshot.connection_id(), Some(7));
+        assert_eq!(snapshot.negotiated(), conn.negotiated());
+
+        let permit = snapshot.try_acquire_outstanding().expect("permit");
+        assert_eq!(conn.outstanding_available(), 0);
+        assert!(conn.try_acquire_outstanding().is_none());
+        drop(permit);
+        assert_eq!(conn.outstanding_available(), 1);
+
+        // Flags changed on the original after the clone stay off the clone.
+        conn.set_block_requests(true);
+        assert!(!snapshot.block_requests());
     }
 }
