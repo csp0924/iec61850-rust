@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iec61850_mms::mms::client::{MmsClient, MmsClientBuilder};
-use iec61850_mms::mms::pdu::{DataAccessError, ObjectClass};
+use iec61850_mms::mms::pdu::service_error::subcode::access;
+use iec61850_mms::mms::pdu::{DataAccessError, ErrorClass, ObjectClass};
 use iec61850_mms::ClientError;
 use iec61850_mms::MmsData;
 use iec61850_model::{
@@ -460,13 +461,8 @@ async fn s_srv_n1() {
     let port = handle.bound_addr.port();
     let mut client = connect(port).await;
 
-    // GetNameList on an unknown domain.
-    //
-    // The server answers ConfirmedError(ObjectNonExistent). The client decoder
-    // still falls through to a PDU parse error for some length forms, so only
-    // the presence of an error is asserted here.
-    // TODO: assert the decoded service error class once the client decodes
-    // every ConfirmedError length form
+    // GetNameList on an unknown domain answers a ConfirmedError whose
+    // ServiceError carries access object-non-existent.
     let r1 = tokio::time::timeout(
         TIMEOUT,
         client.get_name_list(ObjectClass::NamedVariable, Some("NOSUCHDOMAIN"), None),
@@ -474,8 +470,14 @@ async fn s_srv_n1() {
     .await
     .expect("gnl timeout");
     assert!(
-        r1.is_err(),
-        "GetNameList on an unknown domain must fail, got {r1:?}"
+        matches!(
+            r1,
+            Err(ClientError::ServiceError {
+                error_class: ErrorClass::Access(access::OBJECT_NON_EXISTENT),
+                ..
+            })
+        ),
+        "GetNameList on an unknown domain must fail with access object-non-existent, got {r1:?}"
     );
 
     // Read on an unknown logical node.
