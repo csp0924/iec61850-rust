@@ -2,14 +2,14 @@
 //!
 //! Each test installs one callback that, once entered, waits on a gate the
 //! test holds closed, and makes the server reach it: a read handler, a write
-//! handler, the selection change handler on a select, the select timeout, the
-//! end of a command, a refusing dynamic check, an abandoned command and the
-//! loss of an association, and a log storage written by the integrity period
-//! or by the data-change of a client write. While the callback is held,
-//! another association must read and write and a new association must be
-//! accepted; the callback is still held when they finish, so they cannot have
-//! waited for it. Opening the gate then completes whatever the callback held
-//! up.
+//! handler, an association authenticator, the selection change handler on a
+//! select, the select timeout, the end of a command, a refusing dynamic check,
+//! an abandoned command and the loss of an association, and a log storage
+//! written by the integrity period or by the data-change of a client write.
+//! While the callback is held, another association must read and write and a
+//! new association must be accepted; the callback is still held when they
+//! finish, so they cannot have waited for it. Opening the gate then completes
+//! whatever the callback held up.
 //!
 //! Two calls into the server do not wait for a held callback either:
 //! `IedServer::block_requests`, also when a handler makes it, and registering a
@@ -30,6 +30,7 @@ use std::time::Duration;
 use iec61850_mms::mms::client::{ClientError, MmsClient, MmsClientBuilder};
 use iec61850_mms::mms::pdu::reject::{ConfirmedRequestRejectReason, RejectReason};
 use iec61850_mms::mms::MmsData;
+use iec61850_mms::IsoConnectionParameters;
 use iec61850_model::cdc::{self, CdcOptions, ControlOptions};
 use iec61850_model::{
     ControlModel, DataAttribute, DataAttributeType, DataObject, DoChild, IedModel, IedModelBuilder,
@@ -45,8 +46,9 @@ use iec61850_server::handler::{
     WriteOutcome as HandlerWriteOutcome,
 };
 use iec61850_server::{
-    Dataset, DatasetEntry, IedServer, InMemoryLogStorage, JournalEntryData, LogControl,
-    LogControlBlock, LogEntryId, LogEntryVisitor, LogStorage, LogStorageError, TriggerOptions,
+    AcseAuth, AssociationDecision, AssociationRequest, Dataset, DatasetEntry, IedServer,
+    IedServerConfig, InMemoryLogStorage, JournalEntryData, LogControl, LogControlBlock, LogEntryId,
+    LogEntryVisitor, LogStorage, LogStorageError, TriggerOptions,
 };
 
 const DOMAIN: &str = "blkLD0";
@@ -931,6 +933,69 @@ async fn a_blocked_selection_handler_on_an_abandoned_command_leaves_the_server_s
     assert_eq!(gate.entered(), 1, "the change is still held");
 
     gate.open();
+    running.stop();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Association authenticator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An authenticator that holds an association offering the password `hold`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_authenticator_leaves_the_server_serving() {
+    let server = IedServer::builder()
+        .model(build_model(30_000))
+        .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .config({
+            let mut config = IedServerConfig::default();
+            // The held association waits on the gate, never on this.
+            config.association_setup_timeout_ms = 3_600_000;
+            config
+        })
+        .build()
+        .expect("server");
+    let gate = Arc::new(Gate::default());
+    let _opener = gate.opener();
+    server.set_authenticator(Some(Arc::new({
+        let gate = gate.clone();
+        move |request: &AssociationRequest<'_>| {
+            if request.password() == Some(&b"hold"[..]) {
+                gate.pass();
+            }
+            AssociationDecision::Accept
+        }
+    })));
+    let running = ServerThread::start(&server, Flavor::CurrentThread);
+    let mut other = connect(running.port).await;
+
+    let port = running.port;
+    let held = tokio::spawn(async move {
+        let mut params = IsoConnectionParameters::default();
+        params.authentication = AcseAuth::Password(b"hold".to_vec());
+        let mut client = MmsClientBuilder::new()
+            .connect_timeout_ms(3_600_000)
+            .request_timeout_ms(60_000)
+            .iso_parameters(params)
+            .build();
+        client.connect("127.0.0.1", port).await?;
+        client.read(DOMAIN, PROBE_READ).await
+    });
+    gate.wait_entered().await;
+
+    serve_others(running.port, &mut other).await;
+    assert!(
+        !held.is_finished(),
+        "the association waits for its authenticator"
+    );
+    assert_eq!(gate.entered(), 1);
+
+    gate.open();
+    assert_eq!(
+        held.await
+            .unwrap()
+            .expect("the held association is accepted"),
+        MmsData::Boolean(false)
+    );
     running.stop();
 }
 

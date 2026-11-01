@@ -393,6 +393,8 @@ enum ConnError {
     UnexpectedSessionIndication(SessionIndication),
     #[error("association setup did not complete within the setup timeout")]
     SetupTimedOut,
+    #[error("the runtime shut down before the association was decided")]
+    ShuttingDown,
     #[error("a PDU could not be written within the send timeout")]
     SendTimedOut,
 }
@@ -589,10 +591,17 @@ where
     }
 
     if let Some(authenticator) = server.authenticator() {
-        let request =
-            AssociationRequest::new(peer, acse.aarq_addressing(), acse.calling_authentication());
-        let mechanism = acse.calling_authentication().label();
-        match authenticator.authenticate(&request) {
+        let addressing = acse.aarq_addressing().clone();
+        let authentication = acse.calling_authentication().clone();
+        let mechanism = authentication.label();
+        // The authenticator may block, so it decides off the runtime, within
+        // the setup deadline.
+        let decision = crate::blocking::off_the_runtime(move || {
+            authenticator.authenticate(&AssociationRequest::new(peer, &addressing, &authentication))
+        })
+        .await
+        .ok_or(ConnError::ShuttingDown)?;
+        match decision {
             AssociationDecision::Accept => {
                 tracing::debug!(
                     conn_id,

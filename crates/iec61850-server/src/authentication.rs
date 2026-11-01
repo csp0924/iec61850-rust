@@ -80,6 +80,12 @@ pub enum AssociationDecision {
 ///
 /// Implemented for every `Fn(&AssociationRequest<'_>) -> AssociationDecision`
 /// that is `Send + Sync`, so a closure can be installed directly.
+///
+/// A started server asks it on the blocking thread pool of its runtime, never
+/// on a worker thread, so it may block, on a directory lookup for instance,
+/// without holding up any other association. The association waits for the
+/// decision within its setup timeout, and is closed when the timeout passes
+/// first.
 pub trait AssociationAuthenticator: Send + Sync {
     /// Returns the decision for `request`.
     fn authenticate(&self, request: &AssociationRequest<'_>) -> AssociationDecision;
