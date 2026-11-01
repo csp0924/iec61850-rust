@@ -70,6 +70,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// group itself, so a handler only decides whether an operation proceeds and
 /// may persist the values elsewhere; it does not have to write any data
 /// attribute.
+///
+/// The callbacks run with no lock of the setting group control block held.
+/// Those a client request causes run on the blocking thread pool of the
+/// runtime, so a callback may block, persisting the values for instance,
+/// without holding up any other association.
 pub trait SettingGroupHandler: Send + Sync {
     /// Called before the active setting group changes. Returning `false`
     /// refuses the change with `ObjectAccessDenied`, and the FC=SG values stay

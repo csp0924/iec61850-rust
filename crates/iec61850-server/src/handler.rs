@@ -12,6 +12,16 @@
 //! found by a request for `MMXU1$MX$TotW$mag`. Installing twice on one path
 //! replaces the handler and logs a warning, so an operator can see the
 //! shadowing rather than having to infer it.
+//!
+//! A started server runs the handlers on the blocking thread pool of its tokio
+//! runtime, never on a worker thread, so a handler may block, on I/O for
+//! instance. The request it answers waits for it, and so do the later requests
+//! of that association, while the other associations, the reports and the
+//! periodic triggers carry on. This holds on a current-thread runtime too.
+//! The handlers share the blocking pool with every other user of
+//! `spawn_blocking` on that runtime: past the pool's `max_blocking_threads`
+//! limit, 512 by default, further requests and periodic triggers wait in a
+//! queue until a thread frees up.
 
 // AtomicBool comes from core; the rest goes through the compat facade.
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -179,6 +189,9 @@ pub trait ReadHandler: Send + Sync + core::fmt::Debug {
     /// that lock after every handler has answered. The values the read takes
     /// while it asks the handlers, outside the lock, decide only a read that
     /// is refused for its size.
+    ///
+    /// It runs off the runtime's worker threads and may block, as the module
+    /// documentation describes.
     fn read(&self, ctx: &ReadContext<'_>) -> ReadOutcome;
 }
 
@@ -210,6 +223,9 @@ pub trait AttributeAccessHandler: Send + Sync + core::fmt::Debug {
     /// read and the store, so the merged value may differ from the final state
     /// by that leaf; the decision the handler makes still applies to this
     /// write only.
+    ///
+    /// The server calls this holding none of its locks, off the runtime's
+    /// worker threads; it may block, as the module documentation describes.
     fn on_write(&self, ctx: &WriteContext<'_>, value: &MmsValue) -> WriteOutcome;
 }
 

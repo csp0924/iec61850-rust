@@ -733,9 +733,9 @@ impl AcceptedOperate {
     /// Gives up a command whose positive response was not delivered: the
     /// command does not run and the object returns to unselected, reporting
     /// `reason`.
-    pub(crate) fn abandon(&self, reason: SelectStateChangedReason) {
+    pub(crate) async fn abandon(&self, reason: SelectStateChangedReason) {
+        change_off_the_runtime(&self.obj, move |obj| obj.abort(reason)).await;
         self.phase.store(FINISHED, Ordering::Release);
-        self.obj.abort(reason);
     }
 
     /// Returns whether the object uses enhanced security, whose result travels
@@ -776,8 +776,8 @@ impl AcceptedOperate {
             .await;
         if let Err(cause) = outcome {
             tracing::warn!(name = %self.obj.config.name, ?cause, "operate refused by the dynamic check");
+            change_off_the_runtime(&self.obj, ControlObject::abort_to_unselected).await;
             self.phase.store(FINISHED, Ordering::Release);
-            self.obj.abort_to_unselected();
         }
         outcome
     }
@@ -817,8 +817,8 @@ impl AcceptedOperate {
             }
         };
         // Return to ready or unselected according to the select class.
+        change_off_the_runtime(&self.obj, ControlObject::finish_operate).await;
         self.phase.store(FINISHED, Ordering::Release);
-        self.obj.finish_operate();
 
         match result {
             Ok(()) => tracing::debug!(name = %name, "operate succeeded"),
@@ -878,6 +878,27 @@ impl AcceptedOperate {
                 self.oper_value.clone(),
             ),
         }
+    }
+}
+
+/// Applies `change` to `obj` off the runtime, since a change of the selection
+/// reaches the selection change handlers; inline when the runtime is shutting
+/// down.
+///
+/// A command marks itself finished only once this returns, so a command
+/// dropped while it waits, as on a runtime shutdown, still ends through its
+/// `Drop`; both changes are idempotent.
+async fn change_off_the_runtime<F>(obj: &ControlObject, change: F)
+where
+    F: FnOnce(&ControlObject) + Clone + Send + 'static,
+{
+    let object = obj.clone();
+    let off = change.clone();
+    if crate::blocking::off_the_runtime(move || off(&object))
+        .await
+        .is_none()
+    {
+        change(obj);
     }
 }
 
@@ -1563,5 +1584,98 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(accepted.run().await, Ok(()));
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(3600));
+    }
+
+    // ── A command dropped at its final change still leaves the executing states ──
+
+    /// Admits an Operate on `obj` whose command succeeds at once.
+    fn admit_now(
+        obj: &ControlObject,
+        wait: Option<Arc<dyn WaitForExecutionHandler>>,
+    ) -> AcceptedOperate {
+        let params = OperParams::from_mms_value(&make_oper_value()).expect("oper");
+        let oper_h: Arc<dyn ControlHandler> = Arc::new(AlwaysSuccessOperateHandler);
+        admit_operate(
+            obj,
+            1,
+            params,
+            &make_oper_value(),
+            None,
+            wait.as_ref(),
+            Some(&oper_h),
+        )
+        .unwrap_or_else(|cause| panic!("refused: {cause:?}"))
+    }
+
+    /// Runs `step` on `accepted` in a task of a current-thread runtime whose
+    /// one blocking thread is held, so the change of the object the step ends
+    /// with waits in the queue, and shuts the runtime down with the task
+    /// waiting there.
+    fn drop_at_the_final_change<F, Fut>(accepted: AcceptedOperate, step: F)
+    where
+        F: FnOnce(AcceptedOperate) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            held_tx.send(()).expect("held");
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().expect("the blocking thread is held");
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.spawn({
+            let started = started.clone();
+            async move {
+                started.store(true, Ordering::SeqCst);
+                step(accepted).await;
+            }
+        });
+        // Nothing the step awaits before its final change is pending, so the
+        // task reaches that change before this sees the flag.
+        runtime.block_on(async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        });
+        runtime.shutdown_background();
+        drop(release_tx);
+    }
+
+    #[test]
+    fn a_command_dropped_as_it_finishes_leaves_the_operate_state() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let accepted = admit_now(&obj, None);
+        drop_at_the_final_change(accepted, |a| async move {
+            let _ = a.run().await;
+        });
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[test]
+    fn a_command_dropped_as_its_dynamic_check_refuses_leaves_the_wait_state() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let wait: Arc<dyn WaitForExecutionHandler> =
+            Arc::new(RefusingWait(ControlAddCause::BlockedBySynchrocheck));
+        let accepted = admit_now(&obj, Some(wait));
+        drop_at_the_final_change(accepted, |a| async move {
+            let _ = a.dynamic_check().await;
+        });
+        assert_eq!(obj.state(), ControlState::Unselected);
+    }
+
+    #[test]
+    fn a_command_dropped_as_it_is_abandoned_leaves_the_wait_state() {
+        let obj = make_direct_obj(ControlModel::DirectEnhanced);
+        let accepted = admit_now(&obj, None);
+        drop_at_the_final_change(accepted, |a| async move {
+            a.abandon(SelectStateChangedReason::Disconnected).await;
+        });
+        assert_eq!(obj.state(), ControlState::Unselected);
     }
 }

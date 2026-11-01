@@ -175,6 +175,10 @@ name = "dispatcher_control_routing"
 required-features = ["control"]
 
 [[test]]
+name = "blocking_callback_e2e"
+required-features = ["full-server"]
+
+[[test]]
 name = "brcb_overflow_dropped_counter_e2e"
 required-features = ["reporting"]
 

@@ -244,6 +244,12 @@ pub enum SeekResult {
 /// The reporting engine calls it with the engine lock held, also while an
 /// `IedServer` raises the triggers of value updates one batch at a time, so a
 /// backend must not update the server or wait for anything that does.
+/// Calls a client request or the periodic triggers cause run off the
+/// runtime's worker threads; a backend that blocks holds up every report
+/// while it does, and every update whose triggers queue behind the batch
+/// under way: the writes other associations make to attributes that raise a
+/// trigger and `IedServer::update_*` calls on any thread. An update called on
+/// a runtime worker stalls that worker until the backend returns.
 pub trait ReportBufferBackend: std::fmt::Debug + Send + Sync {
     /// Stores an entry.
     ///

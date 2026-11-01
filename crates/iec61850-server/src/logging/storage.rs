@@ -118,6 +118,20 @@ pub trait LogEntryVisitor {
 /// - `oldest_and_newest` answers from cached metadata rather than scanning, and
 ///   returns `None` for an empty log.
 ///
+/// # Calling context
+///
+/// A started server writes and queries the log from client requests and from
+/// its periodic triggers on the blocking thread pool of the runtime, never on
+/// a worker thread. A backend that blocks still holds up whatever waits for
+/// it: the request it serves and every update whose triggers queue behind the
+/// batch under way, which takes in the writes other associations make to
+/// attributes that raise a trigger and `IedServer::update_*` calls on any
+/// thread. An update called on a runtime worker stalls that worker until the
+/// backend returns, and on a current-thread runtime the whole server. An
+/// update made through `IedServer::update_*` writes on the caller's thread. An
+/// integrity entry is written while the periodic triggers hold off
+/// `IedServer::lock_data_model`, so a backend does not call it.
+///
 /// # Calls from the update path
 ///
 /// An `IedServer` writes the entries of value updates while it raises their

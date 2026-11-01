@@ -638,7 +638,8 @@ impl ControlObject {
         let obj = self.clone();
         let task = runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
-            obj.expire_selection(period);
+            // The deselect reaches the selection change handlers.
+            let _ = crate::blocking::off_the_runtime(move || obj.expire_selection(period)).await;
         });
         g.stop_timer();
         g.timer = Some(task.abort_handle());

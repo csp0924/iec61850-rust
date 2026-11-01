@@ -19,6 +19,10 @@
 //! however long a log storage takes. An update returns once its own triggers
 //! have been raised. An update a log storage makes while the server writes an
 //! entry to it is raised after the batch under way, and returns at once.
+//! An update may therefore wait for the log storage and report buffer backends
+//! of the batches before it. When those can block, async code calls `update_*`
+//! through `tokio::task::spawn_blocking` or from a thread of its own rather
+//! than on a runtime worker.
 
 use crate::authentication::AssociationAuthenticator;
 use crate::config::IedServerConfig;

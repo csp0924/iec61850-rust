@@ -40,6 +40,8 @@ extern crate alloc;
 
 #[cfg(feature = "full-server")]
 pub mod authentication;
+#[cfg(any(feature = "full-server", feature = "control"))]
+mod blocking;
 pub mod compat;
 pub mod config;
 // The bitflag types (TriggerOptions, OptFlds, InclusionFlag) sit at crate top

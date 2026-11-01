@@ -10,6 +10,19 @@
 //! confirmed requests until the peer concludes, the server aborts, or a layer
 //! fails to parse.
 //!
+//! The work that can reach an application callback, the dispatch of a request,
+//! a tick of the periodic triggers and the release of an association, runs on
+//! the blocking thread pool of the runtime. A callback that blocks therefore
+//! holds up only the association, or the tick, that is waiting for it, on a
+//! current-thread runtime too.
+//!
+//! A runtime shut down under a running server drops the association tasks
+//! while a dispatch already started keeps running on the blocking pool: it
+//! completes after its association has been released, and what it changes,
+//! such as a select or a reservation, stays with an association that no
+//! longer exists. `ServerHandle::stop` before the runtime shuts down avoids
+//! this.
+//!
 //! Behavior a peer can rely on:
 //!
 //! - A connection beyond `max_mms_connections` has its socket closed with no
@@ -132,6 +145,10 @@ impl ServerHandle {
     /// Shuts the server down: the accept and tick loops are told to exit, every
     /// open association is marked for abort so its task sends an A-ABORT and
     /// closes its socket, and both loops are awaited.
+    ///
+    /// Call this before shutting the runtime down. A runtime shut down under a
+    /// running server lets a request already being dispatched complete after
+    /// its association has been released.
     pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         self.server.abort_all_connections();
@@ -184,7 +201,9 @@ impl IedServer {
 /// model is locked these wait, so none of them sees part of a batch of updates.
 /// Once per second the tick also releases expired buffered-report and setting
 /// group reservations; an accumulated millisecond count carries that period, so
-/// jitter in the 1 ms interval cannot skip a sweep.
+/// jitter in the 1 ms interval cannot skip a sweep. Each tick runs off the
+/// runtime and the next one waits for it, so a report buffer backend or log
+/// storage that blocks delays the ticks and nothing else.
 ///
 /// A poisoned lock is logged and the loop continues: reporting stops working
 /// but the rest of the server keeps serving.
@@ -201,42 +220,60 @@ async fn run_tick_loop(server: IedServer, mut shutdown_rx: watch::Receiver<bool>
                 }
             }
             _ = interval.tick() => {
-                let now = std::time::Instant::now();
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                if let Some(_batch) = server.periodic_gate() {
-                    match server.reporting_engine().lock() {
-                        Ok(engine) => {
-                            engine.tick();
-                            engine.tick_brcb(now, now_ms);
-                        }
-                        Err(_) => {
-                            tracing::warn!("tick loop: the reporting engine lock is poisoned, skipping this tick");
-                        }
-                    }
-                    server.tick_log_integrity(now, now_ms);
-                }
                 reservation_accum_ms = reservation_accum_ms.saturating_add(1);
-                if reservation_accum_ms >= 1000 {
+                let sweep = reservation_accum_ms >= 1000;
+                if sweep {
                     reservation_accum_ms = 0;
-                    if let Ok(engine) = server.reporting_engine().lock() {
-                        engine.tick_brcb_reservations();
-                    }
-                    // The setting group registry takes its own write lock, so
-                    // the engine lock is released first rather than nesting the
-                    // two.
-                    let released = server.setting_groups().tick_reservations();
-                    for (domain, owner) in released {
-                        tracing::info!(
-                            domain,
-                            conn_id = owner,
-                            "setting group reservation expired, releasing the edit session"
-                        );
-                    }
+                }
+                let server = server.clone();
+                if crate::blocking::off_the_runtime(move || tick_once(&server, sweep))
+                    .await
+                    .is_none()
+                {
+                    break;
                 }
             }
+        }
+    }
+}
+
+/// One tick of the tick loop; `sweep` also releases the expired reservations.
+///
+/// It reaches the report buffer backends and the log storages, so the loop
+/// runs it off the runtime.
+fn tick_once(server: &IedServer, sweep: bool) {
+    let now = std::time::Instant::now();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Some(_batch) = server.periodic_gate() {
+        match server.reporting_engine().lock() {
+            Ok(engine) => {
+                engine.tick();
+                engine.tick_brcb(now, now_ms);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "tick loop: the reporting engine lock is poisoned, skipping this tick"
+                );
+            }
+        }
+        server.tick_log_integrity(now, now_ms);
+    }
+    if sweep {
+        if let Ok(engine) = server.reporting_engine().lock() {
+            engine.tick_brcb_reservations();
+        }
+        // The setting group registry takes its own write lock, so the engine
+        // lock is released first rather than nesting the two.
+        let released = server.setting_groups().tick_reservations();
+        for (domain, owner) in released {
+            tracing::info!(
+                domain,
+                conn_id = owner,
+                "setting group reservation expired, releasing the edit session"
+            );
         }
     }
 }
@@ -374,7 +411,7 @@ async fn handle_connection_inner<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let conn_id = server.next_connection_id();
-    let _teardown = AssociationTeardown {
+    let teardown = AssociationTeardown {
         server: server.clone(),
         conn_id,
     };
@@ -397,6 +434,9 @@ async fn handle_connection_inner<S>(
             tracing::warn!(conn_id, ?peer, error = %e, "connection closed after an error");
         }
     }
+    // The release reaches the selection change handlers, so it runs off the
+    // runtime as well; a task dropped before this point releases inline.
+    let _ = crate::blocking::off_the_runtime(move || drop(teardown)).await;
 }
 
 /// Releases everything an association holds when its connection task ends,
@@ -405,6 +445,8 @@ async fn handle_connection_inner<S>(
 ///
 /// Every release is idempotent and tolerates a connection id that never
 /// registered, so the guard is armed before the association is established.
+/// A task that ends drops the guard off the runtime, since the release reaches
+/// the selection change handlers; a task dropped early releases inline.
 struct AssociationTeardown {
     server: IedServer,
     conn_id: ConnectionId,
@@ -1034,9 +1076,25 @@ where
                 break;
             }
             id if id == pres.mms_context_id => {
-                let outcome = client_conn
-                    .with_mms(|m| parse_message(m, dispatcher.as_ref(), &inner_payload))
-                    .unwrap_or(MessageOutcome::Silent);
+                // The request is dispatched off the runtime, so the handlers it
+                // reaches do not run on a worker thread.
+                let dispatched = {
+                    let client_conn = client_conn.clone();
+                    let dispatcher = dispatcher.clone();
+                    crate::blocking::off_the_runtime(move || {
+                        client_conn
+                            .with_mms(|m| parse_message(m, dispatcher.as_ref(), &inner_payload))
+                            .unwrap_or(MessageOutcome::Silent)
+                    })
+                    .await
+                };
+                let outcome = match dispatched {
+                    Some(outcome) => outcome,
+                    None => {
+                        tracing::warn!(conn_id, "the runtime is shutting down, closing the socket");
+                        break;
+                    }
+                };
 
                 // Reports the request produced go ahead of its response.
                 for report in control_outbox.take_before_response(conn_id) {

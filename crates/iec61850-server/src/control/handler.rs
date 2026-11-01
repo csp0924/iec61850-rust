@@ -5,6 +5,14 @@
 //! carries the command out. The two handlers that may take time return a boxed
 //! future, so waiting is expressed by `await` and the server never polls. An
 //! application supplies its handlers as `Arc<dyn Trait + Send + Sync>`.
+//!
+//! The synchronous handlers, the check handler and the selection change
+//! handler, run with no lock of the control object or its registry held. When
+//! a client request, the select timeout, the end of a command or the loss of an
+//! association causes the call, it runs on the blocking thread pool of the
+//! runtime, so the handler may block without holding up any other association.
+//! The futures of the other two handlers are polled on the runtime like any
+//! task: work in them that blocks belongs in `tokio::task::spawn_blocking`.
 
 use super::model::{ControlAction, ControlAddCause};
 use iec61850_model::MmsValue;

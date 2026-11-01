@@ -467,7 +467,9 @@ fn operate(
                     cntrl_obj,
                     "operate abandoned: the association closed before its positive response was sent"
                 );
-                accepted.abandon(SelectStateChangedReason::Disconnected);
+                accepted
+                    .abandon(SelectStateChangedReason::Disconnected)
+                    .await;
                 return;
             }
         }
