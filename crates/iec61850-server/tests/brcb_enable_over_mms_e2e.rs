@@ -393,9 +393,9 @@ async fn brcb_resv_tms(mms: &mut MmsClient) -> MmsData {
 
 /// On a BRCB with `ResvTms` = 0, writes other than one to `ResvTms` reserve
 /// nothing (IEC 61850-7-2 §17.2.2.17): after configuration writes another client
-/// still configures it, enabling and disabling leave `ResvTms` at 0, and once
-/// the association that enabled it ends `ResvTms` reads 0 and another client
-/// takes the BRCB at once.
+/// still configures it, enabling and disabling leave `ResvTms` at 0, disabling
+/// lets another client configure it again, and once the association that
+/// enabled it ends `ResvTms` reads 0 and another client takes the BRCB at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn brcb_writes_other_than_resv_tms_do_not_reserve() {
     let f = start(0).await;
@@ -418,6 +418,11 @@ async fn brcb_writes_other_than_resv_tms_do_not_reserve() {
             .await
             .expect("write RptEna");
         assert_eq!(brcb_resv_tms(&mut other).await, MmsData::Integer(0));
+        if !enable {
+            write_brcb(&mut other, "IntgPd", MmsData::Unsigned(0))
+                .await
+                .expect("another client configures the disabled brcb");
+        }
     }
 
     first.disconnect().await.expect("disconnect");

@@ -41,9 +41,10 @@ pub enum ResvTmsState {
     /// Pre-configured owner: never times out, and only a client whose address
     /// matches may take the control block.
     Preconfigured,
-    /// Unreserved: any client may write the control block, and no write other
-    /// than one to ResvTms reserves it. The client that enables it holds it until
-    /// it disables it or its association ends, with no reservation kept after.
+    /// Unreserved: any client may write the control block while no other client
+    /// has it enabled, and no write other than one to ResvTms reserves it. The
+    /// client that enables it holds it until it disables it or its association
+    /// ends, with no reservation kept after.
     NotReserved,
     /// Reserved with a timeout; the value is the number of seconds remaining.
     WithTimeout(NonZeroU16),
