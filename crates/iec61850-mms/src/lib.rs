@@ -61,9 +61,9 @@ pub use iso::tpkt::{TpktHeader, TPKT_HEADER_LEN};
 
 // ACSE types used by the MMS client
 pub use iso::acse::{
-    encode_aare, encode_aarq, encode_abrt, encode_associate_failed, encode_rlre, encode_rlrq,
-    AcseAuth, AcseAuthenticator, AcseConnection, AcseConnectionState, AcseError, AcseIndication,
-    IsoApplicationReference,
+    encode_aare, encode_aare_with_diagnostic, encode_aarq, encode_abrt, encode_associate_failed,
+    encode_rlre, encode_rlrq, AcseAuth, AcseAuthenticator, AcseConnection, AcseConnectionState,
+    AcseError, AcseIndication, AcseServiceUserDiagnostic, IsoApplicationReference,
 };
 
 // ISO addressing offered when an association is opened

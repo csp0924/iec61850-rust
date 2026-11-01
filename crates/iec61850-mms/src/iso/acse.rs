@@ -2,8 +2,12 @@
 //!
 //! Encodes and decodes the five PDUs AARQ, AARE, RLRQ, RLRE and ABRT, carries the
 //! MMS application-context-name OID (1.0.9506.2.3), supports the no-auth and
-//! password mechanisms, and returns the user-information payload as a slice
-//! borrowed from the input buffer.
+//! password mechanisms, passes any other mechanism through as its name and
+//! value, and returns the user-information payload as a slice borrowed from the
+//! input buffer.
+//!
+//! An AARQ yields its called and calling AP-title and AE-qualifier and the
+//! credentials it carries; an AARE yields its result-source-diagnostic.
 //!
 //! Robustness cases covered:
 //! - A PDU shorter than a tag plus one length byte is rejected.
@@ -77,8 +81,10 @@ const APP_CONTEXT_NAME_MMS: [u8; 5] = [0x28, 0xca, 0x22, 0x02, 0x03];
 /// Password mechanism OID 2.2.3.1, as BER content octets.
 const AUTH_MECH_PASSWORD_OID: [u8; 3] = [0x52, 0x03, 0x01];
 
-/// sender-ACSE-requirements BIT STRING value; bit 0 signals authentication.
-const REQUIREMENTS_AUTHENTICATION: [u8; 1] = [0x80];
+/// sender-ACSE-requirements `[10]` IMPLICIT BIT STRING with bit 0,
+/// authentication, set: tag, length, unused-bits octet and value, the one
+/// encoding every authenticated AARQ uses.
+const SENDER_REQUIREMENTS_AUTHENTICATION: [u8; 4] = [0x8a, 0x02, 0x04, 0x80];
 
 /// AARQ called-AP-title `[2]` EXPLICIT.
 const TAG_CALLED_AP_TITLE: u8 = 0xa2;
@@ -132,22 +138,55 @@ pub enum AcseIndication {
     Abort,
 }
 
-/// ACSE authentication credentials.
+/// ACSE authentication credentials: the mechanism-name and
+/// calling-authentication-value fields of an AARQ.
 ///
-/// The `Debug` output of a password gives its length, never its content.
+/// The `Debug` output never shows a password or an authentication value, only
+/// their length.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcseAuth {
     /// No authentication; the mechanism fields are absent.
     None,
-    /// Password authentication in the charstring form.
+    /// The password mechanism (2.2.3.1) with a charstring value.
     Password(Vec<u8>),
-    /// TLS certificate authentication. Unimplemented placeholder: no
-    /// mechanism-name OID is emitted, so on the wire an association carrying this
-    /// variant is indistinguishable from `AcseAuth::None`, and the certificate is
-    /// only checked by the TLS handshake itself.
-    // TODO: emit the certificate mechanism-name OID so a peer can tell the two apart.
+    /// Placeholder for the certificate mechanism of IEC 62351-4. It writes no
+    /// authentication field, so on the wire it is indistinguishable from
+    /// `AcseAuth::None`; the certificate is checked by the TLS handshake alone.
+    // TODO: carry the IEC 62351-4 certificate mechanism. Its mechanism-name and
+    // the structure of its authentication value have to be confirmed against
+    // the text of IEC 62351-4 clause 11 and Annex A first.
     TlsCertificate(Vec<u8>),
+    /// Any other mechanism, or an authentication value without the password
+    /// mechanism.
+    #[non_exhaustive]
+    Other {
+        /// BER content octets of the mechanism-name OBJECT IDENTIFIER; empty
+        /// when the AARQ names no mechanism.
+        mechanism: Vec<u8>,
+        /// The Authentication-value, tag and length included, that
+        /// calling-authentication-value `[12]` carries; empty when absent.
+        value: Vec<u8>,
+    },
+}
+
+impl AcseAuth {
+    /// Builds `AcseAuth::Other` from the content octets of a mechanism-name
+    /// OBJECT IDENTIFIER and a complete Authentication-value encoding.
+    pub fn other(mechanism: Vec<u8>, value: Vec<u8>) -> Self {
+        AcseAuth::Other { mechanism, value }
+    }
+
+    /// Names the mechanism for logging: `none`, `password`, `certificate` or
+    /// `other`. The name never carries a credential.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AcseAuth::None => "none",
+            AcseAuth::Password(_) => "password",
+            AcseAuth::TlsCertificate(_) => "certificate",
+            AcseAuth::Other { .. } => "other",
+        }
+    }
 }
 
 impl core::fmt::Debug for AcseAuth {
@@ -159,7 +198,152 @@ impl core::fmt::Debug for AcseAuth {
                 .field(&format_args!("<{} bytes redacted>", pw.len()))
                 .finish(),
             AcseAuth::TlsCertificate(cert) => f.debug_tuple("TlsCertificate").field(cert).finish(),
+            AcseAuth::Other { mechanism, value } => f
+                .debug_struct("Other")
+                .field("mechanism", &format_args!("{mechanism:02x?}"))
+                .field("value", &format_args!("<{} bytes redacted>", value.len()))
+                .finish(),
         }
+    }
+}
+
+/// The acse-service-user alternative of Associate-source-diagnostic, the
+/// result-source-diagnostic `[3]` of an AARE (ISO 8650-1, ITU-T X.227).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AcseServiceUserDiagnostic {
+    /// null (0).
+    Null,
+    /// no-reason-given (1).
+    NoReasonGiven,
+    /// application-context-name-not-supported (2).
+    ApplicationContextNameNotSupported,
+    /// calling-AP-title-not-recognized (3).
+    CallingApTitleNotRecognized,
+    /// calling-AP-invocation-identifier-not-recognized (4).
+    CallingApInvocationIdentifierNotRecognized,
+    /// calling-AE-qualifier-not-recognized (5).
+    CallingAeQualifierNotRecognized,
+    /// calling-AE-invocation-identifier-not-recognized (6).
+    CallingAeInvocationIdentifierNotRecognized,
+    /// called-AP-title-not-recognized (7).
+    CalledApTitleNotRecognized,
+    /// called-AP-invocation-identifier-not-recognized (8).
+    CalledApInvocationIdentifierNotRecognized,
+    /// called-AE-qualifier-not-recognized (9).
+    CalledAeQualifierNotRecognized,
+    /// called-AE-invocation-identifier-not-recognized (10).
+    CalledAeInvocationIdentifierNotRecognized,
+    /// authentication-mechanism-name-not-recognized (11).
+    AuthenticationMechanismNameNotRecognized,
+    /// authentication-mechanism-name-required (12).
+    AuthenticationMechanismNameRequired,
+    /// authentication-failure (13).
+    AuthenticationFailure,
+    /// authentication-required (14).
+    AuthenticationRequired,
+}
+
+/// Every acse-service-user diagnostic with its INTEGER value and its ASN.1 name.
+const SERVICE_USER_DIAGNOSTICS: [(AcseServiceUserDiagnostic, u8, &str); 15] = {
+    use AcseServiceUserDiagnostic::*;
+    [
+        (Null, 0, "null"),
+        (NoReasonGiven, 1, "no-reason-given"),
+        (
+            ApplicationContextNameNotSupported,
+            2,
+            "application-context-name-not-supported",
+        ),
+        (
+            CallingApTitleNotRecognized,
+            3,
+            "calling-AP-title-not-recognized",
+        ),
+        (
+            CallingApInvocationIdentifierNotRecognized,
+            4,
+            "calling-AP-invocation-identifier-not-recognized",
+        ),
+        (
+            CallingAeQualifierNotRecognized,
+            5,
+            "calling-AE-qualifier-not-recognized",
+        ),
+        (
+            CallingAeInvocationIdentifierNotRecognized,
+            6,
+            "calling-AE-invocation-identifier-not-recognized",
+        ),
+        (
+            CalledApTitleNotRecognized,
+            7,
+            "called-AP-title-not-recognized",
+        ),
+        (
+            CalledApInvocationIdentifierNotRecognized,
+            8,
+            "called-AP-invocation-identifier-not-recognized",
+        ),
+        (
+            CalledAeQualifierNotRecognized,
+            9,
+            "called-AE-qualifier-not-recognized",
+        ),
+        (
+            CalledAeInvocationIdentifierNotRecognized,
+            10,
+            "called-AE-invocation-identifier-not-recognized",
+        ),
+        (
+            AuthenticationMechanismNameNotRecognized,
+            11,
+            "authentication-mechanism-name-not-recognized",
+        ),
+        (
+            AuthenticationMechanismNameRequired,
+            12,
+            "authentication-mechanism-name-required",
+        ),
+        (AuthenticationFailure, 13, "authentication-failure"),
+        (AuthenticationRequired, 14, "authentication-required"),
+    ]
+};
+
+impl AcseServiceUserDiagnostic {
+    /// Returns the diagnostic of an INTEGER value, or `None` for a value outside
+    /// 0..=14.
+    pub fn from_code(code: u32) -> Option<Self> {
+        SERVICE_USER_DIAGNOSTICS
+            .iter()
+            .find(|(_, value, _)| u32::from(*value) == code)
+            .map(|(diagnostic, _, _)| *diagnostic)
+    }
+
+    /// Returns the INTEGER value of the diagnostic.
+    pub fn code(self) -> u8 {
+        self.entry().1
+    }
+
+    /// Whether the diagnostic refuses the calling entity or its credentials:
+    /// an unrecognized calling AP-title, AE-qualifier or invocation identifier
+    /// (3 to 6), or one of the four authentication diagnostics (11 to 14).
+    pub fn is_authentication_refusal(self) -> bool {
+        matches!(self.code(), 3..=6 | 11..=14)
+    }
+
+    /// Returns the table entry of the diagnostic.
+    fn entry(self) -> &'static (AcseServiceUserDiagnostic, u8, &'static str) {
+        SERVICE_USER_DIAGNOSTICS
+            .iter()
+            .find(|(diagnostic, _, _)| *diagnostic == self)
+            .unwrap_or(&SERVICE_USER_DIAGNOSTICS[0])
+    }
+}
+
+impl core::fmt::Display for AcseServiceUserDiagnostic {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.entry().2)
     }
 }
 
@@ -186,6 +370,12 @@ pub struct AcseConnection {
     pub application_reference: IsoApplicationReference,
     /// Authentication callback; `None` accepts every association.
     authenticator: Option<Box<dyn AcseAuthenticator>>,
+    /// Called and calling AP-title and AE-qualifier of the last AARQ parsed.
+    aarq_addressing: AarqAddressing,
+    /// Credentials of the last AARQ parsed.
+    calling_authentication: AcseAuth,
+    /// acse-service-user diagnostic of the last AARE parsed.
+    result_source_diagnostic: Option<AcseServiceUserDiagnostic>,
 }
 
 /// Callback that decides whether an association is accepted.
@@ -204,7 +394,29 @@ impl AcseConnection {
             next_reference: 0,
             application_reference: IsoApplicationReference::default(),
             authenticator,
+            aarq_addressing: AarqAddressing::default(),
+            calling_authentication: AcseAuth::None,
+            result_source_diagnostic: None,
         }
+    }
+
+    /// Returns the called and calling AP-title and AE-qualifier of the last
+    /// AARQ parsed; a field the AARQ left out, or whose value does not decode,
+    /// is `None`.
+    pub fn aarq_addressing(&self) -> &AarqAddressing {
+        &self.aarq_addressing
+    }
+
+    /// Returns the credentials of the last AARQ parsed.
+    pub fn calling_authentication(&self) -> &AcseAuth {
+        &self.calling_authentication
+    }
+
+    /// Returns the result-source-diagnostic of the last AARE parsed when it is
+    /// the acse-service-user alternative with a value in 0..=14, `None`
+    /// otherwise.
+    pub fn result_source_diagnostic(&self) -> Option<AcseServiceUserDiagnostic> {
+        self.result_source_diagnostic
     }
 
     /// Parses any ACSE PDU and dispatches on AARQ, AARE, RLRQ, RLRE or ABRT.
@@ -233,10 +445,12 @@ impl AcseConnection {
             0x60 => {
                 // AARQ
                 let (user_data, auth) = self.parse_aarq(buf)?;
-                let (passed, auth) = self.check_authentication(auth);
+                let passed = self.check_authentication(&auth);
+                let mechanism = auth.label();
+                self.calling_authentication = auth;
                 if !passed {
                     warn!(
-                        mechanism = mechanism_label(&auth),
+                        mechanism,
                         "acse aarq authentication failed, rejecting association"
                     );
                     return Ok((AcseIndication::AssociateFailed, &[]));
@@ -274,20 +488,15 @@ impl AcseConnection {
         }
     }
 
-    /// Checks the association against the authenticator.
-    ///
-    /// Returns whether the association is accepted, together with the credentials
-    /// `auth` taken from the AARQ.
+    /// Checks the credentials `auth` taken from the AARQ against the
+    /// authenticator and returns whether the association is accepted.
     ///
     /// - Without an authenticator every association is accepted.
     /// - With one it is called with `auth` and the calling application reference.
-    fn check_authentication(&self, auth: AcseAuth) -> (bool, AcseAuth) {
+    fn check_authentication(&self, auth: &AcseAuth) -> bool {
         match &self.authenticator {
-            None => (true, auth),
-            Some(auth_fn) => {
-                let passed = auth_fn.authenticate(&auth, &self.application_reference);
-                (passed, auth)
-            }
+            None => true,
+            Some(auth_fn) => auth_fn.authenticate(auth, &self.application_reference),
         }
     }
 
@@ -295,10 +504,14 @@ impl AcseConnection {
     ///
     /// Returns the user-information payload and the credentials the AARQ carries:
     /// `AcseAuth::Password` when mechanism-name is the password OID and
-    /// calling-authentication-value is a charstring, `AcseAuth::None` otherwise.
+    /// calling-authentication-value is a charstring, `AcseAuth::None` when both
+    /// fields are absent, and `AcseAuth::Other` otherwise. Also records the
+    /// called and calling AP-title and AE-qualifier.
     ///
     /// Every TLV is bounds checked before it is read.
     fn parse_aarq<'buf>(&mut self, buf: &'buf [u8]) -> Result<(&'buf [u8], AcseAuth), AcseError> {
+        self.aarq_addressing = AarqAddressing::default();
+        self.calling_authentication = AcseAuth::None;
         let mut pos = 1usize; // skip the outer tag 0x60
         let outer_len = ber_decode_length(buf, &mut pos, buf.len())?;
         let end = pos + outer_len;
@@ -339,20 +552,35 @@ impl AcseConnection {
                     parse_app_context_name_warn(context_bytes);
                     pos += len;
                 }
-                0xa2 | 0xa3 | 0xa4 | 0xa5 | 0xa8 | 0xa9 | 0xaa | 0xad => {
-                    // called, calling and responding titles; only user-information is needed
+                TAG_CALLED_AP_TITLE => {
+                    // called-AP-title [2] EXPLICIT OID
+                    let field = safe_slice(buf, pos, len, end)?;
+                    self.aarq_addressing.called_ap_title = decode_ap_title(field);
                     pos += len;
                 }
-                0xa6 => {
+                TAG_CALLED_AE_QUALIFIER => {
+                    // called-AE-qualifier [3] EXPLICIT INTEGER
+                    let field = safe_slice(buf, pos, len, end)?;
+                    self.aarq_addressing.called_ae_qualifier = parse_ae_qualifier(field);
+                    pos += len;
+                }
+                0xa4 | 0xa5 | 0xa8 | 0xa9 | 0xaa | 0xad => {
+                    // invocation identifiers and implementation information, skipped
+                    pos += len;
+                }
+                TAG_CALLING_AP_TITLE => {
                     // calling-AP-title [6] EXPLICIT OID
                     let field = safe_slice(buf, pos, len, end)?;
                     self.application_reference.ap_title = parse_ap_title(field);
+                    self.aarq_addressing.calling_ap_title = decode_ap_title(field);
                     pos += len;
                 }
-                0xa7 => {
+                TAG_CALLING_AE_QUALIFIER => {
                     // calling-AE-qualifier [7] EXPLICIT INTEGER
                     let field = safe_slice(buf, pos, len, end)?;
-                    self.application_reference.ae_qualifier = parse_ae_qualifier(field);
+                    let qualifier = parse_ae_qualifier(field);
+                    self.application_reference.ae_qualifier = qualifier.unwrap_or(0);
+                    self.aarq_addressing.calling_ae_qualifier = qualifier;
                     pos += len;
                 }
                 0x8a => {
@@ -387,13 +615,17 @@ impl AcseConnection {
             return Err(AcseError::NoUserData);
         };
         let auth = match (mechanism, auth_value) {
+            (None, None) => AcseAuth::None,
             (Some(oid), Some(value)) if oid == AUTH_MECH_PASSWORD_OID => {
                 match parse_charstring(value)? {
                     Some(pw) => AcseAuth::Password(pw.to_vec()),
-                    None => AcseAuth::None,
+                    None => AcseAuth::other(oid.to_vec(), value.to_vec()),
                 }
             }
-            _ => AcseAuth::None,
+            (oid, value) => AcseAuth::other(
+                oid.map(<[u8]>::to_vec).unwrap_or_default(),
+                value.map(<[u8]>::to_vec).unwrap_or_default(),
+            ),
         };
         Ok((ud, auth))
     }
@@ -423,6 +655,7 @@ impl AcseConnection {
         let mut result_code: u32 = 0;
         let mut user_data: Option<&'buf [u8]> = None;
         let mut saw_result = false;
+        self.result_source_diagnostic = None;
 
         while pos < end {
             // Bound the tag byte before reading it
@@ -476,7 +709,9 @@ impl AcseConnection {
                     pos += len;
                 }
                 0xa3 => {
-                    // result-source-diagnostic [3] EXPLICIT, a fixed value, skipped
+                    // result-source-diagnostic [3] EXPLICIT
+                    let field = safe_slice(buf, pos, len, end)?;
+                    self.result_source_diagnostic = parse_service_user_diagnostic(field);
                     pos += len;
                 }
                 0xbe => {
@@ -566,15 +801,38 @@ pub fn encode_aarq(
 ///   `None` or an empty payload leaves user-information out.
 /// - `next_reference`: the indirect-reference, the presentation context
 ///   identifier of MMS that the initiator chose.
+///
+/// The result-source-diagnostic is acse-service-user null; see
+/// [`encode_aare_with_diagnostic`] for another one.
 pub fn encode_aare(result: u32, payload: Option<&[u8]>, next_reference: u32, out: &mut BytesMut) {
+    encode_aare_with_diagnostic(
+        result,
+        AcseServiceUserDiagnostic::Null,
+        payload,
+        next_reference,
+        out,
+    );
+}
+
+/// Serializes an AARE PDU, tag 0x61, whose result-source-diagnostic is the
+/// acse-service-user `diagnostic`; the other parameters are those of
+/// [`encode_aare`].
+pub fn encode_aare_with_diagnostic(
+    result: u32,
+    diagnostic: AcseServiceUserDiagnostic,
+    payload: Option<&[u8]>,
+    next_reference: u32,
+    out: &mut BytesMut,
+) {
     let app_ctx_bytes = build_app_context_name();
 
     // result [2] EXPLICIT: a2 03 02 01 <result>
     let result_byte = result.min(255) as u8;
     let result_bytes: [u8; 5] = [0xa2, 0x03, 0x02, 0x01, result_byte];
 
-    // result-source-diagnostic [3] EXPLICIT, fixed: a3 05 a1 03 02 01 00
-    let diag_bytes: [u8; 7] = [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, 0x00];
+    // result-source-diagnostic [3] EXPLICIT holding acse-service-user [1]
+    // EXPLICIT INTEGER: a3 05 a1 03 02 01 <diagnostic>
+    let diag_bytes: [u8; 7] = [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, diagnostic.code()];
 
     // user-information is written for a non-empty payload, whatever the result
     let user_info = match payload {
@@ -769,28 +1027,36 @@ fn parse_charstring(value: &[u8]) -> Result<Option<&[u8]>, AcseError> {
     Ok(Some(charstring))
 }
 
-/// Names the mechanism of `auth` for logging, without its credentials.
-fn mechanism_label(auth: &AcseAuth) -> &'static str {
-    match auth {
-        AcseAuth::None => "none",
-        AcseAuth::Password(_) => "password",
-        AcseAuth::TlsCertificate(_) => "certificate",
-    }
-}
-
-/// Builds the authentication fields for the no-auth and password mechanisms.
+/// Builds the sender-ACSE-requirements, mechanism-name and
+/// calling-authentication-value fields of `auth`.
 ///
-/// `AcseAuth::TlsCertificate` emits no fields: the client certificate is validated
-/// during the TLS handshake and IEC 62351-4 does not repeat it in the AARQ. The
-/// mechanism-name OID that marks certificate authentication is not emitted yet, so
-/// a peer cannot tell this apart from no authentication.
-// TODO: emit the IEC 62351-4 mechanism-name OID for certificate authentication.
+/// `AcseAuth::TlsCertificate` writes no field, like `AcseAuth::None`.
+/// `AcseAuth::Other` writes its mechanism-name when it has one and its value
+/// when it has one.
+// TODO: write the IEC 62351-4 certificate mechanism once its mechanism-name and
+// authentication value are confirmed against IEC 62351-4 clause 11 and Annex A.
 fn build_auth_fields(auth: Option<&AcseAuth>) -> Vec<u8> {
     match auth {
         None | Some(AcseAuth::None) | Some(AcseAuth::TlsCertificate(_)) => Vec::new(),
+        Some(AcseAuth::Other { mechanism, value }) => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&SENDER_REQUIREMENTS_AUTHENTICATION);
+            if !mechanism.is_empty() {
+                // mechanism-name [11] IMPLICIT OID
+                out.push(0x8b);
+                write_ber_length(&mut out, mechanism.len());
+                out.extend_from_slice(mechanism);
+            }
+            if !value.is_empty() {
+                // calling-authentication-value [12] EXPLICIT Authentication-value
+                out.push(0xac);
+                write_ber_length(&mut out, value.len());
+                out.extend_from_slice(value);
+            }
+            out
+        }
         Some(AcseAuth::Password(pw)) => {
-            // sender-ACSE-requirements [10] IMPLICIT BIT STRING: 8a 02 04 80
-            let req: [u8; 4] = [0x8a, 0x02, 0x04, REQUIREMENTS_AUTHENTICATION[0]];
+            let req = SENDER_REQUIREMENTS_AUTHENTICATION;
             // mechanism-name [11] IMPLICIT OID: 8b 03 <OID>
             let mech: [u8; 5] = [
                 0x8b,
@@ -926,32 +1192,68 @@ fn parse_app_context_name_warn(field: &[u8]) {
     }
 }
 
-/// Parses calling-AP-title and returns its OID bytes.
+/// Parses an AP-title field and returns its OID content octets, or an empty
+/// vector when the field is not an OBJECT IDENTIFIER.
 ///
-/// Expected encoding: 06 <len> <oid bytes>.
+/// Expected encoding, where `field` is the content of the EXPLICIT tag:
+/// 06 <len> <oid bytes>, the length in short or long form.
 fn parse_ap_title(field: &[u8]) -> Vec<u8> {
-    if field.len() < 2 || field[0] != 0x06 {
-        return Vec::new();
-    }
-    let oid_len = field[1] as usize;
-    if 2 + oid_len > field.len() {
-        return Vec::new();
-    }
-    field[2..2 + oid_len].to_vec()
+    explicit_inner(field, BER_TAG_OID)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
-/// Parses calling-AE-qualifier and returns its integer value.
+/// Decodes an AP-title field into an [`ApTitle`], or `None` when it is not a
+/// well-formed OBJECT IDENTIFIER.
+fn decode_ap_title(field: &[u8]) -> Option<ApTitle> {
+    let content = explicit_inner(field, BER_TAG_OID)?;
+    match ApTitle::from_ber_content(content) {
+        Ok(title) => Some(title),
+        Err(e) => {
+            warn!(error = %e, "aarq ap-title does not decode, ignoring it");
+            None
+        }
+    }
+}
+
+/// Returns the content of the single TLV of `field` when its tag is
+/// `expected_tag` and it fills `field` exactly.
+fn explicit_inner(field: &[u8], expected_tag: u8) -> Option<&[u8]> {
+    let mut pos = 0usize;
+    if safe_get_byte(field, &mut pos, field.len()).ok()? != expected_tag {
+        return None;
+    }
+    let len = ber_decode_length(field, &mut pos, field.len()).ok()?;
+    if pos + len != field.len() {
+        return None;
+    }
+    Some(&field[pos..])
+}
+
+/// Parses result-source-diagnostic and returns its acse-service-user value.
 ///
-/// Expected encoding, where `field` is the content of tag 0xa7: 02 <len> <int bytes>.
-fn parse_ae_qualifier(field: &[u8]) -> i32 {
-    if field.len() < 2 || field[0] != 0x02 {
-        return 0;
+/// Expected encoding, where `field` is the content of tag 0xa3:
+/// a1 <len> 02 <len> <int bytes>. The acse-service-provider alternative, and a
+/// value outside 0..=14, yield `None`.
+fn parse_service_user_diagnostic(field: &[u8]) -> Option<AcseServiceUserDiagnostic> {
+    let integer = explicit_inner(field, 0xa1)?;
+    let content = explicit_inner(integer, BER_TAG_INTEGER)?;
+    if content.is_empty() || content.len() > 4 {
+        return None;
     }
-    let int_len = field[1] as usize;
-    if 2 + int_len > field.len() || int_len == 0 {
-        return 0;
+    AcseServiceUserDiagnostic::from_code(ber_decode_uint(content, 0, content.len()))
+}
+
+/// Parses an AE-qualifier field and returns its integer value, or `None` when
+/// the field is not an INTEGER of one to four octets.
+///
+/// Expected encoding, where `field` is the content of the EXPLICIT tag:
+/// 02 <len> <int bytes>.
+fn parse_ae_qualifier(field: &[u8]) -> Option<i32> {
+    let int_bytes = explicit_inner(field, BER_TAG_INTEGER)?;
+    if int_bytes.is_empty() || int_bytes.len() > 4 {
+        return None;
     }
-    let int_bytes = &field[2..2 + int_len];
     // BER signed integer, most significant byte first
     let mut val: i32 = if int_bytes[0] & 0x80 != 0 {
         -1i32
@@ -961,7 +1263,7 @@ fn parse_ae_qualifier(field: &[u8]) -> i32 {
     for &b in int_bytes {
         val = (val << 8) | (b as i32);
     }
-    val
+    Some(val)
 }
 
 // BER encoding and decoding helpers
@@ -1636,9 +1938,9 @@ mod tests {
     }
 
     /// A charstring followed by further bytes inside calling-authentication-value
-    /// is not presented as a password.
+    /// is not presented as a password but as another mechanism.
     #[test]
-    fn aarq_charstring_with_trailing_bytes_passes_none() {
+    fn aarq_charstring_with_trailing_bytes_is_not_a_password() {
         let (mut conn, seen) = password_conn(b"secret");
         let mut aarq = make_aarq_pw(&[0x01, 0x02], b"secret");
         // ac 08 80 06 "secret" -> ac 0a 80 06 "secret" 00 00, outer lengths adjusted
@@ -1655,7 +1957,12 @@ mod tests {
         aarq[1] += 2;
         let (indication, _) = conn.parse_message(&aarq).unwrap();
         assert_eq!(indication, AcseIndication::AssociateFailed);
-        assert_eq!(*seen.lock().unwrap(), Some(AcseAuth::None));
+        let mut value = vec![0x80, 0x06];
+        value.extend_from_slice(b"secret");
+        value.extend_from_slice(&[0x00, 0x00]);
+        let expected = AcseAuth::other(AUTH_MECH_PASSWORD_OID.to_vec(), value);
+        assert_eq!(*seen.lock().unwrap(), Some(expected.clone()));
+        assert_eq!(conn.calling_authentication(), &expected);
     }
 
     /// The `Debug` output of a password names its length and leaves out its bytes.
@@ -1668,9 +1975,9 @@ mod tests {
     }
 
     /// An authentication value under a mechanism-name other than the password one
-    /// is not presented as a password.
+    /// is not presented as a password but as that mechanism with its value.
     #[test]
-    fn aarq_value_under_unknown_mechanism_passes_none() {
+    fn aarq_value_under_unknown_mechanism_is_another_mechanism() {
         let (mut conn, seen) = password_conn(b"secret");
         let mut aarq = make_aarq_pw(&[0x01, 0x02], b"secret");
         let pos = aarq
@@ -1680,6 +1987,203 @@ mod tests {
         aarq[pos + 2] = 0x02;
         let (indication, _) = conn.parse_message(&aarq).unwrap();
         assert_eq!(indication, AcseIndication::AssociateFailed);
-        assert_eq!(*seen.lock().unwrap(), Some(AcseAuth::None));
+        let mut value = vec![0x80, 0x06];
+        value.extend_from_slice(b"secret");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(AcseAuth::other(vec![0x52, 0x03, 0x02], value))
+        );
+    }
+
+    /// The `Debug` output of another mechanism shows its name and only the
+    /// length of its value.
+    #[test]
+    fn acse_auth_debug_redacts_another_mechanism_value() {
+        let text = format!(
+            "{:?}",
+            AcseAuth::other(vec![0x2b, 0x06], b"\x80\x07hunter2".to_vec())
+        );
+        assert_eq!(
+            text,
+            "Other { mechanism: [2b, 06], value: <9 bytes redacted> }"
+        );
+        assert_eq!(AcseAuth::other(Vec::new(), Vec::new()).label(), "other");
+    }
+
+    /// Another mechanism round trips through the encoder and the parser with
+    /// its mechanism-name and its Authentication-value unchanged.
+    #[test]
+    fn another_mechanism_round_trips() {
+        let mechanism = vec![0x2b, 0xce, 0x0f, 0x01];
+        let value = vec![0xa2, 0x03, 0x02, 0x01, 0x05];
+        let auth = AcseAuth::other(mechanism.clone(), value.clone());
+        let mut out = BytesMut::new();
+        encode_aarq(
+            &[0x01, 0x02],
+            Some(&auth),
+            3,
+            &AarqAddressing::default(),
+            &mut out,
+        );
+        let pdu = out.as_ref();
+        let mut fields = vec![0x8a, 0x02, 0x04, 0x80, 0x8b, 0x04];
+        fields.extend_from_slice(&mechanism);
+        fields.extend_from_slice(&[0xac, 0x05]);
+        fields.extend_from_slice(&value);
+        assert!(
+            pdu.windows(fields.len()).any(|w| w == fields.as_slice()),
+            "{pdu:02x?}"
+        );
+        let mut conn = AcseConnection::new(None);
+        let (indication, user_data) = conn.parse_message(pdu).unwrap();
+        assert_eq!(indication, AcseIndication::Associate);
+        assert_eq!(user_data, &[0x01, 0x02]);
+        assert_eq!(conn.calling_authentication(), &auth);
+    }
+
+    /// The password mechanism keeps its encoding and is read back as a password.
+    #[test]
+    fn password_round_trips() {
+        let auth = AcseAuth::Password(b"secret".to_vec());
+        let mut out = BytesMut::new();
+        encode_aarq(
+            &[0x01],
+            Some(&auth),
+            3,
+            &AarqAddressing::default(),
+            &mut out,
+        );
+        let mut conn = AcseConnection::new(None);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(conn.calling_authentication(), &auth);
+
+        let mut out = BytesMut::new();
+        encode_aarq(&[0x01], None, 3, &AarqAddressing::default(), &mut out);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(
+            conn.calling_authentication(),
+            &AcseAuth::None,
+            "each aarq replaces the credentials of the previous one"
+        );
+    }
+
+    /// The called and calling AP-title and AE-qualifier are read back as
+    /// encoded, each absent field as `None`.
+    #[test]
+    fn aarq_addressing_is_read_back() {
+        let addressing = AarqAddressing {
+            called_ap_title: Some(ap_title("1.1.1.999.1")),
+            called_ae_qualifier: Some(-3),
+            calling_ap_title: Some(ap_title("1.3.9999.13")),
+            calling_ae_qualifier: Some(300),
+        };
+        let mut out = BytesMut::new();
+        encode_aarq(&[0x01], None, 3, &addressing, &mut out);
+        let mut conn = AcseConnection::new(None);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(conn.aarq_addressing(), &addressing);
+
+        let calling_only = AarqAddressing {
+            calling_ap_title: Some(ap_title("1.1.1.999")),
+            ..AarqAddressing::default()
+        };
+        let mut out = BytesMut::new();
+        encode_aarq(&[0x01], None, 3, &calling_only, &mut out);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(conn.aarq_addressing(), &calling_only);
+    }
+
+    /// An AP-title whose OBJECT IDENTIFIER exceeds 127 octets, so that its
+    /// length takes the long form, is read back whole.
+    #[test]
+    fn long_form_ap_title_is_read_back() {
+        let arcs: Vec<String> = core::iter::once("1.3".to_string())
+            .chain((0..150).map(|i| (1000 + i).to_string()))
+            .collect();
+        let title = ap_title(&arcs.join("."));
+        assert!(title.to_ber_content().len() > 127);
+        let addressing = AarqAddressing {
+            calling_ap_title: Some(title.clone()),
+            ..AarqAddressing::default()
+        };
+        let mut out = BytesMut::new();
+        encode_aarq(&[0x01], None, 3, &addressing, &mut out);
+        let mut conn = AcseConnection::new(None);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(conn.aarq_addressing().calling_ap_title, Some(title.clone()));
+        assert_eq!(
+            conn.application_reference.ap_title,
+            title.to_ber_content(),
+            "the application reference reads the long form as well"
+        );
+    }
+
+    /// The acse-service-user diagnostic of an AARE is written and read back for
+    /// every value, and its INTEGER value is the ISO 8650 one.
+    #[test]
+    fn aare_diagnostic_round_trips() {
+        for code in 0..=14u32 {
+            let diagnostic = AcseServiceUserDiagnostic::from_code(code).unwrap();
+            assert_eq!(u32::from(diagnostic.code()), code);
+            let mut out = BytesMut::new();
+            encode_aare_with_diagnostic(1, diagnostic, None, 3, &mut out);
+            let diag_field = [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, code as u8];
+            assert!(out.windows(7).any(|w| w == diag_field), "{out:02x?}");
+            let mut conn = AcseConnection::new(None);
+            let (indication, _) = conn.parse_message(out.as_ref()).unwrap();
+            assert_eq!(indication, AcseIndication::AssociateFailed);
+            assert_eq!(conn.result_source_diagnostic(), Some(diagnostic));
+        }
+        assert_eq!(AcseServiceUserDiagnostic::from_code(15), None);
+        assert_eq!(
+            AcseServiceUserDiagnostic::AuthenticationFailure.to_string(),
+            "authentication-failure"
+        );
+    }
+
+    /// `encode_aare` keeps the diagnostic null.
+    #[test]
+    fn encode_aare_writes_a_null_diagnostic() {
+        let mut out = BytesMut::new();
+        encode_aare(0, Some(&[0xa9, 0x00]), 3, &mut out);
+        let diag_field = [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, 0x00];
+        assert!(out.windows(7).any(|w| w == diag_field));
+        let mut conn = AcseConnection::new(None);
+        conn.parse_message(out.as_ref()).unwrap();
+        assert_eq!(
+            conn.result_source_diagnostic(),
+            Some(AcseServiceUserDiagnostic::Null)
+        );
+    }
+
+    /// The acse-service-provider alternative and a value outside 0..=14 yield
+    /// no service-user diagnostic.
+    #[test]
+    fn aare_without_a_service_user_diagnostic_yields_none() {
+        for diag in [
+            [0xa3, 0x05, 0xa2, 0x03, 0x02, 0x01, 0x02],
+            [0xa3, 0x05, 0xa1, 0x03, 0x02, 0x01, 0x0f],
+        ] {
+            let mut out = BytesMut::new();
+            encode_aare(1, None, 3, &mut out);
+            let at = out.windows(7).position(|w| w[0] == 0xa3).unwrap();
+            out[at..at + 7].copy_from_slice(&diag);
+            let mut conn = AcseConnection::new(None);
+            let (indication, _) = conn.parse_message(out.as_ref()).unwrap();
+            assert_eq!(indication, AcseIndication::AssociateFailed);
+            assert_eq!(conn.result_source_diagnostic(), None, "{diag:02x?}");
+        }
+    }
+
+    /// The diagnostics that refuse the calling entity or its credentials are
+    /// exactly 3 to 6 and 11 to 14.
+    #[test]
+    fn authentication_refusals_are_the_calling_and_authentication_diagnostics() {
+        let refusals: Vec<u8> = (0..=14u32)
+            .filter_map(AcseServiceUserDiagnostic::from_code)
+            .filter(|d| d.is_authentication_refusal())
+            .map(AcseServiceUserDiagnostic::code)
+            .collect();
+        assert_eq!(refusals, vec![3, 4, 5, 6, 11, 12, 13, 14]);
     }
 }
